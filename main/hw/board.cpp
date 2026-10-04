@@ -1,4 +1,5 @@
 #include "board.h"
+#include "board_hw.h"
 
 #include <cstring>
 #include <esp_log.h>

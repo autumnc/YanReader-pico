@@ -8,14 +8,11 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include "board.h"
 #include "epdiy.h"
 #include "fb_fast.h"
 #include "ttf_font.h"
 #include "u8g2_shim.h"
 #include "ui_helpers.h"
-
-extern u8g2_t *g_u8g2;   // 定义在 hw/board.cpp（各绘制模块都这样就地声明）
 
 static const char *TAG = "BootSplash";
 

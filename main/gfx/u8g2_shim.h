@@ -22,6 +22,12 @@ typedef struct u8g2_struct {
 
 typedef u8g2_struct u8g2_t;
 
+// 全局 shim 句柄（定义在 hw/board.cpp）。各绘制模块以前各自就地写一份
+// `extern u8g2_t *g_u8g2;`，外加十来行手搓的 u8g2 函数原型——那些原型把形参写成
+// `void *`，跟这里的 `u8g2_t *` 对不上，同一个 C 链接符号有了两套声明。
+// 声明收在这儿，谁要画图就 include 这一个头，不用再抄。
+extern u8g2_t *g_u8g2;
+
 void u8g2_InitDisplay(u8g2_t* u8g2);
 void u8g2_SetPowerSave(u8g2_t* u8g2, uint8_t is_enable);
 uint8_t* u8g2_GetBufferPtr(u8g2_t* u8g2);

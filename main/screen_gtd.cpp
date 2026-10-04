@@ -39,24 +39,14 @@
 #include <sys/stat.h>
 
 #include <dirent.h>
+#include "u8g2_shim.h"
 
 
-
-extern u8g2_t *g_u8g2;
 
 extern "C" {
 
-    extern void u8g2_SetDrawColor(void *u8g2, int color);
-
-    extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
-
-    extern void u8g2_DrawHLine(void *u8g2, int x, int y, int w);
-
-    extern void u8g2_DrawFrame(void *u8g2, int x, int y, int w, int h);
-
     // 图标字体直接写 4bpp 帧缓冲（与主菜单 drawMainMenuIcon 同一条路），不走 u8g2 的
     // 画点接口。返回的就是 epdiy 的 front_fb。
-    extern uint8_t* u8g2_GetBufferPtr(void *u8g2);
 
 }
 

@@ -3,7 +3,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 
-#include "board.h"
+#include "board_hw.h"
 #include "cst836u.h"
 #include "pjournal_app.h"  // KEY_UP/DOWN/LEFT/RIGHT/…
 #include "read_pico_pmu.h"

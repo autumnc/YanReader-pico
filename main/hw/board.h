@@ -1,23 +1,18 @@
 #pragma once
 
+// 板级**应用接口**：初始化、屏幕方向、夜间反色、u8g2 绘制句柄。
+//
+// 故意保持 epdiy 无关 —— 这里不 include epd_highlevel.h 之类，任何 UI 模块
+// 都能放心 include 而不背上整套驱动依赖。要摸硬件的（推屏、触摸、加速度计）
+// 请 include "board_hw.h"。
+
 #include <stdint.h>
 #include <stdbool.h>
 
-#include "read_pico_init.h"
-#include "epd_highlevel.h"
-
-struct u8g2_struct;
-typedef struct u8g2_struct u8g2_t;
-
-// 板级全局句柄（定义于 hw/board.cpp）：hl / framebuffer / touch / sensor / pmu_ready。
-extern read_pico_handle_t g_hw;
-// u8g2 shim 句柄：g_u8g2->fb 指向 epdiy 4bpp framebuffer。
-extern u8g2_t *g_u8g2;
+#include "u8g2_shim.h"  // u8g2_t + g_u8g2（shim 句柄）
 
 // 板级 bring-up：read_pico_init + 上电 + 清屏 + 清白。失败返回 false。
 bool board_init();
-
-EpdiyHighlevelState *board_hl();
 
 // 应用方向设置（"landscape" 默认 | "portrait"）。改旋转后由调用方整屏重刷。
 void board_apply_orientation(const char *orientation);

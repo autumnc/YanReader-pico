@@ -6,13 +6,7 @@
 #include "ui_helpers.h"
 
 #include <algorithm>
-
-extern u8g2_t *g_u8g2;
-
-extern "C" {
-extern void u8g2_SetDrawColor(void *u8g2, int color);
-extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
-}
+#include "u8g2_shim.h"
 
 // ── 会话状态 ────────────────────────────────────────────────────────────
 // 选区一律用**缓冲里的字节偏移**表示：宿主给行表、模块算字节，双方都不用互相

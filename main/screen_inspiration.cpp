@@ -15,15 +15,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <algorithm>
-
-extern u8g2_t *g_u8g2;
-extern "C" {
-    extern void u8g2_SetDrawColor(void *g_u8g2, int color);
-    extern void u8g2_DrawPixel(void *g_u8g2, int x, int y);
-    extern void u8g2_DrawBox(void *g_u8g2, int x, int y, int w, int h);
-    extern void u8g2_DrawHLine(void *g_u8g2, int x, int y, int w);
-    extern void u8g2_DrawFrame(void *g_u8g2, int x, int y, int w, int h);
-}
+#include "u8g2_shim.h"
 
 #define INSPIRATION_FILE "/sdcard/outline/inspiration.json"
 #define MAX_PREVIEW 30

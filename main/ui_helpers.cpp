@@ -6,7 +6,6 @@
 #include "settings_manager.h"
 #include "ime/IME.h"
 #include "bt_keyboard.h"
-#include "board.h"
 #include "display.h"
 #include "app_config.h"
 #include "read_pico_pmu.h"
@@ -21,8 +20,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_heap_caps.h>
-
-extern u8g2_t *g_u8g2;
 
 // ── 运行时屏幕几何（由 epd 旋转决定）───────────────────────────────────
 int ui_screen_w() { return epd_rotated_display_width(); }

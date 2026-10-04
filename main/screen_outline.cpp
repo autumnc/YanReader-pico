@@ -15,18 +15,10 @@
 #include <algorithm>
 #include <unistd.h>
 #include <set>
+#include "u8g2_shim.h"
 
 #define KEY_CTRL_ENTER 0x85
 static const long MAX_OUTLINE_CONTENT_FILE_SIZE = 256 * 1024;
-
-extern u8g2_t *g_u8g2;
-extern "C" {
-    extern void u8g2_SetDrawColor(void *g_u8g2, int color);
-    extern void u8g2_DrawPixel(void *g_u8g2, int x, int y);
-    extern void u8g2_DrawBox(void *g_u8g2, int x, int y, int w, int h);
-    extern void u8g2_DrawHLine(void *g_u8g2, int x, int y, int w);
-    extern void u8g2_DrawFrame(void *g_u8g2, int x, int y, int w, int h);
-}
 
 // ── File icon bitmap (from Go-Song2Propo-NF-R.ttf, U+F15B fa-file-text-o) ──
 static const uint8_t FILE_ICON_BITS[] = {

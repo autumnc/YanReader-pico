@@ -14,14 +14,7 @@
 #include <vector>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-
-extern u8g2_t *g_u8g2;
-
-extern "C" {
-    extern void u8g2_SetDrawColor(void *u8g2, int color);
-    extern void u8g2_DrawHLine(void *u8g2, int x, int y, int w);
-    extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
-}
+#include "u8g2_shim.h"
 
 // Work chain: DeepSeek polish, show result. The dialog (R key) edits the extra
 // instruction before re-running the chain.

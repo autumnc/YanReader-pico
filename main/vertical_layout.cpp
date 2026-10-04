@@ -3,16 +3,7 @@
 #include "ui_helpers.h"
 
 #include <algorithm>
-
-extern "C" {
-    extern void u8g2_SetDrawColor(void *u8g2, int color);
-    extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
-    extern void u8g2_DrawVLine(void *u8g2, int x, int y, int h);
-    extern void u8g2_DrawPixel(void *u8g2, int x, int y);
-}
-struct u8g2_struct;
-typedef struct u8g2_struct u8g2_t;
-extern u8g2_t *g_u8g2;
+#include "u8g2_shim.h"
 
 static int nextUtf8Byte(const std::string &line, int pos) {
     if (pos >= (int)line.size()) return (int)line.size();

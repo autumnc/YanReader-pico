@@ -26,7 +26,6 @@ int  FontRenderer::px_          = 50;
 bool FontRenderer::loaded_      = false;
 
 // 定义于 main.cpp / ui_helpers（u8g2 shim 句柄，含 epdiy framebuffer 指针）
-extern u8g2_t *g_u8g2;
 
 // ---- 状态栏专用图标（pjournal 自定义 PUA，NF-Propo 无对应字形，程序化绘制） ----
 static bool isStatusSymbol(uint32_t cp) {

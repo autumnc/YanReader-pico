@@ -21,7 +21,7 @@
 #include "ui_helpers.h"   // SCREEN_W / SCREEN_H
 
 #include "app_config.h"
-#include "board.h"
+#include "board_hw.h"
 #include "display.h"
 #include "editor_vk.h"   // editorVkVisible/editorVkTop：虚拟键盘面板顶
 #include "e0470_epaper_waveform.h"
@@ -39,8 +39,6 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
-
-extern u8g2_t *g_u8g2;
 
 static const char *TAG = "ui_render";
 

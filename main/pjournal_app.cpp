@@ -18,8 +18,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-extern u8g2_t *g_u8g2;
-
 std::string g_flomoPendingText;
 AppState g_flomoReturnTo = APP_EDITOR;
 

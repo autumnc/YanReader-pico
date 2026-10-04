@@ -29,6 +29,7 @@
 #include "boot_splash.h"  // Yan Reader 开机动画（研读｜研墨｜研虑）
 
 #include "board.h"
+#include "board_hw.h"
 #include "u8g2_shim.h"
 #include "hw/input.h"
 #include "crossmux_platform.h"

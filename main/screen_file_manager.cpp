@@ -7,14 +7,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <cstdio>
-
-extern u8g2_t *g_u8g2;
-
-extern "C" {
-    extern void u8g2_SetDrawColor(void *u8g2, int color);
-    extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
-    extern void u8g2_DrawHLine(void *u8g2, int x, int y, int w);
-}
+#include "u8g2_shim.h"
 
 static struct {
     bool serverRunning = false;

@@ -29,14 +29,10 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include "u8g2_shim.h"
 
-extern u8g2_t *g_u8g2;
 extern "C" {
-    extern void u8g2_SetDrawColor(void *g_u8g2, int color);
-    extern void u8g2_DrawHLine(void *g_u8g2, int x, int y, int w);
-    extern void u8g2_DrawFrame(void *g_u8g2, int x, int y, int w, int h);
     // 图标字体不走 u8g2，直接写 4bpp 帧缓冲（与 screen_editor 同一手法）。
-    extern unsigned char *u8g2_GetBufferPtr(void *u8g2);
 }
 
 #define FLOMO_DIR "/sdcard/flomo"

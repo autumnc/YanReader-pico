@@ -5,15 +5,7 @@
 #include "input.h"       // input_tap_xy：点按/长按的落点靠它（浮动按钮与长按菜单都要）
 #include <cstdio>
 #include <esp_timer.h>
-
-extern u8g2_t *g_u8g2;
-
-extern "C" {
-    extern void u8g2_SetDrawColor(void *u8g2, int color);
-    extern void u8g2_DrawHLine(void *u8g2, int x, int y, int w);
-    extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
-    extern void u8g2_DrawFrame(void *u8g2, int x, int y, int w, int h);
-}
+#include "u8g2_shim.h"
 
 // ── BT manage state ───────────────────────────────────────────────────────
 enum BtMode { BT_MANAGE, BT_SCAN };
