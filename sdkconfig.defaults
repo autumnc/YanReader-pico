@@ -1,0 +1,84 @@
+# pjournal-pico: 合并 read_pico 板级配置 + pjournal 的 BLE/WiFi/HTTP 需求。
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16M.csv"
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+# read_pico 板级调优：flash 与 PSRAM 共用 120MHz 时钟域（见 read_pico sdkconfig.defaults 注释）。
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_ESPTOOLPY_FLASHFREQ_120M=y
+CONFIG_SPI_FLASH_HPM_ENA=y
+CONFIG_SPI_FLASH_HPM_DC_DISABLE=y
+CONFIG_SPIRAM_SPEED_120M=y
+CONFIG_SPIRAM_TIMING_TUNING_POINT_VIA_TEMPERATURE_SENSOR=n
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# 默认 16384：小于该阈值的分配强制走内部 RAM。阅读器解析一章要造出海量几百字节~几 KB 的
+# std::string/TextBlock/ParsedText，全部落在内部 RAM 会把 32KB 的 DMA 保留区吃光，
+# 于是 SDMMC 的弹跳缓冲分配失败（allocate_dma_buf: not enough mem）、读写直接报错。
+# 降到 1024 仍不够：写作模式实测打字时内部堆掉到只剩 1.2KB 空闲、最大连续块 544B
+# （内部 242KB 里已分配 234KB），此时任何一次小块分配失败都会让 libc 直接 abort
+# ——实际崩溃点是蓝牙重连时 loadPairedDevices() 的 fopen/fgets 给 FILE 分配互斥量失败。
+# 设为 0：所有默认分配优先 PSRAM（PSRAM 还空着 4.7MB），PSRAM 失败才回退内部堆。
+# 真正需要内部/DMA 的缓冲都走显式 MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA，不受此项影响
+# （epdiy 行队列、LCD 逐行 DMA 缓冲、SDMMC 弹跳缓冲均已显式指定）。
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+
+# WiFi（pjournal 的 STA 网络：WebDAV/Flomo/Deepseek/NTP）
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+# WiFi 的静态 RX/TX 缓冲**必须落在内部 DMA RAM**（PSRAM 走不了），本机内部 RAM
+# 到阅读模式初始化时只剩 ~30KB、最大连续块 ~29KB，用默认值（RX 6 / TX 16 / cache 32）
+# 时 esp_wifi_init 直接报 `esf_buf_setup_static: alloc eb fail` 而起不来。
+# 我们的网络用途只有 OPDS/WebDAV/Flomo/NTP 这类小 HTTP，把各池压到这个量足够。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=2
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=2
+CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=2
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+# mbedTLS 默认所有动态分配都走**内部** RAM。本机进阅读模式后内部 RAM 只剩 ~20KB，
+# 而 TLS 的 in/out 缓冲就 16KB+4KB（非对称内容长度），mbedtls_ssl_setup 直接
+# 返回 -0x008D(MBEDTLS_ERR_SSL_ALLOC_FAILED = PSA_ERROR_INSUFFICIENT_MEMORY)，
+# HTTPS 全线连不上。改用 PSRAM（本机 8MB，余 5MB+）。安全性提示：除非开了 flash
+# 加密，PSRAM 内容不上加密总线；个人阅读设备可接受。
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# HTTP（文件管理服务器 + WebDAV/Flomo/Deepseek 客户端）
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=1024
+
+# 板级：epdiy 行队列改用 8 行小队列（read_pico 组件 Kconfig 选项）。
+# 32 行队列 ×2 线程 ≈ 19KB 内部 DMA RAM，8 行省下约 14KB；本机要同时养 epdiy、
+# Bluedroid 与 WiFi 三份内部 RAM，必须挤出来。见 read_pico Kconfig 注释。
+CONFIG_READ_PICO_EPD_SMALL_FEED_QUEUE=y
+
+# BLE（pjournal 的 BLE HID 键盘主机）
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_BTU_TASK_STACK_SIZE=4096
+CONFIG_BT_BTC_TASK_STACK_SIZE=4096
+# 键盘 HID 报告(键盘+consumer+system+vendor)的 CCC 通知注册数；默认 5 不够，
+# 会报 "Max Notification Reached" 导致连上后收不到按键。
+CONFIG_BT_GATTC_NOTIF_REG_MAX=20
+
+# ESP32-S3 的 RTC fast RAM(8KB @0x600FE000) 只登记 MALLOC_CAP_INTERNAL、DMA 不可达，
+# 而 SDMMC 驱动仅按地址对齐就决定直接 DMA，会把落在该区的 fread/fwrite 缓冲写坏
+# （表现为 EPUB 章节解析中途报错、正文空白）。关闭它，避免这块兜底区被当普通堆用。
+# CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP is not set

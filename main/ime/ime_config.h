@@ -1,0 +1,39 @@
+#pragma once
+
+// Compile-time switches for IME modules. Defaults keep the current firmware
+// behavior intact while leaving room for optional table modules.
+#ifndef PJOURNAL_IME_ENABLE_PINYIN
+#define PJOURNAL_IME_ENABLE_PINYIN 1
+#endif
+
+#ifndef PJOURNAL_IME_ENABLE_LIANGFEN
+#define PJOURNAL_IME_ENABLE_LIANGFEN 1
+#endif
+
+#ifndef PJOURNAL_IME_ENABLE_WUBI
+#define PJOURNAL_IME_ENABLE_WUBI 0
+#endif
+
+#ifndef PJOURNAL_IME_ENABLE_SHUANGPIN
+#define PJOURNAL_IME_ENABLE_SHUANGPIN 0
+#endif
+
+#ifndef PJOURNAL_IME_FAST_LOOKUP
+#define PJOURNAL_IME_FAST_LOOKUP 1
+#endif
+
+#ifndef PJOURNAL_IME_PERF_LOG
+#define PJOURNAL_IME_PERF_LOG 0
+#endif
+
+#ifndef PJOURNAL_IME_USERDICT_JOURNAL_DEFER_US
+#define PJOURNAL_IME_USERDICT_JOURNAL_DEFER_US 500000
+#endif
+
+#ifndef PJOURNAL_IME_USERDICT_JOURNAL_BATCH_LIMIT
+#define PJOURNAL_IME_USERDICT_JOURNAL_BATCH_LIMIT 16
+#endif
+
+#ifndef PJOURNAL_IME_PREDICT_INDEX_MAX_GROUPS
+#define PJOURNAL_IME_PREDICT_INDEX_MAX_GROUPS 4096
+#endif

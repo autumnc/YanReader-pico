@@ -1,0 +1,38 @@
+#pragma once
+#include <cstdint>
+
+#include "FirstLineIndent.h"
+
+// The resolved text-rendering configuration a reader hands to the layout
+// engine. Section-cache validation keys on every field: a section file built
+// with a different spec is discarded and rebuilt.
+//
+// Build one via CrossPointSettings::readerRenderSpec(width, height), which
+// fills settings and viewport fields. The reader supplies collectTouchLinks
+// from the input device and applies any session-only CSS fallback. Taking
+// the viewport as arguments is what keeps a spec from
+// existing in a half-filled state — the 0 defaults below are a last-resort
+// backstop (a 0x0 viewport lays out nothing), not an invitation to omit it.
+struct ReaderRenderSpec {
+  int fontId = 0;
+  // Identifies the actual typeface when it is not the reader's own font — today the
+  // book's embedded font. fontId only picks a size, so without this two different
+  // faces at the same size would share a section cache. The reader supplies a value
+  // derived from the loaded font (0 = the user's/built-in font).
+  uint32_t fontTag = 0;
+  float lineCompression = 1.0f;
+  uint8_t extraParagraphSpacing = 0;  // 0=off, 1..5=0.5x/0.75x/1x/1.25x/1.5x line height
+  // Reader-level first-line indent, one of FirstLineIndent::Auto/Indent/
+  // NoIndent (see ParsedText.h). Independent of extraParagraphSpacing:
+  // paragraphs keep their indent even when extra paragraph spacing is
+  // enabled.
+  uint8_t firstLineIndent = FirstLineIndent::Auto;
+  uint8_t paragraphAlignment = 0;
+  uint16_t viewportWidth = 0;
+  uint16_t viewportHeight = 0;
+  bool hyphenationEnabled = false;
+  bool embeddedStyle = true;
+  uint8_t imageRendering = 0;
+  bool focusReadingEnabled = false;
+  bool collectTouchLinks = false;
+};

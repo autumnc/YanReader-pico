@@ -1,0 +1,646 @@
+# syllables<TAB>word
+# syllables use space-separated pinyin syllables, e.g. "shu ru fa".
+an guang	暗光
+xi an	西安
+fang an	方案
+dang an	档案
+ti an	提案
+di an	堤岸
+ming an	命案
+ping an	平安
+xue an	血案
+li an	立案
+yi an	议案
+yu an	预案
+bi an	彼岸
+yan an	延安
+xin an	心安
+xin ai	心爱
+qin ai	亲爱
+guan ai	关爱
+pi ao	皮袄
+chang e	嫦娥
+ji e	饥饿
+qi e	企鹅
+ke e	可恶
+ji ang	激昂
+ku ai	酷爱
+jiao ao	骄傲
+tian an men	天安门
+dang an guan	档案馆
+shu ru	输入
+shu ru fa	输入法
+hou xuan	候选
+hou xuan qu	候选区
+hou xuan ci	候选词
+yong hu ci	用户词
+yong hu ci ku	用户词库
+yong hu ci dian	用户词典
+lian xiang	联想
+lian xiang gong neng	联想功能
+lian xiang ci	联想词
+lian xiang ci ku	联想词库
+gu ding ci ku	固定词库
+dong tai ci ku	动态词库
+ci ku	词库
+ci pin	词频
+ci zu	词组
+jian pin	简拼
+quan pin	全拼
+pin yin	拼音
+ma biao	码表
+bian ma	编码
+yin jie	音节
+fen ci	分词
+gu jian	固件
+shua ji	刷机
+qi dong	启动
+qi dong jie mian	启动界面
+chong qi	重启
+ka dun	卡顿
+you hua	优化
+ban ben	版本
+lan ya	蓝牙
+lan ya jian pan	蓝牙键盘
+lan ya she bei	蓝牙设备
+lan ya lian jie	蓝牙连接
+jian pan	键盘
+jian pan dian liang	键盘电量
+dian liang	电量
+ping mu	屏幕
+ping mu shua xin	屏幕刷新
+she zhi	设置
+she zhi xiang	设置项
+ri ji	日记
+tong bu	同步
+wen jian tong bu	文件同步
+wen ben	文本
+bian ji	编辑
+biao dian	标点
+quan jiao	全角
+ban jiao	半角
+ying wen	英文
+wen jian	文件
+mu lu	目录
+dao chu	导出
+dao ru	导入
+yu yin	语音
+yu yin shu ru	语音输入
+yu yin shi bie	语音识别
+shi bie	识别
+wang luo	网络
+mi ma	密码
+ling gan	灵感
+ling gan ji lu	灵感记录
+da gang	大纲
+ren wu	任务
+ren wu guan li	任务管理
+dai ban	待办
+bi ji	笔记
+bi ji tong bu	笔记同步
+xiu gai	修改
+bao cun	保存
+sou suo	搜索
+sou suo jie guo	搜索结果
+chang yong	常用
+chang yong ci	常用词
+chang yong ci zu	常用词组
+chang yong duan yu	常用短语
+ri ji ji lu	日记记录
+jin tian	今天
+ming tian	明天
+zuo tian	昨天
+shang wu	上午
+xia wu	下午
+wan shang	晚上
+qing xu	情绪
+xin qing	心情
+gan shou	感受
+xiang fa	想法
+ling gan lai yuan	灵感来源
+gong zuo	工作
+gong zuo ri zhi	工作日志
+xue xi	学习
+xue xi ji lu	学习记录
+xiang mu	项目
+xiang mu jin zhan	项目进展
+wen ti	问题
+wen ti ji lu	问题记录
+jie jue	解决
+jie jue fang an	解决方案
+fu pan	复盘
+mei ri fu pan	每日复盘
+zhou bao	周报
+yue bao	月报
+zong jie	总结
+jie duan zong jie	阶段总结
+xia yi bu	下一步
+xia yi bu ji hua	下一步计划
+ji hua	计划
+ri cheng	日程
+an pai	安排
+ti xing	提醒
+qing dan	清单
+ren wu qing dan	任务清单
+wan cheng	完成
+yi wan cheng	已完成
+wei wan cheng	未完成
+jin zhan	进展
+mu biao	目标
+duan qi mu biao	短期目标
+chang qi mu biao	长期目标
+guan jian	关键
+guan jian ci	关键词
+bei wang	备忘
+bei wang lu	备忘录
+duan luo	段落
+wen zhang	文章
+cao gao	草稿
+hui yi	会议
+hui yi ji lu	会议记录
+hui yi ji yao	会议纪要
+jin tian xiang xie	今天想写
+jin tian xiang ji lu	今天想记录
+jin tian wan cheng	今天完成
+jin tian xu yao	今天需要
+ming tian ji xu	明天继续
+ming tian ji xu chu li	明天继续处理
+zuo tian wan cheng	昨天完成
+wen ti yi jing jie jue	问题已经解决
+wen ti xu yao chu li	问题需要处理
+xiang fa xian ji lu	想法先记录
+ling gan xian ji lu	灵感先记录
+xia yi bu ji xu	下一步继续
+shou ji	手机
+dian nao	电脑
+she bei	设备
+gu zhang	故障
+gu zhang pai cha	故障排查
+ri zhi	日志
+cuo wu	错误
+cuo wu xin xi	错误信息
+pei zhi	配置
+pei zhi wen jian	配置文件
+lian jie	连接
+lian jie shi bai	连接失败
+bao cun shi bai	保存失败
+tong bu shi bai	同步失败
+tong bu cheng gong	同步成功
+dao ru shi bai	导入失败
+dao chu shi bai	导出失败
+shu ru ti yan	输入体验
+hou xuan pai xu	候选排序
+mo hu yin	模糊音
+shuang pin	双拼
+wu bi	五笔
+chang ju	长句
+chang ju shu ru	长句输入
+zheng ju	整句
+zheng ju shu ru	整句输入
+li xian	离线
+li xian jian cha	离线检查
+hui gui	回归
+hui gui jian cha	回归检查
+
+# Yong pinyin supplemental phrases verified against pypinyin.
+bai wu yi yong shi shu sheng	百无一用是书生
+ban feng jian ban zhi min di	半封建半殖民地
+ban qi shi tou za zi ji jiao	搬起石头砸自己脚
+ban zhi min di ban feng jian	半殖民地半封建
+ba wang ying shang gong	霸王硬上弓
+bian bei dong wei zhu dong	变被动为主动
+bing jia bi zheng zhi di	兵家必争之地
+bing xiong xiong yi ge	兵熊熊一个
+bi xi	赑屃
+bu dao chang cheng fei hao han	不到长城非好汉
+bu fen qing hong zao bai	不分青红皂白
+bu gan yue lei chi yi bu	不敢越雷池一步
+bu jian guan cai bu luo lei	不见棺材不落泪
+bu jian tu zi bu sa ying	不见兔子不撒鹰
+bu shi ren jian yan huo	不食人间烟火
+bu wei wu dou mi zhe yao	不为五斗米折腰
+bu xian shan bu lu shui	不显山不露水
+bu zhan er qu ren zhi bing	不战而屈人之兵
+bu zheng dang shou duan	不正当手段
+bu zhuang nan qiang bu hui tou	不撞南墙不回头
+cang zai shen gui wu ren shi	藏在深闺无人识
+chang sheng jiang jun	常胜将军
+cheng huang cheng kong	诚惶诚恐
+cheng shuang cheng dui	成双成对
+chi bu liao dou zhe zou	吃不了兜着走
+chi cheng huang lv qing lan zi	赤橙黄绿青蓝紫
+chi yi qian zhang yi zhi	吃一堑长一智
+chuan duan kang cheng	川端康成
+chun xiao yi ke zhi qian jin	春宵一刻值千金
+chu sheng niu du bu pa hu	初生牛犊不怕虎
+ci di wu yin san bai liang	此地无银三百两
+ci fu	伺服
+ci fu qi	伺服器
+cong biao mian shang kan	从表面上看
+cong chang yuan lai kan	从长远来看
+cong ming fan bei cong ming wu	聪明反被聪明误
+cong ming yi shi hu tu yi shi	聪明一世糊涂一时
+cong mou zhong cheng du shang	从某种程度上
+cong mou zhong yi yi shang	从某种意义上
+cong xiao chu zhuo shou	从小处着手
+cun jin nan mai cun guang yin	寸金难买寸光阴
+da kai fang bian zhi men	大开方便之门
+da ren bu ji xiao ren guo	大人不记小人过
+da zhong lian chong pang zi	打肿脸充胖子
+de rao ren chu qie rao ren	得饶人处且饶人
+diao si	屌丝
+die die zhuang zhuang	跌跌撞撞
+dong fang bu liang xi fang liang	东方不亮西方亮
+duan duan zheng zheng	端端正正
+duo ru guo jiang zhi ji	多如过江之鲫
+e xiang dan bian sheng	恶向胆边生
+fang chang xian diao da yu	放长线钓大鱼
+fang fang zheng zheng	方方正正
+fang zhi si hai er jie zhun	放之四海而皆准
+fei shang zhi tou bian feng huang	飞上枝头变凤凰
+feng gao fang huo tian	风高放火天
+feng ma niu bu xiang ji	风马牛不相及
+feng shi xing guan jie yan	风湿性关节炎
+feng shui lun liu zhuan	风水轮流转
+geng shang yi ceng lou	更上一层楼
+gong fu bu fu you xin ren	工夫不负有心人
+gong jing bu ru cong ming	恭敬不如从命
+gong ye he xin xi hua bu	工业和信息化部
+guang jiao de bu pa chuan xie de	光脚的不怕穿鞋的
+guan gong zhan qin qiong	关公战秦琼
+guan liao zi ben zhu yi	官僚资本主义
+gu lao rou	咕咾肉
+guo wu guan zhan liu jiang	过五关斩六将
+hang hang chu zhuang yuan	行行出状元
+hao gang yong zai dao ren shang	好钢用在刀刃上
+hao han bu chi yan qian kui	好汉不吃眼前亏
+hao han bu ti dang nian yong	好汉不提当年勇
+hao ma bu chi hui tou cao	好马不吃回头草
+hao xin dang zuo lv gan fei	好心当作驴肝肺
+hei yun ya cheng cheng yu cui	黑云压城城欲摧
+heng chong zhi zhuang	横冲直撞
+heng tiao bi zi shu tiao yan	横挑鼻子竖挑眼
+hou guo bu kan she xiang	后果不堪设想
+hou lang tui qian lang	后浪推前浪
+hou tian xia zhi le er le	后天下之乐而乐
+hua hu bu cheng fan lei quan	画虎不成反类犬
+huang huang bu ke zhong ri	惶惶不可终日
+huang huang zhang zhang	慌慌张张
+hui mou yi xiao bai mei sheng	回眸一笑百媚生
+hu luo ping yang bei quan qi	虎落平阳被犬欺
+huo xiang zheng qi shui	藿香正气水
+jia chou bu ke wai yang	家丑不可外扬
+jian bu duan li hai luan	剪不断理还乱
+jian ding wei yuan hui	鉴定委员会
+jiang hai shi lao de la	姜还是老的辣
+jiang xiong xiong yi wo	将熊熊一窝
+jiao ta liang zhi chuan	脚踏两只船
+jiao ta liang tiao chuan	脚踏两条船
+jiao tian tian bu ying	叫天天不应
+jie ling hai xu xi ling ren	解铃还须系铃人
+jing bing qiang jiang	精兵强将
+jing jiu bu chi chi fa jiu	敬酒不吃吃罚酒
+jing shen wen ming jian she	精神文明建设
+jing shui bu fan he shui	井水不犯河水
+jin shui lou tai xian de yue	近水楼台先得月
+ji ren zi you tian xiang	吉人自有天相
+ji shan zhi jia bi you yu qing	积善之家必有余庆
+jiu bu zui ren ren zi zui	酒不醉人人自醉
+jiu xiang bu pa xiang zi shen	酒香不怕巷子深
+ji xing chuan ran bing	急性传染病
+jun zi bu li wei qiang zhi xia	君子不立危墙之下
+jun zi dong kou bu dong shou	君子动口不动手
+ju ren yu qian li zhi wai	拒人于千里之外
+kai chuang xin ju mian	开创新局面
+ke bian cheng kong zhi qi	可编程控制器
+ke lian tian xia fu mu xin	可怜天下父母心
+kong bian shuang fang	控辩双方
+kong huang wan zhuang	恐慌万状
+kong shou tao bai lang	空手套白狼
+lai er bu wang fei li ye	来而不往非礼也
+lai ha ma xiang chi tian e rou	癞蛤蟆想吃天鹅肉
+lang huan	琅嬛
+lang zi hui tou jin bu huan	浪子回头金不换
+lan ni fu bu shang qiang	烂泥扶不上墙
+lao ai	嫪毐
+lao ping zhuang xin jiu	老瓶装新酒
+lao si bu xiang wang lai	老死不相往来
+lei sheng da yu dian xiao	雷声大雨点小
+lian chan cheng bao ze ren zhi	联产承包责任制
+liang ge wen ming jian she	两个文明建设
+liang hai xiang quan qu qi qing	两害相权取其轻
+liang liang qiang qiang	踉踉跄跄
+liang shen zhong shen zhi	两审终审制
+liang xiang qing yuan	两厢情愿
+liang xiang qing yuan	两相情愿
+lian xiang dou bu gan xiang	连想都不敢想
+li gong shou jiang zhe	立功受奖者
+ling ren nan yi zhi xin	令人难以置信
+li shan	历山
+liu an hua ming you yi cun	柳暗花明又一村
+liu yi guo ji er tong jie	六一国际儿童节
+long feng cheng xiang	龙凤呈祥
+lou luo	喽啰
+luan dian yuan yang pu	乱点鸳鸯谱
+luo suo	啰嗦
+mai mai bu cheng ren yi zai	买卖不成仁义在
+mao ku hao zi jia ci bei	猫哭耗子假慈悲
+mao tian xia zhi da bu wei	冒天下之大不韪
+mei guo zhong yang qing bao ju	美国中央情报局
+mei li jian he zhong guo	美利坚合众国
+mei you bu tou feng de qiang	没有不透风的墙
+meng xiang cheng zhen	梦想成真
+ming bu jian jing zhuan	名不见经传
+ming bu zheng yan bu shun	名不正言不顺
+ming ren bu shuo an hua	明人不说暗话
+mi qie lian xi qun zhong	密切联系群众
+mo dao bu wu kan chai gong	磨刀不误砍柴工
+mo pan	魔盘
+na ge ji mao dang ling jian	拿个鸡毛当令箭
+nan deng da ya zhi tang	难登大雅之堂
+nan er you lei bu qing tan	男儿有泪不轻弹
+nan nv shou shou bu qin	男女授受不亲
+nan yue	南乐
+nian ping jun zeng zhang	年平均增长
+nian ping jun zeng zhang lv	年平均增长率
+nian sheng chan neng li	年生产能力
+nie pan	涅槃
+ning cheng yi gu sheng	拧成一股绳
+ning xia hui zu zi zhi qu	宁夏回族自治区
+ni ren ye you san fen tu xing	泥人也有三分土性
+nong cun xin yong he zuo she	农村信用合作社
+nong tian ji ben jian she	农田基本建设
+nong ye sheng chan zi liao	农业生产资料
+nong ye zai shang xin tai jie	农业再上新台阶
+pei le fu ren you zhe bing	赔了夫人又折兵
+peng you bian tian xia	朋友遍天下
+piao piao liang liang	漂漂亮亮
+ping jun ri chan liang	平均日产量
+ping jun zeng zhang su du	平均增长速度
+ping lun yuan wen zhang	评论员文章
+pi ping yu zi wo pi ping	批评与自我批评
+qian ding ning wan zhu fu	千叮咛万嘱咐
+qiang dao zhong ren tui	墙倒众人推
+qiang niu de gua bu tian	强扭的瓜不甜
+qiang zhong geng you qiang zhong shou	强中更有强中手
+qian li zhi di kui yu yi xue	千里之堤溃于蚁穴
+qian yi fa er dong quan shen	牵一发而动全身
+qiao fu nan wei wu mi zhi chui	巧妇难为无米之炊
+qiao kou qu	硚口区
+qing chu yu lan sheng yu lan	青出于蓝胜于蓝
+qing guan nan duan jia wu shi	清官难断家务事
+qing jiang bu ru ji jiang	请将不如激将
+qing nian wen ming hao	青年文明号
+qing pi ping zhi zheng	请批评指正
+qing shao nian shi dai	青少年时代
+qing ye	情液
+qing zhuang shang zhen	轻装上阵
+qin zhe tong chou zhe kuai	亲者痛仇者快
+qi ren	奇仁
+qi rong ta ren han shui	岂容他人鼾睡
+quan guo ren min dai biao da hui	全国人民代表大会
+quan zhong guo ren min	全中国人民
+qu bie qing zhong huan ji	区别轻重缓急
+rang wai bi xian an nei	攘外必先安内
+ren cai jiao liu zhong xin	人才交流中心
+ren feng xi shi jing shen shuang	人逢喜事精神爽
+ren gong zhi neng ji shu	人工智能技术
+ren gui you zi zhi zhi ming	人贵有自知之明
+ren min dai biao da hui	人民代表大会
+ren min min zhu zhuan zheng	人民民主专政
+ren min ying xiong ji nian bei	人民英雄纪念碑
+ren pa chu ming zhu pa zhuang	人怕出名猪怕壮
+ren suan bu ru tian suan	人算不如天算
+ren xin bu zu she tun xiang	人心不足蛇吞象
+ren zao di qiu wei xing	人造地球卫星
+ren zheng wu zheng ju zai	人证物证俱在
+ru bao shan er kong hui	入宝山而空回
+sa er wa duo gong he guo	萨尔瓦多共和国
+se zi tou shang yi ba dao	色字头上一把刀
+sha ji yan yong niu dao	杀鸡焉用牛刀
+shang dao shan xia huo hai	上刀山下火海
+shang liang bu zheng xia liang wai	上梁不正下梁歪
+shang you lao xia you xiao	上有老下有小
+shan ren zi you miao ji	山人自有妙计
+shan yu yu lai feng man lou	山雨欲来风满楼
+shao hua qian duo ban shi	少花钱多办事
+shao nian xian feng dui	少年先锋队
+shao shu fu cong duo shu	少数服从多数
+sha ren bu guo tou dian di	杀人不过头点地
+sheng bai nai bing jia chang shi	胜败乃兵家常事
+sheng bu jiao bai bu nei	胜不骄败不馁
+sheng chan li yu sheng chan guan xi	生产力与生产关系
+sheng ming zai yu yun dong	生命在于运动
+sheng mi zhu cheng shu fan	生米煮成熟饭
+shen jiao zhong yu yan jiao	身教重于言教
+shen long jian shou bu jian wei	神龙见首不见尾
+shen ren	瘆人
+shen sheng bu ke qin fan	神圣不可侵犯
+shen tou yu fan shen tou	渗透与反渗透
+shen zai cao ying xin zai han	身在曹营心在汉
+shen zai fu zhong bu zhi fu	身在福中不知福
+shen zheng bu pa ying zi xie	身正不怕影子斜
+shi bai nai cheng gong zhi mu	失败乃成功之母
+shi bai wei cheng gong zhi mu	失败为成功之母
+shi bu guan ji gao gao gua qi	事不关己高高挂起
+shi chu fan chang bi you yao	事出反常必有妖
+shi jie ling xian di wei	世界领先地位
+shi jie wei sheng zu zhi	世界卫生组织
+shi jie xian jin shui ping	世界先进水平
+shi qing kuang er ding	视情况而定
+shi shen ren mian xiang	狮身人面像
+shi shi wu zhe wei jun jie	识时务者为俊杰
+shi yi jie san zhong quan hui	十一届三中全会
+shi you shu chu guo zu zhi	石油输出国组织
+shou de yun kai jian yue ming	守得云开见月明
+shou di xia jian zhen zhang	手底下见真章
+shuang ceng jing ying	双层经营
+shuang chong shen fen	双重身份
+shuang quan nan di si shou	双拳难敌四手
+shui huo bu xiang rong	水火不相容
+shui ye mei you xiang dao	谁也没有想到
+shuo shi chi na shi kuai	说时迟那时快
+shuo shi yan jiu sheng	硕士研究生
+shu xiu	束脩
+shu yu jing er feng bu zhi	树欲静而风不止
+si ma dang zuo huo ma yi	死马当作活马医
+si xiang ji ben yuan ze	四项基本原则
+si zhu bu pa kai shui tang	死猪不怕开水烫
+sui qian wan ren wu wang yi	虽千万人吾往矣
+tai tou bu jian di tou jian	抬头不见低头见
+tai wan min zhu zi zhi tong meng	台湾民主自治同盟
+tai yang cong xi bian chu lai	太阳从西边出来
+tai yang neng dian chi	太阳能电池
+tang ji he de	唐吉诃德
+tang tang huang huang	堂堂皇皇
+tang tang zheng zheng	堂堂正正
+tian bu guo nei kong bai	填补国内空白
+tian shang diao xian bing	天上掉馅饼
+tian sheng wo cai bi you yong	天生我才必有用
+tian tian xiang shang	天天向上
+tian xia wu bu san zhi yan xi	天下无不散之筵席
+tian xia wu ya yi ban hei	天下乌鸦一般黑
+tian ya he chu wu fang cao	天涯何处无芳草
+tiao tiao da lu tong luo ma	条条大路通罗马
+tiao tiao kuang kuang	条条框框
+ting diao bu ting xuan	听调不听宣
+tong chuang gong zhen	同床共枕
+tong shi tian ya lun luo ren	同是天涯沦落人
+tong wang chang yi yang	同往常一样
+tong yi zhan xian li lun	统一战线理论
+tou ji bu cheng shi ba mi	偷鸡不成蚀把米
+tu xing tu xiang chu li	图形图像处理
+tu zi bu chi wo bian cao	兔子不吃窝边草
+wai xiang xing jing ji	外向型经济
+wan fu bu dang zhi yong	万夫不当之勇
+wan wan mei you xiang dao	万万没有想到
+wei guang miao zhun ju	微光瞄准具
+wei kong tian xia bu luan	惟恐天下不乱
+wei ren chu shi	为人处事
+wei shen zhong qi jian	为慎重起见
+wen liang gong jian rang	温良恭俭让
+wen xian ge er zhi ya yi	闻弦歌而知雅意
+wu shi bu deng san bao dian	无事不登三宝殿
+wu yi guo ji lao dong jie	五一国际劳动节
+wu yi lao dong jiang zhang	五一劳动奖章
+wu zheng fu zhuang tai	无政府状态
+xia ji fu cong shang ji	下级服从上级
+xia lu xiang feng yong zhe sheng	狭路相逢勇者胜
+xia mao peng shang si hao zi	瞎猫碰上死耗子
+xiang lan ye lan bu zhu	想拦也拦不住
+xiang she hui kai fang	向社会开放
+xian guan bu ru xian guan	县官不如现管
+xiang zong shen fa zhan	向纵深发展
+xian xiang huan sheng	险象环生
+xian xia shou wei qiang	先下手为强
+xiao bu ren ze luan da mou	小不忍则乱大谋
+xiao fei pin shi chang	消费品市场
+xiao pin bu xiao chang	笑贫不笑娼
+xie tian zi yi ling zhu hou	挟天子以令诸侯
+xin bing hai xu xin yao yi	心病还须心药医
+xing bai li zhe ban jiu shi	行百里者半九十
+xing shi fan zui fen zi	刑事犯罪分子
+xin guan shang ren san ba huo	新官上任三把火
+xing zheng shi ye dan wei	行政事业单位
+xin jiang wei wu er zi zhi qu	新疆维吾尔自治区
+xin ping zhuang jiu jiu	新瓶装旧酒
+xin you ling xi yi dian tong	心有灵犀一点通
+xiong feng bu jian dang nian	雄风不减当年
+xi tong gong cheng xue	系统工程学
+xun lei bu ji yan er zhi shi	迅雷不及掩耳之势
+yang bing qian ri yong bing yi shi	养兵千日用兵一时
+yang mao chu zai yang shen shang	羊毛出在羊身上
+yan guan bi bi guan xin	眼观鼻鼻观心
+yan hai kai fang cheng shi	沿海开放城市
+yan que an zhi hong hu zhi zhi	燕雀安知鸿鹄之志
+yi bu bian ying wan bian	以不变应万变
+yi chuan shi shi chuan bai	一传十十传百
+yi fa lv wei zhun sheng	以法律为准绳
+yi fang you nan ba fang zhi yuan	一方有难八方支援
+yi fa zhui jiu xing shi ze ren	依法追究刑事责任
+yi ge zhong yao fang mian	一个重要方面
+yi huan jin kou yi huan	一环紧扣一环
+yi jiang gong cheng wan gu ku	一将功成万骨枯
+yi ku er nao san shang diao	一哭二闹三上吊
+ying te na xiong nai er	英特纳雄耐尔
+ying xiong bu wen chu chu	英雄不问出处
+ying xiong chu shao nian	英雄出少年
+ying xiong nan guo mei ren guan	英雄难过美人关
+ying xiong xing xiang	英雄形象
+ying xiong you yong wu zhi di	英雄有用武之地
+yi shi bai er gao zhong	以失败而告终
+yi shi ji qi qian ceng lang	一石激起千层浪
+yi shi zu cheng qian gu hen	一失足成千古恨
+yi shu gan ran	艺术感染
+yi tiao dao zou dao hei	一条道走到黑
+yong yi ju hua lai shuo	用一句话来说
+you bao pi pa ban zhe mian	犹抱琵琶半遮面
+you qian neng shi gui tui mo	有钱能使鬼推磨
+you qi ming er wu qi shi	有其名而无其实
+you qing ren zhong cheng juan shu	有情人终成眷属
+you xian ze ren gong si	有限责任公司
+you yan bu shi tai shan	有眼不识泰山
+you yi fen re fa yi fen guang	有一分热发一分光
+you yuan qian li lai xiang hui	有缘千里来相会
+you yu zhong zhong yuan yin	由于种种原因
+you zhi zhe shi jing cheng	有志者事竟成
+yuan jia yi jie bu yi jie	冤家宜解不宜结
+yuan shui jie bu liao jin ke	远水解不了近渴
+yuan shui jiu bu liao jin huo	远水救不了近火
+zai bai mang zhi zhong	在百忙之中
+zai bu jiu de jiang lai	在不久的将来
+zai quan guo fan wei nei	在全国范围内
+zai ren he qing kuang xia	在任何情况下
+zai te ding qing kuang xia	在特定情况下
+zai te shu qing kuang xia	在特殊情况下
+zai tie de shi shi mian qian	在铁的事实面前
+zai tong chang qing kuang xia	在通常情况下
+zai tong deng tiao jian xia	在同等条件下
+zai zhe ge ji chu shang	在这个基础上
+zai zheng chang qing kuang xia	在正常情况下
+zhang yi mei duo tu gou bei	丈义每多屠狗辈
+zhan zheng zhuang tai	战争状态
+zheng chang qing kuang	正常情况
+zheng chang yun zhuan	正常运转
+zheng fan liang fang mian	正反两方面
+zheng fu gong zuo bao gao	政府工作报告
+zheng mian zhan chang	正面战场
+zheng qiang hao sheng	争强好胜
+zheng quan jiao yi suo	证券交易所
+zheng ren xian zheng ji	正人先正己
+zheng yin wei zhe yang	正因为这样
+zheng zheng jing jing	正正经经
+zheng zhi xie shang hui yi	政治协商会议
+zhen jian dui mai mang	针尖对麦芒
+zhen jin bu pa huo lian	真金不怕火炼
+zhen zhen zheng zheng	真真正正
+zhe shan wang zhe na shan gao	这山望着那山高
+zhi gong dai biao da hui	职工代表大会
+zhi hui kong zhi xi tong	指挥控制系统
+zhi shi jiu shi li liang	知识就是力量
+zhi xian yuan yang bu xian xian	只羡鸳鸯不羡仙
+zhi yu si di er hou kuai	置于死地而后快
+zhi zhi si di er hou sheng	置之死地而后生
+zhong deng zhuan ye jiao yu	中等专业教育
+zhong dian gong cheng	重点工程
+zhong dong zhan zheng	中东战争
+zhong guo gong chan dang	中国共产党
+zhong guo gong shang yin hang	中国工商银行
+zhong guo guo min dang	中国国民党
+zhong guo hong shi zi hui	中国红十字会
+zhong guo hong shi zi hui zong hui	中国红十字会总会
+zhong guo jiao tong yin hang	中国交通银行
+zhong guo min zhu cu jin hui	中国民主促进会
+zhong guo min zhu jian guo hui	中国民主建国会
+zhong guo min zhu tong meng	中国民主同盟
+zhong guo nong gong min zhu dang	中国农工民主党
+zhong guo nong ye yin hang	中国农业银行
+zhong guo qing nian dang	中国青年党
+zhong guo ren min da xue	中国人民大学
+zhong guo ren min jie fang jun	中国人民解放军
+zhong guo ren min yin hang	中国人民银行
+zhong guo shao nian xian feng dui	中国少年先锋队
+zhong guo she hui ke xue yuan	中国社会科学院
+zhong guo zhi gong dang	中国致公党
+zhong hua ren min gong he guo	中华人民共和国
+zhong kou xiang chuan	众口相传
+zhong yang ban gong ting	中央办公厅
+zhong yang dian shi tai	中央电视台
+zhong yang ren min guang bo dian tai	中央人民广播电台
+zhong yang wei yuan hui	中央委员会
+zhong yang zheng zhi ju	中央政治局
+zhong zhi cheng cheng	众志成城
+zhong zhong zhi zhong	重中之重
+zhuang sha chong leng	装傻充愣
+zhuan kuan zhuan yong	专款专用
+zhuan zheng dui xiang	专政对象
+zhu fang cheng xiang jian she bu	住房城乡建设部
+zhu guan neng dong xing	主观能动性
+zhu guan wei xin zhu yi	主观唯心主义
+zhu lan da shui yi chang kong	竹篮打水一场空
+zhuo zhuang cheng zhang	茁壮成长
+zhu ren weng jing shen	主人翁精神
+zi gu ying xiong chu shao nian	自古英雄出少年
+zui gao ren min fa yuan	最高人民法院
+zui gao ren min jian cha yuan	最高人民检察院
+zui weng zhi yi bu zai jiu	醉翁之意不在酒

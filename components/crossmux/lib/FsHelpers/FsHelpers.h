@@ -1,0 +1,71 @@
+#pragma once
+
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace FsHelpers {
+
+std::string decodeUriEscapes(const std::string& path);
+
+std::string normalisePath(const std::string& path);
+
+// Numeric-aware, case-insensitive comparison ("2" < "10"). Returns true when str1 orders
+// before str2. Same ordering sortFileList applies within the file/directory groups.
+bool naturalLess(const std::string& str1, const std::string& str2);
+
+void sortFileList(std::vector<std::string>& strs);
+
+/**
+ * Check if the given filename ends with the specified extension (case-insensitive).
+ */
+bool checkFileExtension(std::string_view fileName, const char* extension);
+
+// Check for either .jpg or .jpeg extension (case-insensitive)
+bool hasJpgExtension(std::string_view fileName);
+
+// Check for .png extension (case-insensitive)
+bool hasPngExtension(std::string_view fileName);
+
+// Check for .bmp extension (case-insensitive)
+bool hasBmpExtension(std::string_view fileName);
+
+// Check for .gif extension (case-insensitive)
+bool hasGifExtension(std::string_view fileName);
+
+// Check for .epub extension (case-insensitive)
+bool hasEpubExtension(std::string_view fileName);
+
+// Check for either .xtc or .xtch extension (case-insensitive)
+bool hasXtcExtension(std::string_view fileName);
+
+// Check for .txt extension (case-insensitive)
+bool hasTxtExtension(std::string_view fileName);
+
+// Check for .md extension (case-insensitive)
+bool hasMarkdownExtension(std::string_view fileName);
+
+// Check for .css extension (case-insensitive)
+bool hasCssExtension(std::string_view fileName);
+
+std::string extractFolderPath(const std::string& filePath);
+
+// Path-component validation used before destructive SD-card rename/move operations.
+bool isValidPathComponent(std::string_view component);
+
+// Names owned by the firmware or operating system and not editable in the library.
+bool isProtectedPathComponent(std::string_view component);
+
+// Both arguments are normalized absolute paths. Equality counts as containment.
+bool isSameOrDescendantPath(std::string_view path, std::string_view root);
+
+// Replace oldRoot with newRoot when path is oldRoot or one of its descendants.
+std::string rebasePath(std::string_view path, std::string_view oldRoot, std::string_view newRoot);
+
+/**
+ * Sanitize a filename/path component for FAT32 in a caller-provided buffer.
+ * Replaces invalid path characters, spaces, and control characters with '-'.
+ */
+void sanitizePathComponentForFat32(const char* input, char* output, size_t maxLen);
+
+}  // namespace FsHelpers
