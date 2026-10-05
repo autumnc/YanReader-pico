@@ -22,7 +22,7 @@
 //    里撞名 —— 阅读模式的 TU 一个都不能碰 epdiy.h。
 // 2) 而 ttf_* 是**跨组件契约**：main 的界面层和 crossmux 的 GfxRenderer.cpp 都要声明它。
 //    以前它拉 epdiy.h，于是每个"不能吃 epdiy"的 TU 只能手抄一份接口
-//    （screen_reader.cpp 曾整段照抄，连 ttf_font_item_t / ttf_bench_stats_t 都字段级复制）。
+//    （screen_reader.cpp 曾整段照抄，连 ttf_font_item_t 都字段级复制）。
 // 现在只剩 stdint / stdbool / esp_err 三个轻量依赖，任何 TU 都能直接包含。
 //
 // 唯一曾经需要 epdiy 的是下面几个原型里的 `enum EpdFontFlags align` 参数 —— 已改成
@@ -60,31 +60,6 @@ typedef struct {
     char name[TTF_FONT_NAME_MAX];
     char path[TTF_FONT_PATH_MAX];
 } ttf_font_item_t;
-
-typedef struct {
-    uint32_t glyphs;
-    uint32_t hits;
-    uint32_t misses;
-    int64_t read_us;
-    int64_t raster_us;
-    int64_t total_us;
-    // 字库 SD I/O 细分：read_us 里有多少是 lseek(大文件上 FATFS 要走簇链)、
-    // 读了多少次、多少字节。用来判断"字体读"是寻道开销还是吞吐瓶颈。
-    // 只在 bench_on 期间累加，全是计数器，没有额外 syscall。
-    int64_t seek_us;
-    uint32_t read_calls;
-    uint32_t read_bytes;
-    // 预取合并的有效性：本页一共碰了多少块(去重后)、实际发起几次预取读。
-    // blocks/runs 就是合并倍率；span_min/span_max 是这些块在文件里的范围，
-    // 用来判断"字形是否集中在表的一小段"(跨度小 → 整表映射或章节级 arena 才有意义)。
-    uint32_t io_blocks;
-    uint32_t io_runs;
-    uint32_t io_span_min;
-    uint32_t io_span_max;
-    // 字形缓存占用 / 当前额度(KB)。额度是"静态上限"和"PSRAM 余量"取小的那个。
-    uint32_t cache_kb;
-    uint32_t cache_cap_kb;
-} ttf_bench_stats_t;
 
 #define TTF_FONT_BUILTIN "builtin"
 
@@ -171,8 +146,6 @@ void ttf_set_weight(int wght);
 int ttf_get_weight(void);
 
 void ttf_font_cache_clear(void);
-void ttf_bench_begin(void);
-void ttf_bench_end(ttf_bench_stats_t* out);
 
 #ifdef __cplusplus
 }

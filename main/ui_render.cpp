@@ -101,7 +101,12 @@ static const char *TAG = "ui_render";
 enum { JOB_PRESENT = 0, JOB_FULL, JOB_FROM_WHITE, JOB_INVALIDATE };
 
 // 「那两行什么时候记账清残影」的两个位（设置项 ime_clean，见 ime_clean_policy）。
-enum { IME_CLEAN_ON_PUNCT = 1, IME_CLEAN_ON_COMMIT = 2 };
+// NO_GC16 是最激进档（"从不清"）：输入法这条路上**永远不做那次区域 GC16**，
+// 连下面那个跟设置无关的计数兜底也一起关掉 —— 打字全程只有快刷（跟随 DU / 8 灰阶
+// 正文表），一个字都不会因为"要还账"而多停一帧。代价是快档发灰的正文与键盘残影
+// 只能等下一次整屏刷新（翻页全刷/换章/摇一摇/长按全刷/进别的界面）才被打扫。
+// 它不是"off 的低配"：off 只关"句读/上屏那两拍记账"，快档自己的欠账照还。
+enum { IME_CLEAN_ON_PUNCT = 1, IME_CLEAN_ON_COMMIT = 2, IME_CLEAN_NO_GC16 = 4 };
 
 struct UiJob {
     int idx;         // 工作缓冲下标（-1 = 用 front_fb 直画，降级路径）
@@ -113,6 +118,9 @@ struct UiJob {
     // 上屏那一拍要不要记账清残影。与 ime_commit 分开：ime_commit 还管着"这一帧把刷新区域
     // 扩到候选区、换 8 灰阶正文表"（那是渲染决策，与清残影无关，不受设置影响）。
     bool ime_clean_commit;
+    // "从不清"档（IME_CLEAN_NO_GC16）：这一帧的输入法欠账一律不坐实，连计数兜底也不走。
+    // 与 ime_clean_commit 分开：后者管"要不要记这笔账"，它管"这条路还能不能清"。
+    bool ime_no_clean;
     // 实体键盘打字时正文那一拍走哪条路（设置项 ime_commit_mode，见 ime_commit_fast_policy）：
     // false = 整屏阈值 DU（现在这样，墨实、每拍约 220ms）；true = 只推差分矩形的跟随 DU
     // （约 56ms，但跟随表推力只有阈值表的 1/4，刚上屏的字先发灰，得靠停顿那次区域 GC16
@@ -128,6 +136,7 @@ static uint8_t ime_clean_policy(void) {
     if (m == "commit") return IME_CLEAN_ON_COMMIT;
     if (m == "both") return IME_CLEAN_ON_PUNCT | IME_CLEAN_ON_COMMIT;
     if (m == "off") return 0;
+    if (m == "never") return IME_CLEAN_NO_GC16;
     return IME_CLEAN_ON_PUNCT;   // "punct" / 认不出
 }
 
@@ -492,6 +501,9 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
     // 那一拍的渲染仍然用 8 灰阶表（正文是黑白像素，少 7 个相的梯子看不错、省 80ms），
     // 只是它不再兼任"清残影"。
     const auto clean_ime_rows = [&](const EpdRect *extra = nullptr) {
+        // "从不清"档：输入法这条路上一次区域 GC16 都不做（连默认那条计数兜底也不走）。
+        // 这一档是用户明选的"打字永不停顿换画质"，只有整屏刷新能打扫残影。
+        if (job.ime_no_clean) return;
         if (rel_idx < 0) {
             // 降级路径（渲染任务没起来，core0 自己同步推）：没有空闲节拍帮我们补，
             // 只能当场清。extra 也要并进去 —— 快档下那是发灰的正文所在的地方。
@@ -523,6 +535,7 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
             //       ime_clean = commit / both → 计数法：攒够 FAST_SETTLE_EVERY 拍还。
             //       ime_clean = off → 只剩计数法的兜底那一半（欠账是快档自己生的，
             //                        不清就会一直脏，off 只管输入法那两行）。
+            //       ime_clean = never（最激进）→ 连计数兜底都没有，全程只快刷。
             //
             //     **同步清那一拍没有"多推一遍"**：这一拍本来就欠一次推屏（差分 d），
             //     干脆用它来清 —— GC16 本来就是把当前 front 按全灰阶写实，写实的同时
@@ -558,7 +571,7 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
                                   update_display_area_with(hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, d));
                 s_body_dirty = s_body_dirty_any ? rect_union(s_body_dirty, d) : d;
                 s_body_dirty_any = true;
-                if (++s_fast_body_n >= FAST_SETTLE_EVERY) {
+                if (!job.ime_no_clean && ++s_fast_body_n >= FAST_SETTLE_EVERY) {
                     // 计数法（上屏档）／兜底：到次数就借这一拍把欠账交给停顿那次清。
                     s_fast_body_n = 0;
                     clean_ime_rows(&s_body_dirty);
@@ -630,18 +643,12 @@ static void flush_deferred() {
     EpdiyHighlevelState *hl = board_hl();
     copy_to_front(hl, cur);
 
-    // 临时探针（量"虚拟键盘一下要多久"）：合并窗口到期推屏的耗时。这一行的时间戳减去
-    // 上一次 `Click: 反馈音`（core0 收到按键那一刻）就是一次按键的端到端延迟。定位到就删。
-    const int64_t tFlush = esp_timer_get_time();
     if (commit && cand.width > 0 && cand.height > 0) {
         const EpdRect r = rect_union(s_defer_rect, cand);
         guard_draw_result(hl, update_display_area_with(hl, &E0470_GRAY8_TEXT_WAVEFORM, MODE_GL16, r));
     } else {
         guard_draw_result(hl, update_display_area_with(hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, s_defer_rect));
     }
-    ESP_LOGI(TAG, "合并窗口刷屏: %s 区域 %d,%d %dx%d 耗时 %lldms", commit ? "上屏" : "打字",
-             s_defer_rect.x, s_defer_rect.y, s_defer_rect.width, s_defer_rect.height,
-             (long long)((esp_timer_get_time() - tFlush) / 1000));
     if (++s_follow_partials >= FOLLOW_GC16_EVERY) {
         s_follow_partials = 0;
         if (s_local_only || s_fast_partial) {
@@ -675,10 +682,100 @@ static void flush_deferred() {
 //   像素上根本不驱动（GL16 全保持，只补一帧白推，见 display.c 的
 //   update_display_area_clean），等于每 20 个面板帧白花一次 30 相 ≈330ms 的卡顿，
 //   什么都没清掉。阅读器的 VK 帧不在渲染任务里，用不了 ime_clean_tick 那套
-//   "记账 + 空闲节拍"，要真清得先想清楚清哪儿、再另开一个记账口。）
+//   "记账 + 空闲节拍"，要真清得先想清楚清哪儿、再另开一个记账口——就是下面这个。）
+//
+// ── 阅读器虚拟键盘的"上屏快档"欠账（上面那个记账口）─────────────────────────
+// 设置项 ime_commit_mode = fast（"上屏刷法=快"）时，上屏那一拍的正文区改用跟随 DU 推：
+// 8 相 @FAST ≈100ms，替掉 8 灰阶正文表 + GL16 的 30 相 ≈336ms。和编辑器实体键那条快档
+// 是同一笔交易 —— **跟随表推力只有阈值表的 1/4**，刚上屏的字先发灰、旧字还留残影，
+// 得靠"第二拍"坐实。编辑器那条路的第二拍由渲染任务按 ime_clean 的策略还账（见
+// render_present 的 2′ 与 note_ime_clean）；阅读器整条路在 core0、不经渲染任务，
+// 所以这里另开一份**不跨核**的账，**口径与编辑器那套一一对齐**（用户要求：
+// "清残影策略虚拟键盘也应该跟随实体键盘的设定"）：
+//
+//   设置项 ime_clean    快档的欠账怎么还              稳档的编码候选两行
+//   ─────────────────────────────────────────────────────────────────────
+//   punct（默认）       敲完句读那一拍**同步清**         不动（稳档不做同步清）
+//   commit              每拍记账 → 停手后清一次         上屏那一拍记账 → 停手后清
+//   both                句读同步清 + 上屏同样记账       同 commit
+//   off                 只剩下面的计数兜底              不动
+//
+// 计数兜底（FAST_SETTLE_EVERY）与设置无关：跟编辑器一样，那笔灰是"上屏刷法=快"自己
+// 欠下的，关掉 ime_clean 也只管输入法那两行，不管快档的第二拍。
+//
+// 两笔账为什么要并集、不能只记最后一拍，同 s_body_dirty 那段：差分是拿 back_fb 比的
+// （增量），只清最后一拍会漏掉前几拍推过又抹掉的位置（旧字残影）。
+static EpdRect s_rvk_dirty = {0, 0, 0, 0};   // 被跟随表欠推过的区域（并集）
+static bool    s_rvk_dirty_any = false;
+static bool    s_rvk_owed = false;            // 有账要清：攒够了就等停手
+static int64_t s_rvk_due_us = 0;              // 清账期限（每次打字往后推）
+static uint8_t s_rvk_body_n = 0;              // 快档计数兜底（同编辑器的 s_fast_body_n）
+static uint32_t s_rvk_seen_punct = 0;         // 句读认帧（同编辑器的 take_ime_punct）
+
+// 只在 core0 调（reader_vk_present 这条路上）——读 g_settings 与渲染任务不碰它的规矩一致。
+static bool rvk_fast_mode(void) { return g_settings.imeCommitMode() == "fast"; }
+
+// 累计"被欠推过"的区域。**只记不问**：什么时候真清由 s_rvk_owed/期限定。
+static void rvk_accum(EpdRect r) {
+    s_rvk_dirty = s_rvk_dirty_any ? rect_union(s_rvk_dirty, r) : r;
+    s_rvk_dirty_any = true;
+}
+
+// 记账：到停手（IME_CLEAN_PAUSE_US 内不再有输入法动作）就清一次当时累计的全部区域。
+static void rvk_owe(void) {
+    s_rvk_owed = true;
+    s_rvk_due_us = esp_timer_get_time() + IME_CLEAN_PAUSE_US;
+}
+
+// 清完把账销干净。**不清 s_rvk_seen_punct** —— 那是"认帧"的状态，不是欠账。
+static void rvk_clear_account(void) {
+    s_rvk_owed = false;
+    s_rvk_dirty_any = false;
+    s_rvk_dirty = EpdRect{0, 0, 0, 0};
+    s_rvk_body_n = 0;
+}
+
+// 句读认帧：IME::punctSeq 变了就是"这一拍刚吐出一个句读"。每次推屏都取走（不管走哪条
+// 路），免得一段旧账留到后面的帧上被误判成本拍的句读。
+static bool rvk_take_punct(void) {
+    const uint32_t s = g_ime.punctSeq();
+    if (s == s_rvk_seen_punct) return false;
+    s_rvk_seen_punct = s;
+    return true;
+}
+
+// 到点就把账坐实（区域 GC16，见 update_display_area_clean）。阅读器帧循环每轮调一次
+// （空转帧也算 —— 那正是"用户停手了"的证据）。front_fb 就是屏上现在的内容（阅读器直画
+// 它、自己同步推屏），所以这一次重推既坐实灰阶又把残影清掉，不需要重画。
+void ui_render_reader_vk_settle_tick(void) {
+    if (!s_rvk_owed || esp_timer_get_time() < s_rvk_due_us) return;
+    // 改设置改到"从不清"档时，攒着的那笔账就作废 —— 那一档承诺这条路一次区域 GC16 都没有。
+    if (ime_clean_policy() & IME_CLEAN_NO_GC16) { rvk_clear_account(); return; }
+    EpdRect r = s_rvk_dirty;
+    rvk_clear_account();
+    EpdiyHighlevelState *hl = board_hl();
+    if (!hl || r.width <= 0 || r.height <= 0) return;
+    guard_draw_result(hl, update_display_area_clean(hl, r));
+    ESP_LOGI(TAG, "阅读器键盘: 欠账坐实 %d,%d %dx%d", r.x, r.y, r.width, r.height);
+}
+
+// 整屏全像素刷过一遍（进阅读器的 invalidate、翻页整屏全刷/换章）之后这块已经被驱动
+// 干净了，账作废 —— 不然停顿时会再白闪一次同样的地块。顺手把句读认帧对齐到当下：
+// 新的这一段从这里开始，别把别处（写作模式的实体键盘）敲过的句读带进来。
+void ui_render_reader_vk_settle_forget(void) {
+    rvk_clear_account();
+    s_rvk_seen_punct = g_ime.punctSeq();
+}
+
 void reader_vk_present(int panel_top, int cand_h) {
     EpdiyHighlevelState *hl = board_hl();
     if (!hl) return;
+    // 句读认帧：**任何一条路都取走**（面板帧、早退帧都算），这样一段旧账不会留到后面的
+    // 帧上被误判成"本拍吐了个句读"。
+    const bool punctFrame = rvk_take_punct();
+    // 虚拟键盘还弹着 = 用户还在打字：把坐实期限往后推，别从连打中间插进来一次 336ms 的
+    // 清残影（同渲染任务那边"落在输入法条内的帧也推期限"）。下面记账那一拍会重新钉期限。
+    if (s_rvk_owed) s_rvk_due_us = esp_timer_get_time() + IME_CLEAN_PAUSE_US;
     // 差分基准是 epdiy 的 back_fb："上一次真正驱动到面板上的内容"。阅读器直画 front_fb，
     // 所以差异就是 front_fb vs back_fb（同 render_present）。
     EpdRect d = diff_bounding_rect(hl->front_fb, hl->back_fb);
@@ -703,10 +800,45 @@ void reader_vk_present(int panel_top, int cand_h) {
         done("键盘面板快刷", update_display_area_with(hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, d), d);
         return;
     }
-    // 正文/文本输入区变了 = 一次上屏。区域扩到盖住编码候选两行（同 render_present 的
-    // commit 那一拍），把上屏那一拍整排换字的候选栏一次写清楚。
+    // 正文/文本输入区变了 = 一次上屏（或一次句读直通落进正文）。区域扩到盖住编码候选
+    // 两行（同 render_present 的 commit 那一拍），把上屏那一拍整排换字的候选栏一次写清楚。
     EpdRect r = d;
     if (cand_h > 0) r = rect_union(r, EpdRect{0, panel_top, SCREEN_W, cand_h});
+    const uint8_t pol = ime_clean_policy();
+    if (rvk_fast_mode()) {
+        // 上屏刷法=快：推差分矩形 + 跟随 DU（8 相 ≈100ms），欠下的推力（发灰的正文、
+        // 旧字残影）记账，等停手由 ui_render_reader_vk_settle_tick 用一次区域 GC16 坐实。
+        //
+        // 句读档（默认）：句读那一拍**同步清** —— 这一拍本来就欠一次推屏，拿它来清
+        // （GC16 写实的同时残影就没了），矩形取并集（本拍 ∪ 这期间累计的欠账），
+        // 一次推屏管完。代价是这一拍 ~100ms 变 ~336ms，换的是"敲完标点当场干净"。
+        // 不加脏、不推期限：账当场清了，再记一笔会让停顿那次白清一遍同样的地块。
+        if (punctFrame && (pol & IME_CLEAN_ON_PUNCT)) {
+            EpdRect q = s_rvk_dirty_any ? rect_union(r, s_rvk_dirty) : r;
+            rvk_clear_account();
+            done("正文+候选句读同步清", update_display_area_clean(hl, q), q);
+            return;
+        }
+        done("正文+候选快刷(跟随DU)",
+             update_display_area_with(hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, r), r);
+        rvk_accum(r);
+        // 上屏档：每拍记账（打长句、很久不敲标点的人用这个）；计数兜底与设置无关
+        // （见上面那张表：那笔灰是快档自己欠的）。**"从不清"档连兜底都不走**。
+        if (!(pol & IME_CLEAN_NO_GC16) &&
+            (++s_rvk_body_n >= FAST_SETTLE_EVERY || (pol & IME_CLEAN_ON_COMMIT))) {
+            s_rvk_body_n = 0;
+            rvk_owe();
+        }
+        return;
+    }
+    // 稳档：正文与候选两行都是 GL16 局刷（画质优先）。上屏那一拍按设置记一笔**编码候选
+    // 两行**的账 —— GL16 在白底上是全保持、不驱动（见 display.c），上屏前后那两行的旧字
+    // 残影它擦不掉，只有停顿那次区域 GC16 能擦。这与编辑器虚拟键盘那条路同一条规矩
+    // （render_present 第 3 条路里的 clean_ime_rows）。稳档不做句读同步清（用户拍板）。
+    if ((pol & IME_CLEAN_ON_COMMIT) && cand_h > 0) {
+        rvk_accum(EpdRect{0, panel_top, SCREEN_W, cand_h});
+        rvk_owe();
+    }
     done("正文+候选局刷", update_display_area_with(hl, &E0470_GRAY8_TEXT_WAVEFORM, MODE_GL16, r), r);
 }
 
@@ -752,6 +884,7 @@ static void invalidate_state(void) {
     s_fast_body_n = 0;
     s_gc16_pending = false;
     ime_clean_forget();   // 下一帧就是整屏 GC16，输入法那两行的记账不用留
+    s_rvk_dirty_any = false;   // 阅读器快档那份欠账同理：进阅读器/丢参考帧 = 整屏重推
 }
 
 // ── 渲染任务 ─────────────────────────────────────────────────────────────
@@ -888,6 +1021,7 @@ static void submit_sync(uint8_t *fb, bool force_full) {
     const uint8_t pol = ime_clean_policy();
     job.ime_punct = take_ime_punct() && (pol & IME_CLEAN_ON_PUNCT);
     job.ime_clean_commit = (pol & IME_CLEAN_ON_COMMIT) != 0;
+    job.ime_no_clean = (pol & IME_CLEAN_NO_GC16) != 0;
     job.ime_commit_fast = ime_commit_fast_policy();
     render_present(job, fb, -1);
 }
@@ -1007,6 +1141,7 @@ void ui_render_submit(bool force_full) {
     const uint8_t pol = ime_clean_policy();
     job.ime_punct = take_ime_punct() && (pol & IME_CLEAN_ON_PUNCT);
     job.ime_clean_commit = (pol & IME_CLEAN_ON_COMMIT) != 0;
+    job.ime_no_clean = (pol & IME_CLEAN_NO_GC16) != 0;
     job.ime_commit_fast = ime_commit_fast_policy();
     const int idx = s_taken;
     s_taken = -1;

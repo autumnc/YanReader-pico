@@ -227,8 +227,13 @@ static const OptItem KB_LAYOUT_OPTS[] = {
 // 输入法那两行（编码区+候选区）什么时候清残影。清一次 = 一次区域 GC16，约 330ms
 // （耗时看相位数，不看区域大小）；上屏与句读都记的话，一句话里会清两遍（用户报障
 // "会刷新2次"），所以默认只留句读。见 ui_render.cpp 的 ime_clean_policy。
+// "never"是最激进的一档：输入法这条路**一次区域 GC16 都不做**（连快档那条跟设置无关的
+// 计数兜底也一起关掉），打字全程只快刷 —— 代价是发灰的正文与键盘残影只能等下一次整屏
+// 全刷（翻页/换章/摇一摇）才被扫掉。**它跟 "off" 不是一回事**：off 只关"句读/上屏那两拍
+// 记账"，快档自己欠下的那笔照还。
 static const OptItem IME_CLEAN_OPTS[] = {
     {"punct", "句读后"}, {"commit", "上屏后"}, {"both", "两者都清"}, {"off", "不清"},
+    {"never", "从不清(只快刷)"},
 };
 static int imeCleanIndex(const char *k) {
     for (int i = 0; i < (int)(sizeof(IME_CLEAN_OPTS) / sizeof(IME_CLEAN_OPTS[0])); i++)

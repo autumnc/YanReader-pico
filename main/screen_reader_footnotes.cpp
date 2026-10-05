@@ -57,13 +57,6 @@ bool loadCurrentFootnotes() {
     st.footnoteNums.push_back(fn.number[0] ? fn.number : "[链接]");
     st.footnoteHrefs.push_back(fn.href);
   }
-  if (st.footnoteHrefs.empty()) {
-    // 临时诊断：页里明明有上标号，脚注表却是空的。两种可能——(a) 解析时注号被记到了
-    // 邻页（pendingFootnotes 的页归属差一行）；(b) 这一页是旧版解析器落下的页缓存。
-    // 打页码+章节号，配合 `点注:` 那行就能分辨。
-    ESP_LOGW(TAG, "点注诊断: 第%d页(spine %d)脚注表为空，本页词 %u 个",
-             st.page, st.spineIndex, (unsigned)(g_pageText.valid ? g_pageText.words.size() : 0));
-  }
   return !st.footnoteHrefs.empty();
 }
 
@@ -71,9 +64,8 @@ bool loadCurrentFootnotes() {
 // 为什么需要：本节是**惰性排版**的（空闲帧只领先读者 kPrebuildAhead 页），而注释正文
 // 常常压在**本节末尾**——晋书的校勘记就是正文后一整块 `<p id="note-001">`，最后一处
 // 正文引用在源文件的 83% 处。读者停在第 4 页点注号时，本节只排到第 9 页，锚点那一页
-// 压根没排出来 → 锚点表里没有 → 原来 getPageForAnchor 直接返回空，弹注/跳转全落空
-// （日志 `注号对上了但取不到注文`，然后按键落进左右 1/3 翻页，这正是用户看到的"点注
-// 变成翻页"）。
+// 压根没排出来 → 锚点表里没有 → 原来 getPageForAnchor 直接返回空，弹注/跳转全落空，
+// 然后按键落进左右 1/3 翻页，这正是用户看到的"点注变成翻页"。
 // 这里先查一次（活构建 + 磁盘锚点表），没查到且本节还在排就有界地继续排，边排边查。
 // 预算按**时间**封顶而不是按页数：一次翻页的排版量级是几十毫秒，这个预算足够覆盖
 // "注释就在后面几页"的常见情形；真遇到超长章节也只是退化回原来的行为，不会把按键

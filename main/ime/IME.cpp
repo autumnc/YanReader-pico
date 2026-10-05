@@ -5751,10 +5751,6 @@ bool IME::handleKey(int key, std::string &out) {
     // 新声明的空串进来的，所以这里既不会误判也不会覆盖内容。
     if (handled && isPausePunctTail(out)) {
         _punctSeq++;
-        // 打断点用的一行：这条链子（按键 → 计数 → core0 认帧 → 区域 GC16）任何一环断了，
-        // 现象都是"句读之后残影还在"，没有日志就分不清是没触发还是触发了没清掉。
-        // 一次句读一行，量很小。
-        ESP_LOGI(IME_TAG, "句读 #%u key=%d -> %s", (unsigned)_punctSeq, key, out.c_str());
     }
     return handled;
 }

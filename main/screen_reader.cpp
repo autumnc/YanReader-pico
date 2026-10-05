@@ -68,7 +68,7 @@
 // 字体模块接口：现在可以直接包含真头了。P1.3 之后 ttf_font.h 不再 #include epdiy.h
 // （它把唯一依赖的 enum EpdFontFlags 降级成了 int），所以 epd_internals.h 的 EpdFont
 // 不会再被拖进来跟本 TU 里 crossmux 的 EpdFont class 撞名（同本文件开头的说明）。
-// 以前这里整段照抄接口，连 ttf_font_item_t / ttf_bench_stats_t 都字段级复制了一份 ——
+// 以前这里整段照抄接口，连 ttf_font_item_t 都字段级复制了一份 ——
 // 漂移已经发生了：照抄的 ttf_font_open 返回 int，真头返回 esp_err_t。
 #include "font/ttf_font.h"
 #include "wifi_manager.h"
@@ -527,20 +527,6 @@ static void applyCssFontLadder() {
     }
   }
   g_rd.setCssFontLadder(ids);
-  // 临时诊断（字号锚定）：梯子到底灌了什么、每个 id 对应多少 px。正文 id = 1+L 这一档
-  // 就是"用户选的字号"，书里 1em 的块必须落到它上面。
-  {
-    char px[160] = {0};
-    for (int i = 0; i < 5; i++) {
-      char t[32];
-      snprintf(t, sizeof(t), "%s%d:%.0fpx", i == 0 ? "" : " ", (int)ids[i],
-               (double)g_rd.getLineHeight(ids[i]));
-      strncat(px, t, sizeof(px) - strlen(px) - 1);
-    }
-    ESP_LOGW(TAG, "字号锚定: 档L=%d 正文id=%d 梯子[%d,%d,%d,%d,%d] px[%s] 内嵌解析=%d",
-             L, BODY_FONT_ID_BASE + L, (int)ids[0], (int)ids[1], (int)ids[2], (int)ids[3],
-             (int)ids[4], px, (int)styleEmbedded());
-  }
 }
 
 static int linesPerPage() {
@@ -1212,7 +1198,7 @@ int sbCount(const char *key, int def, int n) {
 //   章节名那个循环对**每一个** TOC 条目都调它两遍（getSpineIndexForTocIndex + getTocItem
 //   各一次），TOC 上千条 → 每取一次章节名就是上千次 SD 随机读。
 //   而它在**每次按键**（rdStatsNoteActivity）和**每帧状态栏**（titleMode==1 那条）
-//   里都会被调到，于是每翻一页白白多花 7.7 秒（日志 `分发探针: … 统计 7706ms`）。
+//   里都会被调到，于是每翻一页白白多花 7.7 秒。
 //
 // 修法：章节名只在换章时变，所以把整张 TOC 的 (spineIndex, title) 一次性读进 RAM
 // （每本书一份，第一次用到时建；getTocItem 返回的条目本身就带 spineIndex，原来多算的
@@ -1439,7 +1425,7 @@ static void rdPrebuildAhead() {
 // 反过来说，这条路的**代价**：这几秒在书架上是真占 CPU/SD 的，所以规矩 1、2 必须守。
 // 停手多久才算"用户不在跟前，可以开工"。这两个值是拿第一次上机日志校出来的：
 // 原来只留 3 秒，结果开机落在书架上、用户一下都没碰，6 秒后就无视一切地做了 13 秒
-// （日志里那条 `帧探针: 处理 13795ms key=0`）—— 那正是"用户就在机器跟前"的时刻，
+// —— 而那正是"用户就在机器跟前"的时刻，
 // 他这时去点一本**已经缓存过**的书，就要白等这 13 秒。所以：
 //   · 用户动过手（在书架里翻过、从书里退出来…）再停手 kShelfIdleUs 才开工；
 //   · 一个按键都还没有（刚开机/刚切回书架）则等 kShelfIdleColdUs，默认他马上会动手。
@@ -2194,40 +2180,6 @@ static void rdDrawOverlays(const RdPageText &pt, int fontId) {
   }
 }
 
-// ── 翻页性能埋点 ────────────────────────────────────────────────────────
-// renderCurrent 末尾那条"翻页耗时"只把一页拆成 绘制/决策/刷屏 三段，而绘制那
-// 七八百毫秒里到底是取页、栅格化还是文字地图，从外面看不出来。下面再拆一层，
-// 顺带记下这一页有几个图片元素、调用了多少个字形、字形缓存命中多少（ttf_font.c
-// 里的 ttf_bench_* 本来就统计这些，只是一直没人调用），以及正文字面是内建还是
-// SD 卡上的外部字体——后者会让每个冷字形都真读一次盘，是"发闷变慢"的头号嫌疑。
-//
-// 开销：ttf_bench 打开时每个字形多两次 esp_timer_get_time()，一页 ~600 字形约
-// 1ms，相对 1300ms 可以忽略，所以常开，不做开关。
-struct RdPageProf {
-  int64_t loadUs = 0;     // Section::loadPage：SD 打开 + 反序列化
-  int64_t renderUs = 0;   // page->render：字形栅格化 + 写进帧缓冲
-  int64_t textmapUs = 0;  // rdBuildPageText：长按选词用的文字地图
-  uint32_t glyphs = 0, hits = 0, misses = 0;
-  int64_t rasterUs = 0, fontReadUs = 0;
-  // 字库 SD I/O 细分：fontReadUs 里有多少花在 lseek(大文件上 FATFS 要重走簇链)、
-  // 多少次读、多少字节。用来分辨"寻道开销"还是"吞吐瓶颈"。
-  int64_t fontSeekUs = 0;
-  uint32_t fontReadCalls = 0, fontReadBytes = 0;
-  // 整页预取（rdWarmPageText）：单独记一笔，好和下面"绘制期间"的 I/O 分开看。
-  // 预取做得对的话，这里的读次数应当远小于字形数、而绘制期间的读次数接近 0。
-  int64_t warmUs = 0;
-  int64_t warmReadUs = 0, warmSeekUs = 0;
-  uint32_t warmCalls = 0, warmBytes = 0;
-  uint32_t ioBlocks = 0, ioRuns = 0;  // 预取涉及的块数(去重) / 实际发起的读次数
-  int64_t ioSpan = 0;                 // 这些块在字体文件里的跨度（字节）
-  // 字形缓存占用/额度（KB）。顶到 cache_cap_kb 还大量未命中 → 内存已给足，
-  // 瓶颈在别处；占用 < 额度 → 是 PSRAM 余量卡住了，不是静态上限。
-  uint32_t cacheKB = 0, cacheCapKB = 0;
-  int images = 0;  // 本页图片元素个数（>0 会强制整屏全刷，解码也算在 renderUs 里）
-  int valid = 0;   // 本帧是阅读页并且填过数据
-};
-static RdPageProf s_prof;
-
 // ── 阅读线（正文行间引导线）──────────────────────────────────────────────
 // 每行正文下面一条 1px 中灰线，垫在**这一行的字形盒底**和**下一行的盒顶**之间，
 // 给横向阅读一个落点参照（抄自参考固件 book_layout_draw_page 的同名功能）。
@@ -2284,58 +2236,21 @@ static void renderEpubPage() {
   const int fontId = BODY_FONT_ID_BASE + st.fontLevel;
   g_pageText = RdPageText();
   st.pageLinks.clear();
-  s_prof = RdPageProf();
-  s_prof.valid = 1;
   if (st.section) {
-    int64_t tA = esp_timer_get_time();
     auto page = st.section->loadPage(st.page);
-    s_prof.loadUs = esp_timer_get_time() - tA;
     if (page) {
-      for (const auto &el : page->elements)
-        if (el->getTag() == TAG_PageImage) s_prof.images++;
       if (page->hasImages()) st.fullRefresh = true;
       // 先把文字地图建出来（它只查排版块，与帧缓冲无关），再用它做整页预取，
       // 最后才画。顺序不能反：预取必须整页一次性做，逐词做就没意义了。
-      tA = esp_timer_get_time();
       g_pageText = rdBuildPageText(*page, fontId, bodyMargin(), RD_BODY_TOP);
-      s_prof.textmapUs = esp_timer_get_time() - tA;
       // 页面链接矩形跟着页一起抄下来：PageLink 存的是页内坐标（解析时已含 leftInset），
       // 与 PageLine 同一套，所以屏幕坐标 = 页内坐标 + 渲染偏移（bodyMargin / RD_BODY_TOP）。
       st.pageLinks.clear();
       for (const auto &lk : page->links) {
         st.pageLinks.push_back({std::string(lk.href), lk.x + bodyMargin(), lk.y + RD_BODY_TOP, lk.width, lk.height});
       }
-      ttf_bench_stats_t ws;
-      ttf_bench_begin();
-      tA = esp_timer_get_time();
       rdWarmPageText(g_pageText);
-      s_prof.warmUs = esp_timer_get_time() - tA;
-      ttf_bench_end(&ws);
-      s_prof.warmReadUs = ws.read_us;
-      s_prof.warmSeekUs = ws.seek_us;
-      s_prof.warmCalls = ws.read_calls;
-      s_prof.warmBytes = ws.read_bytes;
-      s_prof.ioBlocks = ws.io_blocks;
-      s_prof.ioRuns = ws.io_runs;
-      s_prof.ioSpan = ws.io_span_max > ws.io_span_min
-                          ? (int64_t)(ws.io_span_max - ws.io_span_min) + 4096
-                          : 0;
-      ttf_bench_stats_t bs;
-      ttf_bench_begin();
-      tA = esp_timer_get_time();
       page->render(g_rd, fontId, bodyMargin(), RD_BODY_TOP);
-      s_prof.renderUs = esp_timer_get_time() - tA;
-      ttf_bench_end(&bs);
-      s_prof.glyphs = bs.glyphs;
-      s_prof.hits = bs.hits;
-      s_prof.misses = bs.misses;
-      s_prof.rasterUs = bs.raster_us;
-      s_prof.fontReadUs = bs.read_us;
-      s_prof.fontSeekUs = bs.seek_us;
-      s_prof.fontReadCalls = bs.read_calls;
-      s_prof.fontReadBytes = bs.read_bytes;
-      s_prof.cacheKB = bs.cache_kb;
-      s_prof.cacheCapKB = bs.cache_cap_kb;
       // 图片解码缓存(.pxc 像素)在 RAM 里的那份副本：整页渲染期间留着，好让同一页
       // 的多趟绘制不再读 SD；这一页画完就还回去。它最大 96KB PSRAM，跨页持有没意义。
       ImageBlock::releaseRenderCache();
@@ -2361,8 +2276,6 @@ static void renderTxtPage() {
   int asc = g_rd.getFontAscenderSize(fontId);
   std::vector<std::string> segs;   // 同时留一份给"文字地图"（长按选词用）
   segs.reserve(static_cast<size_t>(lpp));
-  s_prof = RdPageProf();
-  s_prof.valid = 1;
   // 1) 先切好这一页的行（不画）。原文是边切边画，但整页预取必须先把整页的字收齐，
   //    所以这里拆成"收集 → 预取 → 绘制"三步，绘制结果与原顺序逐像素一致。
   for (int ln = 0; ln < lpp; ln++) {
@@ -2385,45 +2298,14 @@ static void renderTxtPage() {
       all.reserve(total + 8);
       for (const auto &s : segs) all += s;
     }
-    ttf_bench_stats_t ws;
-    ttf_bench_begin();
-    int64_t tw = esp_timer_get_time();
     rdWarmStrings(TTF_ROLE_CONTENT, all);  // TXT 没有样式，只有内容面
-    s_prof.warmUs = esp_timer_get_time() - tw;
-    ttf_bench_end(&ws);
-    s_prof.warmReadUs = ws.read_us;
-    s_prof.warmSeekUs = ws.seek_us;
-    s_prof.warmCalls = ws.read_calls;
-    s_prof.warmBytes = ws.read_bytes;
-    s_prof.ioBlocks = ws.io_blocks;
-    s_prof.ioRuns = ws.io_runs;
-    s_prof.ioSpan = ws.io_span_max > ws.io_span_min
-                        ? (int64_t)(ws.io_span_max - ws.io_span_min) + 4096
-                        : 0;
   }
   // 3) 画。y 的推进与收集循环一一对应（每个 seg 一行，含空行）。
-  ttf_bench_stats_t bs;
-  ttf_bench_begin();
-  int64_t tA = esp_timer_get_time();
   for (const auto &seg : segs) {
     if (!seg.empty()) g_rd.drawText(fontId, bodyMargin(), y + asc, seg.c_str(), true);
     y += lh;
   }
-  s_prof.renderUs = esp_timer_get_time() - tA;
-  ttf_bench_end(&bs);
-  s_prof.glyphs = bs.glyphs;
-  s_prof.hits = bs.hits;
-  s_prof.misses = bs.misses;
-  s_prof.rasterUs = bs.raster_us;
-  s_prof.fontReadUs = bs.read_us;
-  s_prof.fontSeekUs = bs.seek_us;
-  s_prof.fontReadCalls = bs.read_calls;
-  s_prof.fontReadBytes = bs.read_bytes;
-  s_prof.cacheKB = bs.cache_kb;
-  s_prof.cacheCapKB = bs.cache_cap_kb;
-  tA = esp_timer_get_time();
   g_pageText = rdBuildPageTextTxt(segs, fontId, bodyMargin(), RD_BODY_TOP, lh);
-  s_prof.textmapUs = esp_timer_get_time() - tA;
   rdDrawReadingLines(fontId);  // 与 EPUB 同一条阅读线（TXT 的 y 推进就是标称行距）
   drawReaderStatus();
   rdDrawOverlays(g_pageText, fontId);
@@ -2431,8 +2313,6 @@ static void renderTxtPage() {
 
 static void renderXtcPage() {
   g_rd.clearScreen();
-  s_prof = RdPageProf();
-  s_prof.valid = 1;
   if (!st.xtc) { drawCenteredLine(200, "XTC 打开失败"); drawReaderStatus(); return; }
   uint32_t w = st.xtc->getPageWidth();
   uint32_t h = st.xtc->getPageHeight();
@@ -2452,9 +2332,7 @@ static void renderXtcPage() {
   // （分配-释放-再分配，PSRAM 迟早被切碎）。resize 不缩容，容量稳定在一页大小。
   static std::vector<uint8_t> buf;
   buf.resize(bufsize);
-  int64_t tA = esp_timer_get_time();
   int rd = st.xtc->loadPage(st.xtcPage, buf.data(), bufsize);
-  s_prof.loadUs = esp_timer_get_time() - tA;
   if (rd == 0) {
     drawCenteredLine(200, "页面读取失败");
     drawReaderStatus();
@@ -2465,7 +2343,6 @@ static void renderXtcPage() {
   float scale = std::min(static_cast<float>(vw) / w, static_cast<float>(vh) / h);
   int dw = static_cast<int>(w * scale), dh = static_cast<int>(h * scale);
   int ox = (g_rd.getScreenWidth() - dw) / 2, oy = RD_BODY_TOP;
-  tA = esp_timer_get_time();
   for (int yy = 0; yy < dh; yy++) {
     int sy = static_cast<int>(yy / scale);
     if (sy >= static_cast<int>(h)) sy = h - 1;
@@ -2479,7 +2356,6 @@ static void renderXtcPage() {
       else g_rd.drawGrayscale16Pixel(ox + xx, oy + yy, v == 0 ? 0 : v == 1 ? 5 : v == 2 ? 10 : 15);
     }
   }
-  s_prof.renderUs = esp_timer_get_time() - tA;
   drawReaderStatus();
 }
 
@@ -4148,9 +4024,39 @@ void vkEnter() {
   }
 }
 
-// 临时探针的状态：最近一次"落到键盘上"的按键时刻（虚拟键盘点按、或虚拟键盘弹着时的
-// 实体键盘按键），用来在推屏那一拍量出"按键→出图"有多久。定位到就删（连同读取处）。
-static int64_t s_vkLastKeyUs = 0;
+// ── 虚拟键盘"增量帧" ─────────────────────────────────────────────────────
+// 面板那块（编码行、候选行、键区）由 editorVkDraw 自己整块重铺：先把面板矩形填成
+// 白底，再画键框/标签/候选 —— 也就是说**它不依赖底下画了什么**。于是只要这一拍
+// 除了键盘自身没有任何东西变化，就没必要把整页重画一遍：上一帧留在帧缓冲里的
+// 上半屏（标题/查询框/结果列表/笔记正文框/词典释义）本来就是当前该显示的内容，
+// 让它原样待着即可，只有面板那块需要重刷。省下的是每键 100ms 上下的整屏绘制 ——
+// **差分与波形一像素都不变**（差分比的是 back_fb，不是中间那份白屏），所以只是
+// 把"按键→出图"里的分发包削掉一段，不会动刷新策略那套。
+//
+// 判据用一个最不容易出错的口径：**目标字符串在这一拍前后逐字节相同**。它一次性
+// 罩住退格、英文直通上屏、句读直通（后两者根本不走 commitSeq）、以及"重新过滤
+// 命中表导致选中项回到第一项"（commitVk 里那句 searchSel=0 只在串变了时才发生）。
+// 另外还要求：模式没变（回车打开结果会切模式）、本帧没被置 fullRefresh（换面板/
+// 换布局/T9/中英切换那几键必须整屏 GC16，见 vkTap 的注释）、键盘确实弹着、
+// 且场上没有任何浮层（busy/浮动提示是盖在上半屏的，而且随时间自己变）。
+static bool s_vk_incr_ok = false;
+
+// 作用域守卫：vkTap 里所有早退（死区、EVK_* 那十来个分支、回车/退格/普通字符）
+// 都从这一个析构口出去，不必在每个 return 前各写一遍判定。
+struct RdVkIncrGuard {
+  std::string before;
+  RdMode mode0;
+  RdVkIncrGuard() {
+    const std::string *t = vkTargetString();
+    if (t) before = *t;
+    mode0 = st.mode;
+    s_vk_incr_ok = false;
+  }
+  ~RdVkIncrGuard() {
+    const std::string *t = vkTargetString();
+    s_vk_incr_ok = (t != nullptr && mode0 == st.mode && *t == before);
+  }
+};
 
 // 点按 → editor_vk 命中 → 翻译成"普通键码" → 走阅读模式既有的输入逻辑。
 // 和写作模式一样，键盘不重复实现任何输入逻辑：候选返回 '1'+i（交给 IME 完成选词）、
@@ -4158,11 +4064,11 @@ static int64_t s_vkLastKeyUs = 0;
 // 其余（翻页/中英/布局/Shift/Ctrl）在 editorVkHitTest 内部已经翻转了自身状态，
 // 这里重绘即可。
 void vkTap(int x, int y) {
+  RdVkIncrGuard incrGuard;   // 见 s_vk_incr_ok：这一拍能不能只重画键盘面板
   rdSyncVk();
   EditorVkHit hit;
   const int k = editorVkHitTest(x, y, &hit);
   if (k == EVK_NONE) return;  // 死区/空白：吞掉本次点按，不发生任何动作（防误触）
-  s_vkLastKeyUs = esp_timer_get_time();   // 探针：这一拍从点按开始算
   editorVkMarkPressed(hit);   // 反色由本次动作的重绘一起画出去（不额外推屏）
   // 这几类键的动作会把键面重画成新状态（换标签/翻反白），按下前那份几何再叠上去
   // 就成了两个标签摞一起（中英切换时"拼""英"叠字，按别的键才刷新）。取消补画。
@@ -4944,10 +4850,15 @@ static void rdPinShimFb() {
 
 void renderCurrent() {
   rdPinShimFb();
-  // 翻页手感排查用的分段计时：绘制（含栅格化） / 决策+测量 / 刷屏 三段。
-  // 只在阅读页打，菜单/列表页刷屏快慢与翻页无关，不值得占日志。
-  const int64_t s_t0 = esp_timer_get_time();
-  switch (st.mode) {
+  // 虚拟键盘增量帧：这一拍只有键盘面板变了，上半屏一个像素都不用重画
+  // （帧缓冲里留着的就是上一帧的内容，本来也该是它）。见 s_vk_incr_ok。
+  const bool vkIncr = s_vk_incr_ok && st.vkVisible && !st.fullRefresh &&
+                      vkTargetString() != nullptr && st.busyMsg.empty() && st.floatMsg.empty() &&
+                      !s_imgPresentSkipped;
+  s_vk_incr_ok = false;
+  if (vkIncr) {
+    drawVk();
+  } else switch (st.mode) {   // 常规帧：整页重画
     case RdMode::Browser: renderBrowser(); break;
     case RdMode::Reading: renderReading(); break;
     case RdMode::Toc: renderToc(); break;
@@ -5036,7 +4947,6 @@ void renderCurrent() {
     return;
   }
   applyNightMode();
-  const int64_t tDraw = esp_timer_get_time();
   // 极速刷(DU)只给**用实体键盘打字**的场景：界面上能打字（WiFi/OPDS 地址、笔记、
   // 词典查询），而且键盘不是虚拟键盘（蓝牙键盘连上了才自动收起）。虚拟键盘是手点的，
   // 一键之间有整段等待，抢不到那点刷新时间，DU 的低画质反而把残影留在屏上；那种场景
@@ -5149,7 +5059,6 @@ void renderCurrent() {
     s_ghostAccum = 0;
     s_pagesSinceFull = 0;
   }
-  const int64_t tPrep = esp_timer_get_time();
   // 错相揭页：这一帧是翻页、用户开着动画、且档位是差分正文刷（局刷/8 灰阶正文刷）时，
   // 把方向交给推屏层，让它用 16 条带依次入相的揭页替代这一次普通差分刷。
   // 其它档位（全刷/8 灰阶清账）与其它来由的帧（换章、进菜单、跳目录）都不动画 ——
@@ -5170,80 +5079,16 @@ void renderCurrent() {
     // 虚拟键盘打字帧：只驱动与上一帧有差异的那块矩形（编码/候选两行快刷，键盘区与
     // 文本输入区局刷），与写作模式的虚拟键盘同一套判据 —— 见 reader_vk_present。
     // st.fullRefresh 那一帧不走这条：进界面首帧本来就该整屏 GC16 清场（那是应该的整屏刷）。
-    // 临时探针（量"虚拟键盘一下要多久"）：把这一拍拆成"按键→出图"（= 分发 + 整屏重绘
-    // + 排队）和"刷屏"（面板推屏本身）。用户说"反馈略慢"时，看这两段谁大就知道该动
-    // 绘制那条路还是波形那一档。只在真有按键的那一帧打（点按与实体键都算）。定位到就删。
-    {
-      const int64_t tVk0 = esp_timer_get_time();
-      display.displayBufferVk(vkVkTop(), editorVkCandH());
-      const int64_t tVk1 = esp_timer_get_time();
-      if (s_vkLastKeyUs) {
-        ESP_LOGI(TAG, "VK帧: 按键→出图 %lldms 刷屏 %lldms",
-                 (tVk0 - s_vkLastKeyUs) / 1000, (tVk1 - tVk0) / 1000);
-        s_vkLastKeyUs = 0;
-      }
-    }
+    display.displayBufferVk(vkVkTop(), editorVkCandH());
   } else {
+    // 整屏全刷（翻页全刷/换章/进界面首帧）把每个像素都驱动了一遍，虚拟键盘快档
+    // 欠的那块正文已经干净了，把账销掉，免得停手时再白闪一次。
+    if (m == HalDisplay::FULL_REFRESH) ui_render_reader_vk_settle_forget();
     g_rd.displayBuffer(m);
-  }
-  if (st.mode == RdMode::Reading) {
-    const int64_t tEnd = esp_timer_get_time();
-    ESP_LOGI(TAG, "翻页耗时: 绘制 %lldms 决策 %lldms 刷屏 %lldms 合计 %lldms",
-             (tDraw - s_t0) / 1000, (tPrep - tDraw) / 1000, (tEnd - tPrep) / 1000,
-             (tEnd - s_t0) / 1000);
-    // 明细只解读"绘制"那一段。取页+栅格化+文字图 与 绘制 的差额是 clearScreen、
-    // 状态栏、浮层、夜间反色——若它也很大，说明瓶颈在状态栏而不在正文。
-    // 命中/未命中直接回答"字形缓存是不是在抖"：一页几百个字里未命中占大头，
-    // 就该抬 TTF_CACHE_LIMIT（现在 1.5MB，PSRAM 还空着 4MB 多）。
-    // 字体读：正文字面若是 SD 上的外部字体，冷字形会真读盘，这里会明显非零。
-    if (s_prof.valid) {
-      ESP_LOGI(TAG, "翻页明细: %s%s 取页 %lldms 栅格化 %lldms 文字图 %lldms 其余 %lldms | "
-                    "图 %d 个 字形 %u 命中 %u 未命中 %u 光栅 %lldms 字体读 %lldms | "
-                    "字库缓存 %u/%uKB | 面 %s",
-               st.bookKind == 0 ? "EPUB" : st.bookKind == 1 ? "TXT" : "XTC",
-               (st.bookKind == 0 && st.section && !st.section->isBuildComplete()) ? "(排版未完成)"
-                                                                                  : "",
-               s_prof.loadUs / 1000, s_prof.renderUs / 1000, s_prof.textmapUs / 1000,
-               (tDraw - s_t0 - s_prof.loadUs - s_prof.renderUs - s_prof.textmapUs) / 1000,
-               s_prof.images, (unsigned)s_prof.glyphs, (unsigned)s_prof.hits,
-               (unsigned)s_prof.misses, s_prof.rasterUs / 1000, s_prof.fontReadUs / 1000,
-               (unsigned)s_prof.cacheKB, (unsigned)s_prof.cacheCapKB,
-               ttf_font_display_name());
-      // 字库 I/O 细分（这是**绘制期间**的读，预取的读记在下面那条里）。
-      // 整页预取做对的话，这里的次数应该接近 0；若仍很大，说明预取漏了字
-      // （比如字形在 render 里又变了字号/字重，或 opentype 变量轴走了另外的偏移）。
-      if (s_prof.fontReadCalls > 0) {
-        const int64_t calls = (int64_t)s_prof.fontReadCalls;
-        ESP_LOGI(
-            TAG, "字库I/O: 读 %u 次 %uKB 共 %lldms(其中 seek %lldms) 均 %uB/次 %lldus/次 %lldKB/s",
-            (unsigned)s_prof.fontReadCalls, (unsigned)(s_prof.fontReadBytes / 1024),
-            s_prof.fontReadUs / 1000, s_prof.fontSeekUs / 1000,
-            (unsigned)(s_prof.fontReadBytes / (uint32_t)calls), s_prof.fontReadUs / calls,
-            s_prof.fontReadUs > 0 ? (int64_t)s_prof.fontReadBytes * 1000 / s_prof.fontReadUs
-                                  : 0
-        );
-      }
-      // 整页预取的效果。看三个数：
-      //  · 块数→读次数 = 合并倍率（合并前每次读≈5KB，等于一次随机小读）；
-      //  · 跨度 = 这一页的字形在字体表里的分布范围 —— 只有它接近整表大小时，
-      //    "按章建字形 arena"那种大改才值得做；跨度小就说明本页的字本来就聚在一起，
-      //    靠块缓存+顺序读就够了；
-      //  · warmUs 是这次预取的总耗时，应该被后面的"字体读"降下来对冲掉。
-      if (s_prof.ioBlocks > 0) {
-        ESP_LOGI(TAG, "整页预取: %u 块→%u 次读 %uKB 跨度 %lldKB 耗时 %lldms(seek %lldms)",
-                 (unsigned)s_prof.ioBlocks, (unsigned)s_prof.ioRuns,
-                 (unsigned)(s_prof.warmBytes / 1024), (long long)(s_prof.ioSpan / 1024),
-                 s_prof.warmUs / 1000, s_prof.warmSeekUs / 1000);
-      } else {
-        ESP_LOGI(TAG, "整页预取: 无块可读(字形已缓存/内建字体) 遍历 %lldus",
-                 s_prof.warmUs);
-      }
-    }
   }
   st.fullRefresh = false;
   st.dirty = 0;
   // 这一帧已经推出去了，用户正盯着新页看 —— 正是把排版余量补回来的空档。
-  // 放在计时之后：翻页明细/耗时那两条日志量的还是"翻页本身"，不掺预排版的账。
   rdPrebuildAhead();
 }
 
@@ -5650,22 +5495,15 @@ static bool rdTapOnLink(int x, int y) {
 //   晋书的 `<sup><a href="#note-015">〔一五〕</a></sup>` 排完版被切成若干段——
 //   `〕` 是不许起行的标点会粘在前一个 CJK 字上，于是词表里是 `〔` / `一` / `五〕`。
 //   原来"拿被点中的那个词去比注号"因此**永远比不中**：点 `五〕` 归一化得 "五"，
-//   而注号是 "一五"（日志 `点注: 点中上标词 '五〕' … 但注号列表 … '〔一五〕'`）。
+//   而注号是 "一五"。
 //   顺带一提，单字命中框只有注号的 1/3 宽，所以"点上标"还常常点不中。
 //
 // 修法：先把这个词所在的那**一整段连续上标**并成一个"注号框"，用整段文本归一化比对，
 //   命中判定也用整段的框。比对和命中面积一起修好。合并只在词表里**连续**的上标词之间
 //   发生，所以正文里两个相隔的注号不会被并成一个（中间夹一个非上标词就断）。
 static bool rdTapOnFootnote(int x, int y) {
-  // 临时诊断（点注排查用，验收后删）：把每一次点按的判定依据打出来。
-  const auto noHit = [&](const char *why) {
-    ESP_LOGW(TAG, "点注: (%d,%d) 未命中 — %s", x, y, why);
-    return false;
-  };
-  if (st.bookKind != 0 || !g_pageText.valid || !st.section)
-    return noHit("前置不满足");
-  if (!loadCurrentFootnotes())
-    return noHit("本页没有脚注条目");
+  if (st.bookKind != 0 || !g_pageText.valid || !st.section) return false;
+  if (!loadCurrentFootnotes()) return false;
   const int fontId = BODY_FONT_ID_BASE + st.fontLevel;
   const int asc = g_rd.getFontAscenderSize(fontId);
   // 命中容差：注号字形缩到 50% 画（〔一〕这种只有半个字高、两个字宽），手指根本
@@ -5681,13 +5519,11 @@ static bool rdTapOnFootnote(int x, int y) {
   const int lineDesc = std::max(0, g_rd.getLineHeight(fontId) - asc);
 
   const int n = static_cast<int>(g_pageText.words.size());
-  int supRuns = 0;
   // 命中不再是"扫到第一段就弹"。放宽容差之后，相邻两行的注号框会互相重叠（注文页
   // 一行一条 〔一〕〔二〕…，注号都在同一个 x 上，行距又只有 ~50px），先命中谁就弹谁
   // 会变成"点二弹一"。所以整页扫完，取**框中心离手指最近**的那一段。
   int bestFound = -1;
   long bestDist2 = 0;
-  std::string mismatch;   // 最后一段"对上了注号却不在本页注号表里"的串（日志用）
   for (int i = 0; i < n;) {
     const RdWordHit &w0 = g_pageText.words[i];
     // 只认上标/下标：正文里一个普通的"1"不该把注弹出来。三种弹注写法都是上标
@@ -5709,7 +5545,6 @@ static bool rdTapOnFootnote(int x, int y) {
     }
     const int runEnd = j;                      // [i, runEnd) 是一整段注号
     const RdWordHit &wLast = g_pageText.words[runEnd - 1];
-    supRuns++;
 
     const int boxX = w0.x;
     const int boxW = std::max(wLast.x + wLast.w - boxX, MIN_TOUCH_WIDTH);
@@ -5741,8 +5576,6 @@ static bool rdTapOnFootnote(int x, int y) {
           const long dx = x - cx, dy = y - cy;
           const long d2 = dx * dx + dy * dy;
           if (bestFound < 0 || d2 < bestDist2) { bestDist2 = d2; bestFound = found; }
-        } else {
-          mismatch = marker + "' (norm='" + norm + "')";
         }
       }
     }
@@ -5755,19 +5588,9 @@ static bool rdTapOnFootnote(int x, int y) {
       rdRememberNoteRef(st.footnoteNums[bestFound], st.spineIndex, st.page);
       return true;
     }
-    return noHit("注号对上了但取不到注文");
-  }
-  if (!mismatch.empty()) {
-    std::string all;
-    for (const auto &q : st.footnoteNums) { all += "'"; all += q; all += "' "; }
-    ESP_LOGW(TAG, "点注: 点中注号段 '%s' 但注号列表 %u 条对不上: %s", mismatch.c_str(),
-             (unsigned)st.footnoteNums.size(), all.c_str());
     return false;
   }
-  char buf[128];
-  snprintf(buf, sizeof(buf), "注号段 %d 个（词表 %u），点没落在任何注号框内", supRuns,
-           (unsigned)g_pageText.words.size());
-  return noHit(buf);
+  return false;
 }
 
 // 点"注文条目行首的注号" → 跳到正文里对应的那个**上标**处。
@@ -6143,19 +5966,13 @@ static void handleReading(int key) {
       if (rdTapOnFootnote(x, y)) return;
       // 点"注文条目行首的注号" → 跳到正文里那个上标处（任何时候、任何一条都行）
       if (rdTapOnNoteBack(x, y)) return;
-      // 临时诊断：点按走到了这里说明上面两条都没认，落进了翻页/菜单分区。
-      ESP_LOGW(TAG, "点注: 点按 (%d,%d) 未被上标/标注认领 → 落进 %s", x, y,
-               x < w / 3 ? "左1/3翻页" : (x > w * 2 / 3 ? "右1/3翻页" : "中间菜单"));
       // crossmux 阅读器触摸分区：左右 1/3 翻页，中间 1/3 菜单
       if (x < w / 3) turnBook(-1);
       else if (x > w * 2 / 3) turnBook(+1);
       else openMenu();
       return;
     }
-    // 临时诊断：收到回车却没有点按坐标（BLE/KEY3 的 Enter）—— 说明触摸那一下
-    // 根本没变成 '\n'（被当成滑动/长按/边缘返回吃掉了）。
-    ESP_LOGW(TAG, "点注: 收到 '\\n' 但无点按坐标 → 当菜单键");
-    openMenu();  // 非点按回车(BLE/KEY3)
+    openMenu();  // 非点按回车(BLE/KEY3)，没有点按坐标
     return;
   }
   // 双击左右电容键 = 跳上/下一章（由 main.cpp 的电容键双击分支产生）。
@@ -7853,18 +7670,21 @@ void screen_reader_leave(AppState next) {
 AppState screen_reader_handle(int key, ScreenContext &ctx) {
   (void)ctx;
 
-  // ── 临时帧探针（定位"翻页后 ~8s 无响应"，定位到就删） ──────────────────
-  // 把一次 dispatch 切成 前置/分发/渲染/进度/统计 五段，任一段超阈值就整行打出，
-  // 这样"卡在哪一段"是量出来的。stage 变量在下面各段之间赋值。
-  const int64_t rdT0 = esp_timer_get_time();
-  int64_t rdTa = rdT0, rdTb = rdT0, rdTc = rdT0, rdTd = rdT0;
+  // 一拍只认**这一拍**里 vkTap 设下的"可以走增量帧"。跨拍留着的话，中途任何别的
+  // 状态变化（另一次分发改的东西）都会被那面"只重画键盘"的旗子瞒过去。
+  s_vk_incr_ok = false;
+
+  // 虚拟键盘"上屏刷法=快"欠下的正文那块：停手到点就在这儿坐实（区域 GC16，约 336ms）。
+  // **放在所有早退之前**：下面还有两条 VK 滑动早退（候选行横划/面板竖滑）和一个
+  // 微信读书任务分支，放它们后面会让这次清理被那些帧绕过、拖到不知道什么时候。
+  // 空转帧也要过 —— "没人按键"正是"用户停手了"的证据。见 ui_render.h。
+  ui_render_reader_vk_settle_tick();
 
   // 用户动不动手的锚点（书架空闲预建用）：任何非空按键都算，包括震动全刷、长按、
   // 微信读书那几拍 tick。空转 tick（key==0）不算——空闲帧本来就是"没动手"的证据。
   if (key != 0) {
     s_rdLastInputUs = esp_timer_get_time();
     s_rdSawKey = true;
-    if (st.vkVisible) s_vkLastKeyUs = s_rdLastInputUs;   // 探针：虚拟键盘弹着时的实体键
     // 用户又动手了 → 挂起的弹注作废（他多半是等不及、点了别处）。挂起态只活在
     // "没人按键"的那些空闲帧里，这样它绝不会在用户已经翻到别处之后突然弹出来。
     if (st.fnWaitIdx >= 0) rdFootnoteWaitCancel();
@@ -8014,8 +7834,6 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 网络传输心跳（按键帧和空闲帧都过这里）。放分发之前：它只置 st.dirty，不碰键。
   rdNetTick();
 
-  rdTa = esp_timer_get_time();   // 探针：前置段结束
-
   // 统计：记下分发前的模式。这一键哪怕把界面切走了（打开菜单/目录），
   // 按下它的那一刻人还在阅读页，也算一次阅读交互。
   const RdMode statsModeBefore = st.mode;
@@ -8069,8 +7887,6 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     case RdMode::StatsSettings: handleStatsSettings(key); break;
   }
 
-  rdTb = esp_timer_get_time();   // 探针：分发段结束
-
   // **必需的**一次输入法同步：分发已经做完，这一拍要停在哪个界面已成定局，此时再对齐
   // 一次，首帧画出来就是对的。少了这一句，"从菜单点进词典/笔记"那一帧的 want 是按
   // 上一拍（菜单）算的 = false → IME 是关的 → 虚拟键盘画出 26 键的键位，可布局键上
@@ -8078,21 +7894,9 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 按一下、下一拍 want 才变成 true，键位才跳成他选的那套。
   rdSyncImeActive();
   if (st.dirty) renderCurrent();
-  rdTc = esp_timer_get_time();   // 探针：渲染段结束
   // 阅读页的位置一有变化就落盘（位置没变时 rdRememberProgress 自己会早退，不写 SD）。
   if (st.mode == RdMode::Reading) rdRememberProgress(false);
-  rdTd = esp_timer_get_time();   // 探针：进度落盘段结束
   // 统计记时：一次按键只记一笔（翻页/滚动/弹菜单都算），不在 turnBook 里另记。
   if (statsModeBefore == RdMode::Reading) rdStatsNoteActivity();
-  // 临时帧探针：任一段超 300ms（正常每段都是 0~几十 ms）就整行打出。
-  {
-    const int64_t tEnd = esp_timer_get_time();
-    if (tEnd - rdT0 > 300000)
-      ESP_LOGW(TAG, "分发探针: 前置 %lldms 分发 %lldms 渲染 %lldms 进度 %lldms 统计 %lldms 共 %lldms "
-                    "key=%d mode=%d dirty=%d",
-               (rdTa - rdT0) / 1000, (rdTb - rdTa) / 1000, (rdTc - rdTb) / 1000,
-               (rdTd - rdTc) / 1000, (tEnd - rdTd) / 1000, (tEnd - rdT0) / 1000,
-               key, static_cast<int>(statsModeBefore), (int)st.dirty);
-  }
   return APP_READER;
 }

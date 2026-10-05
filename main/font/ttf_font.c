@@ -413,9 +413,6 @@ extern const uint8_t yanos_logo_ttf_start[] asm("_binary_yanos_logo_ttf_start");
 extern const uint8_t yanos_logo_ttf_end[] asm("_binary_yanos_logo_ttf_end");
 static bool sd_suspended; // 字体传输期间仅允许内置字体。/ Only built-in fonts while transferring font files.
 static ttf_work_t* work;
-static bool bench_on;
-static ttf_bench_stats_t bench;
-static int64_t bench_start_us;
 
 // 选定字面，返回原字面(配 face_leave 还原)。给"进某面做一件固定的事再回来"用
 // (加载/卸载/清缓存)。铁律 1：s_cur 只在这里和 ttf_set_role 里被写。
@@ -461,16 +458,13 @@ static bool io_read_raw(uint32_t offset, void* dst, size_t n) {
         return true;
     }
     if (font_fd < 0) return false;
-    int64_t t0 = bench_on ? esp_timer_get_time() : 0;
     bool ok = false;
     do {
         if (font_file_pos != offset) {
-            int64_t ts = bench_on ? esp_timer_get_time() : 0;
             if (lseek(font_fd, (off_t)offset, SEEK_SET) < 0) {
                 font_file_pos = UINT32_MAX;
                 break;
             }
-            if (bench_on) bench.seek_us += esp_timer_get_time() - ts;
             font_file_pos = offset;
         }
         uint8_t* out = dst;
@@ -483,16 +477,11 @@ static bool io_read_raw(uint32_t offset, void* dst, size_t n) {
                 font_file_pos = UINT32_MAX;
                 break;
             }
-            if (bench_on) {
-                bench.read_calls++;
-                bench.read_bytes += (uint32_t)got;
-            }
             done += (size_t)got;
             font_file_pos = offset + (uint32_t)done;
         }
         ok = done == n;
     } while (0);
-    if (bench_on) bench.read_us += esp_timer_get_time() - t0;
     return ok;
 }
 
@@ -617,27 +606,16 @@ static bool io_load_block(uint32_t base) {
     if (io_data == NULL && !io_ensure()) return false;
     int slot = io_victim();
     uint8_t* dst = io_data + (size_t)slot * TTF_IO_BLOCK;
-    int64_t t0 = bench_on ? esp_timer_get_time() : 0;
     // 顺序补读(上一块的读正好停在块尾)不必再 seek 一次 —— io_read_raw 一直有这个
     // 快路径，这里漏了。逐块读相邻扇区的场景(预取退化成逐块、大字形跨两块)就省下
     // 一次 FATFS 簇链查找。
     if (font_file_pos != base) {
-        int64_t ts = bench_on ? esp_timer_get_time() : 0;
         if (lseek(font_fd, (off_t)base, SEEK_SET) < 0) {
             font_file_pos = UINT32_MAX;
-            if (bench_on) bench.read_us += esp_timer_get_time() - t0;
             return false;
         }
-        if (bench_on) bench.seek_us += esp_timer_get_time() - ts;
     }
     ssize_t got = read(font_fd, dst, TTF_IO_BLOCK);
-    if (bench_on) {
-        bench.read_us += esp_timer_get_time() - t0;
-        if (got > 0) {
-            bench.read_calls++;
-            bench.read_bytes += (uint32_t)got;
-        }
-    }
     if (got <= 0) {
         font_file_pos = UINT32_MAX;
         return false;
@@ -761,18 +739,8 @@ static void io_flush_touches(void) {
         // 后面那几个被碰过的块(读进来的是中间的填空块，真正要的反而没到)。
         int span = (int)((touch_blocks[j - 1] - touch_blocks[i]) / TTF_IO_BLOCK) + 1;
         io_load_run(touch_blocks[i], span);
-        if (bench_on) {
-            bench.io_runs++;
-            if (bench.io_span_min == 0 || touch_blocks[i] < bench.io_span_min) {
-                bench.io_span_min = touch_blocks[i];
-            }
-            if (touch_blocks[j - 1] > bench.io_span_max) {
-                bench.io_span_max = touch_blocks[j - 1];
-            }
-        }
         i = j;
     }
-    if (bench_on) bench.io_blocks += (uint32_t)w;
     touch_n = 0;
 }
 
@@ -2120,13 +2088,8 @@ static glyph_entry_t* rasterize_glyph(uint32_t codepoint, int pixel_height) {
 static const glyph_entry_t* get_glyph(uint32_t codepoint, int pixel_height) {
     if (!font_ready) return NULL;
     pixel_height = clamp_px(pixel_height);
-    if (bench_on) bench.glyphs++;
     glyph_entry_t* entry = cache_lookup(codepoint, pixel_height);
-    if (entry != NULL) {
-        if (bench_on) bench.hits++;
-        return entry;
-    }
-    if (bench_on) bench.misses++;
+    if (entry != NULL) return entry;
     // 本面没有这个字形(.notdef)：别把豆腐块栅进本面缓存，换个能画出它的面
     // (见 fallback_role_for)，字形与缓存都记在**那一面**上。条目跨 face_leave
     // 依然有效(缓存挂在字面结构上，与 s_cur 无关)，寿命与本面字形完全一样 ——
@@ -2141,9 +2104,7 @@ static const glyph_entry_t* get_glyph(uint32_t codepoint, int pixel_height) {
             if (entry != NULL) return entry;
         }
     }
-    int64_t t0 = bench_on ? esp_timer_get_time() : 0;
     entry = rasterize_glyph(codepoint, pixel_height);
-    if (bench_on) bench.raster_us += esp_timer_get_time() - t0;
     return entry;
 }
 
@@ -2247,22 +2208,6 @@ void ttf_font_cache_clear(void) {
     packed_root = -1;
     packed_weight = -1;
     io_reset();
-}
-
-void ttf_bench_begin(void) {
-    memset(&bench, 0, sizeof(bench));
-    bench_on = true;
-    bench_start_us = esp_timer_get_time();
-}
-
-void ttf_bench_end(ttf_bench_stats_t* out) {
-    bench_on = false;
-    bench.total_us = esp_timer_get_time() - bench_start_us;
-    // 缓存占用与当前额度：一眼看出"是不是顶到天花板了"。两个都顶到上限还大量未命中，
-    // 说明内存已经给足、瓶颈在别处；只顶到 room 额度则说明是 PSRAM 让不出来。
-    bench.cache_kb = (uint32_t)(cache_bytes / 1024);
-    bench.cache_cap_kb = (uint32_t)(cache_effective_limit() / 1024);
-    if (out != NULL) *out = bench;
 }
 
 static void abandon_font_source(void) {

@@ -427,7 +427,11 @@ static void idleWaitWithTouch(int total_ms) {
     const int step_ms = 20;   // 40~50Hz：60ms 的点按至少能采到两拍
     for (int left = total_ms; left > 0; ) {
         int step = (left > step_ms) ? step_ms : left;
-        input_tick();
+        // input_pending_key() 内部就是补采一次触摸，顺手问一句"已经有待发按键了吗"：
+        // 有就别再睡了 —— 主循环回到顶部 input_poll() 才把它取走，剩下的整段睡眠
+        // 纯粹是加在"手指离开 → 分发"之间的延迟。实测一次点按在这段白等上中位花
+        // 54ms（量化成 14 + 20k，k 就是没睡完的段数），早退之后只剩那 14ms。
+        if (input_pending_key() != 0) break;
         vTaskDelay(pdMS_TO_TICKS(step));
         left -= step;
     }
@@ -437,7 +441,6 @@ static void idleWaitWithTouch(int total_ms) {
 // leave 钩子也要用它判断"这次离开是不是切模式"。
 
 // 主循环里几个跨 case 要用的现场（原来是循环内的 static/local）。
-static int64_t s_lap_t0 = 0, s_lap_t1 = 0;  // 帧探针的三次采样点
 static AppState inspReturnTo = APP_MAIN;        // 灵感面板：退出回哪儿
 static AppState inspEditorReturnTo = APP_MAIN;  // 灵感面板 → 编辑器：回来时的落点
 
@@ -633,20 +636,9 @@ static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
 
 static AppState scrReader(int key, ScreenContext &ctx) {
     // 阅读模式用 crossmux 自己的 GfxRenderer + ttf_font 渲染，不用 g_font。
-    const int64_t tEntry = esp_timer_get_time();
     AppState next = APP_READER;
     if (key > 0) next = screen_reader_handle(key, ctx);
     else { screen_reader_handle(0, ctx); idleWaitWithTouch(80); }
-    const int64_t tExit = esp_timer_get_time();
-    // 临时帧探针：整趟超 400ms 就打一行（正常一趟只有几十 ms）。
-    // 前置 = 上一趟收尾(状态切换尾巴/空转等待) + 本轮 checkLightSleep/IME 冲刷。
-    static int64_t sPrevExit = 0;
-    if (tExit - s_lap_t0 > 400000 || (sPrevExit && s_lap_t0 - sPrevExit > 400000))
-        ESP_LOGW(TAG, "帧探针: 前置 %lldms 取键 %lldms 处理 %lldms 共 %lldms key=%d",
-                 sPrevExit ? (s_lap_t0 - sPrevExit) / 1000 : -1,
-                 (s_lap_t1 - s_lap_t0) / 1000, (tExit - tEntry) / 1000,
-                 (tExit - s_lap_t0) / 1000, key);
-    sPrevExit = tExit;
     // 离开阅读模式的收尾（记进度 + 释放书对象 + 还方向）不在这里了：它是 kScreens 里
     // 那一行的 leave（screen_reader_leave），主循环无论从哪条路走出去都会调到。
     return next;
@@ -1082,11 +1074,6 @@ extern "C" void app_main() {
     while (currentState != APP_QUIT) {
         checkLightSleep(currentState);
 
-        // ── 临时帧探针（定位"翻页后 ~8s 无响应"，定位到就删） ──────────────
-        // 三次采样把主循环一趟切成"前置/取键/处理"三段；只要总时长超阈值就打一行，
-        // 于是"卡在哪一段"是从日志读出来的，不是猜的。
-        s_lap_t0 = esp_timer_get_time();
-
         int key = g_bt.readKey();
         g_key_from_ble = (key != 0);
         if (key < 0) key = 0;
@@ -1096,8 +1083,6 @@ extern "C" void app_main() {
             int hw = input_poll();
             if (hw != 0 && key == 0) key = hw;
         }
-        int64_t lapT1 = esp_timer_get_time();
-        s_lap_t1 = lapT1;
 
         // BLE 键盘输入视为活动,重置空闲休眠计时
         if (key > 0) s_last_activity_us = esp_timer_get_time();

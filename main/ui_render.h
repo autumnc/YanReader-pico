@@ -79,6 +79,16 @@ void ui_render_set_local_only(bool enable);
 // render_present 的作业队列，只能把同一套差分/波形判据重走一遍——实现在 ui_render.cpp。
 void reader_vk_present(int panel_top, int cand_h);
 
+// 阅读器虚拟键盘的"清残影欠账"：**口径与编辑器那套一一对齐**（设置项 ime_clean，
+// 见 ui_render.cpp 里 reader_vk_present 上面那张表）。快档（上屏刷法=快）欠下的正文那块
+// （跟随 DU 推的、发灰又带残影的）在停手 IME_CLEAN_PAUSE_US 之后由阅读器自己的帧循环
+// （core0，每轮都调，空转帧也算）做一次区域 GC16 坐实；句读档则在句读那一拍当场清，
+// 不来这里。稳档只有"上屏那一拍记账"（同样由 ime_clean 的 commit 位定）。
+// 整屏全刷过的那些帧（翻页全刷/换章/进界面首帧）调 forget 销账，免得停顿时再白闪一次。
+// 两份账都在 core0，和渲染任务里那套 ime_clean 互不相干（各记各的，不共用计数器）。
+void ui_render_reader_vk_settle_tick(void);
+void ui_render_reader_vk_settle_forget(void);
+
 #ifdef __cplusplus
 }
 #endif
