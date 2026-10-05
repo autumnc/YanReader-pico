@@ -100,6 +100,16 @@ enum EpdDrawError update_display_area_with(
     EpdRect area
 );
 
+/// 清一块区域的残影：整块过一遍 8 灰阶 GC16（区域内每一行都标脏）。
+/// **别换成 GL16** —— 那张表白→白是全保持，压不掉"上一拍就已经是白"的墨痕，见
+/// display.c 里那段说明。相位数与 gray8_text 的 GL16 相同，区域不省时间，所以不多花
+/// 时间；代价是这块区域会闪一下。
+/// / Ghost-clean a region with 8-gray GC16 (every line marked dirty). Not GL16:
+/// white→white is all-hold there, so residual ink on pixels that were already
+/// white survives. Same phase count as the GL16 table it replaces, and an area
+/// costs no extra time; the region does visibly blink.
+enum EpdDrawError update_display_area_clean(EpdiyHighlevelState* hl, EpdRect area);
+
 /// 当前像素时钟。/ Current pixel clock.
 int display_pclk_mhz(void);
 /// 出现供数不足就退回安全频率并整屏重刷，其它错误码原样忽略。

@@ -91,6 +91,12 @@ static const SettingField SETTINGS_FIELDS[] = {
     // 键盘面板，正文可视行数相应减少（几何见 editor_vk.cpp 的 evkCandRowH）。
     {"_ime_cand_size", "候选字大小", false, true, CAT_IME},
     {"ime_candidate_highlight", "候选高亮", false, false, CAT_IME},
+    // 编码区+候选区那两行的清残影时机。清一次 = 一次区域 GC16（≈330ms，与区域大小
+    // 无关，见 ui_render.cpp），默认只挑句读：那是用户天然停手组织下一句的时刻。
+    {"_ime_clean", "清残影时机", false, true, CAT_IME},
+    // 实体键盘打字时正文那一拍怎么刷：稳 = 整屏阈值 DU（墨实，每键约 220ms）；快 =
+    // 差分矩形跟随 DU（约 56ms，字先发灰，停顿那次 GC16 坐实）。默认稳。
+    {"_ime_commit_mode", "上屏刷法", false, true, CAT_IME},
     {"ime_sentence", "整句候选", false, false, CAT_IME},
     {"ime_doc_context", "正文词优先", false, false, CAT_IME},
     {"_dict_mgr", "词库管理", false, true, CAT_IME},
@@ -218,6 +224,29 @@ static int editorFontSizeIndex(const char *k) {
 static const OptItem KB_LAYOUT_OPTS[] = {
     {"26", "26键全拼"}, {"14", "14键"}, {"18", "18键"}, {"9", "9键"},
 };
+// 输入法那两行（编码区+候选区）什么时候清残影。清一次 = 一次区域 GC16，约 330ms
+// （耗时看相位数，不看区域大小）；上屏与句读都记的话，一句话里会清两遍（用户报障
+// "会刷新2次"），所以默认只留句读。见 ui_render.cpp 的 ime_clean_policy。
+static const OptItem IME_CLEAN_OPTS[] = {
+    {"punct", "句读后"}, {"commit", "上屏后"}, {"both", "两者都清"}, {"off", "不清"},
+};
+static int imeCleanIndex(const char *k) {
+    for (int i = 0; i < (int)(sizeof(IME_CLEAN_OPTS) / sizeof(IME_CLEAN_OPTS[0])); i++)
+        if (strcmp(k, IME_CLEAN_OPTS[i].key) == 0) return i;
+    return 0;  // 认不出 → 句读后（与 settings_manager 的默认值一致）
+}
+// 实体键盘打字时正文那一拍的推屏方式（见 ui_render.cpp 的 render_present 第 2 条路）：
+//   solid = 整屏阈值 DU（每键约 220ms，墨实，现在就是这样）
+//   fast  = 只推差分矩形的跟随 DU（约 56ms，但跟随表推力只有阈值表的 1/4，刚上屏的
+//           字先发灰，等打字停顿那次区域 GC16 坐实）。默认 solid = 保持现状。
+static const OptItem IME_COMMIT_OPTS[] = {
+    {"solid", "稳（整屏）"}, {"fast", "快（差分）"},
+};
+static int imeCommitIndex(const char *k) {
+    for (int i = 0; i < (int)(sizeof(IME_COMMIT_OPTS) / sizeof(IME_COMMIT_OPTS[0])); i++)
+        if (strcmp(k, IME_COMMIT_OPTS[i].key) == 0) return i;
+    return 0;  // 认不出 → 稳（与 settings_manager 的默认值一致）
+}
 static int kbLayoutIndex(const char *k) {
     for (int i = 0; i < (int)(sizeof(KB_LAYOUT_OPTS) / sizeof(KB_LAYOUT_OPTS[0])); i++)
         if (strcmp(k, KB_LAYOUT_OPTS[i].key) == 0) return i;
@@ -280,6 +309,7 @@ static bool pickerFieldSupported(const char *key) {
            strcmp(key, "_font") == 0 || strcmp(key, "_input_mode") == 0 ||
            strcmp(key, "_kb_layout") == 0 || strcmp(key, "_ime_fuzzy") == 0 ||
            strcmp(key, "_ime_predict_mode") == 0 || strcmp(key, "_ime_cand_size") == 0 ||
+           strcmp(key, "_ime_clean") == 0 || strcmp(key, "_ime_commit_mode") == 0 ||
            strcmp(key, "_editor_font_size") == 0 ||
            strcmp(key, "_click_volume") == 0 ||
            strcmp(key, "_click_chinese") == 0 || strcmp(key, "_vertical_ref_line_style") == 0;
@@ -318,6 +348,9 @@ static std::vector<PickerOpt> pickerOpts(const char *key) {
         return optsFromTable(IME_PREDICT_OPTS, OPT_ITEM_N(IME_PREDICT_OPTS));
     if (strcmp(key, "_ime_cand_size") == 0)
         return optsFromTable(IME_CAND_SIZE_OPTS, OPT_ITEM_N(IME_CAND_SIZE_OPTS));
+    if (strcmp(key, "_ime_clean") == 0) return optsFromTable(IME_CLEAN_OPTS, OPT_ITEM_N(IME_CLEAN_OPTS));
+    if (strcmp(key, "_ime_commit_mode") == 0)
+        return optsFromTable(IME_COMMIT_OPTS, OPT_ITEM_N(IME_COMMIT_OPTS));
     if (strcmp(key, "_editor_font_size") == 0)
         return optsFromTable(EDITOR_FONT_SIZE_OPTS, OPT_ITEM_N(EDITOR_FONT_SIZE_OPTS));
     if (strcmp(key, "_click_chinese") == 0)
@@ -354,6 +387,10 @@ static std::string pickerCurValue(const char *key) {
     if (strcmp(key, "_ime_predict_mode") == 0) return g_settings.imePredictMode();
     if (strcmp(key, "_ime_cand_size") == 0)
         return IME_CAND_SIZE_OPTS[imeCandSizeIndex(g_settings.getString("ime_cand_size", "45").c_str())].key;
+    if (strcmp(key, "_ime_clean") == 0)
+        return IME_CLEAN_OPTS[imeCleanIndex(g_settings.imeCleanMode().c_str())].key;
+    if (strcmp(key, "_ime_commit_mode") == 0)
+        return IME_COMMIT_OPTS[imeCommitIndex(g_settings.imeCommitMode().c_str())].key;
     if (strcmp(key, "_editor_font_size") == 0)
         return EDITOR_FONT_SIZE_OPTS[editorFontSizeIndex(g_settings.getString("editor_font_size", "45").c_str())].key;
     if (strcmp(key, "_click_volume") == 0) return std::to_string(g_settings.typingClickVolume());
@@ -527,6 +564,14 @@ static void pickerApply(const char *key, const std::string &value, ScreenContext
         g_settings.setString("ime_fuzzy", value);
     } else if (strcmp(key, "_ime_predict_mode") == 0) {
         g_settings.setString("ime_predict_mode", value);
+    } else if (strcmp(key, "_ime_clean") == 0) {
+        // 只写键：ui_render 在 core0 组装每一帧的 UiJob 时现读（见 ime_clean_policy），
+        // 下一拍就生效，不用通知任何人。
+        g_settings.setString("ime_clean", value);
+    } else if (strcmp(key, "_ime_commit_mode") == 0) {
+        // 只写键：ui_render 在 core0 组装每一帧的 UiJob 时现读（见 ime_commit_fast_policy），
+        // 下一拍就生效，不用通知任何人。
+        g_settings.setString("ime_commit_mode", value);
     } else if (strcmp(key, "_ime_cand_size") == 0) {
         // 只写键：候选行几何每次绘制现算（ui_helpers 的 imeCandFontPx），下次重绘就是新字号。
         g_settings.setString("ime_cand_size", value);
@@ -1776,6 +1821,12 @@ static void drawBrowseListBody() {
             } else if (strcmp(f.key, "_ime_predict_mode") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          IME_PREDICT_OPTS[imePredictIndex(g_settings.imePredictMode().c_str())].label);
+            } else if (strcmp(f.key, "_ime_clean") == 0) {
+                snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
+                         IME_CLEAN_OPTS[imeCleanIndex(g_settings.imeCleanMode().c_str())].label);
+            } else if (strcmp(f.key, "_ime_commit_mode") == 0) {
+                snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
+                         IME_COMMIT_OPTS[imeCommitIndex(g_settings.imeCommitMode().c_str())].label);
             } else if (strcmp(f.key, "_ime_cand_size") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          IME_CAND_SIZE_OPTS[imeCandSizeIndex(g_settings.getString("ime_cand_size", "45").c_str())].label);

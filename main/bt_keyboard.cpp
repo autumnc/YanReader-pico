@@ -901,6 +901,13 @@ uint16_t BtKeyboard::readKey() {
     return 0;
 }
 
+bool BtKeyboard::waitKey(uint32_t timeout_ms) {
+    if (!s_queue) return false;
+    uint16_t c = 0;
+    // peek：看一眼就走，键留在队列里给 readKey/input_poll 那条唯一出口取。
+    return xQueuePeek(s_queue, &c, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
 void BtKeyboard::flushKeys() {
     if (s_queue) xQueueReset(s_queue);
 }

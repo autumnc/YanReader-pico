@@ -62,6 +62,13 @@ public:
     void flushKeys();
     void checkKeyRepeat();  // Check for key repeat events
 
+    // 等"下一个键就绪"，但**不取走**（xQueuePeek）：返回 true = 队列里已经压着键，
+    // 调用方该立刻回主循环去 readKey；false = 超时。给界面空转的睡眠用 —— 原来整块
+    // 睡 50ms，蓝牙键盘连打时每个键都得先等满这一觉，端到端白多出最多 50ms。
+    // 用 peek 而不是 receive 是刻意的：取键的统一出口仍然是 input_poll，这里只是
+    // 提早醒来，不让两处都能消费队列。队列没建（未初始化）时直接返回 false。
+    bool waitKey(uint32_t timeout_ms);
+
     // Status
     bool isConnected() const;
     bool isInitialized() const;  // true after init() completes (async boot)

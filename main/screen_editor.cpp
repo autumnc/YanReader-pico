@@ -3276,7 +3276,9 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             // 刚上屏的词要立刻进文档上下文: 同一篇里再次输入同一个人名/术语时它就该
             // 排在前面。空串(取消组合等)不必重扫。
             if (!imeOut.empty()) g_ime.setDocumentContext(editorImeContextText());
-            ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
+            ui_clear(); drawEditor();
+            ui_commit();
+            return APP_EDITOR;
         }
     }
 
@@ -3672,6 +3674,7 @@ static bool s_toastShown = false;
 
 bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw) {
     (void)ctx;
+
     // 正文作用域：见 screen_editor_handle 处的说明。
     FontScope body(editorBodyFontPx());
     // 提示框不会动，所以不必每帧重画：只在"画/不画"翻转的那一下补一帧就够了——

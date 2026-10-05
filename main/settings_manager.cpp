@@ -166,6 +166,10 @@ bool SettingsManager::typingClickEnabled() {
 
 std::string SettingsManager::clickChineseMode() { return getString("click_chinese", "key"); }
 
+std::string SettingsManager::imeCleanMode() { return getString("ime_clean", "punct"); }
+
+std::string SettingsManager::imeCommitMode() { return getString("ime_commit_mode", "solid"); }
+
 int SettingsManager::typingClickVolume() {
     // 默认 100：duty 映射的 legal_peak 就是满摆幅，以前默认 80 白扔了 20% 动态范围。
     // makeHit 归一化到满摆幅，所以 100% 也不会撞占空比两端削波。

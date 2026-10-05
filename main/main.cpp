@@ -456,7 +456,17 @@ static AppState scrEditor(int key, ScreenContext &ctx) {
     if (key > 0) next = screen_editor_handle(key, ctx);
     else {
         screen_editor_idle(ctx, false);
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // 空转不睡满 50ms：蓝牙键盘一有键就醒（waitKey 是 peek，不消费）。
+        // 原来这里是整块 vTaskDelay(50)，实体键连打时每个键平均多等 25ms、最坏 50ms
+        // —— 面板那一拍本身约 56ms，这一觉是纯加在端到端延迟上的。拆成 20ms 小段，
+        // 顺带补采触摸（同 idleWaitWithTouch：主循环每轮只在顶部 input_poll 采一次，
+        // 长睡会把一次短点按整个吞掉）。没连键盘时等价于原来的 50ms 睡眠。
+        for (int left = 50; left > 0; ) {
+            int step = (left > 20) ? 20 : left;
+            input_tick();
+            if (g_bt.waitKey(step)) break;
+            left -= step;
+        }
     }
     return next;
 }

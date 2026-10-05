@@ -427,6 +427,50 @@ enum EpdDrawError update_display_area_with(
     return result;
 }
 
+// ── 清一块区域的残影（输入法那两行）────────────────────────────────────────
+//
+// **必须是 GC16，不能是 GL16。** 这是实测踩出来的：很长一段时间里输入法编码区/候选区
+// 的清残影都写的是 8 灰阶正文表 + MODE_GL16（表里 15→15 补了一帧白推），注释还写着
+// "全像素刷，压得干净"。**那句话是错的** —— 全像素只保证"每个像素都过一遍 LUT"，而
+// GL16 表里 `白→白` 这一格是**全保持**（gray8_gl16 的 (to=15,from=15) 30 相全是 0，
+// 补的那一帧白推就是它唯一的驱动）。而残影恰恰就长在"现在是白、之前也是白"的像素上：
+// 候选栏每敲一键整排换字，上一拍的墨痕早被它自己那次差分刷写进了 back_fb，等到清残影
+// 这一拍，front 和 back 在这块地方**一模一样**，GL16 只给它一帧白推 —— 一帧 ≈ 十几毫秒
+// 的推力，压不掉任何东西。所以"上屏/句读之后残影还在"。
+//
+// GC16 的 (to=15,from=15) 是完整梯子：**先黑推 10 帧、再白推 10 帧**（gray8_gc16 实测），
+// 未变像素也被整个黑白摆动带一遍，墨痕这才真的被抹平。这就是全仓别处的清残影都是 GC16
+// 的原因（KEY2 清残影、晃动全刷、软刷攒够 APP_GC16_EVERY 升的那一次）。
+//
+// 相位数与原来那条 GL16 路**相同**（都是 8 灰阶表的 30 相），而**区域只限制驱动范围、
+// 不省时间**（高层刷新 min_y 恒为 0，整块面板本来就要扫一遍），所以换过来不多花时间；
+// 唯一的代价是这块区域会真闪一下（黑白摆动）—— 那是"清干净"本身的价格，不是副作用。
+//
+// 用 *_area_full：把区域内**每一行**都标脏。只标有差异的行就退化成"只清这一拍恰好变了
+// 的像素"，而残影恰恰长在没变的地方（差分刷的基准 back_fb 早被上一拍同步过了）。
+// / Region ghost clean. Must be GC16: in GL16 white→white is *all-hold* (the
+// gray8_text table's single white tick is its only drive), and ghost lives
+// exactly on pixels that are white now and were white in the last frame — one
+// tick cannot erase it. GC16 drives 15→15 through a full 10-black/10-white
+// swing, which does. Same 30 phases as the GL16 table it replaces and, since
+// an area only limits driving (never the panel scan), it costs no more time;
+// the region does visibly blink, which is the price of actually clearing it.
+// `_area_full` marks every line in the region dirty — marking only changed
+// lines would clean just the pixels that happened to change this frame, and
+// the ghost is on the ones that did not.
+enum EpdDrawError update_display_area_clean(EpdiyHighlevelState* hl, EpdRect area) {
+    if (area.width <= 0 || area.height <= 0) return EPD_DRAW_SUCCESS;
+    use_scan_for(&E0470_GRAY8_WAVEFORM, MODE_GC16);
+    epd_poweron();
+    epd_hl_waveform(hl, &E0470_GRAY8_WAVEFORM);
+    night_enter(hl);
+    enum EpdDrawError result = epd_hl_update_area_full(hl, MODE_GC16, 25, area);
+    night_leave(hl);
+    epd_hl_waveform(hl, &E0470_WAVEFORM);
+    rails_keepalive();
+    return result;
+}
+
 // 供数不足时的兜底：把频率退回安全值，整屏白一次，让后面的差分刷有干净参考帧。
 // Underrun fallback: drop to the safe clock and wipe the panel white so later differentials have a clean reference.
 static int s_pclk_mhz = DISPLAY_PCLK_DEFAULT_MHZ;

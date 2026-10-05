@@ -356,6 +356,14 @@ static const char *evkLayoutLabel(int layout) {
     return N[layout];
 }
 
+// 键面上**真正生效**的那个布局的标签。s_layout 是用户的选择，但只要 evkAmbig() 为假
+// （输入法没开 / 英文态），画出来的就是 26 键键位 —— 这时标签必须跟着说"26键"，
+// 否则就是"写着 14键、画着 26键"（用户报障：阅读模式的虚拟键盘，标签与他选的布局
+// 不符，按一下才跳过去）。绘制与按下反馈共用同一个标签，所以只此一处算。
+static const char *evkLayoutLabelEff() {
+    return evkLayoutLabel(evkAmbig() ? s_layout : IME::AMBIG_26);
+}
+
 // 布局的存储键名（不带"键"，就是设置项 "kb_layout" 里存的那串字），与
 // evkLayoutLabel 一一对应。持久化用这一套。
 static const char *evkLayoutKey(int layout) {
@@ -911,7 +919,7 @@ void editorVkDraw() {
     } else {
         evkExtraRowRects(w, keyW, ex, ew);
     }
-    evkKey(ex[0], ry, ew[0], hCtrl, evkLayoutLabel(s_layout), evkAmbig());
+    evkKey(ex[0], ry, ew[0], hCtrl, evkLayoutLabelEff(), evkAmbig());
     evkKey(ex[1], ry, ew[1], hCtrl, "Ctl", s_ctrl);
     for (int d = 0; d < 4; d++) evkTriangleKey(ex[2 + d], ry, ew[2 + d], hCtrl, d);
     evkShiftKey(ex[6], ry, ew[6], hCtrl, s_shift);
@@ -1432,7 +1440,7 @@ int editorVkHitTest(int x, int y, EditorVkHit *hit) {
             // 不改 s_layout：改了也看不见，留着等切回中文时生效反而更让人糊涂。
             if (evkInEllipse(x, y, ex[0], ry, ew[0], rh)) {
                 const bool cn = evkCnPunct();
-                evkSetHit(hit, ex[0], ry, ew[0], rh, 0, 0, evkAmbig(), evkLayoutLabel(s_layout));
+                evkSetHit(hit, ex[0], ry, ew[0], rh, 0, 0, evkAmbig(), evkLayoutLabelEff());
                 // 26→14→18→9→26。改完写设置：下次开机还是这个布局（9 键用户不该每次
                 // 开机再点三下）。写只在这一次点按上发生，绘制路径不碰。
                 if (cn) editorVkSetLayout(evkLayoutKey((s_layout + 1) % IME::ambigLayoutCount()));

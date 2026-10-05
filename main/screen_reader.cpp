@@ -4148,6 +4148,10 @@ void vkEnter() {
   }
 }
 
+// 临时探针的状态：最近一次"落到键盘上"的按键时刻（虚拟键盘点按、或虚拟键盘弹着时的
+// 实体键盘按键），用来在推屏那一拍量出"按键→出图"有多久。定位到就删（连同读取处）。
+static int64_t s_vkLastKeyUs = 0;
+
 // 点按 → editor_vk 命中 → 翻译成"普通键码" → 走阅读模式既有的输入逻辑。
 // 和写作模式一样，键盘不重复实现任何输入逻辑：候选返回 '1'+i（交给 IME 完成选词）、
 // 字母返回 'a'..'z' 或一键多字母布局的组码、空格/退格/回车返回 ' ' / '\b' / '\n'，
@@ -4158,6 +4162,7 @@ void vkTap(int x, int y) {
   EditorVkHit hit;
   const int k = editorVkHitTest(x, y, &hit);
   if (k == EVK_NONE) return;  // 死区/空白：吞掉本次点按，不发生任何动作（防误触）
+  s_vkLastKeyUs = esp_timer_get_time();   // 探针：这一拍从点按开始算
   editorVkMarkPressed(hit);   // 反色由本次动作的重绘一起画出去（不额外推屏）
   // 这几类键的动作会把键面重画成新状态（换标签/翻反白），按下前那份几何再叠上去
   // 就成了两个标签摞一起（中英切换时"拼""英"叠字，按别的键才刷新）。取消补画。
@@ -5165,7 +5170,19 @@ void renderCurrent() {
     // 虚拟键盘打字帧：只驱动与上一帧有差异的那块矩形（编码/候选两行快刷，键盘区与
     // 文本输入区局刷），与写作模式的虚拟键盘同一套判据 —— 见 reader_vk_present。
     // st.fullRefresh 那一帧不走这条：进界面首帧本来就该整屏 GC16 清场（那是应该的整屏刷）。
-    display.displayBufferVk(vkVkTop(), editorVkCandH());
+    // 临时探针（量"虚拟键盘一下要多久"）：把这一拍拆成"按键→出图"（= 分发 + 整屏重绘
+    // + 排队）和"刷屏"（面板推屏本身）。用户说"反馈略慢"时，看这两段谁大就知道该动
+    // 绘制那条路还是波形那一档。只在真有按键的那一帧打（点按与实体键都算）。定位到就删。
+    {
+      const int64_t tVk0 = esp_timer_get_time();
+      display.displayBufferVk(vkVkTop(), editorVkCandH());
+      const int64_t tVk1 = esp_timer_get_time();
+      if (s_vkLastKeyUs) {
+        ESP_LOGI(TAG, "VK帧: 按键→出图 %lldms 刷屏 %lldms",
+                 (tVk0 - s_vkLastKeyUs) / 1000, (tVk1 - tVk0) / 1000);
+        s_vkLastKeyUs = 0;
+      }
+    }
   } else {
     g_rd.displayBuffer(m);
   }
@@ -7847,6 +7864,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   if (key != 0) {
     s_rdLastInputUs = esp_timer_get_time();
     s_rdSawKey = true;
+    if (st.vkVisible) s_vkLastKeyUs = s_rdLastInputUs;   // 探针：虚拟键盘弹着时的实体键
     // 用户又动手了 → 挂起的弹注作废（他多半是等不及、点了别处）。挂起态只活在
     // "没人按键"的那些空闲帧里，这样它绝不会在用户已经翻到别处之后突然弹出来。
     if (st.fnWaitIdx >= 0) rdFootnoteWaitCancel();
@@ -7868,7 +7886,9 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   }
 
   // 打字界面（笔记/词典/WiFi/OPDS 地址）才开系统输入法。放在 key==0 空转之前，
-  // 这样键盘上的中/英标签在第一次按键前就是对的。
+  // 这样空闲帧一进来状态就是对的。**但它跑在按键分发之前，用的是上一拍的 st.mode**，
+  // "这一拍要进哪个界面"恰恰是分发决定的 —— 真正必需的那一次同步在渲染之前（见下面），
+  // 这里留着只是为了让空闲帧不必等到渲染那一步。
   rdSyncImeActive();
 
   if (key == 0) {
@@ -8051,6 +8071,12 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
 
   rdTb = esp_timer_get_time();   // 探针：分发段结束
 
+  // **必需的**一次输入法同步：分发已经做完，这一拍要停在哪个界面已成定局，此时再对齐
+  // 一次，首帧画出来就是对的。少了这一句，"从菜单点进词典/笔记"那一帧的 want 是按
+  // 上一拍（菜单）算的 = false → IME 是关的 → 虚拟键盘画出 26 键的键位，可布局键上
+  // 写的却是用户选的"14键/18键"（标签读 s_layout，与 evkAmbig() 无关），直到用户随便
+  // 按一下、下一拍 want 才变成 true，键位才跳成他选的那套。
+  rdSyncImeActive();
   if (st.dirty) renderCurrent();
   rdTc = esp_timer_get_time();   // 探针：渲染段结束
   // 阅读页的位置一有变化就落盘（位置没变时 rdRememberProgress 自己会早退，不写 SD）。
