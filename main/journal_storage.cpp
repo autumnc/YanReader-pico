@@ -161,6 +161,7 @@ void JournalStorage::scanIndex() {
     // Newest first
     std::sort(m_fileIndex.begin(), m_fileIndex.end(), std::greater<std::string>());
     m_indexValid = true;
+    m_revision++;   // 索引换了内容：stats() 的备忘作废
 }
 
 void JournalStorage::ensureIndex() {
@@ -175,12 +176,14 @@ void JournalStorage::indexAddFile(const std::string &fn) {
     auto it = std::lower_bound(m_fileIndex.begin(), m_fileIndex.end(), fn, std::greater<std::string>());
     m_fileIndex.insert(it, fn);
     m_dateSet.insert(fn.substr(0, 10));
+    m_revision++;
 }
 
 void JournalStorage::indexRemoveFile(const std::string &fn) {
     auto &v = m_fileIndex;
     v.erase(std::remove(v.begin(), v.end(), fn), v.end());
     std::string date = fn.substr(0, 10);
+    m_revision++;
     for (const auto &f : v) {
         if (f.substr(0, 10) == date) return;  // date still has other files
     }
@@ -459,50 +462,59 @@ bool JournalStorage::hasEntry(const std::string &date) {
     return found;
 }
 
-int JournalStorage::countToday() {
-    if (!mounted_) return 0;
+int JournalStorage::countToday() { return stats().todayCount; }
+
+int JournalStorage::getStreak() { return stats().streak; }
+
+int JournalStorage::totalEntries() { return stats().total; }
+
+JournalStorage::Stats JournalStorage::stats() {
+    Stats s;
+    if (!mounted_) return s;
     if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
     ensureIndex();
 
     time_t now; time(&now);
-    struct tm *tm = localtime(&now);
     char today[16];
-    strftime(today, sizeof(today), "%Y-%m-%d", tm);
+    strftime(today, sizeof(today), "%Y-%m-%d", localtime(&now));
 
-    int count = 0;
-    for (const auto &fn : m_fileIndex) {
-        if (fn.substr(0, 10) == today) count++;
+    if (!(m_statsValid && m_statsRev == m_revision && strcmp(m_statsDay, today) == 0)) {
+        s.total = (int)m_fileIndex.size();
+
+        // 今日篇数：只比文件名前 10 个字节（YYYY-MM-DD）。原来走 fn.substr(0, 10) 再比
+        // std::string —— 10 个字符落在 SSO 上不分配，但每篇都白白多一次 strlen + 拷贝，
+        // 而这一行每帧要跑遍整库。
+        s.todayCount = 0;
+        for (const auto &fn : m_fileIndex) {
+            if (fn.size() >= 10 && memcmp(fn.data(), today, 10) == 0) s.todayCount++;
+        }
+
+        // 连续天数：从今天往前一天一天回数，撞到第一个空日就停。一天一次 localtime +
+        // strftime 是这个算法固有的一部分，所以只在备忘失效时才跑（原来每帧跑一遍）。
+        int streak = 0;
+        for (int i = 0; i < 365; i++) {
+            time_t t = now - i * 86400;
+            char date[16];
+            strftime(date, sizeof(date), "%Y-%m-%d", localtime(&t));
+            if (m_dateSet.count(date))
+                streak++;
+            else
+                break;
+        }
+        s.streak = streak;
+
+        m_statsValid = true;
+        m_statsRev = m_revision;
+        memcpy(m_statsDay, today, sizeof(m_statsDay));
+        m_statsTotal = s.total;
+        m_statsToday = s.todayCount;
+        m_statsStreak = s.streak;
+    } else {
+        s.total = m_statsTotal;
+        s.todayCount = m_statsToday;
+        s.streak = m_statsStreak;
     }
-    if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex);
-    return count;
-}
 
-int JournalStorage::getStreak() {
-    if (!mounted_) return 0;
-    if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
-    ensureIndex();
-
-    int streak = 0;
-    time_t now; time(&now);
-    for (int i = 0; i < 365; i++) {
-        time_t t = now - i * 86400;
-        struct tm *tm2 = localtime(&t);
-        char date[16];
-        strftime(date, sizeof(date), "%Y-%m-%d", tm2);
-        if (m_dateSet.count(date))
-            streak++;
-        else
-            break;
-    }
     if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex);
-    return streak;
-}
-
-int JournalStorage::totalEntries() {
-    if (!mounted_) return 0;
-    if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
-    ensureIndex();
-    int count = (int)m_fileIndex.size();
-    if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex);
-    return count;
+    return s;
 }

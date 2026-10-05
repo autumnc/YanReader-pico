@@ -74,10 +74,23 @@ static bool s_night;
 
 void display_set_night(bool on) { s_night = on; }
 
+// 取反本身：整块 415,872 B，front/back 各一遍，一次推屏前后共 4 遍（夜间模式下每个
+// 按键、每次区刷都要付）。按 32 位字翻是逐字节的 ~4 倍，语义逐位不变。
+// 头部先按字节走到 4 字节对齐再进字循环（LX7 不支持非对齐字访问，不能假设 fb 的对齐；
+// 实际两块 fb 都是堆缓冲，这里只是不靠这个假设），尾部不足 4 字节同样退回字节循环。
+static void invert_buf(uint8_t *p, size_t n) {
+    size_t i = 0;
+    for (; i < n && ((uintptr_t)(p + i) & 3u) != 0; i++) p[i] = (uint8_t)~p[i];
+    uint32_t *w = (uint32_t *)(void *)(p + i);
+    const size_t nw = (n - i) / 4;
+    for (size_t k = 0; k < nw; k++) w[k] = ~w[k];
+    for (i += nw * 4; i < n; i++) p[i] = (uint8_t)~p[i];
+}
+
 static void night_flip(EpdiyHighlevelState *hl) {
     const size_t n = (size_t)epd_width() / 2 * epd_height();
-    for (size_t i = 0; i < n; i++) hl->front_fb[i] = (uint8_t)~hl->front_fb[i];
-    for (size_t i = 0; i < n; i++) hl->back_fb[i] = (uint8_t)~hl->back_fb[i];
+    invert_buf(hl->front_fb, n);
+    invert_buf(hl->back_fb, n);
 }
 
 // 罩住一次推屏。必须成对调用（中间不能提前 return）。

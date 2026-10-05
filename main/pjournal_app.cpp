@@ -340,7 +340,11 @@ AppState screen_main_handle(int key, ScreenContext &ctx) {
     ctx.nextState = APP_MAIN;
     ui_clear(); int y = FONT_H;
     const int rowH = LINE_SPACING;
-    bool hasEntries = g_journal.totalEntries() > 0;
+    // 三个统计数一次取全：它们都要遍历索引，而这一屏**每帧**都要（见 JournalStorage::stats
+    // 的备忘）。原来 getStreak/totalEntries(×2)/countToday 各来一趟，一天一遍 localtime 的
+    // 那段连续天数更是每帧重跑。
+    const JournalStorage::Stats jstats = g_journal.stats();
+    bool hasEntries = jstats.total > 0;
     int actionCount = mainMenuVisibleCount(hasEntries);
     if (g_mainMenu.selection >= actionCount) g_mainMenu.selection = actionCount - 1;
     if (g_mainMenu.selection < 0) g_mainMenu.selection = 0;
@@ -387,9 +391,9 @@ AppState screen_main_handle(int key, ScreenContext &ctx) {
         }
         y += rowH * 2;
 
-        char buf[48]; snprintf(buf, sizeof(buf), "连续:%d天 总计:%d篇", g_journal.getStreak(), g_journal.totalEntries());
+        char buf[48]; snprintf(buf, sizeof(buf), "连续:%d天 总计:%d篇", jstats.streak, jstats.total);
         ui_draw_text_centered(y, buf); y += rowH;
-        int tc = g_journal.countToday();
+        int tc = jstats.todayCount;
         int todayBaseline = y;
         if (tc > 0) { snprintf(buf, sizeof(buf), "✓ 今日已写%d篇", tc); ui_draw_text_centered(y, buf, false, true); }
         else ui_draw_text_centered(y, "今日尚未写日记");

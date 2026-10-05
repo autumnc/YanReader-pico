@@ -724,6 +724,11 @@ bool openSpine(int idx) {
   // 重建后页内容可能整个变了而键恰好没变（比如改了行距又翻回同一页），这里一并清掉。
   st.footnoteCacheSpine = st.footnoteCachePage = st.footnoteCacheFont = -1;
   st.footnoteCacheBook.clear();
+  // 页信息缓存（章/页/脚注/书签偏移）同理，而且**只在这里**作废：它的键是 (章, 页)，
+  // 同一个章号换一份 Section 就是换了一套排版，键可能恰好没变。任何新建 Section 的
+  // 路都必须过这里（openBook / 翻章 / 链接跳章 / reopenBook 重排都过）。
+  st.pageInfoSpine = -1;
+  st.pageInfoPage = -1;
   // 字号梯子必须在 startBuild 之前灌：排版期就要按它把 CSS font-size 吸附到某一档。
   applyCssFontLadder();
   if (!st.section->startBuild(makeSpec())) return false;
@@ -2283,7 +2288,17 @@ static void renderEpubPage() {
   st.pageLinks.clear();
   if (st.section) {
     auto page = st.section->loadPage(st.page);
+    // 菜单/书签要的两条派生信息跟着这一页一起采（见 RdState::pageInfo*）：反正页已经读
+    // 出来了，offset 也是 loadPage 顺手带出来的（Page::visibleTextOffset），不要再开一次
+    // 文件。页没读出来就作废缓存 —— 让 getter 现算，而不是把"没读到"当成"这页没脚注"
+    // 记下来（构建中的页正是这种情况，等它排出来自然会被下一次渲染重新采）。
+    st.pageInfoSpine = -1;
+    st.pageInfoPage = -1;
     if (page) {
+      st.pageInfoSpine = st.spineIndex;
+      st.pageInfoPage = st.page;
+      st.pageInfoFootnotes = !page->footnotes.empty();
+      st.pageInfoOffset = page->visibleTextOffset;
       if (page->hasImages()) {
         st.fullRefresh = true;
         st.frameGray = 1;  // 插图页会在面板上留下真中灰（白底纪律记账，见 renderCurrent 尾）
@@ -3474,9 +3489,18 @@ static int curPage() {
   return st.xtcPage;
 }
 
+// 当前页的派生信息有没有缓存（键 = 章 + 页，见 RdState::pageInfo*）。
+// 只有渲染过这一页才有值；没命中就现算，绝不拿别的页的结论冒充。
+static bool pageInfoCached() {
+  return st.bookKind == 0 && st.section && st.pageInfoSpine == st.spineIndex && st.pageInfoPage == st.page;
+}
+
 // epub 当前页可见文本偏移（跨重排的书签标识）。txt/xtc 返回 UINT32_MAX。
 static uint32_t currentVisibleOffset() {
   if (st.bookKind == 0 && st.section) {
+    // 命中缓存就直接答：这一页渲染时已经从同一个 Page 上拿到了 offset（Page::visibleTextOffset
+    // 是 loadPage 顺手带出来的），不必再开一次 section 文件读 offset LUT。
+    if (pageInfoCached()) return st.pageInfoOffset;
     auto o = st.section->getVisibleTextOffsetForPage(static_cast<uint16_t>(st.page));
     if (o) return *o;
   }
@@ -3485,6 +3509,7 @@ static uint32_t currentVisibleOffset() {
 
 static bool currentPageHasFootnotes() {
   if (st.bookKind != 0 || !st.section) return false;
+  if (pageInfoCached()) return st.pageInfoFootnotes;
   auto page = st.section->loadPage(st.page);
   return page && !page->footnotes.empty();
 }

@@ -465,14 +465,22 @@ std::string GfxRenderer::truncatedText(const int fontId, const char* text, const
   if (!text) return "";
   std::string s(text);
   if (getTextWidth(fontId, s.c_str(), style) <= maxWidth) return s;
+  // 逐字累加宽度，而不是每加一个字就把整串重拼一遍再整串量宽。ttf 面量宽就是逐码点
+  // advance 相加（measure_width），所以"整串宽 == 前缀宽之和"恒成立，切点逐字符不变。
+  // 原来每个字符都要构造 cand(=out+ch) 并重扫整段，这里是 O(串长²)。
   std::string out;
+  int outW = 0;
   for (size_t i = 0; i < s.size();) {
-    int len = utf8CharLen(static_cast<unsigned char>(s[i]));
+    const int len = utf8CharLen(static_cast<unsigned char>(s[i]));
     if (i + static_cast<size_t>(len) > s.size()) break;
-    std::string cand = out + s.substr(i, len);
-    if (getTextWidth(fontId, cand.c_str(), style) > maxWidth) break;
-    out = cand;
-    i += len;
+    char cb[8];
+    memcpy(cb, s.data() + i, static_cast<size_t>(len));
+    cb[len] = '\0';
+    const int cw = getTextWidth(fontId, cb, style);
+    if (outW + cw > maxWidth) break;
+    out.append(cb, static_cast<size_t>(len));
+    outW += cw;
+    i += static_cast<size_t>(len);
   }
   return out;
 }
@@ -482,6 +490,7 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* 
   if (!text || maxLines <= 0) return lines;
   std::string s(text);
   std::string line;
+  int lineW = 0;   // line 的当前宽度，随追加/新行增量维护（量宽逐码点可加）
   size_t i = 0;
   while (i < s.size() && static_cast<int>(lines.size()) < maxLines) {
     const unsigned char c = static_cast<unsigned char>(s[i]);
@@ -491,6 +500,7 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* 
     if (c == '\n') {
       lines.push_back(line);
       line.clear();
+      lineW = 0;
       i++;
       continue;
     }
@@ -498,17 +508,23 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* 
       i++;
       continue;
     }
-    int len = utf8CharLen(c);
+    const int len = utf8CharLen(c);
     if (i + static_cast<size_t>(len) > s.size()) break;
-    std::string ch = s.substr(i, len);
-    std::string cand = line + ch;
-    if (getTextWidth(fontId, cand.c_str(), style) > maxWidth && !line.empty()) {
+    // 每个字符只量它自己，宽度累加 —— 原实现是 line + ch 重拼整行再整行量宽，
+    // 行长 N 时整段 O(N²)。ttf 面量宽就是逐码点相加，累加与前缀宽之和逐位相同。
+    char cb[8];
+    memcpy(cb, s.data() + i, static_cast<size_t>(len));
+    cb[len] = '\0';
+    const int chW = getTextWidth(fontId, cb, style);
+    if (lineW + chW > maxWidth && !line.empty()) {
       lines.push_back(line);
-      line = ch;
+      line.assign(cb, static_cast<size_t>(len));
+      lineW = chW;
     } else {
-      line = cand;
+      line.append(cb, static_cast<size_t>(len));
+      lineW += chW;
     }
-    i += len;
+    i += static_cast<size_t>(len);
   }
   if (!line.empty()) lines.push_back(line);
   return lines;

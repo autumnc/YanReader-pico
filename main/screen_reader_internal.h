@@ -194,6 +194,21 @@ struct RdState {
   int spineIndex = 0;
   int page = 0;
 
+  // 当前 epub 页的两条派生信息：「这一页有没有脚注」（决定菜单里出不出现「脚注」项）与
+  // 「这一页的可见文本偏移」（书签的身份）。两条都要先把这一页读出来才知道，而
+  // loadPage 是**开一次 section .bin + 反序列化整页**（另加一次开文件读 offset LUT）。
+  // 菜单每帧都问一次（renderMenu → menuItems），也就是每帧一次 SD 读。
+  //
+  // 改成：渲染这一页时（renderEpubPage）顺手采一次，之后直接读缓存。
+  // 键是 (章, 页)：页只由 turnBook 改、改完必然重渲染；重排一定新建 Section、必过
+  // openSpine，那里显式作废（同 footnoteCache* 的规矩）。同一个 Section 里页内容不会
+  // 变（构建只是往后追加），所以 (章, 页) 命中即可信。
+  // pageInfoSpine < 0 = 无缓存，此时 getter 退回现算（宁可慢一拍也不能给错答案）。
+  int pageInfoSpine = -1;
+  int pageInfoPage = -1;
+  bool pageInfoFootnotes = false;
+  uint32_t pageInfoOffset = UINT32_MAX;  // UINT32_MAX = 该页没有可见偏移记录
+
   // 书内嵌字体：非空 = 内容面此刻装的是从当前这本书里解出来的字体（指向缓存目录里的
   // 落盘副本）。bookFontTag 跟着它进版式缓存键（见 ReaderRenderSpec::fontTag）；
   // 0 表示内容面是用户/内建字体。两者都在 openBook() 里换书时清掉。

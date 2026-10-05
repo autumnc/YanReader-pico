@@ -22,6 +22,7 @@
 
 #include "app_config.h"
 #include "board_hw.h"
+#include "diff_scan.h"   // fb_scan_diff_bytes：按 32 位字扫差分（逐字节等价，见 tests/host/diff_scan）
 #include "display.h"
 #include "editor_vk.h"   // editorVkVisible/editorVkTop：虚拟键盘面板顶
 #include "e0470_epaper_waveform.h"
@@ -215,9 +216,13 @@ static void release_buffer(int idx) {
 }
 
 // ── 几何/差分工具 ────────────────────────────────────────────────────────
-// 新旧帧缓冲差异的包围盒（**逻辑**像素坐标）。四种旋转都精确：逐字节找出变化，
+// 新旧帧缓冲差异的包围盒（**逻辑**像素坐标）。四种旋转都精确：找出变化的字节，
 // 再把物理坐标反着映射回逻辑坐标。竖屏下以前一律退化成整屏，虚拟键盘打字就变成
 // 每键整屏刷新；这里必须精确。无差异返回空矩形。
+//
+// 扫描本身交给 fb_scan_diff_bytes（按 32 位字比、命中才展开成字节）—— 整屏 415,872
+// 字节、每个 UI 帧和每个阅读器按键都要过一遍，逐字节是白花带宽。它报出的位置与逐
+// 字节扫描逐位相同（主机端对拍在 tests/host/diff_scan/）。
 static EpdRect diff_bounding_rect(const uint8_t *a, const uint8_t *b) {
     const int fb_w = epd_width(), fb_h = epd_height();
     const int row_bytes = fb_w / 2;
@@ -236,13 +241,10 @@ static EpdRect diff_bounding_rect(const uint8_t *a, const uint8_t *b) {
         if (ly > y1) y1 = ly;
     };
 
-    for (int y = 0; y < fb_h; y++) {
-        const uint8_t *ra = a + (size_t)y * row_bytes;
-        const uint8_t *rb = b + (size_t)y * row_bytes;
-        for (int xb = 0; xb < row_bytes; xb++) {
-            if (ra[xb] != rb[xb]) { add(xb * 2, y); add(xb * 2 + 1, y); }
-        }
-    }
+    fb_scan_diff_bytes(a, b, row_bytes, fb_h, [&](int xb, int y) {
+        add(xb * 2, y);
+        add(xb * 2 + 1, y);
+    });
     EpdRect e = {0, 0, 0, 0};
     if (x1 < 0) return e;
 

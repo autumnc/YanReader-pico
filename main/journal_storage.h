@@ -58,6 +58,17 @@ public:
     // Check if date has entry
     bool hasEntry(const std::string &date);
 
+    // 首页那三个数一次取全（总篇数 / 今日篇数 / 连续天数）。三个都要遍历索引，而首页
+    // **每帧**都要（屏幕就停在那儿不动），所以内部按 (索引版本, 今天) 备忘：索引没动、
+    // 还是同一天，答案必然一样。跨零点由日期串自己抓到，索引改动由 m_revision 抓到。
+    // 下面三个单一取数口都走它，口径自然一致。
+    struct Stats {
+        int total = 0;
+        int todayCount = 0;
+        int streak = 0;
+    };
+    Stats stats();
+
     // Count entries for today
     int countToday();
 
@@ -86,6 +97,16 @@ private:
     std::vector<std::string> m_fileIndex;      // newest first
     std::unordered_set<std::string> m_dateSet; // distinct YYYY-MM-DD dates
     bool m_indexValid = false;
+
+    // stats() 的备忘。m_revision 每次索引变动 ++（scanIndex/indexAddFile/indexRemoveFile），
+    // 它就是"索引有没有动过"的唯一判据。m_* 只在持有 s_sd_mutex 时读写。
+    int m_revision = 0;
+    bool m_statsValid = false;
+    int m_statsRev = -1;
+    char m_statsDay[16] = {0};   // 备忘针对哪一天（跨零点即失效）
+    int m_statsTotal = 0;
+    int m_statsToday = 0;
+    int m_statsStreak = 0;
 
     bool mounted_ = false;
 };

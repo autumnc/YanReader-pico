@@ -247,8 +247,10 @@ bool endsWithBreakableHyphen(const std::string& token) {
 // pagination and must not allocate.
 constexpr size_t FOCUS_PREFIX_BUF_SIZE = 40;
 
-// Advance from the token origin to the start of its regular-weight suffix: the bold prefix plus
-// the kerning across the weight change. Doubles as the suffix's x offset inside the word.
+// Advance from the token origin to the start of its regular-weight suffix: just the bold prefix.
+// 原著这里还加了一段"跨字重切换的 kerning"，但 ttf 面没有字距对表、GfxRenderer::getKerning()
+// 恒返回 0（见其定义），为了那段 0 还得每词解两侧码点。这里直接去掉。
+// Doubles as the suffix's x offset inside the word.
 uint16_t measureFocusPrefixAdvance(const GfxRenderer& renderer, const int fontId, const std::string& word,
                                    const EpdFontFamily::Style style, const uint8_t focusBoundary) {
   char prefixBuf[FOCUS_PREFIX_BUF_SIZE];
@@ -257,9 +259,7 @@ uint16_t measureFocusPrefixAdvance(const GfxRenderer& renderer, const int fontId
   prefixBuf[prefixLen] = '\0';
 
   const auto boldStyle = static_cast<EpdFontFamily::Style>(style | EpdFontFamily::BOLD);
-  const auto* suffixPtr = reinterpret_cast<const unsigned char*>(word.c_str() + focusBoundary);
-  const int kerning = renderer.getKerning(fontId, lastCodepoint(prefixBuf), utf8NextCodepoint(&suffixPtr), boldStyle);
-  return static_cast<uint16_t>(renderer.getTextAdvanceX(fontId, prefixBuf, boldStyle) + kerning);
+  return static_cast<uint16_t>(renderer.getTextAdvanceX(fontId, prefixBuf, boldStyle));
 }
 
 // Advance width of a whole token, accounting for a bold focus prefix when it has one.
@@ -1015,14 +1015,12 @@ bool ParsedText::computeLineBreaks(const GfxRenderer& renderer, const int fontId
     const int effectivePageWidth = i == 0 ? pageWidth - firstLineIndent : pageWidth;
 
     for (size_t j = i; j < totalWordCount; ++j) {
-      // Add space before word j, unless it's the first word on the line or a continuation
+      // Add space before word j, unless it's the first word on the line or a continuation.
+      // 「附着 / 可断附着」（continues）与「无空格」两种边界都不留间隔：原著前者取 kerning，
+      // 但 ttf 面无字距表、getKerning() 恒 0，两条分支等价 —— 合成一条，顺带免掉每对词
+      // 各解一次两侧码点（这里是 O(词数²) 的内层）。
       int gap = 0;
-      if (j > static_cast<size_t>(i) && continuesVec[j]) {
-        // Attached and breakable-attached boundaries both use kerning when kept on one line.
-        gap = renderer.getKerning(fontId, lastCodepoint(words[j - 1]), firstCodepoint(words[j]), wordStyles[j - 1]);
-      } else if (j > static_cast<size_t>(i) && noSpaceBeforeVec[j]) {
-        gap = 0;
-      } else if (j > static_cast<size_t>(i)) {
+      if (j > static_cast<size_t>(i) && !continuesVec[j] && !noSpaceBeforeVec[j]) {
         gap =
             renderer.getSpaceAdvance(fontId, lastCodepoint(words[j - 1]), firstCodepoint(words[j]), wordStyles[j - 1]);
       }
@@ -1125,14 +1123,9 @@ std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& r
     // Consume as many words as possible for current line, splitting when prefixes fit
     while (currentIndex < wordWidths.size()) {
       const bool isFirstWord = currentIndex == lineStart;
+      // 同上一处：continues 分支原著取 kerning（ttf 面恒 0），与 noSpaceBefore 等价合并。
       int spacing = 0;
-      if (!isFirstWord && continuesVec[currentIndex]) {
-        // Attached and breakable-attached boundaries both use kerning when kept on one line.
-        spacing = renderer.getKerning(fontId, lastCodepoint(words[currentIndex - 1]),
-                                      firstCodepoint(words[currentIndex]), wordStyles[currentIndex - 1]);
-      } else if (!isFirstWord && noSpaceBeforeVec[currentIndex]) {
-        spacing = 0;
-      } else if (!isFirstWord) {
+      if (!isFirstWord && !continuesVec[currentIndex] && !noSpaceBeforeVec[currentIndex]) {
         spacing = renderer.getSpaceAdvance(fontId, lastCodepoint(words[currentIndex - 1]),
                                            firstCodepoint(words[currentIndex]), wordStyles[currentIndex - 1]);
       }
@@ -1342,10 +1335,8 @@ bool ParsedText::extractLine(const size_t lineIndex, const size_t lineBreak, con
     if (TokenBoundary::isJustifiableGap(continuesVec[boundaryIdx], noSpaceBeforeVec[boundaryIdx], isSpaceToken)) {
       actualGapCount++;
     }
-    if (continuesVec[boundaryIdx]) {
-      totalNaturalGaps += renderer.getKerning(fontId, lastCodepoint(lineWords[wordIdx - 1]),
-                                              firstCodepoint(lineWords[wordIdx]), lineWordStyles[wordIdx - 1]);
-    } else if (!noSpaceBeforeVec[boundaryIdx]) {
+    // continues 分支原著累加 kerning（ttf 面恒 0），只剩"无空格边界加一个空格宽"这一条。
+    if (!continuesVec[boundaryIdx] && !noSpaceBeforeVec[boundaryIdx]) {
       totalNaturalGaps += renderer.getSpaceAdvance(fontId, lastCodepoint(lineWords[wordIdx - 1]),
                                                    firstCodepoint(lineWords[wordIdx]), lineWordStyles[wordIdx - 1]);
     }
@@ -1436,12 +1427,10 @@ bool ParsedText::extractLine(const size_t lineIndex, const size_t lineBreak, con
                                                          firstCodepoint(reorderedWordsScratch[wordIdx]),
                                                          reorderedStylesScratch[wordIdx - 1]);
       } else if (wordIdx > 0 && reorderedContinuesScratch[wordIdx]) {
+        // continues 分支原著累加 kerning（ttf 面恒 0）：只留下"空格也算一个可拉伸间隔"的记账。
         if (reorderedWordsScratch[wordIdx] == " ") {
           reorderedGapCount++;
         }
-        reorderedNaturalGaps +=
-            renderer.getKerning(fontId, lastCodepoint(reorderedWordsScratch[wordIdx - 1]),
-                                firstCodepoint(reorderedWordsScratch[wordIdx]), reorderedStylesScratch[wordIdx - 1]);
       }
     }
 
@@ -1479,9 +1468,8 @@ bool ParsedText::extractLine(const size_t lineIndex, const size_t lineBreak, con
       const bool nextIsContinuation =
           wordIdx + 1 < reorderedWidthsScratch.size() && reorderedContinuesScratch[wordIdx + 1];
       if (nextIsContinuation) {
-        int advance =
-            renderer.getKerning(fontId, lastCodepoint(reorderedWordsScratch[wordIdx]),
-                                firstCodepoint(reorderedWordsScratch[wordIdx + 1]), reorderedStylesScratch[wordIdx]);
+        // 原著这里是跨边界 kerning（ttf 面恒 0），只留下 justifyExtra 那一段。
+        int advance = 0;
         // wordIdx > 0 mirrors the gap accounting above (which skips index 0): a leading
         // no-break space must not receive justifyExtra, or the line over-stretches by one
         // gap and the last word is pushed past the right margin (issue #2185).
@@ -1524,9 +1512,8 @@ bool ParsedText::extractLine(const size_t lineIndex, const size_t lineBreak, con
 
         const bool nextIsContinuation = wordIdx + 1 < lineWordCount && continuesVec[lastBreakAt + wordIdx + 1];
         if (nextIsContinuation) {
-          // Cross-boundary kerning for continuation words
-          int advance = renderer.getKerning(fontId, lastCodepoint(lineWords[wordIdx]),
-                                            firstCodepoint(lineWords[wordIdx + 1]), lineWordStyles[wordIdx]);
+          // 跨边界 kerning 在 ttf 面恒 0（见 getKerning）；只剩 justifyExtra。
+          int advance = 0;
           // wordIdx > 0: see the LTR branch — a leading no-break space is not a justifiable gap.
           if (wordIdx > 0 && lineWords[wordIdx] == " " && continuesVec[lastBreakAt + wordIdx] &&
               effectiveAlignment == CssTextAlign::Justify && !isLastLine) {
@@ -1563,9 +1550,8 @@ bool ParsedText::extractLine(const size_t lineIndex, const size_t lineBreak, con
 
         const bool nextIsContinuation = wordIdx + 1 < lineWordCount && continuesVec[lastBreakAt + wordIdx + 1];
         if (nextIsContinuation) {
+          // 原著这里再叠加一段跨边界 kerning（ttf 面恒 0），去掉后 advance 就是词宽本身。
           int advance = wordWidths[lastBreakAt + wordIdx];
-          advance += renderer.getKerning(fontId, lastCodepoint(lineWords[wordIdx]),
-                                         firstCodepoint(lineWords[wordIdx + 1]), lineWordStyles[wordIdx]);
           // wordIdx > 0 mirrors the gap accounting above (which skips index 0): a leading
           // no-break space must not receive justifyExtra, or the line over-stretches by one
           // gap and the last word is pushed past the right margin (issue #2185).
