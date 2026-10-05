@@ -26,10 +26,18 @@ static const uint32_t TAB_ICON_DONE      = 0xF05E0;  // md-check-circle
 // ── 搜索入口 ───────────────────────────────────────────────────────────
 static const uint32_t TAB_ICON_SEARCH    = 0xF0349;  // md-magnify
 
+// ── 程序化绘制的标签图标（不是码点，只是 drawTabBar 的分派哨兵）──────────
+// 0 = 统计（柱状图，drawStatsTabIcon）、1 = 应用（九宫格，drawAppsTabIcon）。
+// 引进真字形要重裁 NF-Propo 子集，而当前环境没有 fontTools（见 subset_icon_font.py）。
+static const uint32_t TAB_ICON_APPS_SENTINEL = 1;
+
 // ── 书架/笔记标签页顶部搜索栏右侧的动作图标 ─────────────────────────────
 // 搜索复用上面的 TAB_ICON_SEARCH。刷新是新加进子集的（scripts/subset_icon_font.py
-// 的 SHELF_BAR 组）；微读复用 MENU 组已有的 book_open_page_variant。
+// 的 SHELF_BAR 组）。
 static const uint32_t BAR_ICON_REFRESH   = 0xF0450;  // md-refresh 重新扫描书库
+
+// 微读（book_open_page_variant，复用 MENU 组已有的）。**书架栏上那枚已经删掉了**
+// （微读收进 1 号位「应用」标签之后没必要再挂一枚），现在只给应用页的微读入口用。
 static const uint32_t BAR_ICON_WEREAD    = 0xF05DA;  // md-book-open-page-variant 微读
 
 // ── 文件浏览页的浮动按钮（网络文件管理）──────────────────────────────────

@@ -371,7 +371,20 @@ void renderWereadDl() {
 void handleWeread(int key) {
   if (key == KEY_LEFT) { switchTab(st.tab - 1); return; }
   if (key == KEY_RIGHT) { switchTab(st.tab + 1); return; }
-  if (key == 0x1B || key == KEY_LONG_CONFIRM) { switchTab(0); return; }
+  if (key == 0x1B || key == KEY_LONG_CONFIRM) {
+    // 从「应用」标签的微读图标进来的，Esc 回那一页（retMode 由 rdOpenApp 置位）。
+    // 兜底那条 switchTab(0) 现在几乎没有入口了（书架栏那枚图标 2026-10-05 已删），
+    // 留着是因为 retMode 万一被别处写脏，退回书架总比留在原地强。
+    if (st.retMode == RdMode::Apps) {
+      st.mode = RdMode::Apps;
+      st.retMode = RdMode::Browser;
+      st.fullRefresh = true;
+      st.dirty = 1;
+      return;
+    }
+    switchTab(0);
+    return;
+  }
   {  // 上下/翻页在 ui/list_view.h（与 renderWeread 共用同一个 weShelfListView 几何）
     ListView lv = weShelfListView();
     if (listViewKey(lv, key)) { st.weSel = lv.sel; st.dirty = 1; return; }

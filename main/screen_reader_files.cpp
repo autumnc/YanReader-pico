@@ -82,10 +82,10 @@ void fbScan(const std::string &dir) {
   st.fbEntries.insert(st.fbEntries.end(), files.begin(), files.end());
 }
 
-// 进入文件标签：重扫当前目录。三个入口（标签栏点按、←→ 换标签、恢复上次标签）都得过
-// 这一道。原先只有书架菜单的「文件浏览」那条路会扫描，从标签直接进来（或重启后恢复到
-// 文件标签）时 st.fbEntries 是空的 —— 列表空白，而且空列表会提前 return 吃掉点按，
-// 连标签都切不走，看上去就是"卡死"。
+// 进文件浏览器：重扫当前目录。三个入口（1 号位应用页的文件夹图标、书架菜单的
+// 「文件浏览」、退出阅读模式后恢复到文件浏览器）都得过这一道。原先只有书架菜单那条路
+// 会扫描，从标签直接进来（或重启后恢复）时 st.fbEntries 是空的 —— 列表空白，而且空列表
+// 会提前 return 吃掉点按，连标签都切不走，看上去就是"卡死"。
 void rdEnterFileTab() {
   const int keep = st.fbSel;   // 换标签来回切时保住光标位置
   fbScan(st.fbPath.empty() ? std::string("/sdcard") : st.fbPath);
@@ -458,10 +458,13 @@ void handleFileBrowser(int key) {
       size_t slash = st.fbPath.rfind('/');
       fbScan(slash == 0 ? "/" : st.fbPath.substr(0, slash));
     } else {
-      // 已经在卡根：退到书架标签（原来退到 RdMode::Browser，现在标签化后等价于
-      // switchTab(0)，顺带把标签高亮也摆正）。
+      // 已经在卡根：退回「应用」标签的图标入口页 —— 文件浏览器现在是它的子界面
+      // （1 号位改成应用页之后，卡根再往上退就是那一页；想回书架再 Esc 一次）。
+      // 标签保持 1（st.tab 不动），所以标签栏的高亮本来就是对的。
       st.fbSel = 0;
-      switchTab(0);
+      st.mode = RdMode::Apps;
+      st.fullRefresh = true;
+      st.dirty = 1;
       return;
     }
     st.dirty = 1;

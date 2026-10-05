@@ -62,4 +62,17 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
   ENABLE_CHINESE_VERSION=1
   # WeReadHttpClient 把版本号拼进 User-Agent。
   CROSSPOINT_VERSION="pico"
+  # PNGdec 的扫描线缓冲 ucPixels 默认只按 320×4 RGBA 配：(320*4+1)*2 = 2562 字节，
+  # 那是给 320px 宽的 ESP32-C3 定的。**PNGdec 要在那一块里同时放当前行和上一行**
+  # （png.inl 的 DecodePNG：pPrev = pCurr + iPitch + 1，各自向上对齐 16），所以真正的
+  # 需要量是 ((pitch+1)*2)+32 —— PngToFramebufferConverter 里那道自检就是照这个算的。
+  # 2562 字节折成宽度：RGB 8 位只能到 421px、RGBA 只能到 316px。这块屏 1216px 宽，
+  # 于是图片查看器里打开稍大的 PNG 一律报「无法解码此图片」（JPEG 那条走 JPEGDEC 的
+  # 2048，所以只有 PNG 会这样）。
+  # 提到 16384 后：RGB ≤ 2724px、RGBA ≤ 2043px、灰阶 ≤ 8175px，覆盖得下满屏插图。
+  # 代价只是 PNG 结构体涨 13.8KB，而它是整块 malloc 出来的 —— 本工程
+  # CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0，>0 的分配一律先走 PSRAM，内部 RAM 不动。
+  # （另一条 buildscratch 借用帧缓冲的路子：全仓无人调 buildscratch::lend，claim 恒失败，
+  #  本来就落回堆，所以这个宏变大不会撑爆谁。）
+  PNG_MAX_BUFFERED_PIXELS=16384
 )

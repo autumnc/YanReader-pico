@@ -91,6 +91,7 @@ inline constexpr int RD_BOTTOM_INSET = 4;  // 底部留白(状态栏下方)，�
 // ── 阅读器状态 ──────────────────────────────────────────────────────────
 enum class RdMode {
   Browser, Reading, Toc, Menu, LayoutMenu, Bookmarks, Footnotes, Percent, Qr, Dictionary, Weread, Wifi,
+  Apps,        // 1 号根标签「应用」的图标入口页（文件管理 / 微信读书 / 字典）
   ShelfMenu, ShelfInfo, Recent, FileBrowser, Image, Opds, NetShare, DictDl, ResDl, KeyMap, StatusBar, About,
   Settings, Notes, NoteEdit,
   WereadQr,    // 扫码登录
@@ -112,18 +113,20 @@ enum class RdMode {
   RefreshTest   // 灰阶自检页（16 级梯 / 细线 / 抖动三档对比 / 各刷法耗时，自推屏）
 };
 
-// 主界面五个根标签：0=书架 1=文件 2=笔记 3=设置 4=统计。标签栏只画图标（tab_icons.h），
-// 文字标签下屏——微信读书原本占 1 号位，现已挪进「设置」标签的条目表（MenuAct::Weread），
-// 腾出来的位置给 SD 卡文件浏览器（就是原来的 RdMode::FileBrowser，现在直接当标签用）。
+// 主界面五个根标签：0=书架 1=应用 2=笔记 3=设置 4=统计。标签栏只画图标（tab_icons.h）。
+// 1 号位原本直接是 SD 卡文件浏览器（RdMode::FileBrowser）；现在改成「应用」图标入口页
+// （RdMode::Apps：文件管理 / 微信读书 / 字典），文件浏览器降级成它的子界面，
+// 微信读书也一并从「设置」标签的条目表搬了过来（与「设置 → 词典下载」无关的那一批）。
 // 统计放最后一位：st.tab == 1/3 的判断遍布各处，插在中间要动的地方多。
 inline constexpr int kTabCount = 5;
-// 4 号位（统计）用 0 当哨兵：drawTabBar 见到 0 就走程序化的柱状图图标，不走字体。
-// 理由见 drawStatsTabIcon —— 引进真字形要重裁 NF-Propo 子集，而当前环境没有 fontTools。
-inline constexpr uint32_t kTabIcons[kTabCount] = {TAB_ICON_BOOKSHELF, TAB_ICON_FILES,
+// 图标表：0 和 1 是哨兵——0 = 统计的柱状图、1 = 应用的九宫格，都走程序化绘制（drawTabBar
+// 分派到 drawStatsTabIcon / drawAppsTabIcon），不查字体。理由同 drawStatsTabIcon：
+// 引进真字形要重裁 NF-Propo 子集，而当前环境没有 fontTools。
+inline constexpr uint32_t kTabIcons[kTabCount] = {TAB_ICON_BOOKSHELF, TAB_ICON_APPS_SENTINEL,
                                                   TAB_ICON_NOTES, TAB_ICON_SETTINGS, 0};
 
 inline RdMode tabMode(int tab) {
-  return tab == 1 ? RdMode::FileBrowser : tab == 2 ? RdMode::Notes
+  return tab == 1 ? RdMode::Apps : tab == 2 ? RdMode::Notes
          : tab == 3 ? RdMode::Settings : tab == 4 ? RdMode::Stats : RdMode::Browser;
 }
 
@@ -148,9 +151,13 @@ struct RdState {
   std::string floatMsg, floatSub;
   int64_t floatUntilUs = 0;
 
-  // 主界面根标签（书架/微读/设置）与「设置」标签的选中行
+  // 主界面根标签（书架/应用/笔记/设置/统计）与「设置」标签的选中行
   int tab = 0;
   int setSel = 0;
+
+  // 「应用」标签（1 号位）里挑中的那枚图标入口：0=文件管理 1=微信读书 2=字典。
+  // 单行三格，←→ 与 ↑↓ 都在这三个之间挪（这个标签像书架一样借用了左右键，见 handleApps）。
+  int appSel = 0;
 
   // 「设置」标签的弹层选择（轮换制条目改成弹出式）。浮层盖在列表上，**不换 st.mode**
   // ——底图仍是设置标签，所以绘制走 renderCurrent 的浮层段、按键在分发前先被它拦下。
@@ -628,9 +635,10 @@ bool rdImeBarOn();    // 实体键盘打字时的输入法条是否该占位
 void rdShowBusy(const char *msg, const std::string &sub);   // 打开大书前刷的那一帧"正在…"
 void renderNoteEdit();  // 笔记编辑页（重命名/改文件名共用同一个输入形态）
 
-// ── 「文件」根标签（screen_reader_files.cpp）─────────────────────────────
-// 文件浏览器 + 文件操作菜单 + 图片查看器。主文件在 switchTab（进文件标签要先扫盘）、
-// renderCurrent、按键分发里认它们；阅读菜单的"打开文件"用 rdEnterFileTab。
+// ── 文件浏览器（screen_reader_files.cpp）──────────────────────────────────
+// 文件浏览器 + 文件操作菜单 + 图片查看器。它是「应用」根标签（1 号位）下面的子界面：
+// 三个入口（应用页的文件夹图标、书架菜单的「文件浏览」、恢复上次界面）都调
+// rdEnterFileTab（扫盘 + st.tab=1 + mode=FileBrowser）；卡根按 Esc 退回应用页。
 // fmTarget 给 fileMenuAction 之外没人用，但它是"文件菜单锁定那一项"的唯一取数口。
 void fbScan(const std::string &dir);
 void rdEnterFileTab();

@@ -226,6 +226,11 @@ static void openRdPick(int act);
 static void drawSettingPicker();
 static void handleSettingPicker(int key);
 
+// 「应用」标签（1 号位）的图标入口页。渲染/按键定义在文件后段（设置标签那一节之后），
+// 这里先声明，供 renderCurrent / screen_reader_handle 的分派用。
+static void renderApps();
+static void handleApps(int key);
+
 // 「想要虚拟键盘」的统一入口：点输入框、进编辑态、按确认键想唤出键盘，全走这里。
 //
 // 这几处以前写的是光秃秃的 `st.vkVisible = !g_bt.isConnected();` —— 蓝牙键盘一连上，
@@ -303,7 +308,44 @@ static void drawStatsTabIcon(int x, int y, int box, bool invert) {
   }
 }
 
-// ── 主界面标签栏（书架 / 文件 / 笔记 / 设置 / 统计）──────────────────────
+// 「应用」标签的图标：3×3 九宫格。和统计的柱状图一样是程序化画的 —— 图标子集里没有
+// md-apps / md-view-grid 这类码点，而当前环境装不了 fontTools 裁新字形（见 tab_icons.h）。
+// 九宫格是"应用抽屉"的通用写法，扫一眼就知道"东西都收在这儿"。
+static void drawAppsTabIcon(int x, int y, int box, bool invert) {
+  const int gap = box / 10;               // 格间距
+  const int cell = (box - 2 * gap) / 3;   // 单格边长
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 3; c++) {
+      g_rd.fillRect(x + c * (cell + gap), y + r * (cell + gap), cell, cell, !invert);
+    }
+  }
+}
+
+// 「字典」入口的图标：一本摊开的书（外框 + 书脊 + 三行字）。同样没有现成字形可用
+// （子集里没有 md-book-search / md-dictionary），照上面两枚的先例程序化画。
+// 尺寸全按 box 等比推，和旁边两枚真字形图标排在一行不会显得矮一截。
+static void drawDictAppIcon(int x, int y, int box, bool invert) {
+  const bool fg = !invert;      // 选中时整枚反白（黑底上的白书）
+  const int pad = box / 8;
+  const int w = box - 2 * pad;
+  const int h = (box * 3) / 4;  // 书是扁的：高三 quarter、宽整幅
+  const int top = y + (box - h) / 2;
+  const int t = std::max(2, box / 20);   // 线宽
+  // 四条边（画成外框）
+  g_rd.fillRect(x + pad, top, w, t, fg);
+  g_rd.fillRect(x + pad, top + h - t, w, t, fg);
+  g_rd.fillRect(x + pad, top, t, h, fg);
+  g_rd.fillRect(x + pad + w - t, top, t, h, fg);
+  // 书脊（靠左一竖）+ 右边三行"字"
+  const int spineX = x + pad + w / 4;
+  g_rd.fillRect(spineX, top, t, h, fg);
+  for (int i = 0; i < 3; i++) {
+    const int ly = top + h / 2 - box / 8 + i * (box / 6);
+    g_rd.fillRect(spineX + 2 * t, ly, w - w / 4 - 4 * t, std::max(2, t / 2), fg);
+  }
+}
+
+// ── 主界面标签栏（书架 / 应用 / 笔记 / 设置 / 统计）──────────────────────
 // 刻意与 drawTitle 占用同一条顶栏、返回同一个正文 top（都取 rdHeadBottom()），
 // 标签化不需要另做一套内容区排版。
 int drawTabBar() {
@@ -324,6 +366,8 @@ int drawTabBar() {
     const int ix = i * seg + (seg - TAB_ICON_PX) / 2;
     if (kTabIcons[i] == 0) {
       drawStatsTabIcon(ix, TAB_ICON_INSET, TAB_ICON_PX, i == st.tab);
+    } else if (kTabIcons[i] == TAB_ICON_APPS_SENTINEL) {
+      drawAppsTabIcon(ix, TAB_ICON_INSET, TAB_ICON_PX, i == st.tab);
     } else if (fb) {
       icon_font_draw_sized(fb, ix, TAB_ICON_INSET, TAB_ICON_PX, TAB_ICON_PX, kTabIcons[i],
                            i == st.tab, TAB_ICON_PX);
@@ -352,12 +396,13 @@ static void handleShelfSearch(int key);
 static void handleNotesSearch(int key);
 // 文件标签的进入动作（重扫目录）现在定义在 screen_reader_files.cpp，声明见内部头。
 
-// 切根标签。文件标签进来要额外扫一遍 SD（见 rdEnterFileTab），所以它单独走一条分支。
+// 切根标签。1 号位（应用）以前在这一处特判成"进文件浏览器 + 扫 SD"，现在它就是个普通的
+// 图标入口页 —— 扫 SD 那一步挪到「文件管理」那枚图标按下时（rdEnterFileTab），
+// 于是五个标签走同一条路，切标签不再有副作用。
 void switchTab(int tab) {
   tab = clampI(tab, 0, kTabCount - 1);
   if (tab == st.tab && st.mode == tabMode(tab)) return;
   st.pickOpen = false;   // 切标签一定收起设置弹层（防它被带进别的标签）
-  if (tab == 1) { rdEnterFileTab(); return; }
   st.tab = tab;
   st.mode = tabMode(tab);
   st.fullRefresh = true;
@@ -2414,8 +2459,8 @@ static ListView titleListView(int count, int sel, int itemH, int bottom, int pag
 }
 
 // ── 顶部搜索栏（书架 / 笔记共用）─────────────────────────────────────────
-// 顶标签栏之下一条横栏：左端是占位提示，右端是动作图标（书架 3 个：搜索/刷新/微读；
-// 笔记暂时只放搜索）。书籍封面 / 笔记列表都从栏下方起排（rdBarContentTop）。
+// 顶标签栏之下一条横栏：左端是占位提示，右端是动作图标（书架 2 个：搜索/刷新；
+// 笔记只有搜索，另加一枚「导出」文字按钮）。书籍封面 / 笔记列表都从栏下方起排（rdBarContentTop）。
 // 图标都是 5 位 PUA，icon_font_is_icon() 不认，所以直接调 icon_font_draw_sized。
 static int rdBarTop() { return coverTop(); }
 static int rdBarH() { return uiLineHeight() + 14; }
@@ -2429,9 +2474,11 @@ static int rdBarIconY() { return rdBarTop() + (rdBarH() - rdBarIconPx()) / 2; }
 static int rdBarIconX(int i, int count) {
   return g_rd.getScreenWidth() - MARGIN - (count - i) * rdBarSlotW() + (rdBarSlotW() - rdBarIconPx()) / 2;
 }
-static int rdBarIconCount(bool shelf) { return shelf ? 3 : 1; }
+static int rdBarIconCount(bool shelf) { return shelf ? 2 : 1; }
 static uint32_t rdBarIconCp(int i, bool shelf) {
-  static const uint32_t kShelf[3] = {TAB_ICON_SEARCH, BAR_ICON_REFRESH, BAR_ICON_WEREAD};
+  // 微读原来排第三（BAR_ICON_WEREAD），已随书架栏那枚图标一起删掉；那枚字形还在，
+  // 现在只给「应用」标签的微读入口用。
+  static const uint32_t kShelf[2] = {TAB_ICON_SEARCH, BAR_ICON_REFRESH};
   return shelf ? kShelf[i] : TAB_ICON_SEARCH;
 }
 // 命中判定放宽一圈：e-ink 没有实时反馈，指尖落点差几个像素很常见。
@@ -2572,6 +2619,12 @@ static inline uint8_t rdCoverContrast(uint8_t v) {
   return static_cast<uint8_t>(g);
 }
 
+// 封面这条链（书架缩略图 + 待机封面表盘）的量化档：跟插图/图片查看器共用设置里的
+// 「图片抖动」。所以量化落点必须是 grayToLevel16（DitherUtils.h），不能再用
+// `(v+8)>>4` —— 后者是"除以 16"的凑合写法，而这块屏的 4bpp 里 level*17 才是灰度，
+// 且它没有抖动。换档时 s_coverThumbs 要整体作废（见 applyRdPick 的 ImageDither 分支）。
+static DitherMode rdCoverDitherMode() { return ImageBlock::ditherModeEnabled(); }
+
 // 把 bmp 缩放成 dw×dh 的 0..15 灰度写进 out（行优先，dw*dh 字节）。**只算不画** ——
 // 画（drawGrayscale16Pixel）交给调用方，因为结果要进 PSRAM 缓存复用（见
 // drawCoverThumb）。以前这个函数直接画到帧缓冲，也就没法缓存。
@@ -2619,10 +2672,13 @@ static bool rdBuildCoverThumb(Bitmap &bmp, int dw, int dh, uint8_t *out) {
 
   auto put = [&](int y, const std::vector<uint8_t> &row) {
     uint8_t *dst = out + static_cast<size_t>(y) * dw;
+    const DitherMode dm = rdCoverDitherMode();
+    DitherRowState ds;
     for (int x = 0; x < dw; x++) {
-      int g = (row[x] + 8) >> 4;  // 四舍五入到 0..15（>15 夹住；15=白）
-      if (g > 15) g = 15;
-      dst[x] = static_cast<uint8_t>(g);
+      // 抖动就落在这里：此时 row[x] 还是 0..255（提对比之后、量化之前），
+      // 再往后就没得抖了。put() 逐行、x 从左到右且 y 递增，行扩散档也是对的用法。
+      // y 放大时同一 row 会填几个 dy，Ordered 按各自 y 取图案（本来就应该这样）。
+      dst[x] = grayToLevel16(row[x], x, y, dm, ds);
     }
   };
 
@@ -2752,6 +2808,13 @@ static void rdCoverThumbForget(const std::string &bmpPath) {
       ++i;
     }
   }
+}
+
+// 抖动档变了：缓存里的 pix 是按旧档量化好的，留着就是"设置改了但书架不变"。
+// 整个清掉 —— 重算一页 12 本约 3 秒，只有换档那一次付。
+static void rdCoverThumbClearAll() {
+  s_coverThumbs.clear();
+  s_coverThumbBytes = 0;
 }
 
 // 取（必要时算）path 这本封面缩到"格子大小 boxW×boxH"里的缩略图，然后 blit 到
@@ -2920,9 +2983,9 @@ static void renderBrowser() {
   // 页码对书架没意义。腾出的高度让封面直接排到屏幕底边（见 shelfBottom）。
 }
 
-// 书架搜索栏右端的动作：0=搜索 1=刷新（重扫书库）2=微读。
-// 微读那条与设置页「微信读书」入口同一套状态准备；handleWeread 的 Esc 是 switchTab(0)，
-// 所以从书架进来回退也直接落回书架（不依赖 retMode）。
+// 书架搜索栏右端的动作：0=搜索 1=刷新（重扫书库）。
+// 原来第三个是微读，2026-10-05 删了 —— 微读收进 1 号位的「应用」标签之后，书架栏上
+// 再挂一枚就是重复入口，而且它挤在搜索框右端容易被误触。
 static void rdShelfBarAction(int i) {
   if (i == 0) { rdEnterSearch(RdMode::ShelfSearch); return; }
   if (i == 1) {
@@ -2930,16 +2993,6 @@ static void rdShelfBarAction(int i) {
     st.sel = clampI(st.sel, 0, std::max(0, static_cast<int>(st.books.size()) - 1));
     st.dirty = 1;
     return;
-  }
-  if (i == 2) {
-    st.vkVisible = false;
-    st.weSel = 0;
-    st.weScroll = 0;
-    st.weStatus.clear();
-    st.weShelfLoaded = false;
-    st.mode = RdMode::Weread;
-    st.fullRefresh = true;
-    st.dirty = 1;
   }
 }
 
@@ -3174,7 +3227,8 @@ static void doShelfAction(int i) {
       st.mode = RdMode::Recent;
       break;
     case 2:
-      // 文件浏览现在也是 1 号根标签，走和标签栏同一条进入路径（含目录重扫）。
+      // 文件浏览挂在 1 号位（应用标签）下面，走和应用页那枚文件夹图标同一条进入路径
+      // （rdEnterFileTab，含目录重扫）。从这儿进去，卡根 Esc 会退到应用页而不是书架。
       rdEnterFileTab();
       break;
     case 3:
@@ -3380,7 +3434,7 @@ static void renderToc() {
   drawFooter("↑↓ 选择  上下滑翻页  Enter 跳转  Esc 返回");
 }
 
-// ── 图片抖动（设置 → 排版设定 → 图片抖动）────────────────────────────────
+// ── 图片抖动（设置标签 / 阅读菜单的排版设定 → 图片抖动）──────────────────────
 // 8 位灰量化成面板的 16 级时用哪种抖动。默认"有序"（Bayer）：它是 (灰度,x,y)
 // 的纯函数，同一张图每次重绘逐像素相同 —— 差分刷新不会因为图案漂移而叠影。
 // "行扩散"把量化误差沿一行向右传，渐变更细腻，但图案取决于解码出点顺序；
@@ -4464,10 +4518,11 @@ bool readerCoverScale(const std::string &bmpPath, int boxW, int boxH, uint8_t *o
       if (bmp.readNextRow(data.data(), rowBuf.data(), opacity.data(), Bitmap::RowOutput::Gray8) != BmpReaderError::Ok)
         return false;
       uint8_t *dst = out + static_cast<size_t>(y) * w;
+      const DitherMode dm = rdCoverDitherMode();
+      DitherRowState ds;
       for (int x = 0; x < sw; x++) {
         if (opacity[x] == 0) { dst[x] = 15; continue; }   // 透明 = 纸白
-        int g = (rdCoverContrast(data[x]) + 8) >> 4;
-        dst[x] = static_cast<uint8_t>(g > 15 ? 15 : g);
+        dst[x] = grayToLevel16(rdCoverContrast(data[x]), x, y, dm, ds);
       }
     }
   } else if (!rdBuildCoverThumb(bmp, w, h, out)) {
@@ -4932,6 +4987,7 @@ void renderCurrent() {
     case RdMode::StatusBar: renderStatusBarSet(); break;
     case RdMode::About: renderAbout(); break;
     case RdMode::RefreshTest: renderRefreshTest(); break;
+    case RdMode::Apps: renderApps(); break;
     case RdMode::Settings: renderSettingsTab(); break;
     case RdMode::Notes: renderNotes(); break;
     case RdMode::NoteEdit: renderNoteEdit(); break;
@@ -6408,8 +6464,9 @@ static std::vector<MenuItem> settingsItems() {
   std::vector<MenuItem> m;
   m.push_back({"WiFi 管理", MenuAct::Wifi});
   m.push_back({"WiFi 传书", MenuAct::NetShare});
-  // 微信读书原来是主界面 1 号根标签，现在收进设置（和 OPDS 一起算"书的来源"）。
-  m.push_back({"微信读书", MenuAct::Weread});
+  // 微信读书已经从这一屏搬去 1 号位的「应用」标签（RdMode::Apps 的微读图标）。
+  // 词典下载留在这儿：它跟下面的「资源下载」一样是**下素材**的维护动作，不是天天用的
+  // 入口；「应用」标签里那枚「字典」是查词页（RdMode::Dictionary），两回事。
   m.push_back({"OPDS 书库", MenuAct::Opds});
   m.push_back({"词典下载", MenuAct::DictDl});
   m.push_back({"资源下载", MenuAct::ResDl});
@@ -6432,6 +6489,11 @@ static std::vector<MenuItem> settingsItems() {
     }
     m.push_back({label, MenuAct::FullEvery});
   }
+  // 插图/书架封面的抖动档。它跟刷新策略一样是「屏幕怎么出画面」的档位，阅读页的
+  // 「排版设定」子菜单里也有一条（挨着「图片: 双线性」）；两边写同一个键
+  // （reader_image_dither），改哪儿都算数（同「翻页动画」的惯例）。
+  m.push_back({std::string("图片抖动: ") + kRdDitherNames[clampI(st.imageDither, 0, kRdDitherCount - 1)],
+               MenuAct::ImageDither});
   // 错相揭页开关。主界面的「设置 → 显示与版式 → 翻页动画」已经有这一项，但那个入口
   // 要先退出阅读器；挑翻页动画来试的时候人就该在读书的地方，所以在设置标签里再放一份，
   // 两边写同一个键（page_turn_anim），改哪儿都算数。
@@ -6491,6 +6553,118 @@ static void handleSettingsTab(int key) {
     st.dirty = 1;
     return;
   }
+}
+
+// ── 「应用」标签（1 号位）：三枚图标入口 ────────────────────────────────
+// 文件管理（SD 卡浏览器）/ 微信读书 / 字典（查词页）。以前 1 号位直接就是文件浏览器，
+// 另两个入口分别散在「设置」标签和阅读菜单里；现在收成一股，1 号位只做入口。
+//
+// 交互刻意跟书架标签一致：**左右键在这个标签里是"换选中项"**，不是换标签（书架用它们
+// 翻封面，已经开了这个先例）。换标签靠点标签栏，或 Esc 回书架再用左右键。
+static const int kAppCount = 3;
+static const char *kAppNames[kAppCount] = {"文件管理", "微信读书", "字典"};
+
+// 图标目标像素高。ICON_MAX_PX=112 是硬上限（超了字形被静默丢弃，画出来是空的），
+// 这里留出余量；96 也比标签栏的 56 更适合"一排大图标"的入口页。
+static int rdAppIconPx() { return 96; }
+static int rdAppSlotW() { return g_rd.getScreenWidth() / kAppCount; }
+
+// 图标框上沿：把"图标 + 标签"整块在正文区里居中（正文区 = 标签栏下沿到页脚上沿）。
+static int rdAppIconTop() {
+  const int bodyTop = coverTop();
+  const int bodyBot = statusTop();   // 这一页有页脚（drawFooter），别把块排进页脚里
+  const int block = rdAppIconPx() + 16 + uiLineHeight();
+  int top = bodyTop + (bodyBot - bodyTop - block) / 2;
+  if (top < bodyTop + 8) top = bodyTop + 8;
+  return top;
+}
+
+// 点按命中哪一格：横向按整格切（手指落点糙，不瞄字形），纵向给整块留 12px 容差。
+static int rdAppSlotAt(int x, int y) {
+  const int top = rdAppIconTop();
+  const int bot = top + rdAppIconPx() + 16 + uiLineHeight();
+  if (y < top - 12 || y > bot + 12) return -1;
+  const int s = x / rdAppSlotW();
+  return (s >= 0 && s < kAppCount) ? s : -1;
+}
+
+// 按下某一枚入口。三个都不换标签（st.tab 停在 1），进去的子界面 Esc 都回这一页 ——
+// 文件浏览器回在 handleFileBrowser 的卡根分支，另两个借 st.retMode（见 handleApps）。
+static void rdOpenApp(int i) {
+  switch (i) {
+    case 0:
+      rdEnterFileTab();   // 扫 SD + st.tab=1 + mode=FileBrowser
+      return;
+    case 1:
+      st.retMode = RdMode::Apps;
+      doMenuAction(MenuAct::Weread);
+      break;
+    case 2:
+      st.retMode = RdMode::Apps;
+      doMenuAction(MenuAct::Dict);
+      break;
+    default:
+      return;
+  }
+  st.fullRefresh = true;
+  st.dirty = 1;
+}
+
+static void renderApps() {
+  g_rd.clearScreen();
+  drawTabBar();
+  const int slotW = rdAppSlotW();
+  const int iconPx = rdAppIconPx();
+  const int top = rdAppIconTop();
+  uint8_t *fb = g_rd.getFrameBuffer();
+  for (int i = 0; i < kAppCount; i++) {
+    const int cx = i * slotW + slotW / 2;
+    const int ix = cx - iconPx / 2;
+    const bool sel = (i == st.appSel);
+    if (sel) {
+      // 选中 = 图标后面一块黑底 + 反白图标（跟标签栏/主菜单同一个idiom）。标签不反白：
+      // 黑底只罩着图标，罩到文字会连成一片黑。
+      const int pad = TAB_BOX_PAD + 4;
+      g_rd.fillRect(ix - pad, top - pad, iconPx + 2 * pad, iconPx + 2 * pad, true);
+    }
+    if (i == 0) {
+      if (fb) icon_font_draw_sized(fb, ix, top, iconPx, iconPx, TAB_ICON_FILES, sel, iconPx);
+    } else if (i == 1) {
+      if (fb) icon_font_draw_sized(fb, ix, top, iconPx, iconPx, BAR_ICON_WEREAD, sel, iconPx);
+    } else {
+      drawDictAppIcon(ix, top, iconPx, sel);
+    }
+    // 标签按**格子**居中（drawCenteredLine 是按整屏居中的，这儿用不上）。
+    const char *nm = kAppNames[i];
+    drawLineText(cx - g_rd.getTextWidth(uiFontId(), nm) / 2, top + iconPx + 16, nm, true);
+  }
+  drawFooter("←→ 选择  Enter 打开  Esc 返回书架");
+}
+
+static void handleApps(int key) {
+  // 左右（和上下）都在这三枚之间挪：单行三格，四个方向键当同一个用，符合直觉。
+  if (key == KEY_LEFT || key == KEY_UP) {
+    st.appSel = (st.appSel + kAppCount - 1) % kAppCount;
+    st.dirty = 1;
+    return;
+  }
+  if (key == KEY_RIGHT || key == KEY_DOWN) {
+    st.appSel = (st.appSel + 1) % kAppCount;
+    st.dirty = 1;
+    return;
+  }
+  if (key == 0x1B || key == KEY_LONG_CONFIRM) { switchTab(0); return; }
+  if (key != '\n') return;
+  // 点按坐标只读一次（input_tap_xy 读完即清），标签栏命中和格子命中共用这一份。
+  int x = 0, y = 0;
+  if (input_tap_xy(&x, &y)) {
+    const int t = tabHit(x, y);
+    if (t >= 0) { switchTab(t); return; }
+    const int slot = rdAppSlotAt(x, y);
+    if (slot < 0) return;
+    st.appSel = slot;
+  }
+  rdOpenApp(st.appSel);
 }
 
 // ── 设置弹层：轮换制条目改成弹出式选择 ──────────────────────────────────
@@ -6717,8 +6891,11 @@ static void applyRdPick(int act, const std::string &value) {
         if (value == kRdDitherKeys[i]) st.imageDither = i;
       }
       ImageBlock::setDitherMode(ditherModeOf(st.imageDither));
+      // 书架缩略图/待机封面共用这一档，而且它们的像素是量化后缓存进 PSRAM 的
+      // （.pxc 那套"换档靠缓存名自然失效"在这儿不成立）—— 必须显式清。
+      rdCoverThumbClearAll();
       rdShowFloat(std::string("图片抖动: ") + kRdDitherNames[clampI(st.imageDither, 0, kRdDitherCount - 1)],
-                  "本页下次重绘时按新档重解码", 1500);
+                  "插图与书架封面都按新档重画", 1500);
       st.fullRefresh = true;
       st.dirty = 1;
       break;
@@ -6848,7 +7025,14 @@ static void handleDict(int key) {
   if (key == 0x1B) {
     IME::getInstance().cancelComposition();
     st.vkVisible = false;
-    st.mode = RdMode::Menu;
+    // 从「应用」标签的字典图标进来的，Esc 回那一页；其余入口（阅读菜单 → 词典、
+    // 长按选词 → 查字典）照旧回阅读菜单。
+    if (st.retMode == RdMode::Apps) {
+      st.mode = RdMode::Apps;
+      st.retMode = RdMode::Browser;
+    } else {
+      st.mode = RdMode::Menu;
+    }
     st.fullRefresh = true;
     st.dirty = 1;
     return;
@@ -7457,8 +7641,9 @@ static void rdSaveReturnPoint() {
     case RdMode::Percent:     r.mode = RdMode::Percent; break;
     case RdMode::Recent:      r.mode = RdMode::Recent; break;
     case RdMode::FileBrowser: r.mode = RdMode::FileBrowser; break;
-    // 四个根标签各有自己的常驻界面，直接按标签回来。
+    // 五个根标签各有自己的常驻界面，直接按标签回来。
     case RdMode::Browser:
+    case RdMode::Apps:
     case RdMode::Weread:
     case RdMode::Notes:
     case RdMode::Settings:    r.mode = tabMode(st.tab); break;
@@ -7517,7 +7702,7 @@ static void rdRestoreReturnPoint() {
     return;
   }
   if (r.mode == RdMode::FileBrowser) {
-    st.tab = 1;   // 文件浏览 = 1 号根标签
+    st.tab = 1;   // 文件浏览器挂在 1 号位（应用标签）下面
     fbScan(r.fbPath.empty() ? std::string("/sdcard") : r.fbPath);
     st.fbSel = clampI(r.fbSel, 0, std::max(0, static_cast<int>(st.fbEntries.size()) - 1));
     st.mode = RdMode::FileBrowser;
@@ -7533,9 +7718,9 @@ static void rdRestoreReturnPoint() {
   st.mode = tabMode(st.tab);
   st.fullRefresh = true;
   st.dirty = 1;
-  // 恢复到文件标签时必须重扫目录：进程重启后 st.fbEntries 是空的，只把 mode 设成
-  // FileBrowser 会得到一张空列表（详见 rdEnterFileTab 的注释）。
-  if (st.tab == 1) rdEnterFileTab();
+  // 这儿**不再**对 1 号位补一次 rdEnterFileTab：1 号位现在是「应用」的图标入口页，
+  // 不需要扫 SD（列表是编译期定死的三项）。真正停在文件浏览器里的那一趟，上面
+  // RdMode::FileBrowser 那条分支已经把目录扫回来了。
   ESP_LOGI(TAG, "返回标签 %d，选中 %d", st.tab, st.sel);
 }
 
@@ -7942,6 +8127,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     case RdMode::Footnotes: handleFootnotes(key); break;
     case RdMode::Percent: handlePercent(key); break;
     case RdMode::Qr: handleQr(key); break;
+    case RdMode::Apps: handleApps(key); break;
     case RdMode::Dictionary: handleDict(key); break;
     case RdMode::Weread: handleWeread(key); break;
     case RdMode::WereadQr: handleWereadQr(key); break;
