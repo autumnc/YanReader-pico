@@ -678,13 +678,18 @@ static FnPop openFootnotePopup(int idx, bool allowBuild) {
     text = rdNoteText(*st.section, pg->page, pg->element, BODY_FONT_ID_BASE + st.fontLevel,
                       st.footnoteNums[idx]);
 
-  // 快速路上"锚点没排到"和"排到了但正文取不出来"都先挂起 —— 后者常常是注文本身
-  // 跨到了下一页，那一页也还没排；再多排一点就能取到。
-  if (!allowBuild && text.empty() && st.section->isBuilding() && !st.section->isBuildComplete()) {
+  // **"锚点登记了" ≠ "正文取得到"**，这一条是晋书"点注号一直报取不到注文"的根子：
+  // 锚点在 startNewTextBlock 里、**块刚要排版那一刻**就登记了（flushPendingAnchor），
+  // 它记下的那一页这时往往还没排完 —— build_->lut[page].fileOffset 仍是 0，
+  // loadPage 直接返回空，rdNoteText 交回空串。原来这里只在 allowBuild=false（按键那一拍）
+  // 才保持挂起，而空闲帧重试走的正是 allowBuild=true：一取不到就判 NotHere → 报错，
+  // 其实它只是慢了一页。改成只要本节还在排就继续挂起，下一空闲帧再试。
+  // 排完了还取不出来才是真的取不到（那样下面的跨 spine 兜底与 NotHere 照旧生效）。
+  if (text.empty() && st.section->isBuilding() && !st.section->isBuildComplete()) {
     st.fnWaitIdx = idx;
     st.fnWaitSpine = st.spineIndex;
     st.fnWaitAnchor = anchor;
-    ESP_LOGI(TAG, "弹注计时: 第%d条 锚点 '%s' 未排到 → 挂起后台排", idx, anchor.c_str());
+    ESP_LOGI(TAG, "弹注计时: 第%d条 锚点 '%s' 在表里但正文还取不出 → 继续挂起", idx, anchor.c_str());
     return FnPop::Pending;
   }
 
@@ -750,6 +755,8 @@ void rdFootnoteWaitCancel() {
 //   ① 状态对不上（换了书/换了章/脚注表换了）→ 作废。
 //   ② 只查不排地问一次锚点：到了就弹出来。**空闲帧没人推屏**，所以这里必须自己
 //      重绘一次 —— 和上面 floatMsg 到点自清那一处是同一个道理。
+//      锚点在表里但正文还取不出来（锚点页还没排完）时 openFootnotePopup 回 Pending，
+//      此时**不作废**，接着往下排，下一空闲帧再试。
 //   ③ 还没到就继续排一段（限时），下一空闲帧接着来。
 // 判不出来（整章排完仍没有这个锚点）就作废并给个提示，不会无限等下去。
 void rdFootnoteWaitTick() {
@@ -762,16 +769,22 @@ void rdFootnoteWaitTick() {
   if (rdFindFootnotePage(st.fnWaitAnchor, 0)) {  // 只查不排
     const std::string anchor = st.fnWaitAnchor;
     const FnPop r = openFootnotePopup(st.fnWaitIdx, true);
-    rdFootnoteWaitCancel();
-    if (r == FnPop::Opened) {
-      ESP_LOGI(TAG, "挂起弹注: 锚点 '%s' 排到了 → 弹出", anchor.c_str());
-      rdOverlayRefresh();
-    } else {
-      rdShowFloat("取不到注文", std::string(), 1500);
-      st.dirty = 1;
+    if (r != FnPop::Pending) {
+      rdFootnoteWaitCancel();
+      if (r == FnPop::Opened) {
+        ESP_LOGI(TAG, "挂起弹注: 锚点 '%s' 排到了 → 弹出", anchor.c_str());
+        rdOverlayRefresh();
+      } else {
+        rdShowFloat("取不到注文", std::string(), 1500);
+        st.dirty = 1;
+      }
+      renderCurrent();
+      return;
     }
-    renderCurrent();
-    return;
+    // Pending：锚点在表里，但正文这一刻还取不出来（锚点页还没排完，见 openFootnotePopup）。
+    // **不能在这里 cancel** —— 那会把挂起状态连同"正在取注…"浮层一起清掉。落到下面接着排，
+    // 下一空闲帧再试。openFootnotePopup 只在"本节还在排"时才返回 Pending，排完那一帧它会
+    // 改口成 Opened 或 NotHere，所以这里不会无限等下去。
   }
   if (st.section->isBuildComplete() || !st.section->isBuilding()) {
     rdFootnoteWaitCancel();
