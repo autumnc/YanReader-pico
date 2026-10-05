@@ -97,10 +97,17 @@ namespace {
 // 抹掉、虚/点线按波浪画，CssParser::CSS_CACHE_VERSION 14→15）。页缓存的**形状**没变，
 // 变的是每个词样式位里有没有 UNDERLINE/WAVY_UNDERLINE：老 .bin 排出来是没线的，不清掉
 // 的话已经建过缓存的古籍（含春秋左传注）打开仍然一条线都不画。同样各跳两格。
+// 90/89: 回引链接（`<a class="…backref">`）不再被排除出"内链"这条路。以前 startTag 里
+// 直接把它判成"非内链"，连 addLinkTarget 一起跳过了 —— 注文页因此一个链接矩形都没有，
+// 读端只能走"按注号反查"那条路（要么靠开过弹注"学过"，要么靠往回扫页兜底），用户侧
+// 就是"正常读到注文区点注号跳不回正文，只有从弹注跳过去才点得动"。页缓存块的**形状**
+// 没变，变的是页内**链接表的内容**（注文页多出若干 rect，每个词还多一个 UNDERLINE 样式
+// 位）—— 而链接表是逐字节序列化进 .bin 的，老文件里那张空表会被原样读回来继续点不动。
+// 同样各跳两格。
 #ifdef ENABLE_CHINESE_VERSION
-constexpr uint8_t SECTION_FILE_VERSION = 88;
+constexpr uint8_t SECTION_FILE_VERSION = 90;
 #else
-constexpr uint8_t SECTION_FILE_VERSION = 87;
+constexpr uint8_t SECTION_FILE_VERSION = 89;
 #endif
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. An abandoned /

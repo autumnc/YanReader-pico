@@ -1316,8 +1316,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       // 而链接里一个文字都没有 → currentFootnote.number 为空 → 闭合时不登记脚注，点哪
       // 都弹不出来。这里补一条：**在脚注内链里的**图（href 是纯页内锚点、图就是整条链接
       // 的标签、class/src 也像注号）不发图，改发一个上标序号 —— 闭合时照常登记脚注。
-      if (self->insideFootnoteLink && !self->currentFootnote.href.empty() &&
-          self->currentFootnote.href[0] == '#' &&
+      // !currentFootnoteIsBackref：回引也是内链了（见 startTag 的说明），但注文侧的
+      // 回引图绝不是"注号"，不能在这儿被合成成一条上标序号。
+      if (self->insideFootnoteLink && !self->currentFootnoteIsBackref &&
+          !self->currentFootnote.href.empty() && self->currentFootnote.href[0] == '#' &&
           self->currentFootnoteLinkTextLen == 0 && isFootnoteMarkerImage(klass, src)) {
         if (self->partWordBufferIndex > 0) {
           self->flushPartWordBuffer();
@@ -1833,9 +1835,19 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     // <a class="note-backref"> 是"从注文跳回正文"的反向链接（校勘记/脚注区常见）。
     // 正文里已经有注号在管弹注了，再把回跳链接登记成脚注，注文那一页就会凭空多出
     // 几条指向正文的"脚注"、注号也对不上。注意别误伤 note-ref（那才是正向注号）。
+    //
+    // **但它仍然是一条内链，链接矩形必须留。** 这里原来直接 `isInternalLink = false`，
+    // 把整个 `if (isInternalLink)` 块（含 addLinkTarget）一起跳过了 —— 于是注文页一个
+    // 链接矩形都没有（`$CLAUDE_JOB_DIR/tmp` 里那个主机端探针实测：晋书注文页 links = 0，
+    // 正文页每条上标都有）。读端 `rdTapOnLink` 靠 rect 里的 href 精确跳转，没 rect 就
+    // 只剩"按注号反查"那条路，而它要么靠开过弹注"学过"、要么靠往回扫页兜底 —— 用户侧
+    // 就是"正常读到注文区点注号跳不回正文，只有从弹注跳过去才点得动"。
+    // 现在改成：仍是内链（登记 rect、照常走内链那套），只在"算不算一条脚注"上区分
+    // （class 命中回引 → currentFootnoteIsBackref，由 </a> 关闭处拦住登记）。
+    bool linkClassBackref = false;
     if (isInternalLink) {
       const char* klass = getAttribute(atts, "class");
-      if (klass && strstr(klass, "backref")) isInternalLink = false;
+      if (klass && strstr(klass, "backref")) linkClassBackref = true;
     }
 
     if (isInternalLink) {
@@ -1869,11 +1881,17 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       // `<sup id="ref-001"><a href="#note-001">` 拿到 ref-001，`<a id="1" href="#2">` 拿到 1。
       // 先比对（不含自己）再登记，免得自引用的链接把自己认成回引。
       const std::string localAnchor = localAnchorOf(href, self->filepath);
+      // 两条信号取或：class 命中（calibre 那种 class="note-backref"）与 href 命中所见注号
+      // 锚点（有些书的回引没有 class，只能靠"它指向的正是前面的上标"认出来）。
       self->currentFootnoteIsBackref =
-          !localAnchor.empty() &&
-          std::find(self->footnoteMarkerAnchors.begin(), self->footnoteMarkerAnchors.end(), localAnchor) !=
-              self->footnoteMarkerAnchors.end();
-      if (!self->pendingAnchorId.empty() &&
+          linkClassBackref ||
+          (!localAnchor.empty() &&
+           std::find(self->footnoteMarkerAnchors.begin(), self->footnoteMarkerAnchors.end(), localAnchor) !=
+               self->footnoteMarkerAnchors.end());
+      // 只有**非回引**才登记 pendingAnchorId：回引的外层 id 是"注文那条"的 id
+      // （<p id="note-013"><a class="note-backref" href="#ref-013">），把它也收进注号锚点表，
+      // 之后任何指向该注文的链接都会被误判成回引、不再登记成脚注（一注多引的书就点不出弹注）。
+      if (!self->currentFootnoteIsBackref && !self->pendingAnchorId.empty() &&
           std::find(self->footnoteMarkerAnchors.begin(), self->footnoteMarkerAnchors.end(), self->pendingAnchorId) ==
               self->footnoteMarkerAnchors.end()) {
         self->footnoteMarkerAnchors.push_back(self->pendingAnchorId);

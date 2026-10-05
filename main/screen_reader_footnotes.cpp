@@ -501,10 +501,22 @@ static std::string rdStripLeadingNoteNumber(const std::string &line, const std::
 // <p>/<br>，段首即注文边界；段内折行与跨页续行都不是段首，天然不会被误判。
 //
 // 参数用 Section& 而不是 Page&：跨页要继续 loadPage 下一页，所以非拿这一节不可。
+//
+// incomplete 出参：**交回的文本可能是半截**。惰性排版下"下一页还没排出来"与"真的到章末了"
+// 都表现为 loadPage 返回空（build_->lut[page].fileOffset 还是 0），这里分不清 —— 只要本节
+// 还在排、又需要下一页却拿不到，就置位让调用方挂起重试（见 openFootnotePopup）。这正是
+// 用户侧"注文有时被截断、有时又完整"的由来：注文跨页时撞上没排完的窗口就截断。
+// 排完之后（isBuildComplete）再拿不到就是真的没有了，那时 incomplete 保持 false，半截
+// 就是全部。
 static std::string rdNoteText(Section &sec, int pageIdx, int elementIdx, int fontId,
-                              const std::string &noteNum) {
+                              const std::string &noteNum, bool *incomplete = nullptr) {
   constexpr int kMaxExtraPages = 3;  // 锚点页之外最多再读 3 页
   constexpr int kMaxLines = 240;     // 总行数上限，防跑飞
+
+  if (incomplete) *incomplete = false;
+  const auto needPageFail = [&]() {
+    if (incomplete && sec.isBuilding() && !sec.isBuildComplete()) *incomplete = true;
+  };
 
   // 先定位"注文从哪一页、哪一行开始"。锚点序号指的是**锚点页**；行内锚点会被解析器记到
   // 后一段（见 rdFindNoteStartLine 的说明），极端情况下本段正排在页尾、整段被推到下一页，
@@ -548,6 +560,7 @@ static std::string rdNoteText(Section &sec, int pageIdx, int elementIdx, int fon
     // rdStartsBracketed 当成带括号的注号，一页上撞出两条同号行，那个函数就撒手了）。
     // 首行号码认不出（锚点块是空块、或真被推到更后面）再退回按注号**唯一**命中。
     auto page = sec.loadPage(pageIdx + 1);
+    if (!page) needPageFail();  // 下一页还没排完（或真没有下一页）：先记账，别当成"找不到"
     if (page) {
       std::vector<std::string> lines;
       std::vector<int> lineStart;
@@ -607,7 +620,7 @@ static std::string rdNoteText(Section &sec, int pageIdx, int elementIdx, int fon
 
   for (int extra = 0; extra <= kMaxExtraPages; extra++) {
     auto page = sec.loadPage(startPage + extra);
-    if (!page) break;
+    if (!page) { needPageFail(); break; }
     std::vector<std::string> lines;
     std::vector<int> lineStart;
     std::vector<uint8_t> lineParaStart;
@@ -618,8 +631,12 @@ static std::string rdNoteText(Section &sec, int pageIdx, int elementIdx, int fon
     if (needStart) {
       cur = startCur;
       if (cur >= static_cast<int>(lines.size())) break;
-      // 整页就这一行：没有"下一行"可判终止
-      if (lines.size() == 1) return rdStripLeadingNoteNumber(lines[cur], noteNum);
+      // 整页就这一行：没有"下一行"可判终止 —— 得看下一页的首行是不是新段落。下一页还没
+      // 排出来时也判不了，先记账挂起重试。
+      if (lines.size() == 1) {
+        needPageFail();
+        return rdStripLeadingNoteNumber(lines[cur], noteNum);
+      }
       out = rdStripLeadingNoteNumber(lines[cur], noteNum);
       collected = 1;
       cur++;
@@ -673,10 +690,11 @@ static FnPop openFootnotePopup(int idx, bool allowBuild) {
   if (anchor.empty()) return FnPop::NotHere;
 
   std::string text;
+  bool truncated = false;  // 注文跨页、而下一页还没排完 → text 是半截（见 rdNoteText）
   auto pg = rdFindFootnotePage(anchor, allowBuild ? 2500 * 1000 : 0);
   if (pg)
     text = rdNoteText(*st.section, pg->page, pg->element, BODY_FONT_ID_BASE + st.fontLevel,
-                      st.footnoteNums[idx]);
+                      st.footnoteNums[idx], &truncated);
 
   // **"锚点登记了" ≠ "正文取得到"**，这一条是晋书"点注号一直报取不到注文"的根子：
   // 锚点在 startNewTextBlock 里、**块刚要排版那一刻**就登记了（flushPendingAnchor），
@@ -685,11 +703,17 @@ static FnPop openFootnotePopup(int idx, bool allowBuild) {
   // 才保持挂起，而空闲帧重试走的正是 allowBuild=true：一取不到就判 NotHere → 报错，
   // 其实它只是慢了一页。改成只要本节还在排就继续挂起，下一空闲帧再试。
   // 排完了还取不出来才是真的取不到（那样下面的跨 spine 兜底与 NotHere 照旧生效）。
-  if (text.empty() && st.section->isBuilding() && !st.section->isBuildComplete()) {
+  //
+  // 同一个道理还有第二种面孔：**锚点排到了、注文却跨页**，下一页同样可能还没排 ——
+  // rdNoteText 那时只能交回当前页的半截注文（它置 truncated）。它同样是"慢了一页"，
+  // 不是"就这样了"，所以一起挂起。用户侧的症状正是"注文有时被截断、有时又完整"：
+  // 截不截断取决于点的那一下撞没撞上排版窗口。
+  if ((text.empty() || truncated) && st.section->isBuilding() && !st.section->isBuildComplete()) {
     st.fnWaitIdx = idx;
     st.fnWaitSpine = st.spineIndex;
     st.fnWaitAnchor = anchor;
-    ESP_LOGI(TAG, "弹注计时: 第%d条 锚点 '%s' 在表里但正文还取不出 → 继续挂起", idx, anchor.c_str());
+    ESP_LOGI(TAG, "弹注计时: 第%d条 锚点 '%s' %s → 继续挂起", idx, anchor.c_str(),
+             text.empty() ? "在表里但正文还取不出" : "注文跨页但下一页还没排完");
     return FnPop::Pending;
   }
 
@@ -717,6 +741,11 @@ static FnPop openFootnotePopup(int idx, bool allowBuild) {
   st.fnPopText = std::move(text);
   st.fnPopScroll = 0;
   st.fnPopIdx = idx;
+  // 走到这儿还 truncated，说明本章**排完了**也还是拿不到下一页 —— 那要么注文真到章末了，
+  // 要么跨页数超过了 kMaxExtraPages。两种都不该再等，照常弹，但留一条日志好区分。
+  if (truncated)
+    ESP_LOGW(TAG, "弹注计时: 第%d条 取文到章末为止（%u 字，可能不全）", idx,
+             (unsigned)st.fnPopText.size());
   ESP_LOGI(TAG, "弹注计时: 第%d条 锚点取文 %u 字 共 %lldms", idx, (unsigned)st.fnPopText.size(),
            (long long)((esp_timer_get_time() - t0) / 1000));
   return FnPop::Opened;
