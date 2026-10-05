@@ -154,8 +154,17 @@ std::string battery_status_text() {
 // font_renderer 程序化绘制的矢量图形(不在 TTF 子集里)，删掉不省也不费字体空间。
 
 // ── Word wrap helpers ────────────────────────────────────────────────────
-static int charCellWidth(unsigned char c) {
-    return (c < 0x80) ? 1 : 2;
+// 一个字符的**步进(px)**。只按首字节判断（<0x80 = 拉丁，其余一律全角），与老
+// charCellWidth 同口径；变的只有拉丁那一支：从前恒为半格，现在按**内容面的真实
+// 步进**前进（装了外置字体时拉丁是比例的），与 FontRenderer::charWidth() 同一条规则。
+// 这里是自由函数、没有 FontRenderer 实例，所以复述一遍规则 —— 复述的只有"谁"，
+// "多少"仍旧只有 ttf 层一处（ttf_char_advance_px）。
+//   内置内容面 → 半格（= 没装外置字体时的逐像素原样）；
+//   装了外置字体 → 那个字面的真实步进（内置的 ASCII 步进表，O(1)，见 ttf_font.c）。
+static int charAdvancePx(unsigned char c) {
+    if (c >= 0x80) return g_font.cjkAdvance();
+    if (ttf_font_is_builtin()) return g_font.halfAdvance();
+    return ttf_char_advance_px(TTF_ROLE_CONTENT, g_font.pxHeight(), (uint32_t)c);
 }
 
 static int utf8CharLen(unsigned char c) {
@@ -166,24 +175,30 @@ static int utf8CharLen(unsigned char c) {
     return 1;
 }
 
-int byteToCells(const std::string &line, int byteOffset) {
-    int cells = 0;
+// 行内字节偏移 → 距行首的像素 x。老的 byteToCells 的像素版（"格"已废）。
+int byteToX(const std::string &line, int byteOffset) {
+    if (byteOffset > (int)line.size()) byteOffset = (int)line.size();
+    int x = 0;
     for (int i = 0; i < byteOffset; ) {
-        cells += charCellWidth((unsigned char)line[i]);
+        x += charAdvancePx((unsigned char)line[i]);
         i += utf8CharLen((unsigned char)line[i]);
     }
-    return cells;
+    return x;
 }
 
-int cellsToByte(const std::string &line, int start, int end, int targetCells) {
-    int cells = byteToCells(line, start);
+// [start, end) 内离 targetX 最近的字符**边界**字节偏移（x 是距行首的像素）。
+// 平手取靠左的那个边界，所以 xToByte(line, 0, len, byteToX(line, k)) == k 恒成立。
+int xToByte(const std::string &line, int start, int end, int targetX) {
+    if (start < 0) start = 0;
+    if (end > (int)line.size()) end = (int)line.size();
+    int x = byteToX(line, start);
     for (int ci = start; ci < end; ) {
         unsigned char c = (unsigned char)line[ci];
-        int cc = charCellWidth(c);
-        if (cells + cc > targetCells) {
-            return (targetCells - cells <= cells + cc - targetCells) ? ci : ci + utf8CharLen(c);
+        int cc = charAdvancePx(c);
+        if (x + cc > targetX) {
+            return (targetX - x <= x + cc - targetX) ? ci : ci + utf8CharLen(c);
         }
-        cells += cc;
+        x += cc;
         ci += utf8CharLen(c);
     }
     return end;
@@ -204,16 +219,27 @@ static int mdPrefixLen(const std::string &line) {
     return 0;
 }
 
-// Cells reserved per vrow for the RENDERED block indent so wrapped content
-// doesn't overrun the screen. Must match markdown_render.cpp layout: heading at
-// cell 2, list/task at marker cells (content at start+cells), quote 4 cells
-// (bar at cell 4 + 2px gap). Nested markers reserve leading ws + marker cells.
-static int mdIndentCells(const std::string &line) {
+// 每条 vrow 为该行**渲染出来的块记号**预留的像素宽，好让折下去的内容不冲出屏幕。
+// 口径必须与 markdown_render.cpp 的排版一致（见那里的 mdPrefixAdvancePx）：
+// 引用 4 格、标题 2 格（折叠 4 格，由调用方覆盖）、列表/待办 = 记号本身占的格。
+// 嵌套记号的预留含前导空白。
+//
+// **有序记号是唯一要"量"的一支**：它的原文照原样画，装了外置字体后宽度不再是
+// 整数格。算式与 mdPrefixAdvancePx 共用 mdRawMarkerIndentPx（内置面下与
+// (m.start+m.cells)*半格 逐像素相同，所以老布局不变）。
+//
+// 引用这里刻意还是 4 格、**不加** mdPrefixAdvancePx 那个 +2px：改造前预留就是 4 格
+// 而内容从 4 格+2px 起（少留 2px 的老毛病）。保留原值 = 内置面用户的行宽一字不差。
+static int mdIndentPx(const std::string &line) {
+    const int cell = g_font.halfAdvance();
     MdListMarker m = mdListMarker(line);
-    if (m.ok) return m.start + m.cells;
+    if (m.ok) {
+        if (m.ordered) return mdRawMarkerIndentPx(line, m);
+        return (m.start + m.cells) * cell;
+    }
     int len = (int)line.size();
-    if (len >= 2 && line[0] == '>' && line[1] == ' ') return 4;
-    return mdPrefixLen(line) > 0 ? 2 : 0;  // heading
+    if (len >= 2 && line[0] == '>' && line[1] == ' ') return 4 * cell;
+    return mdPrefixLen(line) > 0 ? 2 * cell : 0;  // heading
 }
 
 std::vector<VRow> buildVrows(const std::vector<std::string> &lines,
@@ -237,40 +263,49 @@ std::vector<VRow> buildVrows(const std::vector<std::string> &lines,
             vrows.push_back({li, 0, 0});
             continue;
         }
-        int maxc = SCREEN_W / g_font.halfAdvance();
-        int indent = mdIndentCells(line);
+        // 折行预算 = SCREEN_W 里**能排下的整格数** × 半格。刻意不是 SCREEN_W：
+        // 改造前 maxc = SCREEN_W / halfAdvance() 是整除（960/22 = 43 格），右边
+        // 那点零头(14px)本来就没用上。直接用 SCREEN_W 会让**没装外置字体的人**
+        // 也整体重排一遍 —— 那不是这次要改的东西。
+        const int cellw = g_font.halfAdvance();
+        const int maxpx = (SCREEN_W / cellw) * cellw;
+        int indentPx = mdIndentPx(line);
         // 折叠标题行渲染为「级别图标 + uF09DA 折叠标志」共 4 格,比未折叠多 2 格;
         // 折行预留须同步加宽,否则换行处内容会画到屏幕右缘之外。
         if (folding && mdInfoPtr && (*mdInfoPtr)[li].headingLevel > 0 &&
             !(*mdInfoPtr)[li].inCodeBlock && foldedHeadings->count(li)) {
-            indent = 4;
+            indentPx = 4 * cellw;
         }
         int prefixEnd = mdPrefixLen(line);
-        int firstIndent = 0;
+        int firstIndentPx = 0;
         if (firstLineIndent && mdInfoPtr) {
             const MdLineInfo &info = (*mdInfoPtr)[li];
             if (info.headingLevel == 0 && !info.list && !info.task &&
                 !info.quote && !info.inCodeBlock && !info.hr) {
-                firstIndent = 4;  // two Chinese-width characters
+                firstIndentPx = 4 * cellw;  // two Chinese-width characters
             }
         }
         int pos = 0;
         while (pos < len) {
-            int cells = 0;
+            int used = 0;
             int end = pos;
             int lastBreak = -1;
             int pe = (pos == 0) ? prefixEnd : 0;  // only the first vrow has the marker
-            // cap 用标记的格数而非字节数(pe):CJK 标记(如 `一、`/`1、`)字节数大于格数,
-            // 用 pe 会让首 vrow 内容多塞几格、画到屏幕右缘之外。
-            int rowIndent = (pos == 0) ? firstIndent : 0;
-            int cap = maxc - indent - rowIndent + ((pos == 0) ? byteToCells(line, prefixEnd) : 0);
-            if (cap > maxc) cap = maxc;
-            if (cap < 1) cap = 1;
+            // 首 vrow 的记号字节已经画在预留区里了，所以把它占的宽**加回**预算。
+            // 用 byteToX(prefixEnd) 而不是它占的格数：CJK 记号(如 `一、`/`1、`)的
+            // 字节数大于格数，也大于它真正画的宽；量出来的才是它实际吃的宽度。
+            int rowIndentPx = (pos == 0) ? firstIndentPx : 0;
+            int cap = maxpx - indentPx - rowIndentPx + ((pos == 0) ? byteToX(line, prefixEnd) : 0);
+            if (cap > maxpx) cap = maxpx;
+            // 至少容得下当前位置这一个字 —— 否则内层 while 一个都不收，end 不前进，
+            // 外层 while 就死循环了（"格"时代 cap≥1 天然够，改成像素后不够）。
+            int firstAdv = charAdvancePx((unsigned char)line[pos]);
+            if (cap < firstAdv) cap = firstAdv;
             while (end < len) {
                 unsigned char c = (unsigned char)line[end];
-                int cc = charCellWidth(c);
-                if (cells + cc > cap) break;
-                cells += cc;
+                int cc = charAdvancePx(c);
+                if (used + cc > cap) break;
+                used += cc;
                 int clen = utf8CharLen(c);
                 if (c == ' ' && end >= pe) {
                     lastBreak = end + 1;
@@ -282,15 +317,15 @@ std::vector<VRow> buildVrows(const std::vector<std::string> &lines,
                 end += clen;
             }
             if (end >= len) {
-                vrows.push_back({li, pos, len, rowIndent});
+                vrows.push_back({li, pos, len, rowIndentPx});
                 break;
             }
             if (lastBreak > pos) {
-                vrows.push_back({li, pos, lastBreak, rowIndent});
+                vrows.push_back({li, pos, lastBreak, rowIndentPx});
                 pos = lastBreak;
                 while (pos < len && line[pos] == ' ') pos++;
             } else {
-                vrows.push_back({li, pos, end, rowIndent});
+                vrows.push_back({li, pos, end, rowIndentPx});
                 pos = end;
             }
         }
@@ -332,8 +367,8 @@ int imeCandAscent() {
     return a;
 }
 
-// 候选串在候选字号下的像素宽：ASCII = 半格（0.5em），其余取该字号下的字形宽。
-// 与 FontRenderer 的等宽 cell 模型同口径，只是把 line_height_ 换成候选字号。
+// 候选串在候选字号下的像素宽：拉丁按内容字面的**真实步进**（内置面 = 半格），
+// 其余取该字号下的字形宽。与 imeCandDrawText 同一份口径（那边照步进前进）。
 int imeCandStrW(const char *s) {
     if (!s) return 0;
     const int px = imeCandFontPx();
@@ -341,7 +376,9 @@ int imeCandStrW(const char *s) {
     while (*s) {
         const unsigned char c = static_cast<unsigned char>(*s);
         if (c < 0x80) {
-            w += px / 2;
+            w += ttf_font_is_builtin()
+                     ? px / 2
+                     : ttf_char_advance_px(TTF_ROLE_CONTENT, px, (uint32_t)c);
             s += 1;
             continue;
         }
@@ -367,21 +404,20 @@ void imeCandDrawText(int x, int baseline, const char *s, bool invert) {
     // 不选就会让候选字顶着内置字体渲染。画完还原调用方的面。
     const int prev_role = ttf_get_role();
     ttf_set_role(TTF_ROLE_CONTENT);
-    // 拉丁字母按 FontRenderer 同一口径：装了外置字体就用用户字体的字形，仍旧半格
-    // 宽、格内居中（imeCandStrW 量的正是这半格，两边不会打架）。
-    const bool user_latin = !ttf_font_is_builtin();
+    // 拉丁字母按 FontRenderer 同一口径：装了外置字体就用用户字体的字形、**按字体自己的
+    // 步进前进**（不再居中塞半格）；没装就走内置等宽路（半格 + 图标字体字形）。
+    // imeCandStrW 量的正是这份步进，两边不会打架。
     while (*s) {
         const unsigned char c = static_cast<unsigned char>(*s);
         if (c < 0x80) {
-            if (user_latin) {
-                char ch[2] = {static_cast<char>(c), '\0'};
-                const int gw = ttf_text_width_px(px, ch);
-                ttf_draw_text_px(fb, x + (px / 2 - gw) / 2, baseline, px, ch,
-                                 TTF_ALIGN_LEFT, fg, bg);
-            } else {
+            if (ttf_font_is_builtin()) {
                 icon_font_draw_baseline(fb, x, baseline, px / 2, px, c, invert);
+                x += px / 2;
+            } else {
+                char ch[2] = {static_cast<char>(c), '\0'};
+                ttf_draw_text_px(fb, x, baseline, px, ch, TTF_ALIGN_LEFT, fg, bg);
+                x += ttf_char_advance_px(TTF_ROLE_CONTENT, px, (uint32_t)c);
             }
-            x += px / 2;
             s += 1;
             continue;
         }
@@ -396,6 +432,11 @@ void imeCandDrawText(int x, int baseline, const char *s, bool invert) {
     }
     ttf_set_role(prev_role);   // 还原调用方的面（见函数头）
 }
+
+// 编码行的量宽：钉在 g_ime_font（拉丁恒等宽）上。fitTextWidth 的 measure 形参是
+// **函数指针**，成员函数传不进去，所以套这一层；不套就会用 g_font 的比例拉丁去截、
+// 却用 g_ime_font 的等宽去画 —— 量画分家，截出来的 "..." 位置对不上。
+static int imeCodeStrW(const char *s) { return g_ime_font.textWidth(s); }
 
 // ── 输入法条（编码行 + 候选行）的两行高 ──────────────────────────────────
 // 行高**刻意与虚拟键盘不同**：键盘面板的键要指尖点得着，候选行给到 px+20；这条是贴在
@@ -545,25 +586,25 @@ void drawIMEUI(int bottomY) {
 
     // ── 编码行：编码串 + 右端页码（都是界面字号，白底黑字）──
     //
-    // **画用 g_font，不是 g_content_font** —— 编码行是给人逐个字母读的**码**，不是
-    // 正文散文，拉丁必须走内置等宽路（g_font 的第二个模板参数 latinBuiltin=true）。
-    // 量宽本来就用 g_font（下面几行），画却用 g_content_font 的那一版会让"量"和"画"
-    // 分家：格宽恒为半格（charWidth() 对 ASCII 一律 halfAdvance()），而 g_content_font
-    // 在用户选了非内置字体时把**比例**拉丁居中塞进这半格 —— 'i' 空一片、'm' 顶到邻格，
-    // 看着就是"有的稀疏有的挤在一起"。两者共用同一份静态格子（px_/ascent_ 都是 static），
-    // 所以只换字形来源，行高、基线、量宽一个像素都不变。CJK（码串里的模式标签）两边
-    // 同一张内容面，也不受影响。
-    int pageW = g_font.textWidth(pageInfo) + 8;
+    // **整行钉在 g_ime_font 上** —— 这是全工程**唯一**保留"ASCII = 半格"的地方。
+    // 编码行是给人逐个字母读的**码**（"nihao"、"zhong"），不是正文散文：等宽排开才好
+    // 认、才好对着键盘找下一个键；比例排会让 'i' 缩成一条、'm' 撑开，读码的人反而
+    // 得重新找位置。g_ime_font = (role=CONTENT, latinBuiltin=true)：拉丁恒走内置等宽，
+    // CJK（码串里的"拼音/英"这类模式标签）仍走内容面 = 用户选的字体。
+    // 它与 g_font 共用同一份静态格子（px_/ascent_ 都是 static），所以行高、基线不变。
+    // **量（imeCodeStrW）与画（g_ime_font）必须同一个实例**，否则截出来的 "..." 会
+    // 按比例拉丁算、按等宽画。
+    int pageW = g_ime_font.textWidth(pageInfo) + 8;
     int pageX = SCREEN_W - pageW - 4;
-    code = fitTextWidth(code, pageX - 12);
-    int codeW = g_font.textWidth(code.c_str()) + 8;
+    code = fitTextWidth(code, pageX - 12, imeCodeStrW);
+    int codeW = g_ime_font.textWidth(code.c_str()) + 8;
     u8g2_DrawBox(g_u8g2, 4, codeBase - g_font.ascent(), codeW, FONT_H);
     u8g2_SetDrawColor(g_u8g2, 0);
-    g_font.drawText(4, codeBase, code.c_str(), false);
+    g_ime_font.drawText(4, codeBase, code.c_str(), false);
     u8g2_SetDrawColor(g_u8g2, 1);
     u8g2_DrawBox(g_u8g2, pageX, codeBase - g_font.ascent(), pageW, FONT_H);
     u8g2_SetDrawColor(g_u8g2, 0);
-    g_font.drawText(pageX + 4, codeBase, pageInfo, false);
+    g_ime_font.drawText(pageX + 4, codeBase, pageInfo, false);
     u8g2_SetDrawColor(g_u8g2, 1);
 
     u8g2_SetDrawColor(g_u8g2, 0);

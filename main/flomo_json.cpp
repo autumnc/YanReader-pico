@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <esp_log.h>
+
 // 本地笔记库最大能读多大。Flomo 的 memos.json 是整库序列化，几千条笔记也就几百 KB；
 // 给 4MB 上限（SD 上读进 PSRAM，见 sdkconfig 的 SPIRAM_MALLOC_ALWAYSINTERNAL=0，
 // 大块 std::string 自动落 PSRAM）。超过就当作坏文件忽略，不让它把内存吃光。
@@ -312,7 +314,14 @@ JsonValue JsonValue::parse(const std::string &json) {
 
 JsonValue JsonValue::loadFromFile(const std::string &path) {
     std::string buf = flomoReadWholeFile(path);
-    if (buf.empty() || (long)buf.size() > MAX_JSON_FILE_SIZE) return JsonValue(nullptr);
+    if (buf.empty()) return JsonValue(nullptr);
+    if ((long)buf.size() > MAX_JSON_FILE_SIZE) {
+        // 别静默：整库超限 = 读出来空库 = 界面上「暂无笔记」，看着像"笔记全丢了"。
+        // 至少让串口日志说出真实原因（上限本身的值见文件头的说明）。
+        ESP_LOGE("FlomoJson", "memos 库 %ld 字节超过 %ld 上限，整库忽略: %s",
+                 (long)buf.size(), MAX_JSON_FILE_SIZE, path.c_str());
+        return JsonValue(nullptr);
+    }
     return parse(buf);
 }
 

@@ -109,7 +109,7 @@ static void drawResult() {
     for (int i = 0; i < vis && (g.scroll + i) < (int)g.vrows.size(); i++) {
         const VRow &vr = g.vrows[g.scroll + i];
         std::string row = g.lines[vr.lineIdx].substr(vr.start, vr.end - vr.start);
-        ui_draw_text(8 + vr.indentCells * g_font.halfAdvance(), y + i * LINE_SPACING, row.c_str());
+        ui_draw_text(8 + vr.indentPx, y + i * LINE_SPACING, row.c_str());
     }
     if (g.vrows.empty()) ui_draw_text(8, y, "(无内容)");
 
@@ -128,7 +128,7 @@ static void drawError() {
     if (vis < 1) vis = 1;
     for (int i = 0; i < vis && i < (int)evrows.size(); i++) {
         std::string row = g.error.substr(evrows[i].start, evrows[i].end - evrows[i].start);
-        ui_draw_text(8 + evrows[i].indentCells * g_font.halfAdvance(), y + i * LINE_SPACING, row.c_str());
+        ui_draw_text(8 + evrows[i].indentPx, y + i * LINE_SPACING, row.c_str());
     }
     ui_draw_status("任意键返回", "");
     ui_commit();

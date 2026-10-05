@@ -6,6 +6,7 @@
 #   tests/host/ime/run.sh --verify-fix       # prove the regression fails on the pre-fix IME.cpp
 #   tests/host/ime/run.sh zhege 1            # build, then one ad-hoc diagnostic scenario
 #   tests/host/ime/run.sh --regress jiushi 就是
+#   tests/host/ime/run.sh --enter nihao      # 输入中按回车 → 编码原样上屏（加 --highlight 换语义）
 #
 # Plain g++ -std=c++17; no ESP-IDF, no CMake, no device.
 set -euo pipefail
@@ -63,10 +64,31 @@ run_regress() {
     return $failed
 }
 
+# 「输入中按回车 = 编码原样上屏」（用户 2026-10-05 报告"这个功能没了"）。不放进
+# run_regress：那组是拿 pre-fix 的 IME.cpp 反证用的，而这条从来没坏过 —— 它是
+# **回归护栏**，钉住这个语义别在以后被改掉。
+ENTER_CASES=("--enter nihao" "--enter zhege" "--enter nihao --highlight")
+
+run_enter() {
+    local bin="$1" expect="$2" failed=0
+    for case in "${ENTER_CASES[@]}"; do
+        if "$bin" $case > "$BUILD/enter.out" 2>&1; then
+            echo "  pass [$expect] $case"
+        else
+            echo "  FAIL [$expect] $case"
+            sed -n '/=== Enter/,$p' "$BUILD/enter.out"
+            failed=1
+        fi
+    done
+    return $failed
+}
+
 case "${1:-}" in
     --regress-only)
         echo ">> regression test (current main/ime/IME.cpp)"
         run_regress "$BIN" "current"
+        echo ">> Enter contract"
+        run_enter "$BIN" "current"
         echo ">> regression passed"
         exit 0
         ;;
@@ -120,4 +142,9 @@ echo "############################################################"
 echo "# regression test (zhege/jiushi, both paging modes)"
 echo "############################################################"
 run_regress "$BIN" "current"
+echo
+echo "############################################################"
+echo "# 输入中按回车 = 编码原样上屏"
+echo "############################################################"
+run_enter "$BIN" "current"
 echo ">> all regression cases passed"

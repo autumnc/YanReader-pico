@@ -47,10 +47,23 @@ bool icon_font_init(void) {
     return true;
 }
 
+// 子集里真有这个字形吗？（只给补充平面 PUA 用，见下面的说明。）
+static bool icon_font_has_cp(uint32_t cp) {
+    return s_ready && stbtt_FindGlyphIndex(&s_info, (int)cp) != 0;
+}
+
 bool icon_font_is_icon(uint32_t cp) {
     // ASCII (< 0x80) 由 FontRenderer 单独路由到等宽图标字体，不在此判断。
     // PUA (Nerd Font 图标)
     if (cp >= 0xE000 && cp <= 0xF8FF) return true;
+    // 补充平面 PUA（MDI 图标全在这里，本子集是 U+F0046..U+F1AF1）。**旧判据整段漏掉**，
+    // 而 markdown 的标题级别图标(U+F03A4..)/待办框(U+F0131/F0132)/折叠标志(U+F09DA)
+    // 是当**文本**画的（走 FontRenderer::drawCellGlyph 的字形路）：判据为假就落到 TTF
+    // 文本面，内置面与用户字体都没有这些码位 → 一个字也画不出来（"标题图标、任务图标
+    // 缺了"的根因，与装没装外置字体无关）。
+    // 判据以**字体里真有这个字形**为准，而不是拍一段范围：往子集里加图标不必回来改这里；
+    // 子集里没有的码位也不会被误判成图标（继续走文本路，与从前一致）。
+    if (cp >= 0xF0000 && cp <= 0x10FFFD) return icon_font_has_cp(cp);
     // 全角字符 (IME 全角模式 + 竖排标点)：FF01-FF5E + 表意空格 + 半角假名标点
     if (icon_font_is_fullwidth(cp)) return true;
     switch (cp) {

@@ -9,8 +9,11 @@ class IME;
 
 struct MdLineInfo;
 
-// VRow structure for word-wrap rendering
-struct VRow { int lineIdx; int start; int end; int indentCells = 0; };
+// VRow structure for word-wrap rendering.
+// indentPx = 该 vrow 的**首行缩进**（像素，普通段的首 vrow 才是 4 个半格，其余 0）。
+// 从前叫 indentCells，是格数；拉丁改成按字体真实步进排之后，"格"不再是通用单位，
+// 所以整条布局链（buildVrows / mdVrowX / 各消费点）都改用像素。
+struct VRow { int lineIdx; int start; int end; int indentPx = 0; };
 
 // ── 屏幕几何：运行时取值（横屏 1216×684 | 竖屏 684×1216）──
 // 由 hw/board.cpp 的 epd_set_rotation 决定，切换方向后调用方整屏重刷。
@@ -157,8 +160,8 @@ void uiFontGuard(const char *who);
 // 一条，px+8），见 editor_vk.cpp 的 evkCandRowH 与 ui_helpers.cpp 的 imeBarRowH。
 int imeCandFontPx();                // 设置值 clamp 到 [28,96]，认不出 → 45
 int imeCandAscent();                // 该字号下的 ascent（字体没就绪 → 0.78em 近似）
-int imeCandStrW(const char *s);     // 候选串在该字号下的像素宽（ASCII = 半格，CJK = 字号宽）
-// 按候选字号直绘一段候选串（ASCII 半格走图标/比例拉丁，CJK 走 TTF）。invert = 反白
+int imeCandStrW(const char *s);     // 候选串在该字号下的像素宽（拉丁按真实步进，CJK = 字号宽）
+// 按候选字号直绘一段候选串（拉丁按真实步进前进，CJK 走 TTF 全角）。invert = 反白
 // （调用方已填黑底，这里把字画白）。内部临时切到内容面，画完还原。
 void imeCandDrawText(int x, int baseline, const char *s, bool invert);
 
@@ -187,9 +190,11 @@ void restore_wifi_state(bool wasConnected);
 // NTP time sync helper
 bool syncNtpTime(const std::string &ntpServer, const std::string &timezone);
 
-// Word-wrap cell conversion helpers
-int byteToCells(const std::string &line, int byteOffset);
-int cellsToByte(const std::string &line, int start, int end, int targetCells);
+// Word-wrap byte ⇄ x(像素) 换算（从前是 byteToCells/cellsToByte 的"格"制版）。
+// 拉丁按字体真实步进排之后，一行里的字符宽度不再整齐，"格"这个单位在布局链上
+// 已经没有意义，所以统一换成像素。ASCII 的口径见 ui_helpers.cpp 的 charAdvancePx。
+int byteToX(const std::string &line, int byteOffset);
+int xToByte(const std::string &line, int start, int end, int targetX);
 
 // Word/body helpers
 int countVisibleChars(const std::string &text);

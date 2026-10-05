@@ -22,6 +22,7 @@
 #include "hw/input.h"
 #include "editor_vk.h"   // 虚拟键盘：检索框没连蓝牙键盘时的唯一输入途径
 #include "text_sel.h"    // 单行输入框的触摸选字 / 粘贴板（三模式共享底层件）
+#include "clipboard.h"   // 长按菜单的「复制内容」
 
 #include <cstdio>
 #include <cstring>
@@ -40,7 +41,7 @@ extern "C" {
 #define FLOMO_TMP_PREFIX "/sdcard/pjournal/__flomo_"
 #define FLOMO_SYNC_ICON 0xF063F   // MENU 组里的 md-cloud-sync，已在图标子集内
 
-enum FlomoMode { FM_LIST, FM_DETAIL, FM_CONFIRM_DELETE, FM_SEARCH, FM_HELP };
+enum FlomoMode { FM_LIST, FM_DETAIL, FM_CONFIRM_DELETE, FM_SEARCH, FM_HELP, FM_ITEM_MENU };
 
 static struct {
     FlomoMode mode = FM_LIST;
@@ -51,6 +52,7 @@ static struct {
     int scroll = 0;
     int detailScroll = 0;
     int helpScroll = 0;
+    int menuSel = 0;             // FM_ITEM_MENU 里高亮的是第几项
 
     std::string query;
     std::string tag;
@@ -337,28 +339,84 @@ static bool flomoSync() {
 
 // ── 绘制 ──────────────────────────────────────────────────────────────────
 
+// 右下角竖成一列的浮动按钮：slot 0 在最下（云同步/编辑），往上每格让开 8px。
+// 同一套几何给绘制与命中共用，改一处两边一起动。
 static int flomoFabPx() { return 52; }
 static int flomoFabX() { return SCREEN_W - 12 - flomoFabPx(); }
-static int flomoFabY() { return STATUS_BAR_Y - 10 - flomoFabPx(); }
-static bool flomoFabHit(int x, int y) {
+static int flomoFabY(int slot) {
+    return STATUS_BAR_Y - 10 - flomoFabPx() - slot * (flomoFabPx() + 8);
+}
+static bool flomoFabHit(int slot, int x, int y) {
     const int pad = 8, b = flomoFabPx();
     return x >= flomoFabX() - pad && x <= flomoFabX() + b + pad &&
-           y >= flomoFabY() - pad && y <= flomoFabY() + b + pad;
+           y >= flomoFabY(slot) - pad && y <= flomoFabY(slot) + b + pad;
 }
+// 整列占掉的竖向高度（详情页正文要避开它，否则末尾几行右端被按钮压住）。
+static int flomoFabColH() { return 2 * flomoFabPx() + 8 + 10; }
 
-// 右下角的"手动同步"按钮：一个云同步图标（FAB_ICON 那一套画法，直写帧缓冲）。
-static void drawSyncFab() {
-    const int b = flomoFabPx();
-    const int x = flomoFabX(), y = flomoFabY();
+// 按钮底：**白底实心** + 黑框。实心是为了压住底下的列表文字——只画一圈框的话
+// 字会从按钮里透出来绞在一起。
+static void flomoFabBox(int slot) {
+    const int b = flomoFabPx(), x = flomoFabX(), y = flomoFabY(slot);
     u8g2_SetDrawColor(g_u8g2, 1);
-    u8g2_DrawFrame(g_u8g2, x, y, b, b);
+    u8g2_DrawBox(g_u8g2, x, y, b, b);
     u8g2_SetDrawColor(g_u8g2, 0);
     u8g2_DrawFrame(g_u8g2, x, y, b, b);
+}
+
+// 图标字体不走 u8g2，直接写 4bpp 帧缓冲（与 screen_editor 同一手法）。
+static void flomoFabIcon(int slot, uint32_t cp) {
+    const int b = flomoFabPx(), x = flomoFabX(), y = flomoFabY(slot);
     uint8_t *fb = g_u8g2 ? u8g2_GetBufferPtr(g_u8g2) : nullptr;
-    if (fb) {
-        int gpx = b - 16;
-        icon_font_draw_sized(fb, x + (b - gpx) / 2, y + (b - gpx) / 2, gpx, gpx,
-                             FLOMO_SYNC_ICON, false, gpx);
+    if (!fb) return;
+    int gpx = b - 16;
+    icon_font_draw_sized(fb, x + (b - gpx) / 2, y + (b - gpx) / 2, gpx, gpx, cp, false, gpx);
+}
+
+// 列表的"手动同步"按钮。
+static void drawSyncFab() {
+    flomoFabBox(0);
+    flomoFabIcon(0, FLOMO_SYNC_ICON);
+}
+
+// 列表的"新建"按钮。图标子集里没有 plus 字形，为它重裁一次字体不划算，
+// 两条实心矩形更省事（照抄阅读模式文件浏览页的 fbDrawNewFab）。
+static void drawNewFab() {
+    flomoFabBox(1);
+    const int b = flomoFabPx(), x = flomoFabX(), y = flomoFabY(1);
+    const int cx = x + b / 2, cy = y + b / 2;
+    const int arm = b / 2 - 10;                 // 笔画半长
+    const int t = std::max(2, b / 12);          // 笔画粗细
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawBox(g_u8g2, cx - arm, cy - t / 2, 2 * arm, t);
+    u8g2_DrawBox(g_u8g2, cx - t / 2, cy - arm, t, 2 * arm);
+}
+
+// 详情页的"编辑"按钮。0x270E(✎) 在 icon_font.c 里被重映射到 md-pencil 0xF03EB，
+// 该字形已在图标子集内（启动日志里实测画得出），不用新裁字形。
+static void drawEditFab() {
+    flomoFabBox(0);
+    flomoFabIcon(0, 0x270E);
+}
+
+// 详情页的"删除"按钮：垃圾桶同样程序化画（横盖 + 提手 + 桶身边框 + 两条竖棱）。
+static void drawTrashFab(int slot) {
+    flomoFabBox(slot);
+    const int b = flomoFabPx(), x = flomoFabX(), y = flomoFabY(slot);
+    const int m = b / 6;                 // 四周留白
+    const int t = std::max(2, b / 16);   // 盖/棱的厚度
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawBox(g_u8g2, x + b / 2 - b / 12, y + m - t, b / 6, t);   // 提手
+    u8g2_DrawBox(g_u8g2, x + m - 2, y + m, b - 2 * m + 4, t);        // 横盖
+    const int bx = x + m + 3, by = y + m + t + 2;
+    const int bw = b - 2 * m - 6, bh = (y + b - m) - by;
+    if (bw > 4 && bh > 6) {
+        u8g2_DrawFrame(g_u8g2, bx, by, bw, bh);                      // 桶身
+        const int ribH = bh - 10;
+        if (ribH > 2) {
+            u8g2_DrawBox(g_u8g2, bx + bw / 2 - 6, by + 5, t, ribH);  // 桶内两条竖棱
+            u8g2_DrawBox(g_u8g2, bx + bw / 2 + 4, by + 5, t, ribH);
+        }
     }
 }
 
@@ -368,7 +426,8 @@ static std::string listStatusLeft() {
     return "Enter详情  N新建  E编辑  D删除  R同步";
 }
 
-static void drawList() {
+// 列表的画面本体（不含提交）：长按菜单要在这上面盖浮层再一次性提交。
+static void drawListBody() {
     ui_clear();
     ui_draw_text_content(4, g_font.ascent(), "Flomo", false);
     {
@@ -401,8 +460,14 @@ static void drawList() {
         ui_draw_text_content(8, y, msg);
     }
 
+    // 浮动按钮最后画，天然压在列表行上面。
     drawSyncFab();
+    drawNewFab();
     ui_draw_status(listStatusLeft().c_str(), "");
+}
+
+static void drawList() {
+    drawListBody();
     ui_commit();
 }
 
@@ -416,9 +481,10 @@ static int listRowAtY(int ty) {
     return fi;
 }
 
-static void drawDetail() {
+// 详情的画面本体（不含提交）：确认框 / 长按菜单要盖在它上面。
+static void drawDetailBody() {
     ui_clear();
-    if (g.filtered.empty()) { drawList(); return; }
+    if (g.filtered.empty()) { drawListBody(); return; }
     const Memo &m = g.store.memos[g.filtered[g.sel]];
 
     ui_draw_text_content(4, g_font.ascent(), m.updatedAt.c_str(), false);
@@ -433,7 +499,11 @@ static void drawDetail() {
 
     std::vector<std::string> lines = wrapText(m.contentText, SCREEN_W - 16);
     int top = sepY + LINE_SPACING;
-    int vis = (STATUS_Y - top) / LINE_SPACING;
+    // 右下角那列浮动按钮占掉的竖向空间要扣掉：正文不往按钮底下铺，否则末尾几行
+    // 的右端会被不透明的按钮压住。按钮列锚在 STATUS_BAR_Y 上（不是 STATUS_Y，
+    // 两者差 4px），所以这里的下界也取 STATUS_BAR_Y，与 flomoFabY() 对得上。
+    // （列表页是一行短标题，那边就不预留了。）
+    int vis = (STATUS_BAR_Y - flomoFabColH() - top) / LINE_SPACING;
     if (vis < 1) vis = 1;
     int maxScroll = (int)lines.size() - vis;
     if (maxScroll < 0) maxScroll = 0;
@@ -445,13 +515,97 @@ static void drawDetail() {
     }
     if (lines.empty()) ui_draw_text_content(8, top, "（空）");
 
+    drawEditFab();
+    drawTrashFab(1);
     ui_draw_status(m.dirty ? "未同步·E编辑 D删除 Esc返回" : "E编辑 D删除 Esc返回", "");
+}
+
+static void drawDetail() {
+    drawDetailBody();
     ui_commit();
 }
 
 static void drawConfirmDelete() {
-    drawDetail();
+    drawDetailBody();
     ui_draw_confirm_dialog("确认删除这条笔记？", "Enter确认  Esc取消", "");
+    ui_commit();
+}
+
+// ── 长按一条笔记弹的菜单 ──────────────────────────────────────────────────
+// 照 GTD 的 M_ITEM_MENU 那一套：居中方框的几何被**绘制与命中共用**；动作表只管
+// "选中之后干什么"；执行时把选项映射回已有的键盘动作，菜单本身不含业务逻辑。
+
+enum FlomoMenuAct { FMA_EDIT, FMA_COPY, FMA_DELETE, FMA_CANCEL };
+static const FlomoMenuAct kFlomoMenuActs[] = {FMA_EDIT, FMA_COPY, FMA_DELETE, FMA_CANCEL};
+static const int FLOMO_MENU_N = sizeof(kFlomoMenuActs) / sizeof(kFlomoMenuActs[0]);
+
+static const char *flomoMenuLabel(FlomoMenuAct a) {
+    switch (a) {
+    case FMA_EDIT:   return "编辑";
+    case FMA_COPY:   return "复制内容";
+    case FMA_DELETE: return "删除";
+    default:         return "取消";
+    }
+}
+
+static void flomoMenuBoxRect(int *bx, int *by, int *bw, int *bh) {
+    int w = 0;
+    for (int i = 0; i < FLOMO_MENU_N; i++) {
+        int tw = g_font.textWidth(flomoMenuLabel(kFlomoMenuActs[i])) + 2 * FONT_H;
+        if (tw > w) w = tw;
+    }
+    if (w < 160) w = 160;
+    if (w > SCREEN_W - 32) w = SCREEN_W - 32;
+    *bw = w;
+    *bh = FLOMO_MENU_N * LINE_SPACING + 16;
+    *bx = (SCREEN_W - w) / 2;
+    *by = (SCREEN_H - *bh) / 2;
+}
+
+// 每一项文字的基线（相对浮层顶）：绘制与命中共用同一个式子。
+static int flomoMenuRowY(int by, int i) { return by + 8 + g_font.ascent() + i * LINE_SPACING; }
+
+// 点按落在第几项；-1 = 落在框外（= 关闭菜单）。
+static int flomoMenuHitAt(int x, int y) {
+    int bx, by, bw, bh;
+    flomoMenuBoxRect(&bx, &by, &bw, &bh);
+    if (x < bx || x >= bx + bw || y < by || y >= by + bh) return -1;
+    int i = (y - by - 8) / LINE_SPACING;
+    if (i < 0) i = 0;
+    if (i >= FLOMO_MENU_N) i = FLOMO_MENU_N - 1;
+    return i;
+}
+
+// 列表 + 居中浮层，**一次提交**（浮层要赶在 ui_commit 之前画进同一块缓冲；
+// 提交完再往那块缓冲上画就是跟 core1 抢同一帧了）。
+static void drawItemMenu() {
+    drawListBody();
+
+    int bx, by, bw, bh;
+    flomoMenuBoxRect(&bx, &by, &bw, &bh);
+    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawBox(g_u8g2, bx, by, bw, bh);
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawFrame(g_u8g2, bx, by, bw, bh);
+
+    for (int i = 0; i < FLOMO_MENU_N; i++) {
+        const char *lb = flomoMenuLabel(kFlomoMenuActs[i]);
+        int ty = flomoMenuRowY(by, i);
+        int tx = bx + (bw - g_font.textWidth(lb)) / 2;
+        if (i == g.menuSel) {
+            // 选中行反白：填黑底 + drawText(...,true) 画白字。
+            // **不能**靠 u8g2_SetDrawColor 反色 —— TTF 渲染器完全不吃那个。
+            u8g2_SetDrawColor(g_u8g2, 0);
+            u8g2_DrawBox(g_u8g2, bx + 4, ty - g_font.ascent() - 2, bw - 8, FONT_H + 4);
+            u8g2_SetDrawColor(g_u8g2, 1);
+            g_font.drawText(tx, ty, lb, true);
+            u8g2_SetDrawColor(g_u8g2, 0);
+        } else {
+            g_font.drawText(tx, ty, lb, false);
+        }
+    }
+
+    ui_commit();
 }
 
 // 检索框里文本的左端 / 基线：绘制与触摸命中共用。
@@ -522,6 +676,10 @@ static const char *HELP_LINES[] = {
     "R     手动同步（连 WiFi）",
     "/     搜索",
     "Esc   返回",
+    "",
+    "触摸：右下角 + 新建、云同步；",
+    "详情页右下角 = 编辑 / 删除；",
+    "长按一条笔记 = 弹出菜单。",
     "",
     "同步说明：新增/修改只存本地，",
     "带 * 的条目表示还没同步；",
@@ -702,6 +860,22 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
                     drawSearch();
                     return APP_FLOMO;
                 }
+                // 没落在检索行上：落在某条**结果**行上就弹同一个笔记菜单，
+                // 否则才交给下面既有的"长按 = 返回"分支。
+                // （下半屏才算结果区——否则点检索行右端的空白会被当成本页第一行。）
+                if (hasTap && ty >= FONT_H + 4 + LINE_SPACING / 2) {
+                    int rfi = listRowAtY(ty);
+                    if (rfi >= 0) {
+                        g.searchIme = false;
+                        g_ime.setActive(false);
+                        editorVkAutoHide();
+                        g.sel = rfi;
+                        g.menuSel = 0;
+                        g.mode = FM_ITEM_MENU;
+                        drawItemMenu();
+                        return APP_FLOMO;
+                    }
+                }
                 key = 0x1B;   // 没落在检索行上 → 交给下面既有的"长按 = 返回"分支
             } else if (key != 0 &&
                        textSelHandleKey(g.searchBuf, g.searchCur, fview, key, tx, ty, hasTap,
@@ -791,11 +965,69 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
         else if (key == KEY_PAGE_UP) { g.detailScroll -= 5; if (g.detailScroll < 0) g.detailScroll = 0; }
         else if (key == KEY_PAGE_DOWN) { g.detailScroll += 5; }
         else if (key == '\n') {
-            // 触摸点按 = 返回列表（笔记长时用上下键滚）。
+            // 触摸点按：右下角浮动按钮（编辑 / 删除）优先，点别处 = 返回列表
+            // （笔记长时用上下键滚）。
             int tx = 0, ty = 0;
-            if (input_tap_xy(&tx, &ty)) { g.mode = FM_LIST; drawList(); return APP_FLOMO; }
+            if (input_tap_xy(&tx, &ty)) {
+                if (!g.filtered.empty()) {
+                    const Memo &m = g.store.memos[g.filtered[g.sel]];
+                    if (flomoFabHit(0, tx, ty)) return openEditorFor(ctx, m.slug, m.contentText);
+                    if (flomoFabHit(1, tx, ty)) {
+                        g.mode = FM_CONFIRM_DELETE;
+                        drawConfirmDelete();
+                        return APP_FLOMO;
+                    }
+                }
+                g.mode = FM_LIST;
+                drawList();
+                return APP_FLOMO;
+            }
         }
         drawDetail();
+        return APP_FLOMO;
+    }
+
+    // ── 长按弹出的笔记菜单 ──
+    case FM_ITEM_MENU: {
+        // 触摸：落在框内某行 = 选中它再当 Enter 执行；落在框外 = 关闭。
+        if (key == '\n') {
+            int tx = 0, ty = 0;
+            if (input_tap_xy(&tx, &ty)) {   // 键盘 Enter 没有待取的点按，不会进这里
+                int hit = flomoMenuHitAt(tx, ty);
+                if (hit < 0) { g.mode = FM_LIST; drawList(); return APP_FLOMO; }
+                g.menuSel = hit;
+            }
+            key = 0x0A;
+        }
+        if (key == KEY_UP || key == 'k') {
+            if (g.menuSel > 0) g.menuSel--;
+        } else if (key == KEY_DOWN || key == 'j') {
+            if (g.menuSel < FLOMO_MENU_N - 1) g.menuSel++;
+        } else if (key == 0x0A || key == 0x0D) {
+            FlomoMenuAct a = (g.menuSel >= 0 && g.menuSel < FLOMO_MENU_N)
+                                 ? kFlomoMenuActs[g.menuSel] : FMA_CANCEL;
+            g.mode = FM_LIST;   // 无论选哪项都先退出浮层（也覆盖去编辑器再回来的情形）
+            if (!g.filtered.empty()) {
+                const Memo &m = g.store.memos[g.filtered[g.sel]];
+                if (a == FMA_EDIT) return openEditorFor(ctx, m.slug, m.contentText);
+                if (a == FMA_COPY) {
+                    clipboardPush(m.contentText);
+                    g.status = clipboardLastTruncated() ? "已复制到粘贴板（超长已截断）"
+                                                        : "已复制到粘贴板";
+                } else if (a == FMA_DELETE) {
+                    g.mode = FM_CONFIRM_DELETE;   // 复用现有确认框与删除逻辑
+                    drawConfirmDelete();
+                    return APP_FLOMO;
+                }
+            }
+            drawList();
+            return APP_FLOMO;
+        } else if (key == 0x1B || key == 'q' || key == 'Q') {
+            g.mode = FM_LIST;
+            drawList();     // 别落到下面的 drawItemMenu（那样会多画一帧浮层）
+            return APP_FLOMO;
+        }
+        drawItemMenu();
         return APP_FLOMO;
     }
 
@@ -803,15 +1035,19 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
     default: break;
     }
 
-    // 触摸长按：列表行上 = 删除确认
+    // 触摸长按：列表行上 = 弹出笔记菜单（编辑/复制/删除）
     if (key == KEY_TOUCH_LONG) {
         int tx = 0, ty = 0;
         if (input_tap_xy(&tx, &ty)) {
+            // 长按落在浮动按钮上：什么都不做。少了这个守卫，"长按按钮"会落进
+            // 下面那句"长按空白 = 退出界面"（蓝牙管理页有同样的守卫）。
+            if (flomoFabHit(0, tx, ty) || flomoFabHit(1, tx, ty)) return APP_FLOMO;
             int fi = listRowAtY(ty);
             if (fi >= 0) {
                 g.sel = fi;
-                g.mode = FM_CONFIRM_DELETE;
-                drawConfirmDelete();
+                g.menuSel = 0;
+                g.mode = FM_ITEM_MENU;
+                drawItemMenu();
                 return APP_FLOMO;
             }
         }
@@ -824,7 +1060,9 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
     if (key == '\n') {
         int tx = 0, ty = 0;
         if (input_tap_xy(&tx, &ty)) {
-            if (flomoFabHit(tx, ty)) {
+            // 浮动按钮优先于行命中：顺序即优先级。
+            if (flomoFabHit(1, tx, ty)) return openEditorFor(ctx, "", "");   // ＋ 新建
+            if (flomoFabHit(0, tx, ty)) {                                    // 云 同步
                 flomoSync();
                 g.mode = FM_LIST;
                 drawList();

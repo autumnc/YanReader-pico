@@ -275,7 +275,9 @@ static int mdContentWidth(const std::string &line, int from, int to) {
                 }
             }
         }
-        if (closeIdx < 0) { px += g_font.halfAdvance(); i = m + 1; continue; }  // unmatched literal
+        // 未配对的记号当字面量画：按**这个字符的真实步进**量（记号都是 ASCII），
+        // 否则量出来是半格、画出来是字体真实的宽 —— 光标/选区直接跟着这个 x 走，会错位。
+        if (closeIdx < 0) { px += g_font.charWidth((uint32_t)(unsigned char)c); i = m + 1; continue; }
         int openEnd = m + openLen;
         if (to <= openEnd) break;  // inside hidden open marker
         int closeEnd = closeIdx + closeLen;
@@ -717,16 +719,53 @@ std::vector<char> mdFoldHiddenLines(const std::vector<std::string> &lines,
     return hidden;
 }
 
+// 有序记号的前缀像素宽：原文是**照原样画**的（见 mdParseLine 的 " " + 原文），
+// 所以量原文。唯一真相在这里 —— buildVrows 的折行预留与 mdPrefixAdvancePx 的内容
+// 起点都调它，两处算式不可能各写一份（差一格就是记号压字）。
+// 内置面下它恒等于 (m.start + m.cells) * 半格：mdListMarker 保证 cells 就是
+// "前导空白 + 原文格数 + 1 格右移"。
+int mdRawMarkerIndentPx(const std::string &line, const MdListMarker &m) {
+    int mend = m.start + m.len;
+    if (mend > (int)line.size()) mend = (int)line.size();
+    return g_font.textWidth((" " + line.substr(0, mend)).c_str());
+}
+
+// 渲染前缀的像素宽 = 内容真正开始的那个 x（不含调用方加的左边界 4/8px）。
+// **这是"记号该占多宽"的唯一真相**：ui_helpers 的 buildVrows 用它做折行预留、
+// 本文件的 mdVisualX/mdVrowX 用它算内容起点 —— 于是"预留的"与"画出来的"不可能打架。
+// （从前这件事由 MdListMarker::cells 兼职，那是**格**制的，只在"ASCII 记号字节 = 1 格"
+// 时成立；装了外置字体后拉丁记号的实际宽度不再等于 cells×半格，预留就会漂。）
+//
+// 折叠标题的前缀宽 4 格（级别图标 + uF09DA 折叠标志），比未折叠多 2 格。
+int mdPrefixAdvancePx(const std::string &line, const MdLineInfo &info, bool folded) {
+    const int cell = g_font.halfAdvance();
+    if (info.headingLevel > 0) return (folded ? 4 : 2) * cell;
+    if (info.quote) return 4 * cell + 2;   // 引用条在 3 格处，内容从 4 格 + 2px 起
+    if (info.list || info.task) {
+        MdListMarker m = mdListMarker(line);
+        if (!m.ok) return 0;
+        if (m.ordered) {
+            // 有序序号是**原文渲染**的，量原文（算式见 mdRawMarkerIndentPx —— 与
+            // buildVrows 的折行预留同一支）。内置面下与本来的 (m.start+m.cells)*cell
+            // 逐像素相同；装了外置字体后量的就是它真实画出来的宽。
+            return mdRawMarkerIndentPx(line, m);
+        }
+        // 无序/待办的记号被**替换字形**顶掉（• / 待办框），替换字形的实际宽度不等于
+        // 这个设计常量 —— 那是改造前就有的偏差，不在这里动：预留继续按设计常量，
+        // 内置面用户因此逐像素不变。
+        return (m.start + m.cells) * cell;
+    }
+    return 0;
+}
+
 int mdVisualX(const std::string &line, const MdLineInfo &info, int bytePos,
               int cursorBytePos, bool folded) {
     if (!s_mdEnabled) return g_font.textWidth(line.substr(0, bytePos).c_str());
     if (cursorBytePos >= 0) return mdParsedX(line, info, bytePos, cursorBytePos, folded);
     if (info.inCodeBlock || info.hr) return g_font.textWidth(line.substr(0, bytePos).c_str());
-    int cell = g_font.halfAdvance();
     if (info.headingLevel > 0) {
-        int prefixCells = folded ? 4 : 2;  // 折叠时:级别图标 + uF09DA 折叠标志
         if (bytePos >= info.headingLevel)
-            return prefixCells * cell + mdContentWidth(line, info.headingLevel, bytePos);
+            return mdPrefixAdvancePx(line, info, folded) + mdContentWidth(line, info.headingLevel, bytePos);
         return 0;
     }
     if (info.list || info.task) {
@@ -734,16 +773,19 @@ int mdVisualX(const std::string &line, const MdLineInfo &info, int bytePos,
         if (m.ok) {
             int mend = m.start + m.len;
             if (bytePos >= mend)
-                return (m.start + m.cells) * cell + mdContentWidth(line, mend, bytePos);
+                return mdPrefixAdvancePx(line, info, folded) + mdContentWidth(line, mend, bytePos);
             if (bytePos <= m.start)
                 return mdContentWidth(line, 0, bytePos);
-            return (m.start + (bytePos - m.start)) * cell;  // inside marker (approx)
+            // 落在被替换掉的记号原文里：有序量原文（与前缀同一口径），无序保持近似
+            if (m.ordered)
+                return g_font.textWidth((std::string(" ") + line.substr(0, bytePos)).c_str());
+            return (m.start + (bytePos - m.start)) * g_font.halfAdvance();
         }
         return mdContentWidth(line, 0, bytePos);
     }
     if (info.quote) {
         if (bytePos >= 2)
-            return 4 * cell + 2 + mdContentWidth(line, 2, bytePos);
+            return mdPrefixAdvancePx(line, info, folded) + mdContentWidth(line, 2, bytePos);
         return mdContentWidth(line, 0, bytePos);
     }
     return mdContentWidth(line, 0, bytePos);
@@ -754,8 +796,8 @@ int mdVisualX(const std::string &line, const MdLineInfo &info, int bytePos,
 // prefix indent so wrapped text stays aligned under the first line. Without
 // this, wrapped lines were placed at their whole-line x, i.e. off-screen.
 int mdVrowX(const std::string &line, const MdLineInfo &info, int bytePos, int vrowStart,
-            int indentCells, int cursorBytePos, bool folded) {
-    int extra = indentCells * g_font.halfAdvance();
+            int indentPx, int cursorBytePos, bool folded) {
+    int extra = indentPx;
     if (!s_mdEnabled)
         return extra + g_font.textWidth(line.substr(vrowStart, bytePos - vrowStart).c_str());
     if (cursorBytePos >= 0) {
@@ -763,22 +805,14 @@ int mdVrowX(const std::string &line, const MdLineInfo &info, int bytePos, int vr
         return extra + mdVisualX(line, info, bytePos, cursorBytePos, folded) -
                mdVisualX(line, info, vrowStart, cursorBytePos, folded) + prefix;
     }
-    int cell = g_font.halfAdvance();
-    int prefix = 0;
-    if (vrowStart > 0) {
-        if (info.headingLevel > 0) prefix = (folded ? 4 : 2) * cell;
-        else if (info.quote) prefix = 4 * cell + 2;
-        else if (info.list || info.task) {
-            MdListMarker m = mdListMarker(line);
-            if (m.ok) prefix = (m.start + m.cells) * cell;
-        }
-    }
+    // 续行的缩进 = 与首行同一个前缀宽（一处真相，见 mdPrefixAdvancePx）
+    int prefix = (vrowStart > 0) ? mdPrefixAdvancePx(line, info, folded) : 0;
     return extra + mdVisualX(line, info, bytePos, -1, folded) -
            mdVisualX(line, info, vrowStart, -1, folded) + prefix;
 }
 
 void mdDrawVrow(int x, int y, const std::string &line, int start, int end,
-                const MdLineInfo &info, int indentCells, int cursorBytePos, bool folded) {
+                const MdLineInfo &info, int indentPx, int cursorBytePos, bool folded) {
     std::vector<MdSeg> segs;
     mdParseLine(line, info, segs, cursorBytePos, folded);
     int len = (int)line.size();
@@ -791,7 +825,7 @@ void mdDrawVrow(int x, int y, const std::string &line, int start, int end,
         if (seg.end <= start) continue;
         int s = std::max(seg.start, start);
         int e = std::min(seg.end, end);
-        int cx = x + mdVrowX(line, info, s, start, indentCells, cursorBytePos, folded);
+        int cx = x + mdVrowX(line, info, s, start, indentPx, cursorBytePos, folded);
         std::string draw = sliceDraw(seg, s, e);
         if (!draw.empty()) g_content_font.drawTextStyled(cx, y, draw.c_str(), seg.ts);
     }

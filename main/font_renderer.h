@@ -6,12 +6,17 @@
 // 字体渲染器：官方 TTF 抗锯齿 (builtin.ttf / SD 外置字体) + NF-Propo 等宽图标字体。
 //
 // 三路字形路由：
-//   - ASCII (<0x80)：NF-Propo 等宽 0.5em 字形；**装了外置字体时改走用户字体的
-//     比例拉丁字形**（仍画进那个固定半格，见 drawCellGlyph）
+//   - ASCII (<0x80)：默认 NF-Propo 等宽 0.5em 字形（**没装外置字体时的普遍情形**，
+//     也就是"零变化"那条路）；装了外置字体则改走用户字体的**比例拉丁**字形，
+//     并且**按该字体自己的步进前进**（不再塞进固定半格 —— 见 charWidth/drawCellGlyph）。
+//     唯一例外：latin_builtin_ 实例（输入法编码行）永远走内置等宽路。
 //   - 图标 (PUA/全角/几何符号)：NF-Propo 子集按需光栅化 —— 特殊符号与图标恒用图标字体
 //   - 其余 (CJK 等)：官方 ttf_font 层 (builtin.ttf / SD 字体) 抗锯齿
 //
-// 保留等宽 cell 模型：ASCII = 1 cell = halfAdvance()，CJK/图标 = 2 cells = cjkAdvance()。
+// 步进模型：CJK/图标 = cjkAdvance()（全角，恒等于 lineHeight）；ASCII = 见上。
+// `halfAdvance()` 仍然是**设计用的半格单位**（首行缩进 4 格、引用条 3 格、状态图标
+// 一格…），只是不再等于"ASCII 的步进"。判定"拉丁要不要比例排"只此一处：
+// usesProportionalLatin()，charWidth() 与 drawCellGlyph() 共用，所以量画不会分家。
 //
 // 字体面：role_ 是**本实例绘制文本字形时用哪个字面**（见 ttf_font.h 的 TTF_ROLE_*）。
 // 界面文本也用用户选的字体，所以 g_font 的文本面就是内容面；"必须固定内置字体"的
@@ -50,8 +55,9 @@ public:
     int  role() const { return role_; }
     // 构造时定文本面，供"不调 begin() 的从属实例"用（它们借用共享格子模型）。
     // latinBuiltin=true：ASCII(<0x80) 恒定走**内置等宽 0.5em** 那条路（NF-Propo），
-    // 即便装了外置字体也不用它的比例拉丁。**界面实例 g_font 用这个**：比例拉丁塞进
-    // 半格会溢出到邻格、相邻字母叠在一起（见 font_renderer.cpp 的 drawCellGlyph）。
+    // 步进恒为 halfAdvance()、字形来自内置图标字体，即便装了外置字体也不变。
+    // **只有输入法编码行 g_ime_font 用这个** —— 编码串是给人逐个字母读的"码"，
+    // 等宽比比例排开更好认（它是一条不折行的独立行，自带量宽+绘制，钉住不惹事）。
     explicit FontRenderer(int role = TTF_ROLE_CONTENT, bool latinBuiltin = false)
         : role_(role), latin_builtin_(latinBuiltin) {}
 
@@ -99,9 +105,9 @@ public:
     int descent() const { return descent_; }
     int fontSize() const { return font_size_; }
 
-    // Cell-based layout helpers (monospace assumption)
+    // 设计用的栏距单位（**不是** ASCII 的步进，那个见 charWidth()）
     int cjkAdvance() const { return line_height_; }     // fullwidth advance (pixels)
-    int halfAdvance() const { return line_height_ / 2; } // halfwidth advance (pixels)
+    int halfAdvance() const { return line_height_ / 2; } // half-cell gutter unit (pixels)
 
     // Check if font is loaded
     bool loaded() const { return loaded_; }
@@ -110,17 +116,23 @@ public:
     static uint32_t utf8Decode(const char *&str);
 
 private:
-    // Draw a single glyph (any route) centered in its [cellW × line_height_] cell.
+    // Draw a single glyph (any route) in its [cellW × line_height_] box; cellW 现在
+    // 就是 charWidth(cp) 给的步进（拉丁 = 字体真实步进 ⇒ 居中自动退化成左对齐，
+    // CJK = 全角 ⇒ 仍是格内居中）。
     // invert=true 填黑 cell 后画白字。bold=true 加描。
     void drawCellGlyph(int x, int y, int cellW, uint32_t cp, bool invert, bool bold);
 
     // 状态栏电池/蓝牙图标 (E001/E002/E018-E02D)：程序化绘制。
     void drawStatusSymbol(int x, int y, uint32_t cp, bool invert, int cellW);
 
+    // 拉丁要不要按字体自己的步进排（= 要不要走用户字体的比例字形）。量(charWidth)与
+    // 画(drawCellGlyph)共用它，所以两边永远一致。定义见 font_renderer.cpp。
+    bool usesProportionalLatin() const;
+
     int role_ = TTF_ROLE_CONTENT;   // 本实例绘制**文本字形**时选用的字面（非共享）
     // ASCII 是否钉在内置等宽路（非共享，与 role_ 正交 —— role_ 管 CJK 用哪个面，
-    // 这个只管拉丁）。格子模型不动：ASCII 的步进恒为 halfAdvance，这里换的只是
-    // **画什么字形**，所以宽度/测量全都不变。
+    // 这个只管拉丁）。钉住时：步进 = halfAdvance()、字形来自内置图标字体，
+    // 与"没用外置字体"时逐像素一致。只有 g_ime_font 用。
     bool latin_builtin_ = false;
 
     // ── 共享格子模型 ─────────────────────────────────────────────────────
@@ -146,6 +158,9 @@ extern FontRenderer g_content_font;  // 内容文本：编辑器正文 / 输入�
 // 用户选的字体走。直接静态构造，**不调 begin()** —— begin() 里的 setSize(20) 会把
 // 共享格子模型重置回 20pt，把用户选的字号冲掉；它借用的正是 g_font 建好的格子。
 extern FontRenderer g_vk_font;
+// 输入法编码行专用（ui_helpers.cpp 的 drawIMEUI）：拉丁钉在内置等宽路，CJK 仍走内容面
+// （编码行里有"拼音/英"这类模式标签，得跟正文一个字体）。同样不调 begin()。
+extern FontRenderer g_ime_font;
 
 // 作用域内把**共享格子**换成另一个光栅高度（px），出作用域（含提前 return）自动还原。
 // 给"整块内容有自己的字号"用 —— 今天是编辑器正文（显示与版式 → 正文字号），以及

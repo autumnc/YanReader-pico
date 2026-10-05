@@ -11,14 +11,19 @@
 
 static const char *TAG = "Font";
 
-// g_font / g_content_font 的文本面就是内容面（默认参数）—— 界面文本也要用用户选的
-// 字体。g_vk_font 例外：虚拟键盘固定内置字体（见 font_renderer.h）。
-// g_font 还把**拉丁**钉回内置等宽路（第二个参数）：用户字体的比例拉丁塞进半格会
-// 溢出到邻格、相邻字母叠在一起，界面上的拉丁（设置项里的字体名等）尤其难看；
-// CJK 不受影响，仍走用户字体。正文那类内容实例不钉 —— 见 drawCellGlyph 的说明。
-FontRenderer g_font(TTF_ROLE_CONTENT, /*latinBuiltin=*/true);
+// 四个实例的差别只有文本面 + 拉丁要不要钉回内置等宽路（见 font_renderer.h）。
+// g_font(界面) 与 g_content_font(正文) 现在完全等价：拉丁一律按**用户字体自己的步进**
+// 排（原来是 g_font 把拉丁钉回内置等宽、g_content_font 不钉，界面上的英文于是对用户
+// 字体没反应，内容区的中英混排则逐格疏密不匀）。两个名字都留着：main.cpp 那 15 处
+// g_font.setSize(n) 不必动。
+FontRenderer g_font;
 FontRenderer g_content_font;
+// 虚拟键盘：文本面钉在内置面上，键帽字体固定（它自己的排版走 g_vk_font.charWidth）。
 FontRenderer g_vk_font(TTF_ROLE_UI);
+// 输入法编码行（打字时底部那串拼音码）：**唯一**保留"拉丁 = 半格等宽"的地方 ——
+// 码是给人逐个字母读的，比例排开反而不好认；而且它是一条不折行的独立行，
+// 自带量宽 + 绘制，钉住不会引入量画分家。见 ui_helpers.cpp 的编码行那一段。
+FontRenderer g_ime_font(TTF_ROLE_CONTENT, /*latinBuiltin=*/true);
 
 // 共享格子模型（见头文件说明）。定义一次，全部实例共用。
 int  FontRenderer::font_size_   = 22;
@@ -195,10 +200,26 @@ static bool isWideStatusSymbol(uint32_t cp) {
     return cp == 0xE001 || (cp >= 0xE018 && cp <= 0xE02D);   // 电池 / 电池电平 / 键盘电量
 }
 
+// 拉丁是否按**字体自己的步进**排 —— 量(charWidth)与画(drawCellGlyph)共用这一条，
+// 所以两边不可能分家。三个条件缺一不可：
+//   * 本实例没把拉丁钉回内置等宽路（latin_builtin_，输入法编码行用）；
+//   * 本实例画的是内容面（虚拟键盘的键帽是 UI 面，走内置等宽图标字体）；
+//   * 装的是外置字体 —— 内容面就是内置时，内置面的拉丁由 icon_font 按 0.5em 画进
+//     半格，步进必须仍是 halfAdvance，这样"没装外置字体"的用户逐像素零变化。
+// 缺字替补只影响字形从哪来，不影响步进，所以这里不需要判 ttf 层。
+bool FontRenderer::usesProportionalLatin() const {
+    return role_ == TTF_ROLE_CONTENT && !latin_builtin_ && !ttf_font_is_builtin();
+}
+
 int FontRenderer::charWidth(uint32_t cp) {
     if (isWideStatusSymbol(cp)) return line_height_;   // 电池：两格
     if (isStatusSymbol(cp)) return halfAdvance();      // 其余窄图标
-    return cp < 0x80 ? halfAdvance() : line_height_;
+    if (cp < 0x80) {
+        // 拉丁：按**将要画它的那个字面**的真实步进前进（比例字体于是自然排开）。
+        if (!usesProportionalLatin()) return halfAdvance();
+        return ttf_char_advance_px(role_, px_, cp);
+    }
+    return line_height_;   // CJK/全角：严格全角，不变
 }
 
 int FontRenderer::textWidth(const char *text) {
@@ -378,19 +399,15 @@ void FontRenderer::drawCellGlyph(int x, int y, int cellW, uint32_t cp,
         return;
     }
 
-    // 拉丁字母/数字/标点：装了外置字体(内容面不是内置)就用**用户字体的字形**，
-    // 仍然画进这个固定半格 —— 格子模型(1 格 = halfAdvance)与所有测量纹丝不动。
-    // 但比例拉丁塞进半格会**溢出到邻格**：字形按 px_(=行高)光栅，宽字母(w/m/W)有
-    // 40px 量级，而格宽只有 halfAdvance(≈25px)，下面 dx = x + (cellW-gw)/2 直接变成
-    // 负数 → 相邻字母叠在一起（"英文字连在一起"）。这正是界面实例 g_font 用
-    // latin_builtin_ 把拉丁钉回内置等宽路的原因（NF-Propo 0.5em，逐像素与没装外置
-    // 字体时一致）。正文/候选那类内容实例不钉：在那儿用用户字体的比例拉丁是想要的
-    // 样子，且整行英文的步进同样是半格，取舍与从前一致。
+    // 拉丁字母/数字/标点：要么按**用户字体自己的步进**前进（下面 ttf 那一支，
+    // cellW 就是它的真实步进，所以 dx 自动等于 x），要么走内置等宽 0.5em 路
+    // （icon_font 把字形缩进半格，逐像素与没装外置字体时一致）。
+    // 走哪条由 usesProportionalLatin() 一处定，charWidth() 用的是同一个判定 ——
+    // 「量的」与「画的」靠这条共用谓词保证相等（历史 bug：g_font 量、g_content_font
+    // 画，格宽只有一个却两边各自的字形来源不同，'i' 空一片、'm' 顶到邻格）。
     // 缺字一律由 ttf 层自动回落到内置面补(见 ttf_font.c 的替补)。
     // 虚拟键盘那个实例文本面是 UI(role_ == TTF_ROLE_UI)，所以键盘的字母不受影响。
-    const bool user_latin = (cp < 0x80) && role_ == TTF_ROLE_CONTENT &&
-                            !latin_builtin_ && !ttf_font_is_builtin();
-    if (cp < 0x80 && !user_latin) {
+    if (cp < 0x80 && !usesProportionalLatin()) {
         // ASCII（等宽 0.5em）按基线对齐，与 CJK 同基线，避免拉丁字符高低不平。
         icon_font_draw_baseline(fb, x, y, cellW, line_height_, cp, invert);
         if (bold) icon_font_draw_baseline(fb, x + 1, y, cellW, line_height_, cp, invert);
@@ -411,9 +428,10 @@ void FontRenderer::drawCellGlyph(int x, int y, int cellW, uint32_t cp,
         return;
     }
 
-    // 其余（CJK 等）走官方 ttf_font —— 文本面由上面的 ttf_set_role(role_) 选好，
-    // 缺字会自动去内置面补。用户字体的拉丁（上面的 user_latin）也落到这里，
-    // 只是它的 cellW 是那个半格。
+    // 其余（CJK、以及按自身步进排的拉丁）走官方 ttf_font —— 文本面由上面的
+    // ttf_set_role(role_) 选好，缺字会自动去内置面补。cellW 就是 charWidth() 给的
+    // 那个步进，所以下面的 dx = x + (cellW-gw)/2 对拉丁恒等于 x（gw 与 cellW 同源）；
+    // 对 CJK 则仍是"全角格里居中"。
     char ch[5];
     int n = utf8Encode(cp, ch);
     ch[n] = '\0';

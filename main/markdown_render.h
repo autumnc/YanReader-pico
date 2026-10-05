@@ -79,8 +79,19 @@ std::vector<MdVCell> mdVerticalCells(const std::string &line, const MdLineInfo &
 // styles. y is the text baseline. Byte offsets match buildVrows output.
 // cursorBytePos >= 0 reveals the inline markdown construct containing that byte
 // as raw text; the rest of the line keeps normal hidden-marker rendering.
+/// 渲染前缀的像素宽 = 内容真正开始的那个 x（不含调用方加的左边界）。**记号该占多宽
+/// 的唯一真相**：buildVrows 拿它做折行预留，mdVisualX/mdVrowX 拿它算内容起点。
+/// 从前这件事由 MdListMarker::cells 兼职，那是格制的，只在"ASCII 记号字节 = 1 格"
+/// 时成立；装了外置字体后拉丁记号的实际宽不再等于 cells×半格，预留就会漂。
+int mdPrefixAdvancePx(const std::string &line, const MdLineInfo &info, bool folded = false);
+
+/// 有序记号（`1. `/`1、`/`一、`）的前缀像素宽 —— 原文是照原样画的，所以量原文。
+/// **唯一真相**：mdPrefixAdvancePx 的有序分支与 buildVrows 的折行预留都调它。
+/// 内置内容面下恒等于 (m.start + m.cells) * 半格，所以老布局逐像素不变。
+int mdRawMarkerIndentPx(const std::string &line, const MdListMarker &m);
+
 void mdDrawVrow(int x, int y, const std::string &line, int start, int end,
-                const MdLineInfo &info, int indentCells = 0, int cursorBytePos = -1,
+                const MdLineInfo &info, int indentPx = 0, int cursorBytePos = -1,
                 bool folded = false);
 
 // Visual x (px from the line's left edge) at which raw byte bytePos renders.
@@ -95,7 +106,7 @@ int mdVisualX(const std::string &line, const MdLineInfo &info, int bytePos,
 // Continuation vrows repeat the prefix indent. Use for all vrow drawing /
 // cursor / selection positioning.
 int mdVrowX(const std::string &line, const MdLineInfo &info, int bytePos, int vrowStart,
-            int indentCells = 0, int cursorBytePos = -1, bool folded = false);
+            int indentPx = 0, int cursorBytePos = -1, bool folded = false);
 
 // Enable/disable markdown rendering (Settings "Markdown渲染"). When disabled,
 // every line is drawn as raw text with the marker characters untouched.

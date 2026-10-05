@@ -13,6 +13,12 @@
 // Usage:
 //   ime_driver <letters> [commitIdx] [--fixed]        diagnostic dump + commit
 //   ime_driver --regress <letters> <word> [--fixed]   regression assertion, exit!=0 on fail
+//   ime_driver --enter <letters> [--highlight]        Enter 直接编码上屏的断言
+//
+// ENTER (--enter): 输入中按回车必须**原样上屏还没有选中的编码**（typing nihao + Enter
+// → 正文里出现 "nihao"，不是换行、也不是第一个候选）。默认「候选高亮」关着，所以
+// out 必须逐字节等于输入串；--highlight 把 imeCandidateHighlight 打开后，回车改成
+// 上屏**高亮那个候选**（_highlightSelectMode 分支，见 IME.cpp:6132）。
 //
 // Both modes print, after every keystroke:
 //   _code, _displayCode, _pageStart, _page.size(), _all.size(), _curPage,
@@ -121,6 +127,8 @@ struct Options {
     int commitIdx = 0;
     bool regress = false;
     bool widthPaging = true;
+    bool enter = false;      // --enter: 断言"输入中按回车直接编码上屏"
+    bool highlight = false;  // --highlight: 打开「候选高亮」（回车改成上屏高亮候选）
 };
 
 static void initIme(IME &ime, bool widthPaging) {
@@ -166,6 +174,8 @@ int main(int argc, char **argv) {
     std::vector<std::string> pos;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--regress")) opt.regress = true;
+        else if (!strcmp(argv[i], "--enter")) opt.enter = true;
+        else if (!strcmp(argv[i], "--highlight")) opt.highlight = true;
         else if (!strcmp(argv[i], "--fixed") || !strcmp(argv[i], "--no-width"))
             opt.widthPaging = false;
         else if (!strcmp(argv[i], "--no-sentence")) hostime::setSentence(false);
@@ -186,6 +196,8 @@ int main(int argc, char **argv) {
         opt.letters = pos[0];
         if (pos.size() > 1) opt.commitIdx = atoi(pos[1].c_str());
     }
+    // _highlightSelectMode 是 begin() 里读的（IME.cpp:1356），必须赶在 initIme 之前设。
+    hostime::setCandidateHighlight(opt.highlight);
 
     std::string tag = " mode=regress word=" + opt.word;
     printf("=== ime_driver: letters='%s' commitIdx=%d paging=%s%s ===\n", opt.letters.c_str(),
@@ -204,7 +216,36 @@ int main(int argc, char **argv) {
     feedKeys(ime, opt.letters, trace);
 
     int rc = 0;
-    if (!opt.regress) {
+    if (opt.enter) {
+        // 「输入法输入过程中按回车 = 编码原样上屏」。调用方（screen_editor /
+        // screen_polish_prompt / 阅读模式的输入框）都是把 '\n' 直接喂给 handleKey，
+        // 所以这里也走同一条路：喂一个真的 '\n'（虚拟键盘的回车键就是这个码，
+        // 见 editor_vk.cpp 的 evkFinishKey('\n')；蓝牙键盘的 HID 0x28 在
+        // bt_keyboard.cpp 的 s_asc_low 里也映射成 0x0A）。
+        printf("\n=== Enter: 输入中直接编码上屏 ===\n");
+        printf("  输入中: _code='%s' 候选 %zu 个 高亮模式=%d 高亮位=%d\n",
+               ime._code.c_str(), ime._page.size(), opt.highlight ? 1 : 0, ime._sel);
+        // 期望先取好：回车之后 _page/_sel 都被 reset 了。
+        // 默认（高亮关）→ 逐字节等于输入串；高亮开 → 上屏**当前高亮位**那个候选。
+        std::string want = opt.letters;
+        if (opt.highlight && ime._sel >= 0 && ime._sel < (int)ime._page.size())
+            want = ime._page[ime._sel];
+        std::string out;
+        bool handled = ime.handleKey('\n', out);
+        printf("  handleKey('\\n') handled=%d out='%s'\n", handled ? 1 : 0, out.c_str());
+        dumpState(ime, "after-enter");
+        bool ok = handled && out == want && !leftoverComposition(ime);
+        if (ok) {
+            printf("  PASS: 回车%s → '%s'，没有残留编码\n",
+                   opt.highlight ? "上屏高亮候选" : "原样上屏编码", out.c_str());
+        } else {
+            printf("  FAIL: 期望 out=='%s'（handled=1、_code/_prefix/_remainder 清空），"
+                   "实际 out='%s' handled=%d _code='%s' _prefix='%s' _remainder='%s'\n",
+                   want.c_str(), out.c_str(), handled ? 1 : 0, ime._code.c_str(),
+                   ime._prefix.c_str(), ime._remainder.c_str());
+            rc = 1;
+        }
+    } else if (!opt.regress) {
         printf("\n=== commit(%d) ===\n", opt.commitIdx);
         std::string out;
         bool ret = ime.commit(opt.commitIdx, out);

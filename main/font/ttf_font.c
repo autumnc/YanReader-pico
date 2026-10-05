@@ -252,6 +252,9 @@ typedef struct {
  *    height/left/top/advance_x/bitmap)、sfnt_table_t(tag/offset/length)、
  *    ttf_size_metrics_t(scale/ascent) 里出现过的名字一律不能用。
  * ══════════════════════════════════════════════════════════════════════════ */
+// ASCII(<0x80) 步进表的项数。表本身见 ttf_face_t 的 f_ascii_adv。
+#define TTF_ASCII_ADV_N 128
+
 typedef struct ttf_face {
     int f_font_fd;
     const uint8_t* f_font_mem;
@@ -314,6 +317,11 @@ typedef struct ttf_face {
     glyph_entry_t* f_lru_tail;
     size_t f_cache_bytes;
     size_t f_cache_limit;   // 本面字形缓存上限，见 cache_reserve()
+    // ASCII 步进表：见下面的 ascii_adv_ensure()。256B/面、三面共 768B，占内部 RAM
+    // (与结构体其他字段一样在 .bss)，所以若哪天顶穿 _Static_assert 就先把它改成
+    // uint8_t[128]（px 上限 120，步进一定 < 256）。
+    int16_t f_ascii_adv[TTF_ASCII_ADV_N];
+    int f_ascii_adv_px;     // 建表用的像素高；0 = 失效(真实 px ≥ 12，不会撞上)
 } ttf_face_t;
 
 // 结构本身要占内部 DRAM(不进 PSRAM，.bss 段)。超了就先砍 cache_buckets 再说。
@@ -399,6 +407,8 @@ static ttf_face_t* s_cur = &s_faces[TTF_ROLE_CONTENT];
 #define lru_tail              (s_cur->f_lru_tail)
 #define cache_bytes           (s_cur->f_cache_bytes)
 #define cache_limit           (s_cur->f_cache_limit)
+#define ascii_adv             (s_cur->f_ascii_adv)
+#define ascii_adv_px          (s_cur->f_ascii_adv_px)
 
 // 本面实际开几个 IO 槽 / 合并窗口多大（面未初始化时退回编译期上限，保证循环不越界）。
 static int io_slot_count(void) { return io_slots > 0 ? io_slots : TTF_IO_SLOTS; }
@@ -1927,6 +1937,10 @@ static void cache_reset(void) {
     lru_head = NULL;
     lru_tail = NULL;
     cache_bytes = 0;
+    // ASCII 步进表也得作废：它由本面的 cmap/hmtx 算出来，换字体后就不对了。放在这里
+    // 是因为**每一条**换字体/卸载的路都经过 cache_reset —— face_unload() 直接调它，
+    // ttf_font_cache_clear()(→ reloadFont) 也是。像素高变化不走这里，只换表键(见 ascii_adv_ensure)。
+    ascii_adv_px = 0;
     if (n > 0) {
         ESP_LOGI(TAG, "glyph cache dropped %u entries", (unsigned)n);
     }
@@ -2150,33 +2164,69 @@ static void warm_text_io(int pixel_height, const char* text) {
     io_flush_touches();
 }
 
+// 单码点步进，直查 cmap/hmtx（不改任何缓存；表就是由它填出来的）。
+static int cp_advance_raw(int pixel_height, uint32_t cp) {
+    const float scale = font_scale_px(pixel_height);
+    int advance = 0, lsb = 0;
+    int gid = stbtt_FindGlyphIndex(&font_info, (int)cp);
+    // 缺字时和 get_glyph 走同一套替补：字体会在替补面上取字形，步进量就得跟着
+    // 走，否则量出来的宽度和画出来的字对不上(内置 .notdef 与 CJK 全角差得最远)。
+    // 只读另一面的 cmap/hmtx，不触轮廓，分页开销的量级不变。
+    if (gid == 0) {
+        const int role = fallback_role_for(cp);
+        if (role >= 0) {
+            ttf_face_t* prev = face_enter(role);
+            const float fscale = font_scale_px(pixel_height);
+            const int fgid = stbtt_FindGlyphIndex(&font_info, (int)cp);
+            stbtt_GetGlyphHMetrics(&font_info, fgid, &advance, &lsb);
+            face_leave(prev);
+            return (int)lroundf(advance * fscale);
+        }
+    }
+    stbtt_GetGlyphHMetrics(&font_info, gid, &advance, &lsb);
+    return (int)lroundf(advance * scale);
+}
+
+/* ---- ASCII(<0x80) 步进表 / ASCII advance table ----
+ * FontRenderer::charWidth() 现在返回**真实步进**（装了外置字体时拉丁不再恒为半格），
+ * 而调用它的 buildVrows() 每次按键都要把整篇文档重排一遍 —— 单个 ASCII 码点查一次
+ * cmap(二分)+hmtx 约 150ns，万字笔记每键就是 1.5ms 纯开销。表把这一步变成一次数组读。
+ *
+ * 表里的值**就是** cp_advance_raw() 对该码点的结果（同一个函数算的），所以「量的」与
+ * 「画的」相等是构造保证，不是两处人肉对齐。
+ *
+ * 键只按像素高：步进与字重无关(hmtx/gvar 都不改它)。像素高变了**只换键不清表** ——
+ * FontScope 让正文/界面格子每帧来回切，清表等于每帧重测 128 次。作废只发生在
+ * cache_reset()(换字体/卸载)，因为值来自本面的 cmap/hmtx。
+ */
+static void ascii_adv_ensure(int pixel_height) {
+    if (ascii_adv_px == pixel_height) return;
+    for (int i = 0; i < TTF_ASCII_ADV_N; i++) {
+        ascii_adv[i] = (int16_t)cp_advance_raw(pixel_height, (uint32_t)i);
+    }
+    ascii_adv_px = pixel_height;
+}
+
+// 单码点步进(px)。measure_width / ttf_text_width_px 与 FontRenderer::charWidth 都走这里，
+// 所以「量」和「画」不可能分家。
+static int cp_advance(int pixel_height, uint32_t cp) {
+    if (cp < TTF_ASCII_ADV_N) {
+        ascii_adv_ensure(pixel_height);
+        return ascii_adv[cp];
+    }
+    return cp_advance_raw(pixel_height, cp);
+}
+
 static int measure_width(int pixel_height, const char* text) {
     // 字宽只依赖已驻留的 cmap/hmtx；分页不读取轮廓、不生成整章位图。
     // Resident cmap/hmtx suffice for advances; pagination never reads outlines or rasterizes a chapter.
-    const float scale = font_scale_px(pixel_height);
+    // 先夹一次 px：表的键必须是规范值，否则同一个有效字号会反复重建(见 ascii_adv_ensure)。
+    pixel_height = clamp_px(pixel_height);
     int width = 0;
     const char* cursor = text;
     while (*cursor != '\0') {
         uint32_t cp = decode_utf8(&cursor);
-        int advance = 0, lsb = 0;
-        int gid = stbtt_FindGlyphIndex(&font_info, (int)cp);
-        // 缺字时和 get_glyph 走同一套替补：字体会在替补面上取字形，步进量就得跟着
-        // 走，否则量出来的宽度和画出来的字对不上(内置 .notdef 与 CJK 全角差得最远)。
-        // 只读另一面的 cmap/hmtx，不触轮廓，分页开销的量级不变。
-        if (gid == 0) {
-            const int role = fallback_role_for(cp);
-            if (role >= 0) {
-                ttf_face_t* prev = face_enter(role);
-                const float fscale = font_scale_px(pixel_height);
-                const int fgid = stbtt_FindGlyphIndex(&font_info, (int)cp);
-                stbtt_GetGlyphHMetrics(&font_info, fgid, &advance, &lsb);
-                face_leave(prev);
-                width += (int)lroundf(advance * fscale);
-                continue;
-            }
-        }
-        stbtt_GetGlyphHMetrics(&font_info, gid, &advance, &lsb);
-        width += (int)lroundf(advance * scale);
+        width += cp_advance(pixel_height, cp);
     }
     return width;
 }
@@ -2547,6 +2597,16 @@ void ttf_measure_line_px(
 int ttf_text_width_px(int pixel_height, const char* text) {
     if (!font_ready || text == NULL) return 0;
     return measure_width(clamp_px(pixel_height), text);
+}
+
+int ttf_char_advance_px(int role, int pixel_height, uint32_t codepoint) {
+    // role 必须显式传，不能读 s_cur：FontRenderer::setSize()/setGridPx() 量完 ascent
+    // 会把 s_cur 留在 UI 面上不还原，靠 s_cur 就会拿内置面去量用户的拉丁字。
+    // face_enter/face_leave 是本文件允许的跨面手法(见铁律 1、2)。
+    ttf_face_t* prev = face_enter(role);
+    const int width = font_ready ? cp_advance(clamp_px(pixel_height), codepoint) : 0;
+    face_leave(prev);
+    return width;
 }
 
 // 线性抗锯齿的中间灰在这块屏上偏亮。按 TTF_COVER_GAMMA 抬覆盖率，半透明边缘更深。

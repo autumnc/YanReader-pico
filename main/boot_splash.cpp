@@ -81,10 +81,18 @@ struct Canvas {
 // ── 基本图元 ─────────────────────────────────────────────────────────────
 // 全部走 fb_fast（旋转与尺寸只同步一次），坐标是逻辑坐标。
 
+// ⚠️ w/h 与 dx/dy 一样是**设计单位**，必须在函数里自己乘 s：fb_fast_fill_rect 收的
+// 是逻辑像素宽高（它内部按 x+w-1 映射另一个角）。漏了这一步横屏看不出来（s 恒为
+// 1.0，设计单位 == 像素），竖屏 s=0.5625 时每个矩形放大 1/s≈1.78 倍 —— 石框四条直边
+// 各自从已经缩放过的起点往右/往下窜出 84px，看着就是「外框边溢出了很多」
+// （2026-10-05 用户报；横屏完美、竖屏才现形，正是 s=1 掩盖了它）。
+// 端点口径与 fb_fast_fill_rect 的 x+w-1 对齐，免得两处各有一套取整。
 static void fillRect(const Canvas &c, int dx, int dy, int w, int h, int g) {
     if (w <= 0 || h <= 0) return;
     fb_fast_sync();
-    fb_fast_fill_rect(c.fb, c.x(dx), c.y(dy), w, h, (uint8_t)((g & 0xF) << 4));
+    const int x0 = c.x(dx), y0 = c.y(dy);
+    const int x1 = c.x(dx + w - 1), y1 = c.y(dy + h - 1);
+    fb_fast_fill_rect(c.fb, x0, y0, x1 - x0 + 1, y1 - y0 + 1, (uint8_t)((g & 0xF) << 4));
 }
 
 // 实心椭圆（像素坐标中心）。逐扫描线算半宽，一条线一次整行填。

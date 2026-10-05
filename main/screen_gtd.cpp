@@ -3193,7 +3193,7 @@ static void noteEditorLineTable(std::vector<TextSelLine> &out, int &bottom) {
         TextSelLine ln;
         ln.start = base + vr.start;
         ln.end = base + vr.end;
-        ln.x0 = 4 + vr.indentCells * g_font.halfAdvance();
+        ln.x0 = 4 + vr.indentPx;
         ln.baseline = contentY + i * LINE_SPACING;
         out.push_back(ln);
     }
@@ -3308,7 +3308,7 @@ static void drawNoteEditor() {
 
         std::string text = g.noteLines[vr.lineIdx].substr(vr.start, vr.end - vr.start);
 
-        ui_draw_text(4 + vr.indentCells * g_font.halfAdvance(), ly, text.c_str(), false);
+        ui_draw_text(4 + vr.indentPx, ly, text.c_str(), false);
 
     }
 
@@ -3322,7 +3322,7 @@ static void drawNoteEditor() {
 
         std::string before = g.noteLines[vr.lineIdx].substr(vr.start, g.noteCol - vr.start);
 
-        int cx = 4 + vr.indentCells * g_font.halfAdvance() + g_font.textWidth(before.c_str());
+        int cx = 4 + vr.indentPx + g_font.textWidth(before.c_str());
 
         int cy = contentY + (cursorVrow - g.noteScroll) * LINE_SPACING;
 

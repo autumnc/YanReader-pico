@@ -15,6 +15,18 @@ bool flomoFileExists(const std::string &path) {
     return stat(path.c_str(), &st) == 0;
 }
 
+// 逐段建目录。**已存在的段必须先 stat 判一下再跳过**（与 safe_file.cpp 的 ensureDirPath
+// 逐字同一套做法，HalStorage::mkdir 也是）。
+//
+// 不能写成「mkdir 返回 0 或 EEXIST 才算过」：整条路的第一段就是挂载点 /sdcard，而
+// ESP-IDF 的 mkdir 对**已存在的目录**并不返回 EEXIST —— VFS 把挂载点前缀剥掉后对
+// FatFS 的 0: 调 f_mkdir，create_name 见到空名直接 FR_INVALID_NAME（ff.c:2946），
+// vfs_fat.c 的 fresult_to_errno 把它映射成 EINVAL(22)。于是老写法在**第一段就**
+// `return false`，`/sdcard/flomo` 一辈子建不出来。
+// 后果是整条 flomo 本地库链路静默全废：MemoDb::load 里 fopen 拿不到目录 → 空串 →
+// 「暂无笔记」；MemoDb::save → flomoSafeWriteFile 里 `if (!flomoEnsureDir(...)) return false`
+// → **一条也写不进去**（两步的返回值都被调用方忽略，屏上日志一片安静）。用户看到的
+// 就是「每次进入都是暂无笔记，同步一下才（从服务器）拉出来」。
 bool flomoEnsureDir(const std::string &path) {
     if (path.empty()) return false;
     std::string cur;
@@ -26,7 +38,14 @@ bool flomoEnsureDir(const std::string &path) {
         if (!part.empty()) {
             if (!cur.empty() && cur.back() != '/') cur += "/";
             cur += part;
-            if (mkdir(cur.c_str(), 0777) != 0 && errno != EEXIST) {
+            struct stat st;
+            if (stat(cur.c_str(), &st) == 0) {
+                // 已存在（挂载点 /sdcard 也走这里）：是目录就跳过，不是就报错。
+                if (!S_ISDIR(st.st_mode)) {
+                    ESP_LOGE(TAG, "not a dir: %s", cur.c_str());
+                    return false;
+                }
+            } else if (mkdir(cur.c_str(), 0777) != 0 && errno != EEXIST) {
                 ESP_LOGE(TAG, "mkdir failed: %s errno=%d", cur.c_str(), errno);
                 return false;
             }

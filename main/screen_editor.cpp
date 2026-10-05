@@ -39,7 +39,8 @@ extern "C" {
 #include <Utf8.h>        // utf8NextCodepoint：选词时按 UTF-8 边界走
 #include "u8g2_shim.h"
 
-#define EDITOR_MAX_CELLS (SCREEN_W / g_font.halfAdvance())
+// （原 EDITOR_MAX_CELLS = SCREEN_W / halfAdvance() 已删：它是"一行几格"的格制量，
+//   粘列那几个调用点改成行内像素偏移之后没人再用它了。）
 
 // ── Editor state ─────────────────────────────────────────────────────────
 
@@ -61,7 +62,10 @@ struct EditorState {
     std::vector<std::string> lines;
     int cx = 0, cy = 0;
     int scroll = 0;
-    int targetCx = -1;
+    // 上下移动时粘住的**行内像素偏移**（从当前 vrow 的行首算起；<0 = 没粘住）。
+    // 从前叫 targetCx，是"行内格号"（byteToCells(cx) % 每行格数）—— 那在等宽下才
+    // 等于行内偏移，拉丁改成按字体真实步进排之后各行宽不等，取模会漂，所以换像素。
+    int targetX = -1;
     // 提示词。**有没有提示词就是"提示写作 / 自由写作"的唯一判据**（见 editorPromptOn）：
     // 合并成一个「写作」模式后不再单独记一个模式布尔量，否则会出现"切了模式却没有提示词"
     // 的半吊子状态。Ctrl+P 与状态栏那个模式标记都只改这一个变量。
@@ -291,7 +295,7 @@ static void deleteSelection() {
     g_editor.cy = start.cy;
     g_editor.cx = start.cx;
     g_editor.hasSelection = false;
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
     markDirty();
     g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
     g_editor.modifiedSinceSave = true;
@@ -309,6 +313,30 @@ static void extendSelection() {
     }
 }
 
+// 光标上下移动的公共实现：把光标送到第 dstVR 条 vrow，**粘住行内像素偏移**。
+// 从前这段是 `targetCx % 每行格数` + `cellsToByte`，抄了 5 份；"格"改制为像素之后
+// 取模不再等于行内偏移（各行宽不再相等），5 份一起换口径正是分歧的温床 —— 收成一支。
+// 目标行比当前行窄时 xToByte 会就近夹到行末（= 旧实现里那几个 std::min 的用意）。
+static void editorCursorToVrow(int dstVR, const std::vector<VRow> &vrows) {
+    if (dstVR < 0 || dstVR >= (int)vrows.size()) return;
+    int curVR = -1;
+    for (int vi = 0; vi < (int)vrows.size(); vi++) {
+        if (vrows[vi].lineIdx == g_editor.cy && vrows[vi].start <= g_editor.cx &&
+            g_editor.cx <= vrows[vi].end) {
+            curVR = vi; break;
+        }
+    }
+    if (curVR < 0 || curVR == dstVR) return;
+    const std::string &curLine = g_editor.lines[g_editor.cy];
+    if (g_editor.targetX < 0)
+        g_editor.targetX = byteToX(curLine, g_editor.cx) - byteToX(curLine, vrows[curVR].start);
+    const VRow &dst = vrows[dstVR];
+    const std::string &dstLine = g_editor.lines[dst.lineIdx];
+    g_editor.cy = dst.lineIdx;
+    g_editor.cx = xToByte(dstLine, dst.start, dst.end,
+                          byteToX(dstLine, dst.start) + g_editor.targetX);
+}
+
 // Move cursor vertically by `step` visual rows (negative = up, positive = down),
 // preserving the target visual column. Returns true if the cursor moved.
 static bool moveCursorVertical(int step, const std::vector<VRow> &vrows) {
@@ -323,14 +351,7 @@ static bool moveCursorVertical(int step, const std::vector<VRow> &vrows) {
     if (targetVR < 0) targetVR = 0;
     if (targetVR > (int)vrows.size() - 1) targetVR = (int)vrows.size() - 1;
     if (targetVR == curVR) return false;
-    auto &dst = vrows[targetVR];
-    if (g_editor.targetCx < 0)
-        g_editor.targetCx = byteToCells(g_editor.lines[g_editor.cy], g_editor.cx);
-    int visualCol = g_editor.targetCx % EDITOR_MAX_CELLS;
-    g_editor.cy = dst.lineIdx;
-    int vrowStartCells = byteToCells(g_editor.lines[g_editor.cy], dst.start);
-    int targetCells = vrowStartCells + visualCol;
-    g_editor.cx = cellsToByte(g_editor.lines[g_editor.cy], dst.start, dst.end, targetCells);
+    editorCursorToVrow(targetVR, vrows);
     return true;
 }
 
@@ -443,7 +464,7 @@ static void restoreSnapshot(const EditorSnapshot &s) {
     if (g_editor.cx > (int)g_editor.lines[g_editor.cy].length())
         g_editor.cx = (int)g_editor.lines[g_editor.cy].length();
     g_editor.scroll = s.scroll;
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
     g_editor.hasSelection = false;
     markDirty();
 }
@@ -539,7 +560,7 @@ static void clearUndoHistory() {
 static void loadQuickEditFile() {
     loadLinesIntoEditor(quickEditLoad(quickEditIndex()));
     g_editor.scroll = 0;
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
     markDirty();
     g_editor.modifiedSinceSave = false;
     g_editor.autoSaveTime = 0;
@@ -654,7 +675,7 @@ static void moveCursorVerticalInline(int step) {
             g_editor.cx = 0;
         }
     }
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
 }
 
 static void moveCursorVerticalColumn(int dir, const VerticalData &data) {
@@ -667,7 +688,7 @@ static void moveCursorVerticalColumn(int dir, const VerticalData &data) {
     const auto &dst = data.cols[dstCol];
     g_editor.cy = dst.lineIdx;
     g_editor.cx = verticalRowToByte(data.cells[dst.lineIdx], dst.start, dst.end, row);
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
 }
 
 // 竖排选区高亮:对 [hStart, hEnd) 范围内的字符格做 XOR 反白
@@ -742,7 +763,7 @@ static void searchGotoMatch(int idx) {
     g_editor.cy = cy;
     g_editor.cx = cx;
     g_editor.hasSelection = false;
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
     markDirty();
 }
 
@@ -789,7 +810,7 @@ static void applyDocReplace(int start, int end, const std::string &repl) {
     docOffsetToPos(off, cy, cx);
     g_editor.cy = cy; g_editor.cx = cx;
     g_editor.hasSelection = false;
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
     markDirty();
     g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
     g_editor.modifiedSinceSave = true;
@@ -830,7 +851,7 @@ static int searchReplaceAll() {
     recordUndoSnapshot(UndoGroup::Structural);
     loadLinesIntoEditor(out);
     g_editor.hasSelection = false;
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
     markDirty();
     g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
     g_editor.modifiedSinceSave = true;
@@ -1026,7 +1047,7 @@ static void searchOpen() {
         g_editor.cy = start.cy;  // 光标回到选区起点,首个匹配即选中文本
         g_editor.cx = start.cx;
         clearSelection();
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
     }
     sh.termCur = (int)sh.term.length();
     sh.focusRep = false;
@@ -1089,7 +1110,7 @@ static AppState screen_editor_search_handle(int key, ScreenContext &ctx) {
             g_editor.cy = cy;
             g_editor.cx = cx;
             g_editor.hasSelection = true;
-            g_editor.targetCx = -1;
+            g_editor.targetX = -1;
             markDirty();
         }
         searchClose();
@@ -1538,7 +1559,7 @@ static bool editorPosInVrow(int vrIdx, int x, TextPos &out) {
     int b = vr.start;
     for (;;) {
         const int bb = (b > vr.end) ? vr.end : b;
-        const int xb = 4 + mdVrowX(line, mdi, bb, vr.start, vr.indentCells, mdCursor, folded);
+        const int xb = 4 + mdVrowX(line, mdi, bb, vr.start, vr.indentPx, mdCursor, folded);
         const int d = (xb > x) ? (xb - x) : (x - xb);
         if (d < bestD) { bestD = d; bestB = bb; }
         if (bb >= vr.end) break;
@@ -1615,7 +1636,7 @@ static bool editorPosToScreenRaw(const TextPos &p, int &x, int &rowTopY, int &vr
                         g_editor.foldedHeadings.count(vr.lineIdx);
     // 与绘制时同一份 mdCursor：标记行的字形位置会随"光标在不在标记里"变。
     const int mdCursor = (vr.lineIdx == g_editor.cy) ? g_editor.cx : -1;
-    x = 4 + mdVrowX(line, mdi, p.cx, vr.start, vr.indentCells, mdCursor, folded);
+    x = 4 + mdVrowX(line, mdi, p.cx, vr.start, vr.indentPx, mdCursor, folded);
     rowTopY = editorBodyTopY() + vis * LINE_SPACING;
     return true;
 }
@@ -1630,18 +1651,38 @@ static bool editorPosToScreen(const TextPos &p, int &x, int &rowTopY) {
     return vis >= 0 && vis < editorVisibleRows();
 }
 
+// 字节位置处那个字的像素步进（行尾/越界 → 半格）。触摸命中容差用。
+static int editorGlyphAdvance(const std::string &line, int pos) {
+    if (pos < 0 || pos >= (int)line.size()) return g_font.halfAdvance();
+    unsigned char b = (unsigned char)line[pos];
+    int n = 1;
+    if (b >= 0xF0) n = 4; else if (b >= 0xE0) n = 3; else if (b >= 0xC0) n = 2;
+    if (pos + n > (int)line.size()) n = (int)line.size() - pos;
+    return g_font.textWidth(line.substr(pos, n).c_str());
+}
+
 // 手指底下是不是"字"。editorPosAtPoint 在正文区里**永远**能命中（取最近的字界），
 // 所以光看它不够——空行、行尾右侧一大片空白它也会给个位置。这里再按屏幕 x 校一次：
 // 命中的那个字节画出来的位置离手指不超过半个字宽，才算"点在字上"。
 // 用在**双击选词**（editorBeginTouchSelection 内部）和选区会话里"点别处是否顺手挪
 // 光标"——这两处都要"确实点在字上"；普通单击落光标不走这里（空行也该落光标）。
+//
+// 容差从固定半格改成"这一带最宽邻字的一半"：拉丁按字体真实步进排之后，一个 `i`
+// 可能只有 6px、一个 `m` 30px，统一拿半格判会让宽字正中那一下差几像素就判不中。
+// 取 max(半格, 邻字半宽) ⇒ 内置面下**不退步**、外置字体下更贴字形。
 static bool editorTapOnGlyph(int x, int y, TextPos &p) {
     if (!editorPosAtPoint(x, y, p)) return false;
     if (p.cy < 0 || p.cy >= (int)g_editor.lines.size()) return false;
-    if (g_editor.lines[p.cy].empty()) return false;
+    const std::string &line = g_editor.lines[p.cy];
+    if (line.empty()) return false;
     int gx = 0, gy = 0;
     if (!editorPosToScreen(p, gx, gy)) return false;
-    return std::abs(gx - x) <= g_font.halfAdvance();
+    int tol = g_font.halfAdvance();
+    const int advR = editorGlyphAdvance(line, p.cx);
+    const int advL = (p.cx > 0) ? editorGlyphAdvance(line, utf8PrevBoundary(line, p.cx)) : advR;
+    const int half = (advR > advL ? advR : advL) / 2;
+    if (half > tol) tol = half;
+    return std::abs(gx - x) <= tol;
 }
 
 // 选区两端的柄，画在反白块的**外面**（头柄在首行上方、尾柄在末行下方），
@@ -1807,7 +1848,7 @@ static bool editorSelDragApply(const TextPos &p) {
             g.selAnchorCy = a.cy;
             g.selAnchorCx = a.cx;
             markDirty();
-            g.targetCx = -1;
+            g.targetX = -1;
             return true;
         }
     } else {
@@ -1816,7 +1857,7 @@ static bool editorSelDragApply(const TextPos &p) {
             g.cy = a.cy;
             g.cx = a.cx;
             markDirty();
-            g.targetCx = -1;
+            g.targetX = -1;
             return true;
         }
     }
@@ -2077,7 +2118,7 @@ static void drawEditor() {
         bool folded = !g_editor.foldedHeadings.empty() &&
                       g_editor.foldedHeadings.count(vr.lineIdx);
         mdDrawVrow(4, y + i * LINE_SPACING, g_editor.lines[vr.lineIdx], vr.start, vr.end,
-                   mdInfo[vr.lineIdx], vr.indentCells, mdCursor, folded);
+                   mdInfo[vr.lineIdx], vr.indentPx, mdCursor, folded);
     }
 
     // Selection highlight
@@ -2102,9 +2143,9 @@ static void drawEditor() {
                           g_editor.foldedHeadings.count(lineIdx);
             int mdCursor = (lineIdx == g_editor.cy) ? g_editor.cx : -1;
             int xOff = 4 + mdVrowX(g_editor.lines[lineIdx], mdi, hlStart, rowStart,
-                                   vr.indentCells, mdCursor, folded);
+                                   vr.indentPx, mdCursor, folded);
             int selEndX = 4 + mdVrowX(g_editor.lines[lineIdx], mdi, hlEnd, rowStart,
-                                      vr.indentCells, mdCursor, folded);
+                                      vr.indentPx, mdCursor, folded);
             int selW = selEndX - xOff;
             int ly = y + i * LINE_SPACING;
             u8g2_SetDrawColor(g_u8g2, 2);  // XOR mode
@@ -2119,7 +2160,7 @@ static void drawEditor() {
         const MdLineInfo &mdi = mdInfo[vr.lineIdx];
         bool folded = !g_editor.foldedHeadings.empty() &&
                       g_editor.foldedHeadings.count(vr.lineIdx);
-        int cx = 4 + mdVrowX(line, mdi, g_editor.cx, vr.start, vr.indentCells,
+        int cx = 4 + mdVrowX(line, mdi, g_editor.cx, vr.start, vr.indentPx,
                              g_editor.cx, folded);
         int cy_draw = y + (cursorVR - g_editor.scroll) * LINE_SPACING;
         int cw = g_font.halfAdvance();
@@ -2496,7 +2537,7 @@ void screen_editor_init(ScreenContext &ctx) {
     }
 
     g_editor.scroll = 0;
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
     // 一进来（非快捷文件）就是中文态：这个入口本来就是拿来写中文的，每次还得先点
     // 一下「中」太别扭。快捷文件保持原状，不改既有习惯。
     // （提示写作/自由写作合并后，进入的都是"没有提示词"那一态——提示词由 Ctrl+P 或
@@ -2590,7 +2631,7 @@ static void editorSelectAll() {
     g.cy = (int)g.lines.size() - 1;
     g.cx = (int)g.lines[g.cy].length();
     g.hasSelection = true;
-    g.targetCx = -1;
+    g.targetX = -1;
     markDirty();
 }
 
@@ -2693,7 +2734,7 @@ static bool editorBeginTouchSelection(int x, int y) {
         g.cy = we.cy;
         g.cx = we.cx;
         g.hasSelection = true;
-        g.targetCx = -1;
+        g.targetX = -1;
         markDirty();
         editMenuOpen(EM_EDIT);
     } else {
@@ -2881,7 +2922,7 @@ static AppState screen_editor_selection_handle(int key, ScreenContext &ctx, bool
             if (editorTapOnGlyph(tx, ty, p)) {
                 g.cy = p.cy;
                 g.cx = p.cx;
-                g.targetCx = -1;
+                g.targetX = -1;
                 markDirty();
             }
             editorRedrawFull();
@@ -2949,7 +2990,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             if (!fn.empty()) g_editor.savedFilename = fn;
             loadLinesIntoEditor(g_editor.recoveryContent);
             g_editor.scroll = 0;
-            g_editor.targetCx = -1;
+            g_editor.targetX = -1;
             g_editor.modifiedSinceSave = true;
             g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
             g_editor.recoveryPrompt = false;
@@ -3141,7 +3182,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                     clearSelection();
                     g_editor.cy = p.cy;
                     g_editor.cx = p.cx;
-                    g_editor.targetCx = -1;
+                    g_editor.targetX = -1;
                     markDirty();
                     ui_clear(); drawEditor(); ui_commit();
                 }
@@ -3286,7 +3327,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         recordUndoSnapshot(UndoGroup::Structural);
         g_editor.lines[g_editor.cy].insert(g_editor.cx, 4, ' ');
         g_editor.cx += 4;
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
         markDirty();
         g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
         g_editor.modifiedSinceSave = true;
@@ -3446,7 +3487,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             g_editor.cy--;
             g_editor.cx = (int)g_editor.lines[g_editor.cy].length();
         }
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
         markDirty();
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
@@ -3459,7 +3500,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             g_editor.cy++;
             g_editor.cx = 0;
         }
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
         markDirty();
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
@@ -3473,16 +3514,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                 curVR = vi; break;
             }
         }
-        if (curVR > 0) {
-            auto &prev = vrows[curVR - 1];
-            if (g_editor.targetCx < 0)
-                g_editor.targetCx = byteToCells(g_editor.lines[g_editor.cy], g_editor.cx);
-            int visualCol = g_editor.targetCx % EDITOR_MAX_CELLS;
-            g_editor.cy = prev.lineIdx;
-            int vrowStartCells = byteToCells(g_editor.lines[g_editor.cy], prev.start);
-            int targetCells = vrowStartCells + visualCol;
-            g_editor.cx = cellsToByte(g_editor.lines[g_editor.cy], prev.start, prev.end, targetCells);
-        }
+        if (curVR > 0) editorCursorToVrow(curVR - 1, vrows);
         markDirty();
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
@@ -3496,17 +3528,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                 curVR = vi; break;
             }
         }
-        if (curVR >= 0 && curVR < (int)vrows.size() - 1) {
-            auto &next = vrows[curVR + 1];
-            if (g_editor.targetCx < 0)
-                g_editor.targetCx = byteToCells(g_editor.lines[g_editor.cy], g_editor.cx);
-            int visualCol = g_editor.targetCx % EDITOR_MAX_CELLS;
-            g_editor.cy = next.lineIdx;
-            int vrowStartCells = byteToCells(g_editor.lines[g_editor.cy], next.start);
-            int targetCells = vrowStartCells + visualCol;
-            g_editor.cx = std::min(cellsToByte(g_editor.lines[g_editor.cy], next.start, next.end, targetCells),
-                                   (int)g_editor.lines[g_editor.cy].length());
-        }
+        if (curVR >= 0 && curVR < (int)vrows.size() - 1) editorCursorToVrow(curVR + 1, vrows);
         markDirty();
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
@@ -3556,7 +3578,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         g_editor.lines.insert(g_editor.lines.begin() + g_editor.cy, prefix + rest);
         foldLinesInserted(g_editor.cy, 1);
         g_editor.cx = (int)prefix.length();  // 光标落在续行标记之后
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
         markDirty();
         g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
         g_editor.modifiedSinceSave = true;
@@ -3576,7 +3598,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             foldLinesErased(g_editor.cy, 1);
             g_editor.cy--;
         }
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
         markDirty();
         g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
         g_editor.modifiedSinceSave = true;
@@ -3584,7 +3606,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         recordUndoSnapshot(UndoGroup::Typing);
         if (g_editor.hasSelection) deleteSelection();
         imeFieldInsert(editorLineField(), std::string(1, (char)key));
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
         markDirty();
         g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
         g_editor.modifiedSinceSave = true;
@@ -3598,7 +3620,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             g_editor.cy--;
             g_editor.cx = (int)g_editor.lines[g_editor.cy].length();
         }
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
     } else if (key == KEY_RIGHT) {
         clearSelection();
         if (g_editor.cx < (int)g_editor.lines[g_editor.cy].length()) {
@@ -3607,7 +3629,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             g_editor.cy++;
             g_editor.cx = 0;
         }
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
     } else if (key == KEY_UP) {
         clearSelection();
         int curVR = -1;
@@ -3616,16 +3638,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                 curVR = vi; break;
             }
         }
-        if (curVR > 0) {
-            auto &prev = vrows[curVR - 1];
-            if (g_editor.targetCx < 0)
-                g_editor.targetCx = byteToCells(g_editor.lines[g_editor.cy], g_editor.cx);
-            int visualCol = g_editor.targetCx % EDITOR_MAX_CELLS;
-            g_editor.cy = prev.lineIdx;
-            int vrowStartCells = byteToCells(g_editor.lines[g_editor.cy], prev.start);
-            int targetCells = vrowStartCells + visualCol;
-            g_editor.cx = cellsToByte(g_editor.lines[g_editor.cy], prev.start, prev.end, targetCells);
-        }
+        if (curVR > 0) editorCursorToVrow(curVR - 1, vrows);
     } else if (key == KEY_DOWN) {
         clearSelection();
         int curVR = -1;
@@ -3634,25 +3647,15 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                 curVR = vi; break;
             }
         }
-        if (curVR >= 0 && curVR < (int)vrows.size() - 1) {
-            auto &next = vrows[curVR + 1];
-            if (g_editor.targetCx < 0)
-                g_editor.targetCx = byteToCells(g_editor.lines[g_editor.cy], g_editor.cx);
-            int visualCol = g_editor.targetCx % EDITOR_MAX_CELLS;
-            g_editor.cy = next.lineIdx;
-            int vrowStartCells = byteToCells(g_editor.lines[g_editor.cy], next.start);
-            int targetCells = vrowStartCells + visualCol;
-            g_editor.cx = std::min(cellsToByte(g_editor.lines[g_editor.cy], next.start, next.end, targetCells),
-                                   (int)g_editor.lines[g_editor.cy].length());
-        }
+        if (curVR >= 0 && curVR < (int)vrows.size() - 1) editorCursorToVrow(curVR + 1, vrows);
     } else if (key == KEY_HOME) {
         clearSelection();
         editorLineField().setCur(0);
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
     } else if (key == KEY_END) {
         clearSelection();
         imeFieldMoveEnd(editorLineField());
-        g_editor.targetCx = -1;
+        g_editor.targetX = -1;
     } else if (key == KEY_PAGE_UP) {
         clearSelection();
         moveCursorVertical(-editorPageRows(), vrows);
@@ -3928,7 +3931,7 @@ void editorInsertText(const std::string &text) {
     recordUndoSnapshot(UndoGroup::Typing);
     if (g_editor.hasSelection) deleteSelection();
     imeFieldInsert(editorLineField(), text);   // 删除选区可能并了行，字段要在它之后取
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
     markDirty();
     g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
     g_editor.modifiedSinceSave = true;
@@ -3939,7 +3942,7 @@ void editorReplaceAllText(const std::string &text) {
     recordUndoSnapshot(UndoGroup::Structural);
     loadLinesIntoEditor(text);
     g_editor.scroll = 0;
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
     g_editor.hasSelection = false;
     markDirty();
     g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
@@ -3986,7 +3989,7 @@ void editorReplaceSelection(const std::string &text) {
             g_editor.cx = (int)ins.back().length();
         }
     }
-    g_editor.targetCx = -1;
+    g_editor.targetX = -1;
     markDirty();
     g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
     g_editor.modifiedSinceSave = true;

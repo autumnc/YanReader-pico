@@ -142,6 +142,13 @@ void ttf_warm_text_px(int pixel_height, const char* text);
 void ttf_measure_line(int size, const char* text, int* above, int* below);
 void ttf_measure_line_px(int pixel_height, const char* text, int* above, int* below);
 int ttf_text_width_px(int pixel_height, const char* text);
+/// 单码点步进(px)，与 ttf_text_width_px 同一个实现：ASCII(<0x80) 走**每字面 128 项
+/// 缓存表**（见 ttf_font.c 的 ascii_adv_ensure），其余码点走通用度量。与
+/// ttf_text_width_px 逐值相等是构造保证，不是两处对齐。
+///
+/// role 必须显式给（不用 s_cur）：FontRenderer::setSize()/setGridPx() 量完 ascent 会
+/// 把当前面留在 UI 上且不还原，所以"当前面"不是可靠输入。给 -1 会落到内容面。
+int ttf_char_advance_px(int role, int pixel_height, uint32_t codepoint);
 void ttf_set_weight(int wght);
 int ttf_get_weight(void);
 

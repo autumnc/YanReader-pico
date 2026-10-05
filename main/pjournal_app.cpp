@@ -824,7 +824,7 @@ AppState screen_viewer_handle(int key, ScreenContext &ctx) {
     const auto& mdInfo = getViewerMdInfo(mdOn);
     for (int i = 0; i < visible && (g_viewer.scroll + i) < (int)vrows.size(); i++) {
         auto &vr = vrows[g_viewer.scroll + i];
-        mdDrawVrow(4, contentY + i * LINE_SPACING, g_viewer.lines[vr.lineIdx], vr.start, vr.end, mdInfo[vr.lineIdx], vr.indentCells);
+        mdDrawVrow(4, contentY + i * LINE_SPACING, g_viewer.lines[vr.lineIdx], vr.start, vr.end, mdInfo[vr.lineIdx], vr.indentPx);
     }
 
     if (g_viewer.scroll > 0 && maxScroll > 0) {
@@ -959,7 +959,7 @@ static void drawHistoryPreview() {
     const auto& mdInfo = getHistoryMdInfo(mdOn);
     for (int i = 0; i < visible && (g_history.previewScroll + i) < (int)vrows.size(); i++) {
         auto &vr = vrows[g_history.previewScroll + i];
-        mdDrawVrow(4, contentY + i * LINE_SPACING, g_history.lines[vr.lineIdx], vr.start, vr.end, mdInfo[vr.lineIdx], vr.indentCells);
+        mdDrawVrow(4, contentY + i * LINE_SPACING, g_history.lines[vr.lineIdx], vr.start, vr.end, mdInfo[vr.lineIdx], vr.indentPx);
     }
     ui_draw_status("r恢复 d删除 q返回", "");
     ui_commit();
