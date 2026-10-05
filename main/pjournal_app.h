@@ -26,6 +26,17 @@ enum AppState {
     APP_QUIT,
 };
 
+// 界面属于哪个模式：0=阅读 1=写作 2=计划。按界面归属判断而不是另存一个 mode 变量，
+// 这样用户在模式内部乱走(从 GTD 退回写作菜单)也不会把模式标错。
+// 放在头里（原来是 main.cpp 的 file-static）是因为 Screen 的 leave 钩子也要用：
+// 编辑器判断"这次离开是不是切模式"（目的地跨了模式 → 保住会话，回来接着用），
+// 见 screen_editor_leave。语义一字未改。
+inline int appModeOfState(AppState s) {
+    if (s == APP_READER) return 0;
+    if (s == APP_GTD) return 2;
+    return 1;
+}
+
 // Screen context passed between screens
 struct ScreenContext {
     AppState nextState = APP_MAIN;
@@ -134,29 +145,18 @@ AppState screen_viewer_handle(int key, ScreenContext &ctx);
 void screen_history_init(const std::string &filename, AppState returnTo);
 AppState screen_history_handle(int key, ScreenContext &ctx);
 
-// GTD / Outline screens
-void screen_gtd_init();
-AppState screen_gtd_handle(int key, ScreenContext &ctx);
-
-void screen_outline_init();
-AppState screen_outline_handle(int key, ScreenContext &ctx);
-
-// Inspiration screen
-void screen_inspiration_init(AppState returnTo, AppState editorReturnTo);
-AppState screen_inspiration_handle(int key, ScreenContext &ctx);
-
-// Flomo 笔记（移植自 ../Flomo，手动同步，正文借用写作编辑器）
-void screen_flomo_init(AppState returnTo);
-AppState screen_flomo_handle(int key, ScreenContext &ctx);
+// ── 拆出去的屏不在这个头里 ────────────────────────────────────────────────
+// 本头只声明**实现还在 pjournal_app.cpp 里**的屏（main/browser/viewer/history，
+// 见上一段）。已经搬到自己 .cpp 的屏各有 screen_*.h，要用就直接 include 那一个：
+//   screen_editor.h / screen_settings.h / screen_gtd.h / screen_outline.h /
+//   screen_inspiration.h / screen_flomo.h / screen_reader.h / screen_bt_manage.h /
+//   screen_file_manager.h / screen_polish.h / screen_polish_prompt.h
+// 这里以前把它们的原型又抄了一遍 —— 同一份声明两处维护，正是"声明和实现对不上"
+// 的温床（screen_reader.cpp 抄 ttf 接口抄到 ttf_font_open 返回值都变了，同一个毛病）。
 
 // Flomo send text (set by browser/viewer before entering APP_SYNC_SEND_FLOMO)
 extern std::string g_flomoPendingText;
 extern AppState g_flomoReturnTo;
-
-// Reading mode (阅读模式): crossmux 阅读器移植，power 键在写作/阅读间切换。
-void screen_reader_init();
-void screen_reader_exit();
-AppState screen_reader_handle(int key, ScreenContext &ctx);
 
 // 阅读器当前子界面里，长按中间确认键是不是一个**动作**（删词典/解绑按键/删统计里的书）
 // 而不是"待机"。main.cpp 的全局"长按中间键 = 待机"靠它放行这三处，其余一律待机。

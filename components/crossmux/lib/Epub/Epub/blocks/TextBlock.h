@@ -24,7 +24,8 @@
 //   uint16_t textOff[wordCount]        byte offset of word i's text in text[]
 //   int16_t  xpos[wordCount]
 //   uint16_t focusSuffixX[wordCount]   present only when focusPresent
-//   uint8_t  styles[wordCount]
+//   uint16_t styles[wordCount]         EpdFontFamily::Style (16-bit since the
+//                                      WAVY_UNDERLINE bit landed — see EpdFontFamily.h)
 //   uint8_t  focusBoundary[wordCount]  present only when focusPresent
 //   char     text[textBytes]           all words back to back, NUL-terminated
 //
@@ -73,7 +74,7 @@ class TextBlock final : public Block {
   const uint16_t* textOffArr = nullptr;
   const int16_t* xposArr = nullptr;
   const uint16_t* focusSuffixXArr = nullptr;  // null when !focusPresent
-  const uint8_t* stylesArr = nullptr;
+  const uint16_t* stylesArr = nullptr;        // EpdFontFamily::Style, 16-bit
   const uint8_t* focusBoundaryArr = nullptr;  // null when !focusPresent
   const char* textArr = nullptr;
   std::vector<std::string> rubyTexts;

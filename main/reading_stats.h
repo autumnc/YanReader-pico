@@ -22,6 +22,9 @@
 struct ReadingDayStats {
     uint32_t dayOrdinal = 0;
     uint64_t readingMs = 0;
+    // 当天翻过的页数（只数往后翻的，见 reading_stats.cpp 的 notePageTurn）。
+    // Pages turned forward on this day; see notePageTurn for why backward is not counted.
+    uint32_t pages = 0;
 };
 
 struct ReadingBookStats {
@@ -31,6 +34,7 @@ struct ReadingBookStats {
     std::string chapterTitle;
     std::vector<ReadingDayStats> readingDays;
     uint64_t totalReadingMs = 0;
+    uint64_t totalPages = 0;  // 累计翻过的页数（跨天合计）
     uint32_t sessions = 0;
     uint32_t lastSessionMs = 0;
     uint32_t firstReadAt = 0;
@@ -84,6 +88,7 @@ bool shouldCheckpoint();   // 有脏数据 + 会话进行中 + 距上次落盘 �
 void beginSession(const std::string &path, const std::string &title, const std::string &author, uint8_t progressPercent,
                   const std::string &chapterTitle, uint8_t chapterProgressPercent);
 void noteActivity();          // 一次交互：把距上次交互的时间（截到 30 分钟）记进当天
+void notePageTurn();          // 往后翻了一页：当天 + 当前书的页数各 +1
 void tickActiveSession();     // 空闲帧心跳：距上次交互 ≥60s 才补一笔
 void resumeSession();         // 跳出子界面回来：丢弃空档，不补记
 void updateProgress(uint8_t progressPercent, bool completed, const std::string &chapterTitle,
@@ -104,6 +109,9 @@ uint32_t booksFinished();
 uint64_t totalReadingMs();
 uint64_t todayReadingMs();
 uint64_t recentReadingMs(uint32_t days);
+uint64_t totalPagesRead();                    // 所有书累计翻过的页数
+uint32_t todayPages();                        // 今天翻过的页数
+uint32_t pagesOnDay(uint32_t dayOrdinal);     // 某天翻过的页数
 uint32_t currentStreakDays();
 uint32_t maxStreakDays();
 uint32_t readDaysCount();     // 有阅读记录的天数

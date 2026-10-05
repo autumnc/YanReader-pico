@@ -254,6 +254,12 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
   LOG_DBG("IMG", "Loading from cache: %s (%dx%d)", cachePath.c_str(), cachedWidth, cachedHeight);
 
   const int bytesPerRow = (cachedWidth + 3) / 4;  // 2 bits per pixel, 4 pixels per byte
+  // cachedWidth 来自 .pxc 头（缓存损坏/被手改时可能是 0），此时 bytesPerRow == 0：
+  // 下面 4096 / bytesPerRow 会先除零崩（SIGFPE），轮不到 rowsPerRead < 1 那条兜底。
+  if (bytesPerRow < 1) {
+    LOG_ERR("IMG", "Invalid cached row width %u in %s", (unsigned)cachedWidth, cachePath.c_str());
+    return false;
+  }
 
   // First pass of a page render: try to pull the payload into the RAM slot so
   // the remaining ~12 passes skip SD entirely. Only an EMPTY slot is claimed:

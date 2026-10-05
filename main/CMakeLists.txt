@@ -43,6 +43,8 @@ idf_component_register(SRCS
     "clipboard.cpp"
     "edit_menu.cpp"
     "text_sel.cpp"
+    "ui/ime_field.cpp"
+    "net/http.cpp"
     "screen_editor.cpp"
     "editor_vk.cpp"
     "screen_settings.cpp"
@@ -84,6 +86,11 @@ idf_component_register(SRCS
     "markdown_render.cpp"
     "vertical_layout.cpp"
     "screen_reader.cpp"
+    "screen_reader_weread.cpp"   # 微信读书子应用（P3b 从 screen_reader.cpp 拆出）
+    "screen_reader_stats.cpp"    # 「统计」标签与 8 个子界面（P3b 从 screen_reader.cpp 拆出）
+    "screen_reader_subpages.cpp" # 设置标签下的叶子子界面（P3b 从 screen_reader.cpp 拆出）
+    "screen_reader_files.cpp"    # 「文件」标签：浏览器/文件菜单/图片查看器（P3b 拆出）
+    "screen_reader_footnotes.cpp" # 正文脚注引擎（P3b 从 screen_reader.cpp 拆出）
     "reading_stats.cpp"
     # 硬件适配层
     "hw/board.cpp"
@@ -92,13 +99,15 @@ idf_component_register(SRCS
     "gfx/icon_font.c"
     "font/ttf_font.c"
     "display.c"
-    "settings.c"
+    "font_store.c"
     INCLUDE_DIRS
         "."
         "hw"
         "gfx"
         "font"
         "ime"
+        "ui"
+        "net"
     EMBED_FILES
         ${PJOURNAL_EMBED_FILES}
     REQUIRES
@@ -127,7 +136,8 @@ idf_component_register(SRCS
         crossmux
 )
 
-target_compile_definitions(${COMPONENT_LIB} PRIVATE PJOURNAL_VERSION="5.0.0")
+# 本工程是独立项目，版本号不复用 pjournal 那条线：从 1.0.0 重新起算。
+target_compile_definitions(${COMPONENT_LIB} PRIVATE YAN_READER_VERSION="1.0.0")
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PJOURNAL_IME_ENABLE_PINYIN=$<BOOL:${PJOURNAL_IME_ENABLE_PINYIN}>
     PJOURNAL_IME_ENABLE_LIANGFEN=$<BOOL:${PJOURNAL_IME_ENABLE_LIANGFEN}>

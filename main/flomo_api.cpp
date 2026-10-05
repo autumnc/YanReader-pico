@@ -7,13 +7,13 @@
 #include <cstring>
 #include <ctime>
 
-#include <esp_crt_bundle.h>
-#include <esp_http_client.h>
 #include <esp_log.h>
 #include <esp_rom_md5.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+
+#include "net/http.h"
 
 static const char *TAG = "FlomoApi";
 
@@ -100,7 +100,12 @@ static ApiResult parseResponse(int status, const std::string &body) {
     if (root["code"].isNumber()) code = root["code"].asInt(-1);
     else if (root["code"].isString()) code = std::atoi(root["code"].asString().c_str());
     if (code == 0) return {true, "", root["data"]};
-    std::string msg = root["message"].asString(root["msg"].asString());
+    // 不能写成 root["message"].asString(root["msg"].asString())：非 const 的
+    // operator[] 在键缺失时会往 memberValues 里 push（可能扩容），而两个实参的求值
+    // 顺序未定义 —— 先算出的那个引用会悬空。分开先拷贝出来再合并默认值。
+    const JsonValue m1 = root["message"];
+    const JsonValue m2 = root["msg"];
+    std::string msg = m1.asString(m2.asString());
     if (msg.empty()) msg = "API code " + std::to_string(code) + " " + snippet(body);
     return {false, msg, root};
 }
@@ -132,15 +137,17 @@ ApiResult FlomoApi::request(const std::string &method, const std::string &path,
     for (auto &kv : extra) params[kv.first] = kv.second;
     params["sign"] = sign(params);
 
+    net::Request req;
     std::string url = std::string(kBase) + "/" + path;
-    std::string body;
-    esp_http_client_method_t m = HTTP_METHOD_GET;
+    req.headers.push_back({"User-Agent", "pjournal-pico/1.0"});
+    if (!token_.empty()) req.headers.push_back({"Authorization", "Bearer " + token_});
     if (method == "GET" || method == "DELETE") {
         url += "?" + query(params);
-        m = method == "GET" ? HTTP_METHOD_GET : HTTP_METHOD_DELETE;
+        req.method = method == "GET" ? net::Method::Get : net::Method::Delete;
     } else {
-        m = method == "POST" ? HTTP_METHOD_POST : HTTP_METHOD_PUT;
-        body = "{";
+        req.method = method == "POST" ? net::Method::Post : net::Method::Put;
+        req.headers.push_back({"Content-Type", "application/json"});
+        std::string body = "{";
         bool first = true;
         for (auto &kv : params) {
             if (!first) body += ",";
@@ -148,14 +155,14 @@ ApiResult FlomoApi::request(const std::string &method, const std::string &path,
             body += "\"" + jsonEscape(kv.first) + "\":\"" + jsonEscape(kv.second) + "\"";
         }
         body += "}";
+        req.body = std::move(body);
     }
-
-    esp_http_client_config_t cfg{};
-    cfg.url = url.c_str();
-    cfg.method = m;
-    cfg.timeout_ms = 30000;
-    cfg.skip_cert_common_name_check = true;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    req.url = std::move(url);
+    req.timeout_ms = 30000;
+    req.cap = 1024 * 1024;  // 软上限
+    // 墙钟上限：这条跑在主任务上（登录/建卡/删改），对端挂住/挤牙膏时没有它就会
+    // 永久卡在 net::request 的读循环里（按键、待机、看门狗全失效）。见 net/http.h 第 1 条。
+    req.deadline_ms = 45000;
 
     ApiResult result{false, "网络连接失败", {}};
     for (int attempt = 0; attempt < 2; attempt++) {
@@ -166,34 +173,15 @@ ApiResult FlomoApi::request(const std::string &method, const std::string &path,
                 vTaskDelay(pdMS_TO_TICKS((MIN_REQ_GAP_US - gap) / 1000 + 1));
         }
 
-        auto *c = esp_http_client_init(&cfg);
-        if (!c) return {false, "HTTP init failed", {}};
-        esp_http_client_set_header(c, "User-Agent", "pjournal-pico/1.0");
-        if (!token_.empty()) {
-            std::string bearer = "Bearer " + token_;
-            esp_http_client_set_header(c, "Authorization", bearer.c_str());
-        }
-        if (!body.empty()) esp_http_client_set_header(c, "Content-Type", "application/json");
-
-        int status = 0;
-        std::string resp;
-        if (esp_http_client_open(c, body.size()) == 0) {
-            if (!body.empty()) esp_http_client_write(c, body.c_str(), body.size());
-            esp_http_client_fetch_headers(c);
-            status = esp_http_client_get_status_code(c);
-            char buf[1024];
-            int n = 0;
-            while ((n = esp_http_client_read(c, buf, sizeof(buf))) > 0 && resp.size() < 1024 * 1024)
-                resp.append(buf, n);
-            result = parseResponse(status, resp);
-        } else {
-            result = {false, "网络连接失败", {}};
-        }
-        esp_http_client_cleanup(c);
-        s_last_req_us = esp_timer_get_time();   // 成功失败都算一次"打过网络"
+        net::Response resp = net::request(req);
+        const int status = resp.status;
+        const std::string &body = resp.body;
+        if (resp.err != ESP_OK) result = {false, "网络连接失败", {}};
+        else result = parseResponse(status, body);
+        s_last_req_us = esp_timer_get_time();  // 成功失败都算一次"打过网络"
 
         if (status != 429) break;
-        ESP_LOGW(TAG, "%s 限流(429) 第%d次: %s", path.c_str(), attempt + 1, resp.substr(0, 120).c_str());
+        ESP_LOGW(TAG, "%s 限流(429) 第%d次: %s", path.c_str(), attempt + 1, body.substr(0, 120).c_str());
         if (attempt == 0) {
             vTaskDelay(pdMS_TO_TICKS(RETRY_WAIT_MS));
             continue;

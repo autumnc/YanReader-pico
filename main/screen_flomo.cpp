@@ -14,6 +14,7 @@
 #include "font_renderer.h"
 #include "icon_font.h"
 #include "ime/IME.h"
+#include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划/阅读共用一份）
 #include "screen_editor.h"
 #include "settings_manager.h"
 #include "ui_helpers.h"
@@ -72,6 +73,9 @@ static struct {
     int searchCur = 0;
     bool searchIme = false;
 } g;
+
+// 检索框的 ImeField 形态（带真实光标，可左右移）。
+static ImeField flomoSearchField() { return ImeField{&g.searchBuf, &g.searchCur}; }
 
 // ── 小工具 ────────────────────────────────────────────────────────────────
 
@@ -262,6 +266,9 @@ static bool flomoSync() {
             saveLocal();
             g.syncing = false;
             g.status = opName + "失败: " + r.message;
+            // 失败也要重建索引：这一趟可能已经替换过若干 memo（m = remote），
+            // 索引表必须与 memos 对得上，否则调用方回来直接 drawList 会拿旧下标取元素。
+            rebuildFilter();
             return false;
         }
         if (m.pendingOp == "create") {
@@ -295,7 +302,16 @@ static bool flomoSync() {
         snprintf(prog, sizeof(prog), "拉取笔记 第 %d 页…", page);
         syncProgress(prog);
         ApiResult r = api.listPage(slug, updated);
-        if (!r.ok) { saveLocal(); g.syncing = false; g.status = "刷新失败: " + r.message; return false; }
+        if (!r.ok) {
+            saveLocal();
+            g.syncing = false;
+            g.status = "刷新失败: " + r.message;
+            // 关键：上面已经 erase 掉「已删且无标记」的本地条目、也可能 removeMemoBySlug
+            // 过，memos 比进来时短了。不重建 g.filtered 就返回，调用方的 drawList 会拿
+            // 旧下标去 memos[g.filtered[fi]] 越界读 → 崩。
+            rebuildFilter();
+            return false;
+        }
         if (!r.data.isArray() || r.data.size() == 0) break;
         for (size_t i = 0; i < r.data.size(); ++i) {
             Memo m = memoFromJson(r.data[i]);
@@ -701,8 +717,7 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
             std::string imeOut;
             if (g_ime.handleKey(key, imeOut)) {
                 if (!imeOut.empty()) {
-                    g.searchBuf.insert(g.searchCur, imeOut);
-                    g.searchCur += (int)imeOut.length();
+                    imeFieldInsert(flomoSearchField(), imeOut);
                     g.query = g.searchBuf;
                     rebuildFilter();
                     g.sel = 0; g.scroll = 0;
@@ -739,18 +754,13 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
             g.mode = FM_LIST;
             editorVkAutoHide();
         } else if (key == 0x7F || key == 0x08) {
-            if (g.searchCur > 0) {
-                int prev = g.searchCur - 1;
-                while (prev > 0 && ((unsigned char)g.searchBuf[prev] & 0xC0) == 0x80) prev--;
-                g.searchBuf.erase(prev, g.searchCur - prev);
-                g.searchCur = prev;
+            if (imeFieldBackspace(flomoSearchField())) {
                 g.query = g.searchBuf;
                 rebuildFilter();
                 g.sel = 0; g.scroll = 0;
             }
         } else if (key >= 0x20 && key <= 0x7E) {
-            g.searchBuf.insert(g.searchCur, 1, (char)key);
-            g.searchCur++;
+            imeFieldInsert(flomoSearchField(), std::string(1, (char)key));
             g.query = g.searchBuf;
             rebuildFilter();
             g.sel = 0; g.scroll = 0;
@@ -870,7 +880,7 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
         return APP_FLOMO;
     } else if (key == '/') {
         g.searchBuf = g.query;
-        g.searchCur = (int)g.searchBuf.size();
+        imeFieldMoveEnd(flomoSearchField());
         g.searchIme = true;
         g_ime.setActive(true);
         g.sel = 0;

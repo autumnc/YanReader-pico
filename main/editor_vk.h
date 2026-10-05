@@ -59,11 +59,6 @@ void editorVkAutoShow();
 bool editorVkVisible();
 void editorVkSetVisible(bool on);
 
-// 候选字在候选行里的像素宽度（按「候选字大小」设置量，不含 "N." 编号前缀）。
-// 给输入法分页用：main.cpp 的 setWidthFn 在键盘可见时改调这个，保证"输入法算的一行
-// 放几个"和"键盘实际画得下几个"是同一个字号下的结论。
-int editorVkCandidateWidth(const char *text);
-
 // 键位布局（26 / 14 / 18 / 9 键）的外部入口：key 是 "26"/"14"/"18"/"9"，与设置项
 // "kb_layout" 存的是同一串字面量。设置界面用它切换并持久化；editorVkInit 反过来从
 // 设置读。键盘上的"布局"键走的是内部同一条路（点一下就换下一个布局并写设置）。

@@ -53,7 +53,13 @@ class CssParser {
   // 12: 加 font-size（样式 wire 多一个长度字段 + defined 位 18），老 css_rules.cache 必须作废
   // 13: 加 font-family（样式 wire 多 4 字节家族名哈希 + defined 位 19）——同一本老书
   //     用旧缓存排出来的版式里没有次字面位，混着用会出现半页仿宋、半页宋体，同样作废。
-  static constexpr uint8_t CSS_CACHE_VERSION = 13;
+  // 14: 认 `border-bottom`（专名线）与 wavy 线索（书名线）。wire 格式没变，但**解析结果**
+  //     变了：老缓存里那些 span 的 textDecoration 是 None，不清掉的话古籍打开还是没有线。
+  // 15: border-bottom 的线不再被同块里的 `text-decoration: none` 抹掉（BorderLine 标记，
+  //     见 CssStyle.h 的 mergeBorderLine），且虚/点线改按书名线的波浪笔法画。同样是
+  //     wire 格式没变、**解析结果**变了：春秋左传注那本的 span.q / u 在老缓存里是 None，
+  //     不清掉的话打开还是两条线都没有（书名线、专名线都缺）。
+  static constexpr uint8_t CSS_CACHE_VERSION = 15;
 
   /**
    * 家族名（或整个 font-family 家族列表）的归一化哈希：取第一个家族，去引号/空白、

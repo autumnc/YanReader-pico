@@ -6,6 +6,12 @@
 void screen_editor_init(ScreenContext &ctx);
 AppState screen_editor_handle(int key, ScreenContext &ctx);
 
+// 进入 / 离开编辑器（main.cpp 的 kScreens 生命周期钩子）。**要不要重建**这条规则
+// 由编辑器自己拿着（见 .cpp）：从灵感/润色/历史回来时只是被浮层盖过，正文/光标/选区
+// 都还在，不重建；从别处进来则重建。
+void screen_editor_enter(ScreenContext &ctx);
+void screen_editor_leave(AppState next);
+
 // Idle tick (no key): runs auto-save, repaints only if the screen is stale or
 // forceRedraw is set. Returns true if a repaint happened.
 bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw);

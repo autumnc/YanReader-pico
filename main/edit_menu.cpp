@@ -40,6 +40,9 @@ const char *editMenuLabel(int i) {
 }
 
 static void bandRect(int *bx, int *by, int *bw, int *bh) {
+    // 按钮条是**界面框架**：它贴在正文底边之上，几何恒按界面字号，不跟正文字号一起长。
+    // 绘制与命中都从这里算，所以钉在这里一处就够（见 screen_editor_handle 的说明）。
+    FontScope ui(FontRenderer::uiPxHeight());
     *bw = SCREEN_W;
     *bh = 2 * FONT_H + 18;
     *bx = 0;
@@ -81,6 +84,7 @@ void editMenuMove(int delta) {
 }
 
 int editMenuHit(int x, int y) {
+    FontScope ui(FontRenderer::uiPxHeight());
     const int n = editMenuCount();
     if (n <= 0) return -1;
     int bx, by, bw, bh;
@@ -95,6 +99,8 @@ int editMenuHit(int x, int y) {
 }
 
 void editMenuDraw() {
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     const int n = editMenuCount();
     if (n <= 0) return;
     int bx, by, bw, bh;
@@ -146,6 +152,8 @@ static std::string previewOf(const std::string &s) {
 }
 
 static void pickerRect(int n, int *bx, int *by, int *bw, int *bh, int *rows) {
+    // 粘贴板选择器是**界面框架**（浮在正文之上）：几何恒按界面字号。
+    FontScope ui(FontRenderer::uiPxHeight());
     int maxRows = (SCREEN_H - 4 * FONT_H) / LINE_SPACING;   // 上下各留两行余量
     if (maxRows > 10) maxRows = 10;
     if (maxRows < 3) maxRows = 3;
@@ -168,6 +176,7 @@ static void pickerRect(int n, int *bx, int *by, int *bw, int *bh, int *rows) {
 
 // 选项 i 的文字基线（绘制与命中共用，与设置界面选择器同一套几何）。
 static int pickerRowY(int by, int i) {
+    FontScope ui(FontRenderer::uiPxHeight());
     const int sepY = by + 8 + FONT_H + 2;
     return sepY + 6 + g_font.ascent() + i * LINE_SPACING;
 }
@@ -201,6 +210,8 @@ void editMenuPickerMove(int delta) {
 }
 
 void editMenuPickerDraw() {
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     if (!s_pickOpen) return;
     const int n = clipboardCount();
     int bx, by, bw, bh, rows;
@@ -242,6 +253,7 @@ void editMenuPickerDraw() {
 }
 
 int editMenuPickerHit(int x, int y) {
+    FontScope ui(FontRenderer::uiPxHeight());
     if (!s_pickOpen) return -1;
     const int n = clipboardCount();
     if (n <= 0) return -1;

@@ -53,7 +53,15 @@ enum class CssFontStyle : uint8_t { Normal = 0, Italic = 1 };
 enum class CssFontWeight : uint8_t { Normal = 0, Bold = 1 };
 
 // Text decoration options. Values are bit flags so CSS can combine multiple line decorations.
-enum class CssTextDecoration : uint8_t { None = 0, Underline = 1, LineThrough = 2 };
+// Wavy = 波浪下划线（古籍书名线）：本身**不**画线，只是给 Underline 换个笔法；单独出现
+// （没有 Underline）时应当什么都不画，所以 ChapterHtmlSlimParser 的映射里
+// `Underline|Wavy → 波浪`、`Wavy 单独 → 无`。值域仍在 uint8_t 内，CssStyle 布局不变，
+// 所以 CSS 缓存不需要 version bump。
+//
+// BorderLine = 8 也**不画线**，它记的是"这条线的出处是 `border-bottom`"——见下面的
+// mergeBorderLine()。只查 Underline/Wavy/LineThrough 位的消费端（fontStyleForTextDecoration）
+// 看不见它，无害。
+enum class CssTextDecoration : uint8_t { None = 0, Underline = 1, LineThrough = 2, Wavy = 4, BorderLine = 8 };
 
 constexpr CssTextDecoration operator|(const CssTextDecoration a, const CssTextDecoration b) {
   return static_cast<CssTextDecoration>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
@@ -63,8 +71,29 @@ constexpr CssTextDecoration operator&(const CssTextDecoration a, const CssTextDe
   return static_cast<CssTextDecoration>(static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
 }
 
-constexpr uint8_t CSS_TEXT_DECORATION_MASK =
-    static_cast<uint8_t>(CssTextDecoration::Underline) | static_cast<uint8_t>(CssTextDecoration::LineThrough);
+constexpr uint8_t CSS_TEXT_DECORATION_MASK = static_cast<uint8_t>(CssTextDecoration::Underline) |
+                                             static_cast<uint8_t>(CssTextDecoration::LineThrough) |
+                                             static_cast<uint8_t>(CssTextDecoration::Wavy) |
+                                             static_cast<uint8_t>(CssTextDecoration::BorderLine);
+
+// `border-bottom` 和 `text-decoration` 在 CSS 里是**两个独立的属性**：后者写 `none` 只能取消
+// 自己那条线，抹不掉前者的边框线。春秋左传注的 `span.q` / `u` 正是同一块里先写
+// `border-bottom: 1px …`、再写 `text-decoration: none`（作者只想声明"别给我加文字装饰线"），
+// 浏览器照样画边框 —— 而这个移植版把两者折进同一个位段，朴素的整体赋值就把线抹没了，
+// 那本书的书名线/专名线一条都画不出来。
+//
+// 所以在**任何要整体赋值 textDecoration 的地方**（CSS 的 text-decoration 分支、以及
+// CssStyle::applyOver 的级联）都过一遍这个函数：把 carried 里来自边框的那一份
+// （BorderLine 标记 + 它带的 Wavy 笔法）并回 incoming。边框线本身必须是实线，
+// 所以 BorderLine 一定连带 Underline。
+constexpr CssTextDecoration mergeBorderLine(const CssTextDecoration incoming, const CssTextDecoration carried) {
+  if ((carried & CssTextDecoration::BorderLine) == CssTextDecoration::None) return incoming;
+  CssTextDecoration result = incoming | CssTextDecoration::BorderLine | CssTextDecoration::Underline;
+  if ((carried & CssTextDecoration::Wavy) != CssTextDecoration::None) {
+    result = result | CssTextDecoration::Wavy;
+  }
+  return result;
+}
 
 // Display options - only None and Block are relevant for e-ink rendering
 enum class CssDisplay : uint8_t { Block = 0, None = 1 };
@@ -190,7 +219,9 @@ struct CssStyle {
       defined.fontWeight = 1;
     }
     if (base.hasTextDecoration()) {
-      textDecoration = base.textDecoration;
+      // base 优先级更高，整个接管 —— 但自己那条**边框线**不能被它的 `text-decoration: none`
+      // 抹掉（两个属性互不相干），见 mergeBorderLine。
+      textDecoration = mergeBorderLine(base.textDecoration, textDecoration);
       defined.textDecoration = 1;
     }
     if (base.hasFontSize()) {

@@ -82,10 +82,25 @@ namespace {
 // 跟在图片右边），页里多出一种"文字行 + 同一 y 上的 PageImage"的组合。页缓存块的形状
 // 一个字节没变，变的是**同一段 HTML 排出来的页不同了**——旧 .bin 会原样复用那些"图片
 // 独占好几行"的旧版式。按惯例 bump 清缓存，让书重新排一遍。
+// 84/83: 脚注表的 href 从 char[256] 改成了 std::string（"alt:" 哨兵那条路要装整段注文，
+// 256 会截断；见 FootnoteEntry.h），序列化从定长 write 换成 writeString 的**长度前缀**。
+// 页缓存块的**字节形状变了**——旧 .bin 按定长读会把后面的内容读错位。这是纯粹的格式不
+// 兼容，必须换号。两个档位各跳两格（而不是各 +1），免得新英文版(82)撞上旧中文版(82)：
+// 缓存目录只按书的路径哈希，跨固件版本是同一个目录。
+// 86/85: 每个词的样式位从 1 字节加宽到 2 字节，多了书名线的 WAVY_UNDERLINE 位
+// （见 EpdFontFamily.h 与 TextBlock.h）。TextBlock 的 arena 是**逐字节落盘**的
+// （TextBlock::serialize），所以页缓存块的形状真的变了：老 .bin 按 1 字节的
+// styles[] 解释，后面所有数组和文本全错位。同时 CSS 侧也认了 border-bottom
+// （CssParser::CSS_CACHE_VERSION 13→14），老 CSS 缓存里那些 span 没有下划线位。
+// 同样各跳两格。
+// 88/87: 书名线/专名线的解析规则变了（border-bottom 的线不再被 `text-decoration: none`
+// 抹掉、虚/点线按波浪画，CssParser::CSS_CACHE_VERSION 14→15）。页缓存的**形状**没变，
+// 变的是每个词样式位里有没有 UNDERLINE/WAVY_UNDERLINE：老 .bin 排出来是没线的，不清掉
+// 的话已经建过缓存的古籍（含春秋左传注）打开仍然一条线都不画。同样各跳两格。
 #ifdef ENABLE_CHINESE_VERSION
-constexpr uint8_t SECTION_FILE_VERSION = 82;
+constexpr uint8_t SECTION_FILE_VERSION = 88;
 #else
-constexpr uint8_t SECTION_FILE_VERSION = 81;
+constexpr uint8_t SECTION_FILE_VERSION = 87;
 #endif
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. An abandoned /

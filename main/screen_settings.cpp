@@ -1,12 +1,13 @@
 #include "screen_settings.h"
 #include "font_renderer.h"
 #include "settings_manager.h"
-#include "settings.h"
+#include "font_store.h"
 #include "ttf_font.h"
 #include "wifi_manager.h"
 #include "opds_client.h"
 #include "flomo_client.h"
 #include "ime/IME.h"
+#include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划/阅读共用一份）
 #include "editor_vk.h"   // editorVkSetLayout：键盘布局这一行直接改虚拟键盘的键位表
 #include "text_sel.h"    // 输入框的触摸选区（三模式共享件）
 #include "pcf85063.h"
@@ -79,6 +80,9 @@ static const SettingField SETTINGS_FIELDS[] = {
     {"_vertical_ref_line_style", "参考线样式", false, true, CAT_DISPLAY},
     {"md_render", "Markdown渲染", false, false, CAT_DISPLAY},
     {"first_line_indent", "首行缩进", false, false, CAT_DISPLAY},
+    // 编辑区正文字号：**只管编辑器正文那一块**（换行/光标/选区/触摸命中全按它算），
+    // 状态栏、输入法条、查找/帮助浮层仍是界面字号。见 ui_helpers.h 的 editorBodyFontPx。
+    {"_editor_font_size", "正文字号", false, true, CAT_DISPLAY},
     // ── 输入法 ──
     {"_kb_layout", "键盘布局", false, true, CAT_IME},
     {"_ime_fuzzy", "拼音模糊音", false, true, CAT_IME},
@@ -185,13 +189,27 @@ static int imePredictIndex(const char *k) {
     return 0;
 }
 // 输入法候选字大小：key = 候选字像素高，标准 45 与界面 20pt(line_height) 同高。
-// 几何换算在 editor_vk.cpp（evkCandFontPx / evkCandRowH）。
+// 这个设置**同时**管两个候选行：虚拟键盘的候选条与实体键盘的输入法条，两处都按
+// ui_helpers.cpp 的 imeCandFontPx 直写像素（行高各自另算：键盘面板 evkCandRowH，
+// 输入法条 imeBarRowH）。
 static const OptItem IME_CAND_SIZE_OPTS[] = {
     {"34", "小"}, {"45", "标准"}, {"56", "大"}, {"68", "特大"},
 };
 static int imeCandSizeIndex(const char *k) {
     for (int i = 0; i < (int)(sizeof(IME_CAND_SIZE_OPTS) / sizeof(IME_CAND_SIZE_OPTS[0])); i++)
         if (strcmp(k, IME_CAND_SIZE_OPTS[i].key) == 0) return i;
+    return 1;  // 认不出 → 标准档
+}
+// 编辑区正文字号：key = 正文的光栅像素高，标准 45 与界面 20pt(line_height) 同高，
+// 也就是这个设置**没动过**时的逐像素原样。只管编辑器正文那一块（换行/光标/选区/触摸
+// 命中全按它算），状态栏、输入法条、虚拟键盘、各浮层仍是界面字号——见 ui_helpers.h 的
+// editorBodyFontPx 与 screen_editor_handle 顶部的说明。
+static const OptItem EDITOR_FONT_SIZE_OPTS[] = {
+    {"34", "小"}, {"45", "标准"}, {"56", "大"}, {"68", "特大"},
+};
+static int editorFontSizeIndex(const char *k) {
+    for (int i = 0; i < (int)(sizeof(EDITOR_FONT_SIZE_OPTS) / sizeof(EDITOR_FONT_SIZE_OPTS[0])); i++)
+        if (strcmp(k, EDITOR_FONT_SIZE_OPTS[i].key) == 0) return i;
     return 1;  // 认不出 → 标准档
 }
 // 虚拟键盘键位布局：26 键全拼 / 14 / 18 / 9 键（后三个是"一个键多个字母"的歧义布局，
@@ -262,6 +280,7 @@ static bool pickerFieldSupported(const char *key) {
            strcmp(key, "_font") == 0 || strcmp(key, "_input_mode") == 0 ||
            strcmp(key, "_kb_layout") == 0 || strcmp(key, "_ime_fuzzy") == 0 ||
            strcmp(key, "_ime_predict_mode") == 0 || strcmp(key, "_ime_cand_size") == 0 ||
+           strcmp(key, "_editor_font_size") == 0 ||
            strcmp(key, "_click_volume") == 0 ||
            strcmp(key, "_click_chinese") == 0 || strcmp(key, "_vertical_ref_line_style") == 0;
 }
@@ -277,7 +296,8 @@ static std::vector<PickerOpt> pickerOpts(const char *key) {
     if (strcmp(key, "_editor_orientation") == 0) return {{"horizontal", "横排"}, {"vertical", "竖排"}};
     if (strcmp(key, "_clock_face") == 0) {
         std::vector<PickerOpt> v;
-        for (StandbyFace f : {StandbyFace::Off, StandbyFace::Clock, StandbyFace::Almanac, StandbyFace::Cover})
+        for (StandbyFace f : {StandbyFace::Off, StandbyFace::Clock, StandbyFace::Almanac, StandbyFace::Cover,
+                              StandbyFace::Image})
             v.push_back({standbyFaceKey(f), standbyFaceLabel(f)});
         return v;
     }
@@ -298,6 +318,8 @@ static std::vector<PickerOpt> pickerOpts(const char *key) {
         return optsFromTable(IME_PREDICT_OPTS, OPT_ITEM_N(IME_PREDICT_OPTS));
     if (strcmp(key, "_ime_cand_size") == 0)
         return optsFromTable(IME_CAND_SIZE_OPTS, OPT_ITEM_N(IME_CAND_SIZE_OPTS));
+    if (strcmp(key, "_editor_font_size") == 0)
+        return optsFromTable(EDITOR_FONT_SIZE_OPTS, OPT_ITEM_N(EDITOR_FONT_SIZE_OPTS));
     if (strcmp(key, "_click_chinese") == 0)
         return optsFromTable(CLICK_CHINESE_OPTS, OPT_ITEM_N(CLICK_CHINESE_OPTS));
     if (strcmp(key, "_vertical_ref_line_style") == 0)
@@ -323,7 +345,7 @@ static std::string pickerCurValue(const char *key) {
     if (strcmp(key, "_clock_face") == 0)
         return standbyFaceKey(standbyFaceFromKey(g_settings.getString("clock_face").c_str()));
     if (strcmp(key, "_font") == 0) {
-        const char *cur = app_settings_font_path();
+        const char *cur = font_store_get_path();
         return (cur && !ttf_font_path_is_builtin(cur)) ? std::string(cur) : std::string();
     }
     if (strcmp(key, "_input_mode") == 0) return g_settings.inputMode();
@@ -332,6 +354,8 @@ static std::string pickerCurValue(const char *key) {
     if (strcmp(key, "_ime_predict_mode") == 0) return g_settings.imePredictMode();
     if (strcmp(key, "_ime_cand_size") == 0)
         return IME_CAND_SIZE_OPTS[imeCandSizeIndex(g_settings.getString("ime_cand_size", "45").c_str())].key;
+    if (strcmp(key, "_editor_font_size") == 0)
+        return EDITOR_FONT_SIZE_OPTS[editorFontSizeIndex(g_settings.getString("editor_font_size", "45").c_str())].key;
     if (strcmp(key, "_click_volume") == 0) return std::to_string(g_settings.typingClickVolume());
     if (strcmp(key, "_click_chinese") == 0) return g_settings.clickChineseMode();
     if (strcmp(key, "_vertical_ref_line_style") == 0) return g_settings.verticalReferenceLineStyle();
@@ -413,6 +437,10 @@ static struct {
     std::vector<PickerOpt> pickerItems;  // 打开时算一次并缓存（字体项要扫 SD，不能每帧扫）
 } g_settingsState;
 
+static ImeField settingsEditField()       { return ImeField{&g_settingsState.editBuffer, &g_settingsState.editCursor}; }
+static ImeField settingsDictSearchField() { return ImeField{&g_settingsState.dictSearchBuffer, &g_settingsState.dictSearchCursor}; }
+static ImeField settingsDictAddField()    { return ImeField{&g_settingsState.dictAddBuffer, &g_settingsState.dictAddCursor}; }
+
 static const char *dictKindLabel(IME::UserDictKind kind) {
     if (kind == IME::FIXED_DICT) return "固定词库";
     if (kind == IME::PREDICT_DICT) return "联想词库";
@@ -483,7 +511,7 @@ static void pickerApply(const char *key, const std::string &value, ScreenContext
     } else if (strcmp(key, "_font") == 0) {
         // 只重算/清空**内容面**：g_font 是 UI 实例（恒内置），在它上面 reloadFont 会把
         // UI 的 ascender 从错的面上重算、清错缓存，意图完全丢失。
-        app_settings_set_font_path(value.c_str());
+        font_store_set_path(value.c_str());
         ttf_font_open(value.c_str());
         g_content_font.reloadFont();
     } else if (strcmp(key, "_input_mode") == 0) {
@@ -500,10 +528,15 @@ static void pickerApply(const char *key, const std::string &value, ScreenContext
     } else if (strcmp(key, "_ime_predict_mode") == 0) {
         g_settings.setString("ime_predict_mode", value);
     } else if (strcmp(key, "_ime_cand_size") == 0) {
-        // 只写键：键盘几何每次绘制现算（editor_vk 的 evkCandFontPx），下次弹键盘就是新字号。
+        // 只写键：候选行几何每次绘制现算（ui_helpers 的 imeCandFontPx），下次重绘就是新字号。
         g_settings.setString("ime_cand_size", value);
         // 候选字宽是按字符串缓存的，档位一换就得作废，否则分页还按旧字号算。
         IME::getInstance().invalidateCandidateWidths();
+    } else if (strcmp(key, "_editor_font_size") == 0) {
+        // 只写键：正文几何每次绘制现算（ui_helpers 的 editorBodyFontPx 走 FontScope）。
+        // 编辑器的折行缓存按字号存了一份（screen_editor 的 cachedBodyPx），字号一改
+        // 下次 getVrows 自己会重排，这里不用通知谁。
+        g_settings.setString("editor_font_size", value);
     } else if (strcmp(key, "_click_volume") == 0) {
         g_settings.setString("click_volume", value);
         typingClickAudition(3);   // 改完立刻听，不然得退出去打字才知道调没调对
@@ -704,26 +737,6 @@ static std::string settingsTrim(const std::string &s) {
     if (start == std::string::npos) return "";
     size_t end = s.find_last_not_of(" \t\r\n");
     return s.substr(start, end - start + 1);
-}
-
-static void moveCursorLeft(std::string &s, int &cursor) {
-    if (cursor <= 0) return;
-    cursor--;
-    while (cursor > 0 && ((unsigned char)s[cursor] & 0xC0) == 0x80) cursor--;
-}
-
-static void moveCursorRight(std::string &s, int &cursor) {
-    if (cursor >= (int)s.length()) return;
-    cursor++;
-    while (cursor < (int)s.length() && ((unsigned char)s[cursor] & 0xC0) == 0x80) cursor++;
-}
-
-static void eraseBeforeCursor(std::string &s, int &cursor) {
-    if (cursor <= 0) return;
-    int prev = cursor - 1;
-    while (prev > 0 && ((unsigned char)s[prev] & 0xC0) == 0x80) prev--;
-    s.erase(prev, cursor - prev);
-    cursor = prev;
 }
 
 static void invalidateDictCache() {
@@ -1245,10 +1258,11 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
     if (g_settingsState.mode == SETTINGS_DICT_LIST && g_settingsState.dictSearching) {
         if (g_settingsState.dictSearchImeActive && key != 0) {
             std::string imeOut;
+            // 同上：ASCII 兜底那条路还会把 dictSelection/dictScroll 复位（回到第一命中），
+            // 这支没有 —— 合并会丢掉那个复位，所以两条路各留各的。
             if (g_ime.handleKey(key, imeOut)) {
                 if (!imeOut.empty()) {
-                    g_settingsState.dictSearchBuffer.insert(g_settingsState.dictSearchCursor, imeOut);
-                    g_settingsState.dictSearchCursor += (int)imeOut.length();
+                    imeFieldInsert(settingsDictSearchField(), imeOut);
                     g_settingsState.dictFilterCacheValid = false;
                 }
                 drawDictSearch();
@@ -1271,17 +1285,16 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             g_ime.setActive(false);
             editorVkAutoHide();
         } else if (key == 0x7F || key == 0x08) {
-            eraseBeforeCursor(g_settingsState.dictSearchBuffer, g_settingsState.dictSearchCursor);
+            imeFieldBackspace(settingsDictSearchField());
             g_settingsState.dictSelection = 0;
             g_settingsState.dictScroll = 0;
             g_settingsState.dictFilterCacheValid = false;
         } else if (key == KEY_LEFT) {
-            moveCursorLeft(g_settingsState.dictSearchBuffer, g_settingsState.dictSearchCursor);
+            imeFieldMoveLeft(settingsDictSearchField());
         } else if (key == KEY_RIGHT) {
-            moveCursorRight(g_settingsState.dictSearchBuffer, g_settingsState.dictSearchCursor);
+            imeFieldMoveRight(settingsDictSearchField());
         } else if (key >= 0x20 && key <= 0x7E) {
-            g_settingsState.dictSearchBuffer.insert(g_settingsState.dictSearchCursor, 1, (char)key);
-            g_settingsState.dictSearchCursor++;
+            imeFieldInsert(settingsDictSearchField(), std::string(1, (char)key));
             g_settingsState.dictSelection = 0;
             g_settingsState.dictScroll = 0;
             g_settingsState.dictFilterCacheValid = false;
@@ -1355,10 +1368,9 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
     if (g_settingsState.mode == SETTINGS_DICT_ADD) {
         if (g_settingsState.dictAddImeActive && key != 0) {
             std::string imeOut;
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, false, imeOut)) {
                 if (!imeOut.empty()) {
-                    g_settingsState.dictAddBuffer.insert(g_settingsState.dictAddCursor, imeOut);
-                    g_settingsState.dictAddCursor += (int)imeOut.length();
+                    imeFieldInsert(settingsDictAddField(), imeOut);
                 }
                 drawDictAdd();
                 return APP_SETTINGS;
@@ -1387,14 +1399,13 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             g_ime.setActive(false);
             editorVkAutoHide();
         } else if (key == 0x7F || key == 0x08) {
-            eraseBeforeCursor(g_settingsState.dictAddBuffer, g_settingsState.dictAddCursor);
+            imeFieldBackspace(settingsDictAddField());
         } else if (key == KEY_LEFT) {
-            moveCursorLeft(g_settingsState.dictAddBuffer, g_settingsState.dictAddCursor);
+            imeFieldMoveLeft(settingsDictAddField());
         } else if (key == KEY_RIGHT) {
-            moveCursorRight(g_settingsState.dictAddBuffer, g_settingsState.dictAddCursor);
+            imeFieldMoveRight(settingsDictAddField());
         } else if (key >= 0x20 && key <= 0x7E) {
-            g_settingsState.dictAddBuffer.insert(g_settingsState.dictAddCursor, 1, (char)key);
-            g_settingsState.dictAddCursor++;
+            imeFieldInsert(settingsDictAddField(), std::string(1, (char)key));
         }
         drawDictAdd();
         return APP_SETTINGS;
@@ -1440,10 +1451,12 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
 
         if (g_settingsState.imeActive && key != 0) {
             std::string imeOut;
+            // 这一支**故意不并进 imeFieldKeyText**：它的重绘是就地单行的（不折行、不叠触摸
+            // 选区），而"输入法放行的可打印 ASCII"走链尾是 drawSettingsEdit() —— 两条路画法
+            // 不同，合并等于让"输入法开着敲数字"换一套重绘。共享层只用来落串/移光标。
             if (g_ime.handleKey(key, imeOut)) {
                 if (!imeOut.empty()) {
-                    g_settingsState.editBuffer.insert(g_settingsState.editCursor, imeOut);
-                    g_settingsState.editCursor += (int)imeOut.length();
+                    imeFieldInsert(settingsEditField(), imeOut);
                 }
                 ui_clear();
                 auto &f = SETTINGS_FIELDS[fieldAt(g_settingsState.selection)];
@@ -1496,30 +1509,13 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             g_ime.setActive(false);
             editorVkAutoHide();
         } else if (key == 0x7F || key == 0x08) {
-            if (g_settingsState.editCursor > 0) {
-                int prev = g_settingsState.editCursor - 1;
-                while (prev > 0 && ((unsigned char)g_settingsState.editBuffer[prev] & 0xC0) == 0x80)
-                    prev--;
-                g_settingsState.editBuffer.erase(prev, g_settingsState.editCursor - prev);
-                g_settingsState.editCursor = prev;
-            }
+            imeFieldBackspace(settingsEditField());
         } else if (key == KEY_LEFT) {
-            if (g_settingsState.editCursor > 0) {
-                g_settingsState.editCursor--;
-                while (g_settingsState.editCursor > 0 &&
-                       ((unsigned char)g_settingsState.editBuffer[g_settingsState.editCursor] & 0xC0) == 0x80)
-                    g_settingsState.editCursor--;
-            }
+            imeFieldMoveLeft(settingsEditField());
         } else if (key == KEY_RIGHT) {
-            if (g_settingsState.editCursor < (int)g_settingsState.editBuffer.length()) {
-                g_settingsState.editCursor++;
-                while (g_settingsState.editCursor < (int)g_settingsState.editBuffer.length() &&
-                       ((unsigned char)g_settingsState.editBuffer[g_settingsState.editCursor] & 0xC0) == 0x80)
-                    g_settingsState.editCursor++;
-            }
+            imeFieldMoveRight(settingsEditField());
         } else if (key >= 0x20 && key <= 0x7E) {
-            g_settingsState.editBuffer.insert(g_settingsState.editCursor, 1, (char)key);
-            g_settingsState.editCursor++;
+            imeFieldInsert(settingsEditField(), std::string(1, (char)key));
         }
 
         drawSettingsEdit();
@@ -1697,9 +1693,9 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             bool next = !toggleValue(f.key);
             g_settings.setString(f.key, next ? "1" : "0");
             if (strcmp(f.key, "night_mode") == 0) {
-                // 全设备夜间反色：翻 HalDisplay 的全局标志（推屏唯一出口在那里统一取反），
-                // 再让快照失效 → 下一帧 ui_clear 重绘 + 整屏 GC16，立即看到效果。
-                display.setInverted(next);
+                // 全设备夜间反色：走 board_set_night 一处转发（HalDisplay 标志 + display.c
+                // 的实际取反点），再让快照失效 → 下一帧 ui_clear 重绘 + 整屏 GC16，立即看到效果。
+                board_set_night(next);
                 ui_invalidate_snapshot();
             } else if (strcmp(f.key, "click_enabled") == 0) {
                 if (!next) typingClickRelease();
@@ -1783,6 +1779,9 @@ static void drawBrowseListBody() {
             } else if (strcmp(f.key, "_ime_cand_size") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          IME_CAND_SIZE_OPTS[imeCandSizeIndex(g_settings.getString("ime_cand_size", "45").c_str())].label);
+            } else if (strcmp(f.key, "_editor_font_size") == 0) {
+                snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
+                         EDITOR_FONT_SIZE_OPTS[editorFontSizeIndex(g_settings.getString("editor_font_size", "45").c_str())].label);
             } else if (strcmp(f.key, "_click_chinese") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          CLICK_CHINESE_OPTS[clickChineseIndex(g_settings.clickChineseMode().c_str())].label);

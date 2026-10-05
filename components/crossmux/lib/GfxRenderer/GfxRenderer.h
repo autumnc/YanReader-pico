@@ -380,6 +380,16 @@ class GfxRenderer {
   void drawPixelInk(int x, int y, uint8_t ink) const;
   void drawLine(int x1, int y1, int x2, int y2, bool state = true) const;
   void drawLine(int x1, int y1, int x2, int y2, int lineWidth, bool state) const;
+  // 波浪下划线（古籍的书名线）。跟 drawLine 同一套坐标/裁剪规则，`lineWidth` 同样是
+  // 往下叠的行数。周期/幅度固定、不随字号缩放 —— 一条线就是几百次查表，而且一屏几十条的
+  // "波浪感"靠一致性取胜，跟着字号变大反而像锯齿。
+  //
+  // 幅度**单独**放这里（不是 .cpp 里的私有数）：TextBlock 要用它把波浪的中线往下挪。
+  // 峰值压到与实线下划线同高、多出来的幅度全往下扩，这样子波浪永远不会比实线更贴字。
+  // 改这里必须同步 `kWave` 表（下方有 static_assert 卡长度）。
+  static constexpr int kWavyAmplitudePx = 2;  // 单侧；peak-to-peak = 2*该值
+  static constexpr int kWavyPeriodPx = 12;
+  void drawWavyLine(int x1, int y1, int x2, int y2, int lineWidth, bool state) const;
   void drawArc(int maxRadius, int cx, int cy, int xDir, int yDir, int lineWidth, bool state) const;
   void drawRect(int x, int y, int width, int height, bool state = true) const;
   void drawRect(int x, int y, int width, int height, int lineWidth, bool state) const;
@@ -451,8 +461,12 @@ class GfxRenderer {
   std::string truncatedText(int fontId, const char* text, int maxWidth,
                             EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   /// Word-wrap \p text into at most \p maxLines lines, each no wider than
-  /// \p maxWidth pixels. Overflowing words and excess lines are UTF-8-safely
-  /// truncated with an ellipsis (U+2026).
+  /// \p maxWidth pixels. **Hard breaks**: a '\n' (and "\r\n") always ends the
+  /// current line — dictionary definitions, note bodies and footnote text rely
+  /// on this; '\r' is dropped so CRLF input does not leave a stray glyph. An
+  /// empty line is kept as a blank line (paragraph spacing survives).
+  /// Overflowing words and excess lines are UTF-8-safely truncated with an
+  /// ellipsis (U+2026).
   std::vector<std::string> wrappedText(int fontId, const char* text, int maxWidth, int maxLines,
                                        EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
 

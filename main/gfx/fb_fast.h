@@ -37,29 +37,53 @@ static inline void fb_fast_sync(void) {
     }
 }
 
-// 逻辑坐标 → 物理坐标。越界返回 0，否则 *px/*py 有效并返回 1。
-static inline int fb_fast_to_phys(int x, int y, int *px, int *py) {
+// ── 旋转映射的唯一出处（P4）─────────────────────────────────────────────
+// 全仓只在这里定义"逻辑坐标 ↔ 物理坐标"的四个方向。参数是 (rot, 物理宽, 物理高)，
+// 而不是上面那份缓存 —— 这样 ui_render 的差分路径（core1）可以直接用它、不必读
+// g_fb_fast 这个 core0 侧共享的缓存结构，thread-safety 与原来逐字一致。
+// 两份方向定义（to/from）刻意同处一文件：改方向时一处改、两处对。
+static inline void fb_rot_to_phys(int rot, int w, int h, int x, int y, int *px, int *py) {
     int ax = x, ay = y;
-    switch (g_fb_fast.rot) {
+    switch (rot) {
         case EPD_ROT_LANDSCAPE:
             break;
         case EPD_ROT_PORTRAIT: {
             int t = ax; ax = ay; ay = t;
-            ax = g_fb_fast.w - ax - 1;
+            ax = w - ax - 1;
             break;
         }
         case EPD_ROT_INVERTED_LANDSCAPE:
-            ax = g_fb_fast.w - ax - 1;
-            ay = g_fb_fast.h - ay - 1;
+            ax = w - ax - 1;
+            ay = h - ay - 1;
             break;
         case EPD_ROT_INVERTED_PORTRAIT: {
             int t = ax; ax = ay; ay = t;
-            ay = g_fb_fast.h - ay - 1;
+            ay = h - ay - 1;
             break;
         }
         default:
             break;
     }
+    *px = ax;
+    *py = ay;
+}
+
+// 物理坐标 → 逻辑坐标（fb_rot_to_phys 的逆）。ui_render 的差分包围盒把变化的物理点
+// 映回逻辑坐标时用；方向定义与上面同源，不再是 ui_render 里那份手抄的 switch。
+// 未知 rot 落到 270°（沿用 ui_render 原来的 default 语义；实际 rot 恒为四种之一）。
+static inline void fb_rot_from_phys(int rot, int w, int h, int px, int py, int *lx, int *ly) {
+    switch (rot) {
+        case EPD_ROT_LANDSCAPE:          *lx = px;         *ly = py;         break;
+        case EPD_ROT_PORTRAIT:           *lx = py;         *ly = w - 1 - px; break;
+        case EPD_ROT_INVERTED_LANDSCAPE: *lx = w - 1 - px; *ly = h - 1 - py; break;
+        default:                         *lx = h - 1 - py; *ly = px;         break;  // 270°
+    }
+}
+
+// 逻辑坐标 → 物理坐标。越界返回 0，否则 *px/*py 有效并返回 1。
+static inline int fb_fast_to_phys(int x, int y, int *px, int *py) {
+    int ax, ay;
+    fb_rot_to_phys(g_fb_fast.rot, g_fb_fast.w, g_fb_fast.h, x, y, &ax, &ay);
     if (ax < 0 || ax >= g_fb_fast.w) return 0;
     if (ay < 0 || ay >= g_fb_fast.h) return 0;
     *px = ax;
@@ -97,29 +121,10 @@ static inline void fb_fast_set_gray(uint8_t *fb, int x, int y, uint8_t g) {
     else        *p = (uint8_t)((*p & 0xF0) | (g & 0x0F));
 }
 
-// 不带边界检查的旋转映射（矩形填充自行裁剪）。
+// 不带边界检查的旋转映射（矩形填充自行裁剪）。逻辑与 fb_fast_to_phys 相同，
+// 只是省掉边界检查 —— 共用 fb_rot_to_phys，方向只有一份定义。
 static inline void fb_fast_map(int x, int y, int *px, int *py) {
-    int ax = x, ay = y;
-    switch (g_fb_fast.rot) {
-        case EPD_ROT_PORTRAIT: {
-            int t = ax; ax = ay; ay = t;
-            ax = g_fb_fast.w - ax - 1;
-            break;
-        }
-        case EPD_ROT_INVERTED_LANDSCAPE:
-            ax = g_fb_fast.w - ax - 1;
-            ay = g_fb_fast.h - ay - 1;
-            break;
-        case EPD_ROT_INVERTED_PORTRAIT: {
-            int t = ax; ax = ay; ay = t;
-            ay = g_fb_fast.h - ay - 1;
-            break;
-        }
-        default:
-            break;
-    }
-    *px = ax;
-    *py = ay;
+    fb_rot_to_phys(g_fb_fast.rot, g_fb_fast.w, g_fb_fast.h, x, y, px, py);
 }
 
 // 矩形填充：整字节写。逐像素的 fb_fast_pixel 实测约 120ns/像素（半字节读改写），

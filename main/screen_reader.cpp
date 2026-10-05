@@ -1,4 +1,8 @@
-// screen_reader.cpp — 阅读模式（阅读器 + 微信读书）移植。
+// screen_reader.cpp — 阅读模式（阅读器）移植。
+//
+// 按子应用拆文件（P3b）：微信读书已搬到 screen_reader_weread.cpp，共享的状态量与
+// 外壳原语在 screen_reader_internal.h。这个 TU 仍是阅读器本体（书架/翻页/目录/笔记/
+// 词典/设置/统计/文件管理）——往下拆的下一块见 docs/架构评审-2026-10-04.md 的 P3b。
 //
 // 用 read_pico 官方固件的 ui 库与底层驱动（epdiy 4bpp framebuffer + ttf_font），
 // 逻辑层复用 crossmux 的 lib/（Epub/Txt/Xtc/Section/Page/GfxRenderer/HalDisplay/
@@ -11,10 +15,15 @@
 // getDisplayWidth/Height（内部已调 epd_rotated_*），字体度量经 GfxRenderer 取得。
 
 #include "screen_reader.h"
+#include "screen_reader_internal.h"  // RdState/共享原语（P3b 拆文件后的内部层）
 #include "reader_page_turn.h"  // 揭页提示：只有裸声明，不会拖进 epdiy.h
 #include "ui_render.h"   // ui_render_drain：进阅读器前等在飞的 UI 推屏收尾
+#include "ui_helpers.h"  // drawIMEUI / imeBarPanelH：实体键盘打字时的输入法条（见 drawRdImeBar）
 
+#include <algorithm>  // std::sort（导出标注按时序排）
 #include <cmath>  // 阅读档案的雷达图（cos/sin）
+#include <ctime>  // 导出文件名的年月日时分秒
+#include <atomic>  // s_sbPending：网页线程投递"设为待机画面"，主任务取件
 
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
@@ -39,68 +48,29 @@
 #include <Bitmap.h>
 #include <ImageBlock.h>
 #include <ImageDecoderFactory.h>
+// 待机「图片」表盘：把用户选的 JPG/PNG 解成 Gray8 BMP 缓存。走的是封面那条
+// "文件→文件"的流式转换器（不是 ImageDecoderFactory 那条"直接铺 framebuffer"的路），
+// 因为缓存要留到待机那一刻用，那时书对象/渲染器都不在手上。
+#include <JpegToBmpConverter.h>
+#include <PngToBmpConverter.h>
 
 #include "qrcodegen.h"
 
 #include "bt_keyboard.h"
 #include "editor_vk.h"  // 虚拟键盘：写作/计划/阅读三个模式共用同一套（drawVk/vkTap 是薄适配）
 #include "icon_font.h"  // 标签栏/搜索入口图标（NF-Propo 子集）
+#include "u8g2_shim.h"  // u8g2_set_fb：把 shim 钉回阅读器直画的 front_fb（见 rdPinShimFb）
 #include "tab_icons.h"
 #include "reading_stats.h"  // 阅读统计数据层（计时/落盘/查询），界面见文件末尾统计区
 #include "settings_manager.h"
-#include "settings.h"  // app_settings_set_font_path
+#include "font_store.h"  // font_store_set_path
 
-// 字体模块的最小外部声明。不能直接 #include "font/ttf_font.h"：它会 #include epdiy.h，
-// 连带 epd_internals.h 的 typedef EpdFont 与本 TU 里 crossmux 的 EpdFont class 冲突
-// （同本文件开头的说明）。这里只重复声明用到的几个接口与条目结构。
-extern "C" {
-#define RD_TTF_FONT_NAME_MAX 64
-#define RD_TTF_FONT_PATH_MAX 160
-typedef struct {
-  char name[RD_TTF_FONT_NAME_MAX];
-  char path[RD_TTF_FONT_PATH_MAX];
-} rd_ttf_font_item_t;
-int ttf_font_scan(void);
-const rd_ttf_font_item_t *ttf_font_item(int index);
-bool ttf_font_path_is_builtin(const char *path);
-bool ttf_font_is_builtin(void);
-const char *ttf_font_path(void);
-const char *ttf_font_display_name(void);
-int ttf_font_open(const char *path);
-int ttf_font_open_builtin(void);
-// 字形缓存的埋点（ttf_font.c 里本来就有，只是没人调用过）。结构体布局与
-// ttf_font.h 的 ttf_bench_stats_t 逐字段一致——这里不能直接 include 那个头
-// （会和 crossmux 的 EpdFont class 撞名，见本文件开头），所以照抄一份。
-typedef struct {
-  uint32_t glyphs;
-  uint32_t hits;
-  uint32_t misses;
-  int64_t read_us;
-  int64_t raster_us;
-  int64_t total_us;
-  int64_t seek_us;
-  uint32_t read_calls;
-  uint32_t read_bytes;
-  uint32_t io_blocks;
-  uint32_t io_runs;
-  uint32_t io_span_min;
-  uint32_t io_span_max;
-  uint32_t cache_kb;
-  uint32_t cache_cap_kb;
-} rd_ttf_bench_t;
-void ttf_bench_begin(void);
-void ttf_bench_end(rd_ttf_bench_t *out);
-// 整页预取：把这一页所有字的轮廓块一次读进块缓存，避免逐词预取时
-// 每次只能看见一个词、把随机小读摊到整页。ttf_font.h 里的角色枚举值。
-#define RD_TTF_ROLE_CONTENT 0
-#define RD_TTF_ROLE_CONTENT_ALT 2
-void ttf_set_role(int role);
-void ttf_warm_text_px(int pixel_height, const char *text);
-int ttf_font_open_alt(const char *path);
-void ttf_font_close_alt(void);
-bool ttf_font_alt_ready(void);
-int ttf_get_role(void);
-}
+// 字体模块接口：现在可以直接包含真头了。P1.3 之后 ttf_font.h 不再 #include epdiy.h
+// （它把唯一依赖的 enum EpdFontFlags 降级成了 int），所以 epd_internals.h 的 EpdFont
+// 不会再被拖进来跟本 TU 里 crossmux 的 EpdFont class 撞名（同本文件开头的说明）。
+// 以前这里整段照抄接口，连 ttf_font_item_t / ttf_bench_stats_t 都字段级复制了一份 ——
+// 漂移已经发生了：照抄的 ttf_font_open 返回 int，真头返回 esp_err_t。
+#include "font/ttf_font.h"
 #include "wifi_manager.h"
 #include "opds_client.h"
 #include "dictionary_store.h"
@@ -110,8 +80,10 @@ int ttf_get_role(void);
 #include "standby_clock.h"
 #include "clipboard.h"  // 选区「复制」：跨模式粘贴板（写作/阅读/计划共享一份）
 #include "ime/IME.h"
+#include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划共用一份）
+#include "ui/list_view.h"  // 列表选择/滚动/命中（选中项夹边界、窗口公式、tap→行号）
 #include "hw/input.h"
-#include "hw/board_reader.h"
+#include "hw/board.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -122,6 +94,7 @@ int ttf_get_role(void);
 #include <esp_mac.h>
 #include <esp_timer.h>
 #include <algorithm>
+#include <map>
 #include <cctype>  // tolower：书架去重键按全小写路径折叠（FATFS 大小写不敏感）
 #include <cstdio>
 #include <cstdlib>
@@ -133,78 +106,21 @@ int ttf_get_role(void);
 #include <string>
 #include <vector>
 
-// 微信读书：整库移植自 crossmux 的 WeReadWebApi（登录/书架/章节下载/EPUB 打包）。
-#include <WeReadClient.h>
-#include <WeReadStore.h>
+// 微信读书（WeReadClient/WeReadStore）已随子应用拆到 screen_reader_weread.cpp：
+// 本文件只剩分发里那几行 case（renderWeread/handleWeread…），类型经
+// screen_reader_internal.h 可见。
 
 static const char *TAG = "Reader";
 
-// Operation 约 8KB（内含 4KB 收发缓冲），内部 RAM 紧张，优先放 PSRAM。
-struct WeOpDeleter {
-  void operator()(WeReadClient::Operation *op) const {
-    if (!op) return;
-    std::destroy_at(op);
-    heap_caps_free(op);
-  }
-};
-static std::unique_ptr<WeReadClient::Operation, WeOpDeleter> weMakeOperation() {
-  void *raw = heap_caps_malloc(sizeof(WeReadClient::Operation), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!raw) raw = heap_caps_malloc(sizeof(WeReadClient::Operation), MALLOC_CAP_8BIT);
-  if (!raw) return nullptr;
-  return std::unique_ptr<WeReadClient::Operation, WeOpDeleter>(new (raw) WeReadClient::Operation());
-}
-
-// ── 常量 ────────────────────────────────────────────────────────────────
-#define UI_FONT_ID 0
-#define BODY_FONT_ID_BASE 1  // 正文字体 id = BODY_FONT_ID_BASE + fontLevel (1..9)
-// 「UI 尺寸、用户字体」的 id：插的是与 UI_FONT_ID **同一个** EpdFontFamily，所以字号/
-// 度量完全相同，但 id != 0 → GfxRenderer 会选**内容面**（用户所选字体）。给底部状态栏、
-// 笔记、微读书架这类"位置属于外壳、内容属于用户"的地方用：内置 builtin.ttf 是 7710 字
-// 的子集，书名/笔记里出现子集外的字就是豆腐块，换成用户字体才显示得全。
-// 用 20 而不是 6：正文字体 id 现在涨到 1..9，6 会被撞上。
-// ⚠ 阅读器代码不要直接用这个宏，用下面的 uiFontId()：书内嵌字体模式会把内容面换成
-//   本书字面，那时外壳必须退回内置字体（见 uiFontId 的注释）。
-#define CONTENT_UI_FONT_ID 20
-
-
-static const char *CACHE_DIR = "/sdcard/.crossmux";
-static const char *DICT_ROOT = "/sdcard/dictionaries";
-
-// 正文字号表（ttf 像素高，即 EpdFontData::advanceY）。前 kUserFontLevels 档菜单可选，
-// 末尾两档是**标题专用**——CSS 阶梯的向上余量，菜单里选不到，保证正文选到最大档（64）时
-// 标题仍能再大 1~2 档。全部注册为字体 id 1..N（dummy EpdFontData，不额外占内存；
-// 字形缓存按字节计，clamp_px 上限 120 够用）。
-// 26/30/34px 三档已删（实测太小、没法读）。注意这会把**档位下标整体左移**：老
-// reader_font_level 存的是 9 档表的下标，直接沿用会静默换大小 —— 见 screen_reader_init()
-// 里的 _v2 键迁移。
-static const int kBodyPx[6] = {40, 46, 54, 64, 76, 88};
-static const int kBodyPxCount = 6;
-static const int kUserFontLevels = 4;  // 可选档位数：0..3 = 40..64px
-static const int kDefaultFontLevel = 1;  // 46px（删档前的默认 34px 已不存在）
-static const float kLineSpacings[5] = {1.0f, 1.2f, 1.4f, 1.6f, 1.8f};
-static const float kDefaultLineSpacing = 1.2f;
-// 段间距 6 档（0=关）。数值语义同 EPUB 引擎的 extraParagraphSpacing：
-// "每段之后额外留 0.5/0.75/1/1.25/1.5 倍行高"。参与 Section 排版缓存键，改档会自动重排。
-static const char *kParaSpacingLabels[6] = {"关", "0.5x", "0.75x", "1x", "1.25x", "1.5x"};
-
-// 正文左右边距三档（窄/标准/宽）。
-static const int kMargins[3] = {20, 30, 45};
-static const int kDefaultMarginIdx = 1;
-
-static const int MARGIN = 30;    // 正文/列表左右边距
-static const int RD_TOP_INSET = 28;    // 顶部留白(标题起始)，原 8，整体下移 20px
-static const int RD_BODY_TOP = 50;     // 正文起始，原 MARGIN(30)，整体下移 20px
-static const int RD_BOTTOM_INSET = 4;  // 底部留白(状态栏下方)，原 24，状态栏下移 20px
-
 // ── 小工具 ──────────────────────────────────────────────────────────────
-static int clampI(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
-static int utf8Len(unsigned char c) {
+int clampI(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+int utf8Len(unsigned char c) {
   if (c < 0x80) return 1;
   if (c < 0xE0) return 2;
   if (c < 0xF0) return 3;
   return 4;
 }
-static bool endsWith(const std::string &s, const char *suf) {
+bool endsWith(const std::string &s, const char *suf) {
   size_t n = strlen(suf);
   return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
 }
@@ -225,378 +141,11 @@ struct RdFont {
   }
 };
 
-static GfxRenderer g_rd(display);
+GfxRenderer g_rd(display);
 static RdFont g_uiFont;       // id 0
 static RdFont g_bodyFont[9];  // id 1..9
 
-// ── 阅读器状态 ──────────────────────────────────────────────────────────
-enum class RdMode {
-  Browser, Reading, Toc, Menu, Bookmarks, Footnotes, Percent, Qr, Dictionary, Weread, Wifi,
-  ShelfMenu, ShelfInfo, Recent, FileBrowser, Image, Opds, NetShare, DictDl, ResDl, KeyMap, StatusBar, About,
-  Settings, Notes, NoteEdit,
-  WereadQr,    // 扫码登录
-  WereadMenu,  // 选中书目的操作菜单
-  WereadDl,    // 缓存进度
-  ShelfSearch, // 书架搜索（书名关键字过滤）
-  NotesSearch, // 笔记搜索（原文/笔记正文/书名过滤）
-  FileMenu,    // 文件长按弹出：打开/重命名/删除/详情
-  FileRename,  // 重命名（虚拟键盘编辑文件名）
-  FileInfo,    // 文件详情（大小/时间/路径）
-  Stats,       // 统计标签主页（概览卡 + 入口列表 + 已开始的书籍）
-  StatsBook,   // 单本书的统计详情
-  StatsMore,   // 更多详情（7/30 天卡 + 每日/年度柱状图）
-  StatsHeatmap,// 阅读热力图（月历热力格）
-  StatsDay,    // 某一天的阅读详情
-  StatsProfile,// 阅读档案（4 轴雷达 + 总分）
-  StatsAdjust, // 调整某本书某一天的阅读时长
-  StatsSettings// 统计设置（每日目标）
-};
-
-// 主界面五个根标签：0=书架 1=文件 2=笔记 3=设置 4=统计。标签栏只画图标（tab_icons.h），
-// 文字标签下屏——微信读书原本占 1 号位，现已挪进「设置」标签的条目表（MenuAct::Weread），
-// 腾出来的位置给 SD 卡文件浏览器（就是原来的 RdMode::FileBrowser，现在直接当标签用）。
-// 统计放最后一位：st.tab == 1/3 的判断遍布各处，插在中间要动的地方多。
-static const int kTabCount = 5;
-// 4 号位（统计）用 0 当哨兵：drawTabBar 见到 0 就走程序化的柱状图图标，不走字体。
-// 理由见 drawStatsTabIcon —— 引进真字形要重裁 NF-Propo 子集，而当前环境没有 fontTools。
-static const uint32_t kTabIcons[kTabCount] = {TAB_ICON_BOOKSHELF, TAB_ICON_FILES,
-                                              TAB_ICON_NOTES, TAB_ICON_SETTINGS, 0};
-static RdMode tabMode(int tab) {
-  return tab == 1 ? RdMode::FileBrowser : tab == 2 ? RdMode::Notes
-         : tab == 3 ? RdMode::Settings : tab == 4 ? RdMode::Stats : RdMode::Browser;
-}
-
-struct BookEntry {
-  std::string path;
-  std::string name;
-  int kind;  // 0=epub 1=txt 2=xtc
-};
-
-struct RdState {
-  RdMode mode = RdMode::Browser;
-  int dirty = 1;
-  bool fullRefresh = true;  // 进入新界面首帧用 GC16 清残影
-
-  // 阻塞段的"正在…"浮层：打开大书（建元数据/解 zip/分章排版）前先刷一帧出去，
-  // 用户才知道界面没卡死。只在 renderCurrent 里画，不当普通状态用。
-  std::string busyMsg, busySub;
-
-  // 瞬时浮动提示（居中黑底反白框，到点自动消失）。标签页的提示栏取消之后，那些
-  // "刚做完了什么"的消息（服务地址、重命名结果、传完提示）改走这里——它们本来就
-  // 是几秒钟的事，常驻一整行反而是浪费。
-  std::string floatMsg, floatSub;
-  int64_t floatUntilUs = 0;
-
-  // 主界面根标签（书架/微读/设置）与「设置」标签的选中行
-  int tab = 0;
-  int setSel = 0;
-
-  // 「设置」标签的弹层选择（轮换制条目改成弹出式）。浮层盖在列表上，**不换 st.mode**
-  // ——底图仍是设置标签，所以绘制走 renderCurrent 的浮层段、按键在分发前先被它拦下。
-  // pickAct 存的是 MenuAct 的整数值（MenuAct 定义在本结构体后面，这里只能存 int）。
-  bool pickOpen = false;
-  int pickAct = -1;
-  std::string pickTitle;
-  std::vector<std::string> pickLabels;  // 显示用
-  std::vector<std::string> pickValues;  // 落定后交给 applyRdPick 解释（不透明）
-  int pickSel = 0;
-  int pickScroll = 0;
-
-  // 子界面 Esc 的返回目标：从「阅读菜单」进 → Menu；从「设置」标签进 → Settings。
-  // 这样同一批子界面（WiFi/OPDS/按键映射…）在两个入口下都能回到来处。
-  RdMode retMode = RdMode::Menu;
-
-  // 书架
-  std::vector<BookEntry> books;
-  int sel = 0;
-  // 书架/笔记搜索：查询串 + 结果列表里的选中项（0 = 第一命中）。
-  // 查询串留在这里而不是模式里，退出搜索不清空——再点一次放大镜能接着改。
-  std::string shelfQuery;
-  std::string notesQuery;
-  int searchSel = 0;
-
-  // 当前书
-  int bookKind = -1;  // -1 无 0 epub 1 txt 2 xtc
-  std::string bookPath;
-  std::string bookTitle;
-
-  // epub
-  std::shared_ptr<Epub> epub;
-  std::unique_ptr<Section> section;
-  int spineIndex = 0;
-  int page = 0;
-
-  // 书内嵌字体：非空 = 内容面此刻装的是从当前这本书里解出来的字体（指向缓存目录里的
-  // 落盘副本）。bookFontTag 跟着它进版式缓存键（见 ReaderRenderSpec::fontTag）；
-  // 0 表示内容面是用户/内建字体。两者都在 openBook() 里换书时清掉。
-  std::string bookFontLocal;
-  uint32_t bookFontTag = 0;
-  // 书内 CSS 的**次家族**（祖堂集：正文宋体、注文/引文仿宋）。跟 bookFontLocal 同生共死：
-  // 换书/退出阅读/SD 挂起时一起关（次字面一份就占 ~1MB PSRAM，留着就是漏）。
-  // 空 = 这本书没有可用的第二个家族，此时 g_rd 的次家族哈希是 0，排版不会给任何词
-  // 打 ALT_FONT，绘制完全等价于次字面没打开。
-  std::string bookFontAltLocal;
-  uint32_t bookFontAltTag = 0;
-
-  // txt
-  std::string txtUtf8;
-  std::vector<size_t> txtLineStarts;  // 每行起始字节偏移（分页表）
-  int txtPage = 0;
-  // txt 目录：打开时扫一遍正文挑出章节标题行（TXT 没有 EPUB 的 ncx/spine）。
-  // 两个表一一对应；章节 → 页码在跳转时按当前分页表换算（见 txtPageForOffset）。
-  std::vector<size_t> txtChapterOffsets;
-  std::vector<std::string> txtChapterTitles;
-
-  // xtc
-  std::unique_ptr<Xtc> xtc;
-  int xtcPage = 0;
-
-  // toc
-  int tocSel = 0;
-
-  // menu
-  int menuSel = 0;
-
-  // 书架菜单
-  int shelfMenuSel = 0;
-  bool shelfDelArm = false;  // 删除二次确认已就位（再按一次才真删）
-  int shelfIdx = -1;         // 长按锁定的书目下标（-1 = 无，动作回退到 sel）
-
-  // 最近阅读（保存路径/标题，最多 kMaxRecent 条，最新在前）
-  std::vector<BookEntry> recent;
-  int recentSel = 0;
-
-  // 文件浏览器
-  std::string fbPath = "/sdcard";
-  std::vector<BookEntry> fbEntries;  // kind=-1 目录 0 epub 1 txt 2 xtc 3 图片 4 其它文件
-  int fbSel = 0;
-
-  // 文件长按菜单（FileMenu/FileRename/FileInfo 共用）
-  int fmIdx = -1;                  // 长按锁定的条目下标（-1 = 无）
-  int fmSel = 0;                   // 菜单选中行
-  bool fmDelArm = false;           // 删除二次确认已就位（再按一次才真删）
-  bool fmMkdir = false;            // FileRename 复用为「新建文件夹」输入（无扩展名、提交走 mkdir）
-  std::string fmRenameBuf;         // 重命名/新建文件夹的编辑缓冲
-  std::string fmStatus;            // 操作结果提示（成功/失败）
-
-  // 文件剪贴板（单个）：复制/剪切后暂存源路径，粘贴到当前目录。只存一个——一次复制
-  // 一个文件或文件夹，再复制另一个就替换。剪切是「粘贴成功后删源」，粘之前源都在原地。
-  std::string fmClipPath;          // 空 = 剪贴板空
-  std::string fmClipName;          // 底栏/路径行显示用（源文件名）
-  bool fmClipCut = false;          // true=剪切（粘贴成功后删源）
-
-  // 图片查看器（同目录图片列表，左右翻页；源窗口缩放 + 拖动平移）
-  std::vector<std::string> imgList;
-  int imgSel = 0;
-  float imgZoom = 1.0f;   // 1.0 = 适应屏幕
-  // 源窗口左上角占源图的比例，取值 [0, 1 - 1/zoom]，由拖动更新。存比例而不是屏幕像素：
-  // 捏合改了 zoom 之后不需要重新标定，夹取范围（1-1/zoom）自己会跟着缩。
-  float imgPanX = 0.0f;
-  float imgPanY = 0.0f;
-  bool imgFailed = false;
-  // 当前图的源尺寸（renderImage 里探到就记下）。拖动帧要拿它算"屏幕 1px = 源图多少比例"，
-  // 每帧重开文件探尺寸太亏，而且拖动是每帧一发的。
-  int imgSrcW = 0;
-  int imgSrcH = 0;
-  // 从阅读页长按插图进来的查看器：Esc 回阅读页（而不是文件浏览器），且不动标签高亮。
-  bool imgFromReader = false;
-
-  // 书签
-  struct RdBookmark {
-    std::string path;
-    int kind;
-    int spine;
-    uint32_t offset;
-    int page;
-    float percent;
-    std::string summary;
-  };
-  std::vector<RdBookmark> bookmarks;
-  int bookmarkSel = 0;
-
-  // 脚注
-  std::vector<std::string> footnoteNums, footnoteHrefs;
-  int footnoteSel = 0;
-  // 本页的链接矩形（Page::links 抄过来的，坐标已加渲染偏移）。点按命中的**第一依据**：
-  // 拿到 href 就能直接查到锚点 id，不必再去比注号（注号是猜出来的，href 是书里写死的）。
-  // 数组小（每页最多 32 条，多数页 0~2 条），且是纯数据，跟着页重建。
-  struct RdLinkRect { std::string href; int x, y, w, h; };
-  std::vector<RdLinkRect> pageLinks;
-  int footnoteRetSpine = 0, footnoteRetPage = 0;
-  bool footnoteRetValid = false;
-  // 注号 → 正文里那个**上标**所在的（章节, 页）。点注文条目行首的注号时靠它跳回上标处。
-  // 一次一条学出来的（见 rdRememberNoteRef）：点开某条注、或从某条注跳注的那一刻，
-  // 读者正待在那个上标所在的那一页上，顺手就记下了。学不到的下场是退化成往前扫页
-  // （rdSearchNoteRefPage），所以这只是个"快表"，不是唯一数据源。
-  struct RdNoteRef { std::string num; int spine; int page; };
-  std::vector<RdNoteRef> noteRefs;
-  // 脚注弹注（不切模式的浮层，盖在正文页上）。fnPopNum 非空 = 开着；
-  // fnPopText 是注释正文原文，画的时候按弹窗宽度现断行，fnPopScroll 是首行偏移。
-  // fnPopBox* 是上一帧画出来的框，触摸要靠它分"点框里=跳注 / 点框外=关闭"。
-  std::string fnPopNum, fnPopText;
-  int fnPopScroll = 0;
-  int fnPopIdx = -1;   // 弹注对应脚注表里的第几条：弹注里的"跳注"要按它跳，不能按列表的选中项
-  int fnPopBoxX = 0, fnPopBoxY = 0, fnPopBoxW = 0, fnPopBoxH = 0;
-
-  // 百分比跳转
-  int percentVal = 50;
-
-  // 二维码
-  std::string qrText;
-
-  // 阅读设定（与写作模式共享 g_settings 存储，键名带 reader_ 前缀）
-  int fontLevel = kDefaultFontLevel;
-  float lineSpacing = kDefaultLineSpacing;
-  int paraSpacing = 0;  // 段间距：0=关，1..5 = 0.5/0.75/1/1.25/1.5 倍行高
-  int indentMode = 0;  // 0 自动 1 强制 2 取消
-  int alignMode = 0;   // 0 两端 1 左 2 居中 3 书籍样式（跟随 CSS text-align）
-  int marginIdx = kDefaultMarginIdx;        // 边距档位
-  int readingLine = 0;                      // 阅读线：0 无 1 虚线 2 点线 3 实线（正文行间引导线）
-  bool imageBilinear = true;                // 图片缩放：true 双线性 false 最近邻
-  bool night = false;                       // 夜间反色
-  std::string orientation = "landscape";    // 阅读器方向
-
-  // 词典
-  Dictionary dict;
-  bool dictOpen = false;
-  std::string dictQuery;
-  std::string dictResult;
-  std::string dictHeadword;
-  std::string dictStatus;
-
-  // ── 笔记 / 标注 ───────────────────────────────────────────────────────
-  // 一条记录既是"标注"也是"笔记"：note 为空就是只划了重点。锚点是选中的原文，
-  // 渲染时在当前页的词序列里按文本找回（重排换页也不至于错位，找不到就不画）。
-  struct RdNote {
-    std::string path;    // 书路径（笔记列表按它分组）
-    std::string book;    // 书名（列表显示）
-    int spine = 0;       // 章节
-    int page = 0;        // 记下来时的页（跳转用，找不到再就近）
-    std::string text;    // 选中的原文
-    std::string note;    // 笔记正文（空 = 仅标注）
-    int64_t time = 0;    // 记录时间
-  };
-  std::vector<RdNote> notes;
-  int notesSel = 0;
-  int notesScroll = 0;
-  bool noteDelArm = false;    // 笔记列表里删除的二次确认已就位
-  int noteDelIdx = -1;
-
-  // 长按选中的词范围（当前页语言：words 下标）与浮层选择
-  bool selActive = false;
-  int selStart = 0, selEnd = 0;
-  // 抓着哪个手柄（0=起点 1=终点 -1=没抓）。手柄画在行外，一次点按只能是"抓起来"，
-  // 抓起来之后再点词，那一段才跳过去 —— 这样两端都能左右伸缩，而不是只有终点能动。
-  int selGrab = -1;
-  // 按住手柄拖动（KEY_TOUCH_DRAG）：selDrag = 正在被拖的那一端（0/1/-1=没在拖），
-  // selDragX/Y 是拖动锚点（逻辑坐标，从被抓的那个手柄中心起算，逐帧加增量），
-  // selDragActive 记"这一轮按下真的拖动过"——抬手那一下 hw/input 还会照常补一个
-  // 方向键（拖到远处抬手 = 左右/上下滑），要让它把刚拖好的端点再挪一格。
-  int selDrag = -1;
-  int selDragX = 0, selDragY = 0;
-  bool selDragActive = false;
-  int selPopup = 0;        // 0 无浮层 1 未标注（标注/笔记/字典/取消） 2 已标注（删除/改笔记/字典）
-  int selMenuSel = 0;
-  int selNoteIdx = -1;     // 浮层对应的已有笔记下标（-1 = 新标注）
-  int selPageSpine = -1;   // 选区所在章节（防止跨章误用）
-
-  // 笔记编辑器
-  std::string noteEditBuf;
-  int noteEditIdx = -1;          // >=0 改这条；-1 = 新建（原文在 notePendingText）
-  std::string notePendingText;   // 新建笔记待写入的原文
-  std::string noteStatus;
-
-  // ── 微信读书 ──────────────────────────────────────────────────────────
-  // 复制一份原版的角色分工：状态机（WeReadClient::Operation）在 UI 循环里
-  // 逐拍推进（step() 每次只做一小段，联网请求是同步阻塞的），UI 只读它暴露的
-  // 进度/事件。登录、书架同步、整本缓存都走同一条驱动路径。
-  std::unique_ptr<WeReadClient::Operation, WeOpDeleter> weOp;
-  std::vector<WeReadStore::ShelfRecord> weShelf;
-  bool weShelfLoaded = false;   // 书架是否已从 SD 读进内存
-  int weSel = 0, weScroll = 0, weMenuSel = 0;
-  std::string weQrUrl;          // 登录二维码内容
-  std::string weStatus;         // 状态/错误提示
-  std::string weJobTitle;       // 当前任务的书名
-  int weKind = 0;               // 0=登录/书架 1=缓存整本，用于判断完成事件
-  bool weLoggedIn = false;      // 本地会话是否有效
-
-  // 虚拟键盘
-  bool vkVisible = false;
-
-  // WiFi 管理
-  int wifiField = 0;      // 0 SSID 1 密码 2 连接 3 断开
-  bool wifiEditing = false;
-  bool wifiBusy = false;
-  std::string wifiSsidEdit;
-  std::string wifiPassEdit;
-  std::string wifiStatus;
-
-  // 资源下载（词典清单地址 / 字体下载地址 / 下载字体）。这三项原本挂在写作模式的
-  // 设置页（screen_settings.cpp 的「资源下载」分类）下，但下载出来的词典和字体都是
-  // 给阅读用的，整类搬到阅读设置标签下，写作设置里不再出现。
-  int resField = 0;  // 0 词典清单地址 1 字体下载地址 2 下载字体
-  bool resEditing = false;
-  bool resBusy = false;
-  int resPct = 0;
-  std::string resDictEdit;
-  std::string resFontEdit;
-  std::string resStatus;
-
-  // OPDS 书库
-  std::string opdsUrl;       // 当前目录地址（持久化键 opds_url）
-  std::string opdsUrlEdit;   // 编辑中的地址
-  std::vector<OpdsEntry> opdsEntries;
-  std::vector<std::string> opdsStack;  // 上级目录地址栈（Esc 逐级返回）
-  int opdsSel = 0;
-  bool opdsEditing = false;
-  bool opdsBusy = false;
-  std::string opdsStatus;
-
-  // WiFi 传书（复用 file_manager_server，浏览器上下载/上传）
-  std::string netStatus;
-  bool netBusy = false;
-  bool netServerUp = false;
-  int netSel = 0;
-
-  // 词典下载（清单 → /sdcard/dictionaries/<id>/，与「词典」查询共用目录）
-  DictCatalog dictCat;
-  int dictDlSel = 0;
-  bool dictDlBusy = false;
-  std::string dictDlStatus;   // 列表页的状态行
-  std::string dictDlDelArm;   // 待确认删除的 id（长按一次后置位）
-  // 安装进度（dictDlBusy 时由 renderDictDl 走进度版面）
-  std::string dictDlPhase;
-  int dictDlFileIdx = 0, dictDlFileCount = 0;
-  size_t dictDlDone = 0, dictDlTotal = 0;
-  size_t dictDlFileGot = 0, dictDlFileTotal = 0;
-
-  // BLE 按键映射
-  int keyMapSel = 0;
-  int keyMapCapture = -1;  // ≥0 = 正在等待按键的动作序号（-1 不在捕获）
-  std::string keyMapStatus;
-
-  // 自定义状态栏
-  int sbSel = 0;
-
-  // 关于页滚动位置
-  int aboutTop = 0;
-
-  // ── 阅读统计（第 5 个根标签）─────────────────────────────────────────
-  int statsSel = 0;       // 主页交互列表的选中行
-  int statsTop = 0;       // 子界面（更多详情/档案/调整）的滚动位置
-  std::string statsBookPath;   // 子界面正在看的那本书（主页/日详情点进来的）
-  uint32_t statsDay = 0;       // 热力图选中的日序号 / 日详情看的那一天
-  int statsMonthY = 0, statsMonthM = 0;  // 热力图当前显示的月份（0 = 用参考日）
-  std::string statsDelPath;    // 主页里长按删除已就位的书（二次确认；空 = 未就位）
-  // 调整阅读时长（操作/日期/数量三个字段）
-  int statsAdjField = 0;       // 0=操作 1=日期 2=数量
-  int statsAdjOp = 0;          // 0=增加 1=减少
-  int statsAdjAmt = 1;         // 下标 → 15/30/45/60 分钟
-  uint32_t statsAdjDay = 0;
-  bool statsAdjFailed = false; // 上一次应用失败（数量超过那天记录的数）
-};
-
-static RdState st;
+RdState st;
 
 // 阅读器**外壳**（菜单/对话框/列表/状态栏/按钮/文件管理器…）用的字体 id。
 //
@@ -606,7 +155,7 @@ static RdState st;
 // 一开菜单就是一排缺字。所以内嵌字面在位时，外壳退回内置 builtin.ttf（7710 字，
 // 与设置/GTD/写作等其它界面同一套），内嵌字面只负责正文。
 // 判据用 st.bookFontLocal：它非空 ⇔ 内容面此刻装的正是这本书的字面（装载成功才赋值）。
-static int uiFontId() { return st.bookFontLocal.empty() ? CONTENT_UI_FONT_ID : UI_FONT_ID; }
+int uiFontId() { return st.bookFontLocal.empty() ? CONTENT_UI_FONT_ID : UI_FONT_ID; }
 
 // 把当前行距吸附到 kLineSpacings 下标（容差匹配，避免 atof 浮点误差）。
 static int spacingIdx() {
@@ -621,84 +170,98 @@ static int spacingIdx() {
   return best;
 }
 
-static int uiLineHeight() { return g_rd.getLineHeight(UI_FONT_ID); }
-static int uiAsc() { return g_rd.getFontAscenderSize(UI_FONT_ID); }
+int uiLineHeight() { return g_rd.getLineHeight(UI_FONT_ID); }
+int uiAsc() { return g_rd.getFontAscenderSize(UI_FONT_ID); }
 
 // 底部状态栏/提示栏高度与上边界。留 RD_BOTTOM_INSET 底部物理留白，
 // 避免提示文字贴到屏幕底边被边框遮挡（原版固定 44px 时文字基线落到底边被截断）。
-static int footerH() { return uiLineHeight() + 8; }
-static int statusTop() { return g_rd.getScreenHeight() - footerH() - RD_BOTTOM_INSET; }
+int footerH() { return uiLineHeight() + 8; }
+int statusTop() { return g_rd.getScreenHeight() - footerH() - RD_BOTTOM_INSET; }
 
 // 根标签页（书架/文件/笔记/设置/统计）**不再画底部提示栏**，内容一直排到物理底边。
 // 阅读页的状态带、目录/菜单/词典的提示行都还在用 statusTop()——那是各子界面的排版基准，
 // 全局改它会连环炸，所以这里只给标签页单开一个底边，两者互不影响。
-static int tabBottom() { return g_rd.getScreenHeight() - RD_BOTTOM_INSET; }
+int tabBottom() { return g_rd.getScreenHeight() - RD_BOTTOM_INSET; }
 
 // 顶栏底边（分隔线所在）。文字标题栏和图标标签栏共用同一条线，所以 coverTop()
 // 只有一个值，两种顶栏可以互换着用。取两者里更靠下的那个：标签图标（56px）比
 // UI 行高（42px）大，靠这条把正文起点一起往下让，图标才不会被分隔线切到。
-static int rdHeadBottom() {
+int rdHeadBottom() {
   return std::max(RD_TOP_INSET + uiLineHeight() + 6, TAB_BAND_BOTTOM);
 }
 
 // 以 top 为文字上缘画一行 UI 文本（drawText 的 y 是基线）。
-static void drawLineText(int x, int top, const char *s, bool black = true,
-                         int fontId = uiFontId()) {
+// 默认实参（black=true / fontId=uiFontId()）在 screen_reader_internal.h 里给，
+// 这里不能再写一遍——C++ 只认一次。
+void drawLineText(int x, int top, const char *s, bool black, int fontId) {
   g_rd.drawText(fontId, x, top + g_rd.getFontAscenderSize(fontId), s, black);
 }
 
-// 居中一行 UI 文本。
-static void drawCenteredLine(int top, const char *s, bool black = true) {
+// 居中一行 UI 文本。（默认实参在 screen_reader_internal.h。）
+void drawCenteredLine(int top, const char *s, bool black) {
   int x = (g_rd.getScreenWidth() - g_rd.getTextWidth(uiFontId(), s)) / 2;
   drawLineText(x, top, s, black);
 }
 
-static std::string fitWidth(const std::string &s, int maxW);  // 定义在文件后段
-static std::string humanSize(long long bytes);                // 同上（文件浏览器要用来报进度）
+std::string fitWidth(const std::string &s, int maxW);  // 定义在文件后段（stats TU 也调）
+std::string humanSize(long long bytes);                       // 同上（文件浏览器/详情页报大小）
 
 // 打开大书前先刷一帧"正在…"（定义在 renderCurrent 之后）。最近阅读/文件浏览器这两个
 // 打开入口都在文件前段，所以声明要放在这里。
-static void rdShowBusy(const char *msg, const std::string &sub);
+void rdShowBusy(const char *msg, const std::string &sub);
+
+// 挂起的弹注（锚点还没排到）每空闲帧推进一步：接着排、排到了就弹出来。
+// 定义在 openFootnotePopup 之后；rdPrebuildAhead（文件前段）是它的唯一调用者。
 
 // 瞬时浮动提示：居中黑底反白框，ms 毫秒后自己消失。只置状态 + 标脏，不立刻重绘
 // （调用点都在按键处理里，随后 renderCurrent 那一趟就画出来了）。
-static void rdShowFloat(const std::string &msg, const std::string &sub, int ms);
+void rdShowFloat(const std::string &msg, const std::string &sub, int ms);
 
-// 「设置」标签的弹层选择：openRdPick 由 doMenuAction 的轮换条目调（那些条目现在
-// 不再原地循环，改成弹层里挑），drawSettingPicker 由 renderCurrent 的浮层段画，
-// 按键由 screen_reader_handle 在分发前先喂给 handleSettingPicker。三处都在文件后段。
+// 通用弹层选择（「设置」标签 + 阅读菜单的字号/字体都走它）：openRdPick 由 doMenuAction
+// 的轮换条目调（那些条目不再原地循环，改成弹层里挑），drawSettingPicker 由 renderCurrent
+// 的浮层段画（对所有 RdMode 生效，所以阅读菜单上也能盖），按键由 screen_reader_handle
+// 在分发前先喂给 handleSettingPicker。三处都在文件后段。
 static void openRdPick(int act);
 static void drawSettingPicker();
 static void handleSettingPicker(int key);
 
 // 「想要虚拟键盘」的统一入口：点输入框、进编辑态、按确认键想唤出键盘，全走这里。
 //
-// 蓝牙键盘连着的时候按设计**不弹**虚拟键盘（免得白挡半屏正文），原来那些位置写的是
-// 光秃秃的 `st.vkVisible = !g_bt.isConnected();` —— 于是"点输入框一点反应都没有"。
-// 用户看到的只有键盘弹不出来，看不出原因，也没人知道状态栏右端那个图标能强制打开。
-// 这里在"没弹"的时候给一条浮动提示，把原因和出路说清楚；提示只出一次（蓝牙断开再
-// 连上会重新计一次），不要每点一下都冒出来。
+// 这几处以前写的是光秃秃的 `st.vkVisible = !g_bt.isConnected();` —— 蓝牙键盘一连上，
+// "点输入框一点反应都没有"。中间改成一版"不弹 + 浮动提示指路"，但只要用户找不着/点不中
+// 那个小图标，症状与之前一模一样（本轮报障就是）。现在一律弹，蓝牙键盘连着时附一条
+// 提示（只出一次，断开重连会重新计）说明：键盘能用、右下角的图标能收起。
 //
-// 返回 true = 键盘已展开（调用方标脏重绘即可）；false = 蓝牙键盘连着，没弹。
-static bool rdVkWantShow() {
+// 返回 true = 键盘已展开（调用方标脏重绘即可）。恒为 true，保留返回值是为了调用点
+// 不用改（有"弹出来了才 return"的写法，见 handleNoteEdit / handleShelfSearch）。
+bool rdVkWantShow() {
   static bool hinted = false;
-  if (!g_bt.isConnected()) {
+  // 蓝牙键盘连着时**照样弹**（2026-10-05 改）。原来是学写作模式那条"有物理键盘就别
+  // 弹"的规矩，可写作模式的编辑器有**实体键盘的输入法条**（drawIMEUI，编码行+候选行
+  // 一直画着），阅读模式没有——于是"点了输入框什么都没发生"，用户只能看见一行小字
+  // 让他去点右下角那个小图标。这个函数本来也只由"明确想在这儿打字"的手势调用
+  // （点输入框 / 进搜索 / 确认键唤键盘），弹出来是符合预期的：面板上的候选条还能点
+  // 字，蓝牙键盘同时照常可用，不想要就点同一个图标收回去（面板不盖那一行）。
+  if (g_bt.isConnected()) {
+    if (!hinted) {
+      hinted = true;
+      rdShowFloat("蓝牙键盘已连接", "虚拟键盘照常可用；点右下角的键盘图标可收起", 4000);
+    }
+  } else {
     hinted = false;
-    st.vkVisible = true;
-    return true;
   }
-  if (!hinted) {
-    hinted = true;
-    rdShowFloat("蓝牙键盘已连接", "虚拟键盘不自动弹出；点状态栏右端的键盘图标可强制打开", 5000);
-  }
-  return false;
+  // 从"没弹"变成"弹着"也是一次整块换图样（同 rdToggleVk 的理由）：面板顶上来、
+  // 正文重排，置一次全刷。已经弹着时不置 —— 这个入口在每次点输入框时都会被调用。
+  if (!st.vkVisible) st.fullRefresh = true;
+  st.vkVisible = true;
+  return true;
 }
 
 // 底部提示行。
 // 右端要给虚拟键盘的开关图标让位（editorVkDrawIcon 画在同一行的最右端）。短提示照旧
 // 整屏居中——文字在中间，本来就够不到极右端的图标；只有长到真会压上去时，才按让位后
 // 的宽度截断并在这段里重新居中，免得白截掉半句话。
-static void drawFooter(const char *hint) {
+void drawFooter(const char *hint) {
   int w = g_rd.getScreenWidth();
   int y = statusTop();
   g_rd.drawLine(0, y, w, y, true);
@@ -717,7 +280,7 @@ static void drawFooter(const char *hint) {
 }
 
 // 顶部标题栏，返回正文可用 top。
-static int drawTitle(const char *title) {
+int drawTitle(const char *title) {
   int y = RD_TOP_INSET;
   drawLineText(MARGIN, y, title, true);
   g_rd.drawLine(0, rdHeadBottom(), g_rd.getScreenWidth(), rdHeadBottom(), true);
@@ -742,7 +305,7 @@ static void drawStatsTabIcon(int x, int y, int box, bool invert) {
 // ── 主界面标签栏（书架 / 文件 / 笔记 / 设置 / 统计）──────────────────────
 // 刻意与 drawTitle 占用同一条顶栏、返回同一个正文 top（都取 rdHeadBottom()），
 // 标签化不需要另做一套内容区排版。
-static int drawTabBar() {
+int drawTabBar() {
   int w = g_rd.getScreenWidth();
   int seg = w / kTabCount;
   // 图标尺寸/离顶边距离走 tab_icons.h 的共用常量，和计划模式完全一致；底边交给
@@ -772,7 +335,7 @@ static int drawTabBar() {
 // 点按坐标落在哪个标签上（不在标签栏内返回 -1）。命中带故意不跟着字形走：
 // 从屏幕上沿一路给到标签栏下方一点，整条横带按等分列切——e-ink 上手指落点很糙，
 // 用户瞄的是大概位置，不是那个 56px 的方块。
-static int tabHit(int x, int y) {
+int tabHit(int x, int y) {
   int w = g_rd.getScreenWidth();
   if (y < 0 || y > TAB_BAND_BOTTOM + 6) return -1;
   int i = (x < 0) ? 0 : (x >= w ? kTabCount - 1 : x * kTabCount / w);
@@ -786,11 +349,10 @@ static void renderShelfSearch();
 static void renderNotesSearch();
 static void handleShelfSearch(int key);
 static void handleNotesSearch(int key);
-// 文件标签的进入动作（重扫目录）。定义在文件浏览器那一段，这里先声明给 switchTab 用。
-static void rdEnterFileTab();
+// 文件标签的进入动作（重扫目录）现在定义在 screen_reader_files.cpp，声明见内部头。
 
 // 切根标签。文件标签进来要额外扫一遍 SD（见 rdEnterFileTab），所以它单独走一条分支。
-static void switchTab(int tab) {
+void switchTab(int tab) {
   tab = clampI(tab, 0, kTabCount - 1);
   if (tab == st.tab && st.mode == tabMode(tab)) return;
   st.pickOpen = false;   // 切标签一定收起设置弹层（防它被带进别的标签）
@@ -871,7 +433,7 @@ static uint32_t fontTagFor(const std::string &localPath, size_t size) {
 // 内容面已经是目标字面时直接返回：reopenBook() 每次改字号都会走到这里，而
 // ttf_font_open 是"先卸面再重读"，大 CJK 字体一次就是几百毫秒。
 static void applyUserContentFont() {
-  const char *path = app_settings_font_path();
+  const char *path = font_store_get_path();
   if (ttf_font_path_is_builtin(path)) {
     if (ttf_font_is_builtin()) return;
   } else if (strcmp(ttf_font_path(), path) == 0) {
@@ -997,6 +559,10 @@ static int totalPages() {
   return 1;
 }
 
+// 书架排序（按最近阅读）。定义在后面（要用 reader_progress.txt 的进度表），这里先声明，
+// 因为 scanBooks() 扫完就要用它把列表排好。
+static void rdSortShelfByRecency();
+
 // ── 书架扫描 ────────────────────────────────────────────────────────────
 // 扫描时装作看不见的文件：应用自己的数据也是 .txt，落在 /sdcard 根目录下会被
 // 当成一本书摆上书架（"阅读进度"reader_progress.txt 就这么上架的）。
@@ -1012,8 +578,18 @@ static bool isInternalShelfFile(const std::string &name) {
   return false;
 }
 
-static void scanBooks() {
+// ── 书架空闲预建的状态（实现见 fdShelfIdlePrebuild，几百行之后）──────────────
+// 放在这里而不是实现旁边：scanBooks() 得能把"全都建好了"这条结论作废，而它在前面。
+// 三件事：用户最后一次按键的时刻（空闲窗口的锚）、这个窗口是否已经做过一本、
+// 以及"书架上一本待建的都没有了"。
+static int64_t s_rdLastInputUs = 0;
+static bool s_rdSawKey = false;          // 本次开机进阅读器后有没有过按键（见 kShelfIdleColdUs）
+static int64_t s_rdPrebuiltForInputUs = -1;
+static bool s_rdShelfPrebuildExhausted = false;
+
+void scanBooks() {
   st.books.clear();
+  s_rdShelfPrebuildExhausted = false;   // 书目变了，重新找一遍待建的书
   // /sdcard/WeRead 是微信读书缓存整本后的落盘目录（finalBookPath 前缀）。
   // books/Books 两种大小写都列是因为卡上的目录名不统一；但 FATFS 的 LFN 查找是
   // 大小写不敏感的（没有 CONFIG_FATFS_CASE_SENSITIVE），两者打开的是**同一个**目录，
@@ -1043,10 +619,10 @@ static void scanBooks() {
     }
     closedir(dp);
   }
+  rdSortShelfByRecency();   // 越近读的排越前面
 }
 
 // ── 打开书籍 ────────────────────────────────────────────────────────────
-static bool openSpine(int idx);
 
 static bool openEpub(const std::string &path) {
   auto epub = std::make_shared<Epub>(path, CACHE_DIR);
@@ -1106,13 +682,17 @@ static bool openEpub(const std::string &path) {
   return openSpine(0);
 }
 
-static bool openSpine(int idx) {
+bool openSpine(int idx) {
   if (!st.epub) return false;
   int n = st.epub->getSpineItemsCount();
   if (n <= 0) return false;
   idx = clampI(idx, 0, n - 1);
   st.spineIndex = idx;
   st.section = std::make_unique<Section>(st.epub, idx, g_rd);
+  // 换了 Section 就是换了排版，脚注表缓存的键（书/章/页/字号）虽然够用，但 Section
+  // 重建后页内容可能整个变了而键恰好没变（比如改了行距又翻回同一页），这里一并清掉。
+  st.footnoteCacheSpine = st.footnoteCachePage = st.footnoteCacheFont = -1;
+  st.footnoteCacheBook.clear();
   // 字号梯子必须在 startBuild 之前灌：排版期就要按它把 CSS font-size 吸附到某一档。
   applyCssFontLadder();
   if (!st.section->startBuild(makeSpec())) return false;
@@ -1272,15 +852,14 @@ static bool openXtc(const std::string &path) {
 }
 
 static void generateCoverForOpenedBook();
-static void generateStandbyCoverForOpenedBook();   // 定义在 generateCoverForOpenedBook 之后
 static void pushRecent(const std::string &path, int kind, const std::string &title);
 // 阅读位置落盘/恢复：定义在 buildToPage 之后（恢复要靠它跳页），这里先声明。
 static void rdRememberProgress(bool force);
 static void rdRestoreProgress();
 static void rdStatsBeginSession();  // 定义在 chapterPage() 之后（要用到章节进度）
-static void buildToPage(int target);  // 同上：reopenBook 重排后要靠它跳回原页
+void buildToPage(int target);  // 同上：reopenBook 重排后要靠它跳回原页
 
-static bool openBook(const std::string &path, int kind) {
+bool openBook(const std::string &path, int kind) {
   // 换书之前先把上一本读到哪落盘：下面 openEpub/openTxt 会把书对象整个换掉，
   // 换完 st.spineIndex/st.page 就属于新书了，想记也没得记。
   if (!st.bookPath.empty() && st.bookPath != path) rdRememberProgress(true);
@@ -1323,55 +902,73 @@ static std::string coverBmpPathFor(const std::string &path, int kind) {
 }
 static std::string coverBmpPathFor(const BookEntry &b) { return coverBmpPathFor(b.path, b.kind); }
 
-// 待机「书籍封面」表盘用的整屏封面缓存：**原图**按待机框解出来的那一张，与书架那张
-// 396×528 的 cover_v2.bmp 分开存。名字带版本（v1）：以后改了解析口径/框尺寸，改个
-// 名字就自然作废重生成，不必写迁移。生成端见 generateCoverForOpenedBook。
-// / The full-screen standby-face cover: the book's ORIGINAL image decoded to the standby
-// box, cached separately from the 396×528 shelf cover. Versioned name so a later change
-// in box or decoding invalidates it without a migration.
+// 待机「书籍封面」表盘用的封面缓存：**原图**按封面框解出来的那一张，与书架那张
+// 396×528 的 cover_v2.bmp 分开存。名字带版本（v2）：改了解析口径/框尺寸就改个名字，
+// 自然作废重生成，不必写迁移。v1 是"整屏一张封面"那版的框（近整屏），已不用，见
+// generateCoverForOpenedBook 里的顺手清理。生成端见 generateCoverForOpenedBook。
+// / The standby-face cover: the book's ORIGINAL image decoded to the cover box, cached
+// separately from the 396×528 shelf cover. Versioned name so a later change in box or
+// decoding invalidates it without a migration. v1 was the full-screen box of the
+// cover-only layout and is cleaned up opportunistically.
 static std::string standbyCoverPathFor(const std::string &path, int kind) {
-  return bookCacheDirFor(path, kind) + "/standby_v1.bmp";
+  return bookCacheDirFor(path, kind) + "/standby_v2.bmp";
 }
 
-// 待机封面表盘的目标框（整屏减一圈页边距）。**生成端（本文件）与绘制端
-// （standby_clock.cpp 的 drawCoverFace）都调这一份**：框只有一个来源，改了不会一边
-// 变一边不变 —— 那正是"生成时按 A 尺寸解、画的时候按 B 尺寸又缩一遍"的糊法。
+// 待机封面表盘的**封面框**（版式的上半部分：封面在上，时刻/日期/书名+进度在下）。
+// **生成端（本文件）与绘制端（standby_clock.cpp 的 drawCoverFace）都调这一份**：框只有
+// 一个来源，改了不会一边变一边不变 —— 那正是"生成时按 A 尺寸解、画的时候按 B 尺寸又
+// 缩一遍"的糊法。
+//
+// 尺寸口径：左右各留 1/6（框宽 = 屏宽 2/3 ≈ 456@684）、高取 55%（竖屏）；横屏时屏是
+// 宽扁的，封面占到 55% 就没地方放下面那三行，改成 45%。456:668 ≈ 0.68，与常见封面
+// 的 2:3 几乎一致 —— 框越贴合原图，下采样比越小、糊的越少。
 void readerStandbyCoverBox(int &x, int &y, int &w, int &h) {
   const int W = SCREEN_W, H = SCREEN_H;
   const int m = (W < H ? W : H) / 40;   // 短边的 2.5%：面板本身盖边 3~4px，留一点就够
-  x = m;
+  const bool portrait = W < H;
+  x = W / 6;
   y = m;
-  w = W - 2 * m;
-  h = H - 2 * m;
+  w = W - 2 * (W / 6);
+  h = portrait ? (H * 55 / 100) : (H * 45 / 100);
 }
 
 // 打开书后即时生成封面（用已加载对象，避免二次解压）。
 static void rdCoverThumbForget(const std::string &bmpPath);  // 定义在封面缩放那一段
 static void generateCoverForOpenedBook() {
-  // 顺手清掉 v1 的封面：改名之后它再也不会被读到，留着白占卡（每本约 170KB，
+  // 顺手清掉两代老封面：改名之后它们再也不会被读到，留着白占卡（每本一两百 KB，
   // 几百本就是几十 MB）。删失败也无所谓，下次打开再试。
-  const std::string legacy = bookCacheDirFor(st.bookPath, st.bookKind) + "/cover.bmp";
+  const std::string legacy = bookCacheDirFor(st.bookPath, st.bookKind) + "/cover.bmp";      // 更早的整屏封面
+  const std::string legacyStandby = bookCacheDirFor(st.bookPath, st.bookKind) + "/standby_v1.bmp";  // 单图版表盘的封面
   if (Storage.exists(legacy.c_str())) Storage.remove(legacy.c_str());
+  if (Storage.exists(legacyStandby.c_str())) Storage.remove(legacyStandby.c_str());
   if (st.bookKind == 0) { if (st.epub) st.epub->generateCoverBmp(); }
   else if (st.bookKind == 1) { Txt t(st.bookPath, CACHE_DIR); if (t.load()) (void)t.generateCoverBmp(); }
   else if (st.bookKind == 2) { if (st.xtc) st.xtc->generateCoverBmp(); }
   // 新封面写完了 → 作废缩略图缓存里这本的旧条目（否则书架上还挂着上一版封面）。
   rdCoverThumbForget(coverBmpPathFor(st.bookPath, st.bookKind));
-  generateStandbyCoverForOpenedBook();
+  // 待机整屏封面**故意不在这里做**：它跟"把这本书打开"没有半点关系，纯粹是待机表盘
+  // 的素材，而做它要"解原图 + 缩放 + 写盘"（实测 ~3.0s，开书路径上第三大的一块）。
+  // 两个补做的时机见 rdBuildStandbyCoverForOpenBook 的头注释。
 }
 
-// 待机整屏封面：打开书时顺手留一份，供「书籍封面」表盘 1:1 上屏。
+// 待机整屏封面（「书籍封面」表盘 1:1 上屏的那张 650×1182）。
 //
 // 为什么不在待机时现做：待机是 light sleep 前的最后一屏，那时书对象已经不在手上
 // （screen_reader_exit 会释放），要现做就得重新解压 epub 找封面 —— 而且慢。所以按
-// **原图**在开书这一趟解好，一本书只做一次（文件在就跳过）。
+// **原图**提前解好，一本书只做一次（文件在就跳过）。
 //
 // 为什么不用书架那张 cover_v2.bmp：那是 396×528 的格子缩略图，待机整屏的框是
 // 650×1182 上下，拿它上屏就是"缩略图放大"——用户报的"待机封面糊"就是它。
 //
 // XTC 不做：它的 cover_v2.bmp 本来就是第 0 页原分辨率（见 Xtc.cpp 的注释），已经
 // 是能拿到的最好一版，readerLastBookCover 会退回用它。
-static void generateStandbyCoverForOpenedBook() {
+//
+// **它不挂在开书路径上**（原来挂，改掉了）：这本书有没有待机封面，跟"用户此刻要
+// 不要读它"无关，而 3 秒的开销在开书这一趟是实打实的等待。改由这两个时机补：
+//   · 表盘是「书籍封面」→ 首页推上屏后的空闲帧（rdPrebuildAhead 开头那段）；
+//   · 用户后来才把表盘切成「书籍封面」→ 设置动的那一下（MenuAct::ClockFace）。
+// 没补上的窗口很短：drawCoverFace 会退回书架封面兜底，不会画不出来。
+static void rdBuildStandbyCoverForOpenBook() {
   if (st.bookPath.empty() || st.bookKind == 2) return;
   const std::string out = standbyCoverPathFor(st.bookPath, st.bookKind);
   if (Storage.exists(out.c_str())) return;   // 一书一次
@@ -1387,6 +984,128 @@ static void generateStandbyCoverForOpenedBook() {
   }
   ESP_LOGI(TAG, "待机封面: %s (%dx%d) %s", out.c_str(), bw, bh, ok ? "已生成" : "无原图，退回书架封面");
 }
+
+// ── 待机表盘「图片」：用户自己选的那张图 ─────────────────────────────────
+// 与「书籍封面」同一条路子（见 screen_reader.h 的接口说明）：**不**在待机那一刻解码
+// 原图，而是选中时就按当前屏尺寸解成一张 Gray8 BMP 缓存，待机只做"读 BMP + 铺屏"。
+// 缓存名带屏尺寸 —— 横竖屏的表盘尺寸不同，转了屏自然换一张，转回来还能命中老的。
+static std::string standbyImageCacheFor(int w, int h) {
+  return std::string(CACHE_DIR) + "/standby/image_" + std::to_string(w) + "x" + std::to_string(h) + ".bmp";
+}
+
+bool readerStandbyImage(std::string &bmpPath, std::string &srcPath) {
+  srcPath = g_settings.getString("standby_image");
+  bmpPath = standbyImageCacheFor(SCREEN_W, SCREEN_H);
+  return !srcPath.empty();
+}
+
+// 后缀判断（大小写不敏感——相册/网友上传来的图常是 .JPG）。
+static bool rdImageExtIs(const std::string &name, const char *ext) {
+  const size_t l = strlen(ext);
+  if (name.size() <= l) return false;
+  const size_t off = name.size() - l;
+  for (size_t i = 0; i < l; i++) {
+    char a = name[off + i], b = ext[i];
+    if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+    if (a != b) return false;
+  }
+  return true;
+}
+
+// 把 src 解成当前屏尺寸的待机缓存（Gray8 BMP，同封面那套口径）。失败填 err。
+static bool rdBuildStandbyImageCache(const std::string &src, std::string &err) {
+  err.clear();
+  if (src.empty()) { err = "还没选图片"; return false; }
+  if (!Storage.exists(src.c_str())) { err = "图片不在卡上"; return false; }
+  const bool isPng = rdImageExtIs(src, ".png");
+  const bool isJpg = rdImageExtIs(src, ".jpg") || rdImageExtIs(src, ".jpeg");
+  if (!isPng && !isJpg) { err = "只支持 JPG / PNG"; return false; }
+
+  // fit（crop=false）+ 整屏盒子：待机要的是"整张图都看得见"，裁掉两边去填满会把
+  // 画面切掉一块。留白由绘制端居中处理（readerCoverScale 的 ox/oy）。
+  const int w = SCREEN_W, h = SCREEN_H;
+  const std::string out = standbyImageCacheFor(w, h);
+  Storage.mkdir((std::string(CACHE_DIR) + "/standby").c_str(), true);
+  bool ok = false;
+  {
+    HalFile in, outf;
+    if (Storage.openFileForRead(TAG, src, in) && Storage.openFileForWrite(TAG, out, outf)) {
+      ok = isPng ? PngToBmpConverter::pngFileToBmpStreamWithSize(in, outf, w, h, /*gray8=*/true, /*crop=*/false)
+                 : JpegToBmpConverter::jpegFileToBmpStreamWithSize(in, outf, w, h,
+                                                                   JpegToBmpConverter::Output::Gray8, false);
+    }
+  }
+  if (!ok) {
+    Storage.remove(out.c_str());   // 半截 BMP 不比没有更安全
+    err = "解不开这张图（格式或大小不支持）";
+    ESP_LOGW(TAG, "待机图片: 解码失败 %s", src.c_str());
+    return false;
+  }
+  ESP_LOGI(TAG, "待机图片: %s -> %s (%dx%d)", src.c_str(), out.c_str(), w, h);
+  return true;
+}
+
+bool readerSetStandbyImage(const std::string &srcPath, std::string &err) {
+  if (!rdBuildStandbyImageCache(srcPath, err)) return false;
+  g_settings.setString("standby_image", srcPath);
+  g_settings.setString("clock_face", standbyFaceKey(StandbyFace::Image));
+  // 别的屏尺寸的老缓存顺手删掉（每张几百 KB）。当前这张留着——待机就要用它。
+  const std::string dir = std::string(CACHE_DIR) + "/standby";
+  const std::string keep = standbyImageCacheFor(SCREEN_W, SCREEN_H);
+  DIR *dp = opendir(dir.c_str());
+  if (dp) {
+    struct dirent *e;
+    while ((e = readdir(dp)) != nullptr) {
+      const std::string nm = e->d_name;
+      if (nm == "." || nm == "..") continue;
+      const std::string full = dir + "/" + nm;
+      if (full != keep) Storage.remove(full.c_str());
+    }
+    closedir(dp);
+  }
+  return true;
+}
+
+// 「这组 (原图, 屏尺寸) 已经试过了」——成功失败都算，免得失败时每个空闲帧重解一次。
+static std::string s_rdSbImageSrc;
+static int s_rdSbImageW = 0, s_rdSbImageH = 0;
+
+// 网页（/api/set_standby）那条路**只投递、不落地**。原因是栈：解一张几百万像素的
+// JPEG 要十几 KB 栈（stb_image 的霍夫曼/IDCT 那几层），而 httpd 任务只有 8KB（够发
+// 分块响应而已，handler_download 里那个 4KB 的 buf 就吃掉一半）。主任务 16KB
+// （CONFIG_ESP_MAIN_TASK_STACK_SIZE）才是解图该待的地方 —— 目视浏览器的看图、
+// 文件菜单的"设为待机"本来就在那儿解。
+// 所以这里存一个"待办"，由主循环每拍调 readerStandbyPump() 取件、在主任务上解。
+static std::atomic<bool> s_sbPending{false};
+static std::string s_sbPendingSrc;   // 只在 s_sbPending==true 时有意义
+
+void readerRequestStandbyImage(const std::string &srcPath) {
+  // 先把设置改了：即便图暂时解不出来，语义（"以后待机看这张"）也已经生效，
+  // 表盘那边会画"正在生成"的占位而不是退回上一张。
+  g_settings.setString("standby_image", srcPath);
+  g_settings.setString("clock_face", standbyFaceKey(StandbyFace::Image));
+  s_sbPendingSrc = srcPath;
+  s_sbPending.store(true, std::memory_order_release);   // 写在旗子之前，release 保证可见
+}
+
+void readerStandbyPump() {
+  if (!s_sbPending.load(std::memory_order_acquire)) return;
+  s_sbPending.store(false, std::memory_order_relaxed);
+  const std::string src = s_sbPendingSrc;   // 先拷一份，别再跨线程读
+  if (src.empty() || Storage.exists(standbyImageCacheFor(SCREEN_W, SCREEN_H).c_str())) return;
+  std::string err;
+  if (rdBuildStandbyImageCache(src, err)) {
+    // 告诉空闲补做"这组已经好了"，省得它过 8 秒又解一遍。
+    s_rdSbImageSrc = src; s_rdSbImageW = SCREEN_W; s_rdSbImageH = SCREEN_H;
+  } else {
+    ESP_LOGW(TAG, "网页设为待机画面: %s", err.c_str());
+  }
+}
+
+// 空闲帧补做：转屏之后、或者从 web 界面（/api/set_standby）设的图，缓存可能还没生成。
+// 定义在「书架空闲预建」那一段（要复用那边的"用户停手了多久"这道闸）。
+static void rdStandbyImageIdlePrebuild();
 
 // 重排当前这本书（改字号/行距/段距/边距/方向/字体/样式解析都走这里）。
 // openEpub/openTxt/openXtc 给的是"刚打开"的位置（第 0 章第 0 页），所以先把"读到哪"
@@ -1462,7 +1181,12 @@ static bool turnBook(int dir) {
     int np = st.xtcPage + dir;
     if (np >= 0 && np < static_cast<int>(st.xtc->getPageCount())) { st.xtcPage = np; ok = true; }
   }
-  if (ok) st.dirty = 1;
+  if (ok) {
+    st.dirty = 1;
+    // 「每日页数」只数往后翻（往前翻是回看，来回翻两下页数就假了，时长那栏才管频率）。
+    // 这里也是全阅读器唯一的翻页漏斗：按键、电容键、触摸左右三分区、滑动都并进来。
+    if (dir > 0) ReadingStats::notePageTurn();
+  }
   // 记下方向给推屏用（err 时清掉：这一帧什么都没翻，动画没有意义）。
   s_pendingTurn = ok ? (dir < 0 ? -1 : +1) : 0;
   return ok;
@@ -1476,7 +1200,7 @@ static int curPage();  // 定义在下面（书签/百分比共用）
 static int sbGet(const char *key, int def) {
   return atoi(g_settings.getString(key, std::to_string(def).c_str()).c_str());
 }
-static int sbCount(const char *key, int def, int n) {
+int sbCount(const char *key, int def, int n) {
   int v = sbGet(key, def);
   return (v < 0 || v >= n) ? def : v;
 }
@@ -1652,8 +1376,28 @@ static void rdStatsIdleTick() {
 // 把这份工作量从"按键那一拍"挪到了"读者盯着这一页看"的空档里。
 static const int kPrebuildAhead = 5;
 
+// 「这本书的待机封面已经试过了吗」——见 rdPrebuildAhead 开头那一段。换书时路径变了
+// 自然失效，所以不用显式清。
+static std::string s_rdSbTriedPath;
+
 static void rdPrebuildAhead() {
-  if (st.bookKind != 0 || st.mode != RdMode::Reading || !st.section) return;
+  if (st.mode != RdMode::Reading) return;
+  // （1）待机整屏封面：表盘是「书籍封面」时它总要生成，但开书那一趟被门控跳过了
+  // （开书那一趟故意不做），改到这里补 —— 此时首页已经推上屏、
+  // 读者正看着这一页，几秒的后台解码就藏在这段"没人按键"的空档里（跟下面排版
+  // 余量同一个道理）。做成**一本书一次**：生成失败（书里没有可用原图）时文件不会
+  // 出现，不记一笔的话每个空闲帧都会重试一次整趟解压（~50ms × 每 80ms 一帧）。
+  if (!st.bookPath.empty() && st.bookKind != 2 && s_rdSbTriedPath != st.bookPath) {
+    if (standbyFaceFromKey(g_settings.getString("clock_face").c_str()) == StandbyFace::Cover &&
+        !Storage.exists(standbyCoverPathFor(st.bookPath, st.bookKind).c_str())) {
+      s_rdSbTriedPath = st.bookPath;   // 试过就算，成功失败都别再进
+      rdBuildStandbyCoverForOpenBook();
+    }
+  }
+  if (st.bookKind != 0 || !st.section) return;
+  // 挂起的弹注排在最前面：它要的是**锚点那一页**，可能远在几十页之外（注文常整块压在
+  // 章末），比"领先读者 kPrebuildAhead 页"要紧得多。它自己带预算，也在里面把结果弹出来。
+  if (st.fnWaitIdx >= 0) rdFootnoteWaitTick();
   if (st.section->isBuildComplete()) return;
   // 单次调用有界：一次空闲帧最多花 kPrebuildBudgetUs 做排版，超了就留给下一帧。
   // 空闲帧每 ~80ms 一拍（main.cpp 的 idleWaitWithTouch(80)），几帧就能把余量补满；
@@ -1665,6 +1409,166 @@ static void rdPrebuildAhead() {
     st.section->buildSomeMore(1);
     if (esp_timer_get_time() >= deadline) break;
   }
+}
+
+// ── 书架空闲预建：把"第一次打开一本书"的开销提前到空闲帧 ────────────────────
+// 冷开一本 EPUB 实测 18.4 秒，可这 18 秒几乎全是一次性产物，而且**只跟这本书的文件
+// 内容有关**，跟"用户此刻在读哪本书"毫无关系：
+//     book.bin 元数据        ~6.5s  解 zip 里的 OPF/NCX/HTML 建 spine+TOC 索引
+//     书内嵌字体解压          ~6.8s  两个 .ttf 从 zip 抠出来落缓存（正文 2.4 + 次字面 4.4）
+//     书架封面                ~?     解码原图 + 缩放
+// 既然只跟内容有关，就能在书架上、用户没在动的时候先做出来；真正点进去时这些步骤
+// 全是 stat 命中，开书只剩"装字体 + 排首章 + 画首屏"（热开实测 3.4s）。
+//
+// 三条硬规矩：
+//   1) **只在书架、且用户停手 kShelfIdleUs 之后**才开工。Epub::load() 内部是不可切
+//      分的一整段（expat 解析 zip 里的 XML），一做就是好几秒：放在开书路径里用户
+//      盯着"正在打开…"干等，放在空闲帧里用户看到的是书架停在那儿 —— 前者是白等。
+//   2) **一个空闲窗口只做一本**。做完这个窗口就作废，要等下一次按键之后的新窗口。
+//      宁可少建几本，也不能让"用户这时拿起机器"撞上一个已经排队的下一本。
+//   3) 只补**还没有 book.bin** 的书；已有缓存的书开起来本来就快（热开 3.4s），
+//      重建它纯属浪费 SD 寿命。
+//
+// 字体这一步是**只解压不装载**：ttf_font_open 会占用全局的内容面/次字面，那是"正在
+// 读的那本书"的东西，后台不能碰（换了字面，正在看的那一页下次重排就变样了）。
+// extractEmbeddedFont 只落文件，开书时那段 zip 读取和早退判断就全变成了 stat 命中。
+// 这也是原先计划的 ②「内嵌字体懒加载」真正的落点：**懒加载本身不能做** ——
+// makeSpec 的 fontTag 里带着次字面指纹、ChapterHtmlSlimParser 又按 altFontFamilyHash
+// 给每个词打 ALT_FONT 位，装不装次字面直接改变换行；把"解压"提前则完全等价、且安全。
+//
+// 反过来说，这条路的**代价**：这几秒在书架上是真占 CPU/SD 的，所以规矩 1、2 必须守。
+// 停手多久才算"用户不在跟前，可以开工"。这两个值是拿第一次上机日志校出来的：
+// 原来只留 3 秒，结果开机落在书架上、用户一下都没碰，6 秒后就无视一切地做了 13 秒
+// （日志里那条 `帧探针: 处理 13795ms key=0`）—— 那正是"用户就在机器跟前"的时刻，
+// 他这时去点一本**已经缓存过**的书，就要白等这 13 秒。所以：
+//   · 用户动过手（在书架里翻过、从书里退出来…）再停手 kShelfIdleUs 才开工；
+//   · 一个按键都还没有（刚开机/刚切回书架）则等 kShelfIdleColdUs，默认他马上会动手。
+static const int64_t kShelfIdleUs = 8 * 1000 * 1000;
+static const int64_t kShelfIdleColdUs = 30 * 1000 * 1000;
+
+// 这本书有没有内嵌正文字体？读 <cache>/book_font.txt（v4：`v4\n<href>\n<size>\n<family>\n…`，
+// 主 href 是空行即"没有"），见 Epub::resolveEmbeddedFonts。判不出来（文件不在、版本旧）
+// 一律返回 false = 当成"有"：保守，宁可不预建，也不排一份规格必然对不上、开书即作废的 .bin。
+static bool bookHasNoEmbeddedFont(const std::string &cacheDir) {
+  bool ok = false;
+  const std::string cached = Storage.readFile((cacheDir + "/book_font.txt").c_str(), &ok);
+  if (!ok || cached.rfind("v4\n", 0) != 0) return false;
+  const size_t nl = cached.find('\n', 3);
+  return nl != std::string::npos && nl == 3;   // 主 href 是空行
+}
+
+static void rdShelfIdlePrebuild() {
+  if (st.mode != RdMode::Browser) return;          // 只在书架；读书/别的界面不抢
+  if (s_rdShelfPrebuildExhausted) return;          // 没有待建的书（scanBooks 会作废）
+  const int64_t now = esp_timer_get_time();
+  // 进阅读器后还没有过按键：把这一刻当作"停手的起点"。
+  if (s_rdLastInputUs == 0) {
+    s_rdLastInputUs = now;
+    return;
+  }
+  const bool sawKey = (s_rdSawKey != 0);
+  if (now - s_rdLastInputUs < (sawKey ? kShelfIdleUs : kShelfIdleColdUs)) return;
+  if (s_rdPrebuiltForInputUs == s_rdLastInputUs) return;  // 这个空闲窗口已经做过一本
+
+  // 找一本可以预建的 EPUB。只看 EPUB：TXT 没有这张元数据缓存（拿"文件在不在"当
+  // "建没建"用会永远找不到，变成每帧重做同一本），XTC 更是一本书就是一个文件。
+  // 分两级，优先做第一级：
+  //   ① 还没有 book.bin —— 元数据 + 内嵌字体 + 封面一次全做（原来的范围）；
+  //   ② 元数据有了、但**首章排版还没落盘** —— 点进去还要干等的正是这一段（解 CSS +
+  //      解析 HTML + 逐页断行）。这一级只在"这本书没有内嵌字体"时做：内嵌字体会进
+  //      makeSpec 的 fontTag、还按家族哈希给每个词打 ALT_FONT 位，用书架上（没开书，
+  //      tag=0）的规格排出来的 .bin，真正打开时规格一比就作废，白排。
+  const BookEntry *pick = nullptr;
+  bool needMeta = false;
+  for (const auto &b : st.books) {
+    if (b.kind != 0) continue;
+    const std::string dir = bookCacheDirFor(b.path, b.kind);
+    if (!Storage.exists((dir + "/book.bin").c_str())) { pick = &b; needMeta = true; break; }
+    if (Storage.exists((dir + "/sections/0.bin").c_str())) continue;  // 首章已经排过
+    if (!bookHasNoEmbeddedFont(dir)) continue;                        // 有内嵌字体：规格对不上
+    pick = &b;
+    needMeta = false;
+    break;
+  }
+  if (pick == nullptr) {
+    s_rdShelfPrebuildExhausted = true;
+    return;
+  }
+  s_rdPrebuiltForInputUs = s_rdLastInputUs;   // 先标记，免得中途返回时反复挑同一本
+
+  const std::string path = pick->path, name = pick->name;
+  const bool hadCover = Storage.exists(coverBmpPathFor(path, 0).c_str());
+  ESP_LOGI(TAG, "空闲预建: %s (%s)", name.c_str(), needMeta ? "元数据" : "首章");
+  const int64_t t0 = esp_timer_get_time();
+  {
+    // 一次性把开书路径上那些"只依赖文件内容"的产物做出来。Epub 对象出了这个作用域
+    // 就销毁（zip 句柄、解析缓冲都是 PSRAM 上的临时量），开书时再从缓存读。
+    // 用 make_shared 而不是栈对象：跟 openEpub 同一个用法，避免把几百字节的句柄
+    // 摊在主任务栈上（主任务的栈本来就紧）。
+    auto epub = std::make_shared<Epub>(path, CACHE_DIR);
+    if (epub->load()) {
+      if (needMeta) {
+        // resolveEmbeddedFonts 会把结论写进 <cache>/book_font.txt（v4），开书时直接读它，
+        // 不用再解一遍 OPF 里的 @font-face。
+        const Epub::EmbeddedFontSet fonts = epub->resolveEmbeddedFonts();
+        if (!fonts.primary.itemHref.empty()) (void)epub->extractEmbeddedFont(fonts.primary);
+        // 次字面的落盘名必须和 loadAltEmbeddedFont 里的一致（book_alt.ttf），否则这里
+        // 抠出来的那份开书时用不上，等于白做。
+        if (!fonts.alt.itemHref.empty()) (void)epub->extractEmbeddedFont(fonts.alt, "book_alt.ttf");
+        (void)epub->generateCoverBmp();
+      } else {
+        // 只补首章排版。顺序与 openSpine 一致：字号梯子必须在 startBuild 之前灌，
+        // 排版期要按它把 CSS font-size 吸附到某一档。这一级不碰封面/字体（上头挑的
+        // 时候已经保证没有内嵌字体，book.bin 也在）。
+        applyCssFontLadder();
+        auto section = std::make_shared<Section>(epub, 0, g_rd);
+        if (!section->createSectionFile(makeSpec())) {
+          ESP_LOGW(TAG, "空闲预建: %s 首章排版失败", name.c_str());
+        }
+      }
+    } else {
+      ESP_LOGW(TAG, "空闲预建: %s 打不开，跳过", name.c_str());
+    }
+    // 这里就放开：**别**把它带出作用域。这本的封面生成走的是它自己的 zip 句柄，
+    // 但打开的书（st.epub）随时可能在换页时读图，两份 zip 同时在手上是没必要的
+    // 内存开销（zip 目录 + 解析缓冲都在 PSRAM）。
+  }
+  ESP_LOGI(TAG, "空闲预建完成: %s 用时 %lldms", name.c_str(),
+           (esp_timer_get_time() - t0) / 1000);
+  // 封面刚补出来才重画：封面本来就在的话，这一趟只建了元数据/字体，屏幕上没有
+  // 任何像素会变，白白走一遍差分刷。
+  // 这里必须**当场刷**——空闲帧是主循环唯一不替我们推屏的拍子（同上面浮动提示那条），
+  // 只标脏的话封面会一直不出现，直到用户再按一下。
+  if (!hadCover && Storage.exists(coverBmpPathFor(path, 0).c_str())) {
+    st.dirty = 1;
+    renderCurrent();
+  }
+}
+
+// 待机「图片」表盘的缓存补做（转屏后、或从 web 界面设的图都靠它）。
+// 为什么要有它：从网页 /api/set_standby 设的图只写了个路径，本机没人去解码；转了屏
+// 之后当前尺寸的缓存也不存在了。这一段跑在**任何**阅读器子界面（不像书架预建只在
+// 书架），因为"设完图看文件列表"是最自然的姿势。
+// 闸门与书架预建同一套（用户停手 kShelfIdleUs / 冷启动 kShelfIdleColdUs）：解一张
+// 大图是秒级的，不能刚按完键就开跑。**一组 (原图, 屏尺寸) 只试一次** —— 失败
+// （图不在卡上/解不开）也不每个空闲帧重试。
+static void rdStandbyImageIdlePrebuild() {
+  if (standbyFaceFromKey(g_settings.getString("clock_face").c_str()) != StandbyFace::Image) return;
+  const std::string src = g_settings.getString("standby_image");
+  if (src.empty()) return;
+  const int w = SCREEN_W, h = SCREEN_H;
+  if (src == s_rdSbImageSrc && w == s_rdSbImageW && h == s_rdSbImageH) return;  // 这组看过了
+  // 停手闸（与书架预建同一套）。
+  const int64_t now = esp_timer_get_time();
+  if (s_rdLastInputUs == 0) return;   // 还没有"停手起点"（刚进阅读器）：下一拍再说
+  if (now - s_rdLastInputUs < (s_rdSawKey ? kShelfIdleUs : kShelfIdleColdUs)) return;
+  s_rdSbImageSrc = src;
+  s_rdSbImageW = w;
+  s_rdSbImageH = h;
+  if (Storage.exists(standbyImageCacheFor(w, h).c_str())) return;   // 已经有缓存
+  std::string err;
+  rdBuildStandbyImageCache(src, err);
+  if (!err.empty()) ESP_LOGW(TAG, "待机图片: 空闲补做失败 %s", err.c_str());
 }
 
 // 本地时间（跟随设置的 TZ）。未对时（RTC 无效）返回 false。
@@ -1787,24 +1691,8 @@ static void drawStatusBand(int y) {
 // ── 渲染：各界面 ────────────────────────────────────────────────────────
 static void drawReaderStatus() { drawStatusBand(statusTop()); }
 
-// ── 笔记/标注：当前页的"文字地图" ────────────────────────────────────────
-// 长按选词、标注高亮都要回答两个问题：屏幕上的某个点落在哪个词上、某段文字在
-// 这一页的哪几个词上。这里把当前页的词连同像素坐标采下来，后面都在这张表上做。
-// 采集时必须和 Page::render 用同一套 xOffset/yOffset/字重，否则高亮会画歪。
-struct RdWordHit {
-  int x = 0, w = 0, y = 0;   // 像素：起点、宽、基线
-  uint8_t style = 0;
-  std::string text;
-};
-
-struct RdPageText {
-  std::vector<RdWordHit> words;   // 阅读顺序：行序 → 行内词序
-  std::vector<int> lineFirst;     // 每行首个词的下标，末尾补 words.size()
-  bool valid = false;
-};
-
 // 当前页的文字地图。渲染时采一次，长按命中直接查它，避免再 loadPage 一遍。
-static RdPageText g_pageText;
+RdPageText g_pageText;
 
 static RdPageText rdBuildPageText(const Page &page, int fontId, int xOffset, int yOffset) {
   RdPageText pt;
@@ -1815,14 +1703,20 @@ static RdPageText rdBuildPageText(const Page &page, int fontId, int xOffset, int
     const auto &blk = line.getBlock();
     if (!blk || !blk->valid()) continue;
     pt.lineFirst.push_back(static_cast<int>(pt.words.size()));
-    const int baseY = yOffset + el->yPos;
+    // 与 PageLine::render 逐字对应：el->yPos 是**行顶**，这里的 y 是**基线**
+    // （下面全部按 `w.y - asc` / `w.y - asc/2` 取上沿和字形中心）。少了这一跳 ascender，
+    // 整块文字地图比实画的高一整个 ascender，长按选词会稳定地选到上一行。
+    // 用这一行自己的字体号，和渲染侧同一个来源（CSS 放大过的标题字号不同）。
+    const int lineFontId = blk->renderFontId() ? blk->renderFontId() : fontId;
+    const int baseY = yOffset + el->yPos + g_rd.getFontAscenderSize(lineFontId);
     for (uint16_t i = 0; i < blk->wordCount(); i++) {
       RdWordHit wh;
       wh.x = xOffset + el->xPos + blk->wordXpos(i);
       wh.style = static_cast<uint8_t>(blk->wordStyle(i));
       wh.y = baseY;
       wh.text = blk->wordText(i);
-      wh.w = g_rd.getTextWidth(fontId, wh.text.c_str(), static_cast<EpdFontFamily::Style>(wh.style));
+      // 宽度也按这一行的字体量：渲染用的就是它，用正文号量会让标题行的命中框横向也对不上。
+      wh.w = g_rd.getTextWidth(lineFontId, wh.text.c_str(), static_cast<EpdFontFamily::Style>(wh.style));
       pt.words.push_back(std::move(wh));
     }
   }
@@ -1892,8 +1786,8 @@ static void rdWarmPageText(const RdPageText &pt) {
       main += w.text;
     }
   }
-  rdWarmStrings(RD_TTF_ROLE_CONTENT_ALT, alt);
-  rdWarmStrings(RD_TTF_ROLE_CONTENT, main);  // 最后把角色留在内容面，跟改之前一致
+  rdWarmStrings(TTF_ROLE_CONTENT_ALT, alt);
+  rdWarmStrings(TTF_ROLE_CONTENT, main);  // 最后把角色留在内容面，跟改之前一致
 }
 
 // 词序列 → 展示文本。中日韩之间不加空格（原文本来就没有），拉丁词之间补一个空格。
@@ -2411,7 +2305,7 @@ static void renderEpubPage() {
       for (const auto &lk : page->links) {
         st.pageLinks.push_back({std::string(lk.href), lk.x + bodyMargin(), lk.y + RD_BODY_TOP, lk.width, lk.height});
       }
-      rd_ttf_bench_t ws;
+      ttf_bench_stats_t ws;
       ttf_bench_begin();
       tA = esp_timer_get_time();
       rdWarmPageText(g_pageText);
@@ -2426,7 +2320,7 @@ static void renderEpubPage() {
       s_prof.ioSpan = ws.io_span_max > ws.io_span_min
                           ? (int64_t)(ws.io_span_max - ws.io_span_min) + 4096
                           : 0;
-      rd_ttf_bench_t bs;
+      ttf_bench_stats_t bs;
       ttf_bench_begin();
       tA = esp_timer_get_time();
       page->render(g_rd, fontId, bodyMargin(), RD_BODY_TOP);
@@ -2491,10 +2385,10 @@ static void renderTxtPage() {
       all.reserve(total + 8);
       for (const auto &s : segs) all += s;
     }
-    rd_ttf_bench_t ws;
+    ttf_bench_stats_t ws;
     ttf_bench_begin();
     int64_t tw = esp_timer_get_time();
-    rdWarmStrings(RD_TTF_ROLE_CONTENT, all);  // TXT 没有样式，只有内容面
+    rdWarmStrings(TTF_ROLE_CONTENT, all);  // TXT 没有样式，只有内容面
     s_prof.warmUs = esp_timer_get_time() - tw;
     ttf_bench_end(&ws);
     s_prof.warmReadUs = ws.read_us;
@@ -2508,7 +2402,7 @@ static void renderTxtPage() {
                         : 0;
   }
   // 3) 画。y 的推进与收集循环一一对应（每个 seg 一行，含空行）。
-  rd_ttf_bench_t bs;
+  ttf_bench_stats_t bs;
   ttf_bench_begin();
   int64_t tA = esp_timer_get_time();
   for (const auto &seg : segs) {
@@ -2596,7 +2490,48 @@ static void renderReading() {
 }
 
 // ── 书架封面网格 ─────────────────────────────────────────────────────────
-static int coverTop() { return rdHeadBottom() + 8; }  // == drawTitle / drawTabBar 返回
+int coverTop() { return rdHeadBottom() + 8; }  // == drawTitle / drawTabBar 返回
+
+// 「标题 → 状态行 → 分隔线 → 列表」这一族的列表首行**上沿**（WiFi / OPDS / 词典下载 /
+// 网络文件管理四个子界面）。以前它们是四个同名不同名的函数（wifiListTop / opdsListTop /
+// resListTop / netListTop）抄着同一个式子，而各自的渲染函数里还写着 `ly = top + itemH`
+// —— 五处必须一直保持同值，否则点按命中会整体错一行。收敛成这一个。
+int rdListTop() { return coverTop() + uiLineHeight() + 12; }  // 状态行 + 分隔线
+
+// 平铺列表的通用几何：给定首行上沿与行高，一屏正好装下 count 行（rows == count 表示
+// "没有窗口外的东西"）。渲染与点按命中共用这一个调用 —— 行号就只有一处算法。
+ListView flatListViewAt(int top, int itemH, int count, int sel) {
+  ListView lv;
+  lv.top = top;
+  lv.itemH = itemH;
+  lv.count = count;
+  lv.rows = count;  // 平铺：可见行数就是总行数
+  lv.sel = sel;
+  listViewClamp(lv);
+  return lv;
+}
+
+// 平铺菜单（文件菜单 / 书架菜单 / 按键映射 / 自定义状态栏…）：行高 12，top 默认在标题
+// 栏正下方（coverTop）；带状态行+分隔线的那几屏（WiFi / 结果页）传 rdListTop。
+// 默认实参在 screen_reader_internal.h 里给。
+ListView flatMenuListView(int count, int sel, int top) {
+  return flatListViewAt(top, uiLineHeight() + 12, count, sel);
+}
+
+// 「标题（或标签栏）→ 列表」这一族的居中式窗口（最近阅读 / 目录 / 书签 / 脚注 / 阅读菜单 /
+// 设置 / 统计首页…）。itemH 各屏不同（+6 / +8 / +12），bottom 传列表区下沿——有底部提示栏
+// 的传 statusTop()，一屏到底的标签页传 tabBottom()。渲染与点按命中共用同一个调用。
+static ListView titleListView(int count, int sel, int itemH, int bottom, int page = 8) {
+  ListView lv;
+  lv.top = coverTop();  // == drawTitle / drawTabBar 的返回值
+  lv.itemH = itemH;
+  lv.count = count;
+  lv.rows = std::max(1, (bottom - lv.top - 8) / itemH);
+  lv.page = page;
+  lv.sel = sel;
+  listViewCenter(lv);
+  return lv;
+}
 
 // ── 顶部搜索栏（书架 / 笔记共用）─────────────────────────────────────────
 // 顶标签栏之下一条横栏：左端是占位提示，右端是动作图标（书架 3 个：搜索/刷新/微读；
@@ -2635,6 +2570,32 @@ static bool rdBarBodyHit(int x, int y, bool shelf) {
   return y >= rdBarTop() - 6 && y <= rdBarBottom() + 6 && x >= MARGIN && x < iconsLeft;
 }
 
+// 笔记栏右端除放大镜外还有一个「导出」按钮（导出全部标注/书签，见 rdExportAnnot）。
+// 图标字体子集里没有语义合适的导出字形，当前环境也没 fontTools 重裁（同 tab_icons.h
+// 顶部那条注释），所以用**文字按钮**，不借一个意思不对的图标。
+// 几何只有 rdNotesExportRect 一处，绘制和点按命中都从它取，不会错行。
+static constexpr const char *kNotesExportText = "导出";
+static int rdNotesExportW() { return g_rd.getTextWidth(uiFontId(), kNotesExportText) + 24; }
+static void rdNotesExportRect(int *x, int *y, int *w, int *h) {
+  *w = rdNotesExportW();
+  *h = rdBarH() - 8;
+  *x = rdBarIconX(0, rdBarIconCount(false)) - 12 - *w;
+  *y = rdBarTop() + 4;
+}
+static bool rdNotesExportHit(int tx, int ty) {
+  int x, y, w, h;
+  rdNotesExportRect(&x, &y, &w, &h);
+  // 命中判定放宽一圈：e-ink 没有实时反馈，指尖落点差几个像素很常见（与图标同理）。
+  return tx >= x - 6 && tx <= x + w + 6 && ty >= y - 6 && ty <= y + h + 6;
+}
+static void rdDrawNotesExportBtn() {
+  int x, y, w, h;
+  rdNotesExportRect(&x, &y, &w, &h);
+  g_rd.drawRect(x, y, w, h, true);
+  const int tw = g_rd.getTextWidth(uiFontId(), kNotesExportText);
+  drawLineText(x + (w - tw) / 2, y + (h - uiLineHeight()) / 2, kNotesExportText, true);
+}
+
 static void rdDrawSearchBar(bool shelf) {
   const int w = g_rd.getScreenWidth();
   const int top = rdBarTop(), h = rdBarH();
@@ -2646,6 +2607,7 @@ static void rdDrawSearchBar(bool shelf) {
     if (fb) icon_font_draw_sized(fb, rdBarIconX(i, count), rdBarIconY(), rdBarIconPx(), rdBarIconPx(),
                                  rdBarIconCp(i, shelf), false, rdBarIconPx());
   }
+  if (!shelf) rdDrawNotesExportBtn();   // 书架栏没有导出：那是"当前这些书"，没有标注可导
 }
 
 // ── 旧版底部放大镜已下岗：搜索入口挪到上面的搜索栏 ───────────────────────
@@ -3148,20 +3110,26 @@ static void pushRecent(const std::string &path, int kind, const std::string &tit
   saveRecent();
 }
 
+// 最近阅读：居中式窗口。渲染与点按命中共用这一个几何（以前各写一遍窗口式子）。
+static ListView recentListView() {
+  return titleListView(static_cast<int>(st.recent.size()), st.recentSel, uiLineHeight() + 8, statusTop());
+}
+
 static void renderRecent() {
   g_rd.clearScreen();
   int w = g_rd.getScreenWidth();
-  int top = drawTitle("最近阅读");
-  int n = static_cast<int>(st.recent.size());
+  drawTitle("最近阅读");
+  const ListView lv = recentListView();
+  int top = lv.top;
+  int n = lv.count;
   if (n == 0) {
     drawCenteredLine(g_rd.getScreenHeight() / 2, "暂无阅读记录");
     drawFooter("Esc 返回");
     return;
   }
-  int itemH = uiLineHeight() + 8;
-  int viewH = statusTop() - top - 8;
-  int maxRows = std::max(1, viewH / itemH);
-  int start = clampI(st.recentSel - maxRows / 2, 0, std::max(0, n - maxRows));
+  int itemH = lv.itemH;
+  int maxRows = lv.rows;
+  int start = lv.first;
   for (int i = 0; i < maxRows && start + i < n; i++) {
     int idx = start + i;
     std::string label = g_rd.truncatedText(uiFontId(), st.recent[idx].name.c_str(), w - 2 * MARGIN);
@@ -3177,20 +3145,15 @@ static void handleRecent(int key) {
   if (key == 0x1B) { st.mode = RdMode::Browser; st.fullRefresh = true; st.dirty = 1; return; }
   if (key == KEY_LONG_CONFIRM) { st.mode = RdMode::Browser; st.fullRefresh = true; st.dirty = 1; return; }
   if (n == 0) return;
-  if (key == KEY_UP) { st.recentSel = std::max(0, st.recentSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.recentSel = std::min(n - 1, st.recentSel + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.recentSel = std::max(0, st.recentSel - 8); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.recentSel = std::min(n - 1, st.recentSel + 8); st.dirty = 1; return; }
+  {  // 上下/翻页的算术在 ui/list_view.h（与 renderRecent 共用同一个 recentListView 几何）
+    ListView lv = recentListView();
+    if (listViewKey(lv, key)) { st.recentSel = lv.sel; st.dirty = 1; return; }
+  }
   if (key == '\n') {
     int x, y;
     if (input_tap_xy(&x, &y)) {
-      int top = coverTop();
-      int itemH = uiLineHeight() + 8;
-      int viewH = statusTop() - top - 8;
-      int maxRows = std::max(1, viewH / itemH);
-      int start = clampI(st.recentSel - maxRows / 2, 0, std::max(0, n - maxRows));
-      int row = start + (y - top) / itemH;
-      if (row >= 0 && row < n) st.recentSel = row;
+      const int row = listViewHitAt(recentListView(), y);
+      if (row >= 0) st.recentSel = row;
     }
     BookEntry b = st.recent[st.recentSel];
     rdShowBusy("正在打开…", b.name);
@@ -3205,1158 +3168,6 @@ static void handleRecent(int key) {
   }
 }
 
-// ── 文件浏览器 ───────────────────────────────────────────────────────────
-static bool rdIsImageName(const std::string &n);      // 定义见下方「图片查看器」
-static void imgBuildList(const std::string &path);
-
-static void fbScan(const std::string &dir) {
-  st.fbPath = dir;
-  st.fbEntries.clear();
-  st.fbSel = 0;
-  st.fmStatus.clear();   // 进新目录/重扫：清掉上一条"已重命名/已删除"提示
-  DIR *dp = opendir(dir.c_str());
-  if (!dp) return;
-  std::vector<BookEntry> dirs, files;
-  struct dirent *e;
-  while ((e = readdir(dp)) != nullptr) {
-    std::string name = e->d_name;
-    if (name.empty() || name[0] == '.') continue;  // 跳过隐藏项（含 .crossmux）
-    std::string full = dir + "/" + name;
-    struct stat sb;
-    if (stat(full.c_str(), &sb) != 0) continue;
-    if (S_ISDIR(sb.st_mode)) {
-      dirs.push_back({full, name, -1});
-    } else if (S_ISREG(sb.st_mode)) {
-      int kind = -1;
-      if (endsWith(name, ".epub")) kind = 0;
-      else if (endsWith(name, ".txt")) kind = 1;
-      else if (endsWith(name, ".xtc")) kind = 2;
-      else if (rdIsImageName(name)) kind = 3;
-      else kind = 4;   // 其它任何普通文件：列出来、能改名/删除/复制/剪切，但打不开（见 fbOpenEntry）
-      files.push_back({full, name, kind});
-    }
-  }
-  closedir(dp);
-  auto byName = [](const BookEntry &a, const BookEntry &b) { return a.name < b.name; };
-  std::sort(dirs.begin(), dirs.end(), byName);
-  std::sort(files.begin(), files.end(), byName);
-  st.fbEntries = std::move(dirs);
-  st.fbEntries.insert(st.fbEntries.end(), files.begin(), files.end());
-}
-
-// 进入文件标签：重扫当前目录。三个入口（标签栏点按、←→ 换标签、恢复上次标签）都得过
-// 这一道。原先只有书架菜单的「文件浏览」那条路会扫描，从标签直接进来（或重启后恢复到
-// 文件标签）时 st.fbEntries 是空的 —— 列表空白，而且空列表会提前 return 吃掉点按，
-// 连标签都切不走，看上去就是"卡死"。
-static void rdEnterFileTab() {
-  const int keep = st.fbSel;   // 换标签来回切时保住光标位置
-  fbScan(st.fbPath.empty() ? std::string("/sdcard") : st.fbPath);
-  st.fbSel = clampI(keep, 0, std::max(0, static_cast<int>(st.fbEntries.size()) - 1));
-  st.tab = 1;
-  st.mode = RdMode::FileBrowser;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-// ── 文件浏览页的浮动按钮：网络文件管理 ───────────────────────────────────
-// 右下角一个地球按钮：点一下把 web 文件管理服务立起来（手机/电脑浏览器打开
-// http://<IP>/ 就能看/传 /sdcard 下的文件），再点一下停掉。服务跑在 httpd 自己的
-// 任务里，界面不会被它占住 —— 但**屏幕会一直不动**，传大文件时看着就像死机，
-// 所以底栏会跟着报传输进度（进度源在 file_manager_server.cpp，见 rdNetTick）。
-static int fbFabBoxPx() { return TAB_ICON_PX + 12; }   // 按钮外框比字形大一圈
-static int fbFabGlyphPx() { return TAB_ICON_PX; }
-static int fbFabX() { return g_rd.getScreenWidth() - MARGIN - fbFabBoxPx(); }
-static int fbFabY() { return tabBottom() - 14 - fbFabBoxPx(); }
-
-// 命中区比按钮放宽 8px（e-ink 手指落点糙）。
-static bool fbFabHit(int x, int y) {
-  const int pad = 8, b = fbFabBoxPx();
-  return x >= fbFabX() - pad && x <= fbFabX() + b + pad &&
-         y >= fbFabY() - pad && y <= fbFabY() + b + pad;
-}
-
-// 「新建文件夹」浮动按钮：叠在网络按钮正上方（右下角竖着一列，都靠右对齐）。
-static int fbNewFabY() { return fbFabY() - fbFabBoxPx() - 12; }
-static bool fbNewFabHit(int x, int y) {
-  const int pad = 8, b = fbFabBoxPx();
-  const int bx = fbFabX(), by = fbNewFabY();
-  return x >= bx - pad && x <= bx + b + pad && y >= by - pad && y <= by + b + pad;
-}
-
-// 程序化画一个 "+"：图标子集里没有 plus 字形，为它重裁一次字体不划算，两条实心矩形更省事。
-static void fbDrawNewFab() {
-  const int b = fbFabBoxPx();
-  const int x = fbFabX(), y = fbNewFabY();
-  g_rd.drawRect(x, y, b, b, true);
-  const int cx = x + b / 2, cy = y + b / 2;
-  const int arm = b / 2 - 10;                 // 笔画半长
-  const int t = std::max(2, b / 12);          // 笔画粗细
-  g_rd.fillRect(cx - arm, cy - t / 2, 2 * arm, t, true);
-  g_rd.fillRect(cx - t / 2, cy - arm, t, 2 * arm, true);
-}
-
-// 「+」的动作定义在后面的「文件长按菜单」段（那边才拿到 FileRename 的输入页设施）。
-static void fmBeginMkdir();
-
-// 「刷新」浮动按钮：叠在「+」之上，三个按钮在右下角竖成一列。
-// 为什么要它：目录里列的是 SD 卡上的实体文件，用读卡器、或者用右下角那个地球按钮
-// （网络文件管理）从手机/电脑上增删过之后，本机这份 st.fbEntries 还是旧的，别的界面
-// 也没有"重新扫描"的入口。点一下重扫当前目录即可。
-static int fbRefreshFabY() { return fbNewFabY() - fbFabBoxPx() - 12; }
-static bool fbRefreshFabHit(int x, int y) {
-  const int pad = 8, b = fbFabBoxPx();
-  const int bx = fbFabX(), by = fbRefreshFabY();
-  return x >= bx - pad && x <= bx + b + pad && y >= by - pad && y <= by + b + pad;
-}
-
-// 图标复用顶部搜索栏那个 md-refresh（BAR_ICON_REFRESH，已在图标子集里）。
-static void fbDrawRefreshFab() {
-  const int b = fbFabBoxPx(), g = fbFabGlyphPx();
-  const int x = fbFabX(), y = fbRefreshFabY();
-  g_rd.drawRect(x, y, b, b, true);
-  uint8_t *fb = g_rd.getFrameBuffer();
-  if (fb) icon_font_draw_sized(fb, x + (b - g) / 2, y + (b - g) / 2, g, g, BAR_ICON_REFRESH, false, g);
-}
-
-// 重扫当前目录。fbScan 会把 fbSel 归零，所以先记下选中项的路径、扫完再选回去——
-// 刷新只该更新列表内容，不该把用户的位置弄丢。
-static void fbRefreshAction() {
-  std::string keep;
-  if (st.fbSel >= 0 && st.fbSel < static_cast<int>(st.fbEntries.size()))
-    keep = st.fbEntries[st.fbSel].path;
-  const std::string dir = st.fbPath;
-  const int before = static_cast<int>(st.fbEntries.size());
-  fbScan(dir);
-  if (!keep.empty()) {
-    for (size_t i = 0; i < st.fbEntries.size(); i++)
-      if (st.fbEntries[i].path == keep) { st.fbSel = static_cast<int>(i); break; }
-  }
-  ESP_LOGI(TAG, "文件刷新: %s (%d → %d 项)", dir.c_str(), before,
-           static_cast<int>(st.fbEntries.size()));
-  rdShowFloat("已刷新", dir, 1500);
-  st.dirty = 1;
-}
-
-// 服务开着就画成实心反白，一眼能看出状态；关着是线框。
-static void fbDrawFab() {
-  const int b = fbFabBoxPx(), g = fbFabGlyphPx();
-  const int x = fbFabX(), y = fbFabY();
-  const bool on = st.netServerUp;
-  if (on) g_rd.fillRect(x, y, b, b, true);
-  else g_rd.drawRect(x, y, b, b, true);
-  uint8_t *fb = g_rd.getFrameBuffer();
-  if (fb) icon_font_draw_sized(fb, x + (b - g) / 2, y + (b - g) / 2, g, g, FAB_ICON_WEB, on, g);
-}
-
-// 传输进度文案；没在传就返回空串。总数未知（打包下载算不出来）时只报已传字节。
-static std::string rdNetXferText() {
-  const FmXfer *x = file_manager_get_xfer();
-  if (!x->active) return std::string();
-  // 名字是 httpd 任务写的，读的时候再复制一份并强制结尾，防止恰好读到改名中途。
-  char nm[sizeof(x->name) + 1];
-  memcpy(nm, x->name, sizeof(x->name));
-  nm[sizeof(x->name)] = '\0';
-  const char *verb = (x->kind == 0) ? "接收" : (x->kind == 1) ? "发送" : "打包发送";
-  std::string s = std::string(verb) + " " + nm + "  " + humanSize(x->done);
-  if (x->total) {
-    int pct = (int)((uint64_t)x->done * 100 / (uint64_t)x->total);
-    if (pct > 100) pct = 100;
-    s += " / " + humanSize(x->total) + "  " + std::to_string(pct) + "%";
-  }
-  return s;
-}
-
-// 确保 WiFi 已连上；失败时把原因写进 st.netStatus。文件浏览页的按钮和
-// 「WiFi 传书」界面共用这一套（原来这段逻辑内联在 netShareConnect 里）。
-static bool rdWifiEnsure() {
-  if (g_wifi.isConnected()) return true;
-  std::string ssid = g_settings.wifiSsid();
-  std::string pass = g_settings.wifiPassword();
-  if (ssid.empty()) {
-    st.netStatus = "未配置 WiFi（先到 WiFi 管理填写）";
-    return false;
-  }
-  g_wifi.begin();
-  if (!g_wifi.connect(ssid.c_str(), pass.c_str())) {
-    st.netStatus = "WiFi 连接失败";
-    return false;
-  }
-  st.netStatus.clear();
-  return true;
-}
-
-// 起服务后把地址浮出来几秒。地址是给手机/电脑敲的，浮在屏幕正中最显眼，而且
-// 到点自己消失，不像常驻一行那样白占地方。
-static void fbFabShowAddress() {
-  rdShowFloat("网络文件管理已开启", "http://" + g_wifi.getIp() + "/", 8000);
-}
-
-static void fbFabAction() {
-  const FmXfer *x = file_manager_get_xfer();
-  if (x->active) {
-    // httpd_stop 是调用方忙等，传到一半停会把主循环冻住几十秒（见 file_manager_server.cpp
-    // 里 s_shutdown 的注释），所以传输中拒绝关闭。
-    rdShowFloat("正在传输", "传完才能停服务", 3000);
-    return;
-  }
-  if (st.netServerUp) {
-    // 服务已经在跑：这一下就是"再看一眼地址"。要停服务用长按（见 handleFileBrowser
-    // 的 KEY_TOUCH_LONG）—— 把停服务挂在同一下点按上，想看地址的人会不小心把服务关掉。
-    fbFabShowAddress();
-    return;
-  }
-  rdShowBusy("正在启动服务…", std::string());
-  if (!rdWifiEnsure()) {
-    rdShowFloat(st.netStatus, "", 4000);
-    return;
-  }
-  if (file_manager_server_start(80)) {
-    st.netServerUp = true;
-    fbFabShowAddress();
-  } else {
-    rdShowFloat("服务启动失败", "端口被占用?", 5000);
-  }
-}
-
-// 长按浮动按钮 = 停服务。返回真表示这一下被 FAB 吃掉了（别再当列表长按处理）。
-static bool fbFabLongPress() {
-  if (!st.netServerUp) return false;
-  const FmXfer *x = file_manager_get_xfer();
-  if (x->active) {
-    rdShowFloat("正在传输", "传完才能停服务", 3000);
-    return true;
-  }
-  file_manager_server_stop();
-  st.netServerUp = false;
-  rdShowFloat("网络文件管理已停止", "", 3000);
-  return true;
-}
-
-// 网络传输的心跳。httpd 在自己的任务里收发，主任务这边屏幕一动不动，传大文件时
-// 看着像死机 —— 空闲帧里轮询进度，**文案变了才重绘**，并且限流：阅读器的推屏一次
-// 几百毫秒，刷太勤会把主循环按住。只在文件浏览 / WiFi 传书两个界面轮询。
-static void rdNetTick() {
-  if (!st.netServerUp) return;
-  if (st.mode != RdMode::FileBrowser && st.mode != RdMode::NetShare) return;
-  const FmXfer *x = file_manager_get_xfer();
-  const int64_t now = esp_timer_get_time();
-  static std::string s_drawn;
-  static bool s_wasActive = false;
-  static int64_t s_last_us = 0;
-  if (s_wasActive && !x->active) {
-    // 结束那一拍给条短提示：进度行直接消失会让人以为传失败了。
-    s_wasActive = false;
-    s_drawn.clear();
-    char nm[sizeof(x->name) + 1];
-    memcpy(nm, x->name, sizeof(x->name));
-    nm[sizeof(x->name)] = '\0';
-    rdShowFloat(x->kind == 0 ? "已接收" : "已发送", nm, 4000);
-    return;
-  }
-  if (!x->active) return;
-  s_wasActive = true;
-  const std::string s = rdNetXferText();
-  if (s == s_drawn) return;
-  if (now - s_last_us < 1000000) return;   // 限流 1s
-  s_last_us = now;
-  s_drawn = s;
-  st.dirty = 1;
-}
-
-// 文件标签：路径面包屑 + 目录/文件列表。以前它是从书架菜单进来的子界面（用 drawTitle
-// 占顶栏），现在是 1 号根标签，顶栏换成标签栏，路径下移成正文第一行（fbListTop()）。
-static int fbListTop() { return coverTop() + uiLineHeight() + 6; }
-
-// 列表行 ↔ y 的换算。绘制、点按、长按三处共用同一套公式，避免各自算错位。
-// 参数 clampI 见文件前段的 clamp 工具。返回 -1 = 不在任何一行（面包屑/空白/越界）。
-static int fbRowAtY(int y) {
-  const int top = fbListTop();
-  const int itemH = uiLineHeight() + 6;
-  const int n = static_cast<int>(st.fbEntries.size());
-  const int viewH = tabBottom() - top - 8;
-  const int maxRows = std::max(1, viewH / itemH);
-  const int start = clampI(st.fbSel - maxRows / 2, 0, std::max(0, n - maxRows));
-  const int row = start + (y - top) / itemH;
-  if (y < top || row < 0 || row >= n) return -1;
-  return row;
-}
-
-// 打开一个条目：目录往下走、图片进看图器、书进阅读页。列表回车和长按菜单的「打开」
-// 共用同一条路径，免得两处行为漂移。
-static void fbOpenEntry(const BookEntry &e) {
-  if (e.kind < 0) {
-    fbScan(e.path);
-  } else if (e.kind == 3) {
-    imgBuildList(e.path);
-    st.imgZoom = 1.0f;
-    st.imgPanX = 0.0f;
-    st.imgPanY = 0.0f;
-    st.imgFromReader = false;  // 从文件标签打开的：Esc 回文件浏览器
-    st.mode = RdMode::Image;
-    st.fullRefresh = true;
-  } else if (e.kind == 4) {
-    // 打不开的普通文件（.pdf/.zip/.md…）：直接进详情页，顺带告诉用户长按能改名/复制/删除。
-    for (size_t i = 0; i < st.fbEntries.size(); i++)
-      if (st.fbEntries[i].path == e.path) { st.fmIdx = static_cast<int>(i); break; }
-    st.mode = RdMode::FileInfo;
-    st.fullRefresh = true;
-    st.dirty = 1;
-  } else {
-    rdShowBusy("正在打开…", e.name);
-    if (openBook(e.path, e.kind)) {
-      st.mode = RdMode::Reading;
-      st.fullRefresh = true;
-    } else {
-      ESP_LOGE(TAG, "文件浏览打开失败: %s", e.path.c_str());
-    }
-  }
-}
-
-static void renderFileBrowser() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  drawTabBar();
-  // 剪贴板状态跟路径行挤在一行：右边留给「已复制/已剪切: 名字」，左边路径相应收窄。
-  std::string clipTag;
-  if (!st.fmClipPath.empty()) clipTag = (st.fmClipCut ? "已剪切: " : "已复制: ") + st.fmClipName;
-  int clipW = clipTag.empty() ? 0 : g_rd.getTextWidth(uiFontId(), clipTag.c_str()) + 16;
-  if (clipW > w / 2) { clipTag = g_rd.truncatedText(uiFontId(), clipTag.c_str(), w / 2); clipW = w / 2; }
-  std::string pathLabel = g_rd.truncatedText(uiFontId(), st.fbPath.c_str(), w - 2 * MARGIN - clipW);
-  drawLineText(MARGIN, coverTop(), pathLabel.c_str(), true);
-  if (!clipTag.empty())
-    drawLineText(w - MARGIN - g_rd.getTextWidth(uiFontId(), clipTag.c_str()), coverTop(), clipTag.c_str(), true);
-  int top = fbListTop();
-  int n = static_cast<int>(st.fbEntries.size());
-  if (n == 0) drawCenteredLine(g_rd.getScreenHeight() / 2, "空目录");
-  int itemH = uiLineHeight() + 6;
-  int viewH = tabBottom() - top - 8;
-  int maxRows = std::max(1, viewH / itemH);
-  int start = clampI(st.fbSel - maxRows / 2, 0, std::max(0, n - maxRows));
-  for (int i = 0; i < maxRows && start + i < n; i++) {
-    int idx = start + i;
-    const BookEntry &e = st.fbEntries[idx];
-    std::string label = (e.kind < 0) ? ("[" + e.name + "]") : e.name;
-    int y = top + i * itemH;
-    if (idx == st.fbSel) { g_rd.fillRect(0, y, w, itemH, true); drawLineText(MARGIN, y + 3, label.c_str(), false); }
-    else drawLineText(MARGIN, y + 3, label.c_str(), true);
-  }
-  // 传输进度是唯一留在底边的常驻读数（其余瞬时提示都走中间的浮动框）：它每秒都在变，
-  // 浮在正中会挡住列表，压在最后一行上反而顺眼，而且**不画分隔线**——标签页下面没有
-  // 提示栏了，多一条横线只会让人以为那里还有内容。画在 FAB 之前，FAB 才压得住它。
-  if (const std::string xf = rdNetXferText(); !xf.empty()) {
-    const int y = tabBottom() - uiLineHeight();
-    g_rd.fillRect(0, y, w, uiLineHeight(), false);   // 先擦白，免得和末行文字叠字
-    drawLineText(MARGIN, y, xf.c_str(), true);
-  }
-  // 浮动按钮画在列表之后（压住右下角那格的一部分，这是 FAB 的常态）。
-  fbDrawFab();
-  fbDrawNewFab();
-  fbDrawRefreshFab();
-}
-
-static void handleFileBrowser(int key) {
-  int n = static_cast<int>(st.fbEntries.size());
-  // 点按坐标只读一次（input_tap_xy 读完即清），标签命中和下面的列表行命中共用这一份。
-  int tapX = 0, tapY = 0;
-  const bool tapped = (key == '\n') && input_tap_xy(&tapX, &tapY);
-  // 标签栏命中要放在"空目录提前返回"**前面**：目录空时也得能点标签切走，否则空列表页
-  // 会困住用户——点哪儿都没反应，只剩物理键/边缘划能退出去。
-  if (tapped) {
-    const int t = tabHit(tapX, tapY);
-    if (t >= 0) { switchTab(t); return; }
-    if (fbNewFabHit(tapX, tapY)) { fmBeginMkdir(); return; }
-    if (fbRefreshFabHit(tapX, tapY)) { fbRefreshAction(); return; }
-    if (fbFabHit(tapX, tapY)) { fbFabAction(); return; }
-  }
-  // ←→ 换标签：这个界面现在是 1 号根标签，和其他三个标签的左右键行为一致。
-  if (key == KEY_LEFT) { switchTab(st.tab - 1); return; }
-  if (key == KEY_RIGHT) { switchTab(st.tab + 1); return; }
-  if (key == 0x1B || key == KEY_LONG_CONFIRM || key == KEY_BACK) {
-    if (st.fbPath != "/sdcard" && !st.fbPath.empty()) {
-      size_t slash = st.fbPath.rfind('/');
-      fbScan(slash == 0 ? "/" : st.fbPath.substr(0, slash));
-    } else {
-      // 已经在卡根：退到书架标签（原来退到 RdMode::Browser，现在标签化后等价于
-      // switchTab(0)，顺带把标签高亮也摆正）。
-      st.fbSel = 0;
-      switchTab(0);
-      return;
-    }
-    st.dirty = 1;
-    return;
-  }
-  if (n == 0) return;
-  // 长按列表项 → 弹出上下文菜单（打开/重命名/删除/详情）。长按落点在哪一行就作用于哪
-  // 一行：先把 st.fbSel 指过去，菜单里的动作走同一套入口（与键盘"先选中再操作"等价）。
-  // 这个键能到达这里，是因为 screen_reader_handle 顶部把 KEY_TOUCH_LONG 展平成 0x1B 的
-  // 例外名单里加了 RdMode::FileBrowser（否则长按会被当成"回上一级"）。
-  if (key == KEY_TOUCH_LONG) {
-    int lx = 0, ly = 0;
-    if (input_tap_xy(&lx, &ly)) {
-      // 长按右下角浮动按钮 = 停掉网络文件管理（点按是"起服务/再看一眼地址"）。
-      if (fbNewFabHit(lx, ly)) return;   // 长按「+」不弹行菜单（点按才建文件夹）
-      if (fbRefreshFabHit(lx, ly)) return;   // 长按「刷新」同理，别弹行菜单
-      if (fbFabHit(lx, ly) && fbFabLongPress()) return;
-      int row = fbRowAtY(ly);
-      if (row >= 0) {
-        st.fbSel = row;
-        st.fmIdx = row;
-        st.fmSel = 0;
-        st.fmDelArm = false;
-        st.fmStatus.clear();
-        st.mode = RdMode::FileMenu;
-        st.fullRefresh = true;
-        st.dirty = 1;
-      }
-    }
-    return;
-  }
-  if (key == KEY_UP) { st.fbSel = std::max(0, st.fbSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.fbSel = std::min(n - 1, st.fbSel + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.fbSel = std::max(0, st.fbSel - 8); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.fbSel = std::min(n - 1, st.fbSel + 8); st.dirty = 1; return; }
-  if (key == KEY_HOME) { st.fbSel = 0; st.dirty = 1; return; }
-  if (key == KEY_END) { st.fbSel = n - 1; st.dirty = 1; return; }
-  if (key == '\n') {
-    if (tapped) {
-      int row = fbRowAtY(tapY);
-      if (row >= 0) st.fbSel = row;
-      else { st.dirty = 1; return; }   // 点在面包屑/空白：不打开当前项，别误触
-    }
-    fbOpenEntry(st.fbEntries[st.fbSel]);
-    st.dirty = 1;
-    return;
-  }
-}
-
-// ── 文件长按菜单 / 重命名 / 详情 ────────────────────────────────────────
-// 菜单作用于 st.fmIdx 锁定的条目（长按哪一行就是哪一行）。删除沿用书架菜单的「两次确认」
-// 规矩；重命名走虚拟键盘；详情只读。三者都以 FileBrowser 为返回目标。
-// 这一段排在虚拟键盘那套 helper 定义之前，得自己前置声明（renderNoteEdit 在更后面，
-// 反过来依赖这里的顺序没关系）。
-static void drawVk();
-static void vkTap(int x, int y);
-static int vkVkTop();
-static void rdDrawVkIcon();
-static bool rdVkIconHit(int x, int y);
-static void feedVkKey(int c);
-static void feedVkBackspace();
-
-static const int kFileMenuItemMax = 8;
-
-static const BookEntry *fmTarget() {
-  if (st.fmIdx < 0 || st.fmIdx >= static_cast<int>(st.fbEntries.size())) return nullptr;
-  return &st.fbEntries[st.fmIdx];
-}
-
-// 名字里去掉扩展名 / 取出扩展名（含点）。重命名时只让用户改主干，扩展名照旧保留，
-// 免得改成 .epub 之外的尾巴后打开器认不出来。
-static std::string nameNoExt(const std::string &n) {
-  size_t dot = n.rfind('.');
-  return (dot == std::string::npos || dot == 0) ? n : n.substr(0, dot);
-}
-static std::string nameExt(const std::string &n) {
-  size_t dot = n.rfind('.');
-  return (dot == std::string::npos || dot == 0) ? std::string() : n.substr(dot);
-}
-
-// 菜单动作（顺序即显示顺序）。「打开」只对能打开的条目出现；「粘贴」只在剪贴板非空时出现。
-enum { FM_OPEN = 0, FM_COPY, FM_CUT, FM_PASTE, FM_RENAME, FM_DELETE, FM_INFO };
-static int fileMenuActions(int *acts, int maxN) {
-  const BookEntry *e = fmTarget();
-  int n = 0;
-  if (e && e->kind != 4) acts[n++] = FM_OPEN;   // kind 4（其它文件）没有可打开的动作
-  acts[n++] = FM_COPY;
-  acts[n++] = FM_CUT;
-  if (!st.fmClipPath.empty()) acts[n++] = FM_PASTE;
-  acts[n++] = FM_RENAME;
-  acts[n++] = FM_DELETE;
-  acts[n++] = FM_INFO;
-  (void)maxN;
-  return n;
-}
-
-// 标签从动作派生：两处都只认 fileMenuActions 的返回，绝不会出现「第 3 行显示剪切、按下去
-// 却是粘贴」这种错位。
-static void fileMenuLabels(std::vector<std::string> &out) {
-  out.clear();
-  int acts[kFileMenuItemMax];
-  const int n = fileMenuActions(acts, kFileMenuItemMax);
-  const BookEntry *e = fmTarget();
-  const bool isDir = e && e->kind < 0;
-  for (int i = 0; i < n; i++) {
-    switch (acts[i]) {
-      case FM_OPEN: out.push_back("打开"); break;
-      case FM_COPY: out.push_back("复制"); break;
-      case FM_CUT: out.push_back("剪切"); break;
-      case FM_PASTE: out.push_back(st.fmClipCut ? "粘贴到此处（剪切）" : "粘贴到此处（复制）"); break;
-      case FM_RENAME: out.push_back("重命名"); break;
-      case FM_DELETE: out.push_back(st.fmDelArm ? "确认删除" : isDir ? "删除文件夹" : "删除"); break;
-      case FM_INFO: out.push_back("详情"); break;
-      default: break;
-    }
-  }
-}
-
-static void fmBackToBrowser() {
-  st.fmDelArm = false;
-  st.fmMkdir = false;
-  // 从长按菜单做完的动作（已删除/已重命名/失败原因）在这里转成中间的浮动提示：文件
-  // 标签页已经不画提示栏了，而这条消息本来就是"刚发生了什么"，看一眼就够。转完就清
-  // 掉——重命名输入页还会拿 fmStatus 画自己的错误行，留着会被下一次进来时重复显示。
-  if (!st.fmStatus.empty()) {
-    rdShowFloat(st.fmStatus, "", 4000);
-    st.fmStatus.clear();
-  }
-  st.mode = RdMode::FileBrowser;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-static void renderFileMenu() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const BookEntry *e = fmTarget();
-  std::string title = e ? g_rd.truncatedText(uiFontId(), e->name.c_str(), w - 2 * MARGIN) : "文件菜单";
-  const int top = drawTitle(title.c_str());
-  std::vector<std::string> items;
-  fileMenuLabels(items);
-  const int n = static_cast<int>(items.size());
-  const int itemH = uiLineHeight() + 12;
-  for (int i = 0; i < n; i++) {
-    int y = top + i * itemH;
-    if (i == st.fmSel) { g_rd.fillRect(0, y, w, itemH, true); drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, items[i].c_str(), false); }
-    else drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, items[i].c_str(), true);
-  }
-  if (st.fmDelArm) drawFooter("再按一次确认删除（其余键取消）");
-  else drawFooter("↑↓ 选择  Enter 确认  Esc 返回");
-}
-
-// 从菜单里执行「打开」时先退回文件列表，再走 fbOpenEntry：目录/图片/书各自的模式
-// 切换由它负责，省得在这里再判断一遍。
-static void fmOpen() {
-  const BookEntry e = *fmTarget();
-  fmBackToBrowser();
-  fbOpenEntry(e);
-}
-
-// 进入文件名输入页时把虚拟键盘摆出来（没接蓝牙键盘才摆，有物理键盘时摆出来只是挡屏）。
-// 注意不能只置 st.vkVisible 位：可见性的**唯一真相**是 st.vkVisible，但真正决定画不画
-// 的是 editor_vk 的 s_visible，两者靠 rdSyncVk() 在绘制前对齐。这里显式调
-// editorVkAutoShow() 有三个好处：
-//   1) 它顺手做 evkLoadLayout()，把用户上次选的键位布局读回来（阅读模式从不调
-//      editorVkInit，只有这条路能拿回布局）；
-//   2) 它把 s_userOverride 复原成 false，保留"蓝牙键盘一连上就自动收起"的行为
-//      （若改用 editorVkSetVisible(true)，s_userOverride 会被置真，之后再也收不起来）；
-//   3) 它清掉上一次输入会话的按键状态——新建文件夹是空串，挂着上一段（比如重命名）的
-//      拼音组合/候选会直接往空名字里塞字，所以组合也一并 cancel。
-static void fmAutoShowVk() {
-  IME::getInstance().cancelComposition();
-  rdVkWantShow();
-  if (st.vkVisible) editorVkAutoShow();
-  else editorVkSetVisible(false);
-}
-
-static void fmBeginRename() {
-  const BookEntry *e = fmTarget();
-  if (!e) { fmBackToBrowser(); return; }
-  st.fmMkdir = false;
-  st.fmRenameBuf = nameNoExt(e->name);
-  st.fmStatus.clear();
-  fmAutoShowVk();   // 没接蓝牙键盘就自动弹虚拟键盘
-  st.mode = RdMode::FileRename;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-// 正在读的书落在被移动/删除的路径下时把它放掉（句柄/内存还挂着已不在原处的文件）。
-// 删除给的是文件本身，剪切给的是被剪走的目录——两种情况都按「等于或在其子树里」判。
-static void fmCloseBookIf(const std::string &pathOrDir) {
-  if (st.bookPath.empty()) return;
-  const bool inside = (st.bookPath == pathOrDir) ||
-                      (st.bookPath.rfind(pathOrDir + "/", 0) == 0);
-  if (!inside) return;
-  st.epub.reset(); st.section.reset(); st.xtc.reset();
-  st.txtUtf8.clear(); st.txtLineStarts.clear();
-  st.txtChapterOffsets.clear(); st.txtChapterTitles.clear();
-  st.bookPath.clear(); st.bookTitle.clear(); st.bookKind = -1;
-}
-
-// 删除是不可逆的：菜单里第一次 Enter 只置位（标签变「确认删除」），再按一次才真删。
-static void fmDeleteConfirmed() {
-  const BookEntry e = *fmTarget();
-  if (e.kind < 0) Storage.removeDir(e.path.c_str());
-  else Storage.remove(e.path.c_str());
-
-  fmCloseBookIf(e.path);   // 删的正好是当前打开的书（或它所在的目录）→ 先放掉
-  ESP_LOGI(TAG, "文件菜单删除: %s", e.path.c_str());
-  fbScan(st.fbPath);
-  st.fmStatus = "已删除";
-  fmBackToBrowser();
-}
-
-// 复制一个文件（4KB 弹跳缓冲；没有现成的 copy 原语，HalStorage 只有 rename/remove）。
-static bool rdCopyFile(const std::string &src, const std::string &dst) {
-  HalFile in, out;
-  if (!Storage.openFileForRead("FBM", src, in)) return false;
-  if (!Storage.openFileForWrite("FBM", dst, out)) { in.close(); return false; }
-  uint8_t *buf = static_cast<uint8_t *>(malloc(4096));
-  if (!buf) { in.close(); out.close(); Storage.remove(dst.c_str()); return false; }
-  bool ok = true;
-  int r;
-  while ((r = in.read(buf, 4096)) > 0) {
-    if (out.write(buf, static_cast<size_t>(r)) != static_cast<size_t>(r)) { ok = false; break; }
-  }
-  if (r < 0) ok = false;
-  free(buf);
-  in.close();
-  out.close();
-  if (!ok) Storage.remove(dst.c_str());   // 半截文件不比没有更安全
-  return ok;
-}
-
-// 递归复制文件/目录。隐藏文件也照搬（列表里看不见，但目录整体搬走时应一起走）。
-static bool rdCopyTree(const std::string &src, const std::string &dst) {
-  struct stat sb;
-  if (stat(src.c_str(), &sb) != 0) return false;
-  if (!S_ISDIR(sb.st_mode)) return rdCopyFile(src, dst);
-  if (!Storage.mkdir(dst.c_str(), true)) return false;
-  DIR *dp = opendir(src.c_str());
-  if (!dp) return false;
-  bool ok = true;
-  struct dirent *e;
-  while (ok && (e = readdir(dp)) != nullptr) {
-    const std::string nm = e->d_name;
-    if (nm == "." || nm == "..") continue;
-    ok = rdCopyTree(src + "/" + nm, dst + "/" + nm);
-  }
-  closedir(dp);
-  return ok;
-}
-
-static void fmCopy(bool cut) {
-  const BookEntry *e = fmTarget();
-  if (!e) { fmBackToBrowser(); return; }
-  st.fmClipPath = e->path;
-  st.fmClipName = e->name;
-  st.fmClipCut = cut;
-  st.fmStatus = cut ? "已剪切" : "已复制";
-  ESP_LOGI(TAG, "文件菜单%s: %s", cut ? "剪切" : "复制", e->path.c_str());
-  fmBackToBrowser();
-}
-
-// 粘贴到当前目录。剪切优先走 rename（同一张 SD，瞬间完成，还保住 inode）；rename 失败
-// 才退回复制 + 删源。复制则一律递归拷贝。粘完清空剪贴板（单个剪贴板的语义）。
-static void fmPaste() {
-  if (st.fmClipPath.empty()) { fmBackToBrowser(); return; }
-  const std::string src = st.fmClipPath;
-  // 长按的是一行目录 → 粘进那个目录；长按的是文件/空白 → 粘进当前目录。
-  const BookEntry *e = fmTarget();
-  const std::string dir = (e && e->kind < 0) ? e->path : st.fbPath;
-  const std::string dst = dir + "/" + st.fmClipName;
-  if (dst == src) { st.fmStatus = "就是它自己"; fmBackToBrowser(); return; }
-  if (dst.rfind(src + "/", 0) == 0) { st.fmStatus = "不能粘进自己的子目录"; fmBackToBrowser(); return; }
-  if (Storage.exists(dst.c_str())) { st.fmStatus = "同名已存在"; fmBackToBrowser(); return; }
-
-  bool ok;
-  // rename 报成功不等于文件真到了目的地：本机报过"剪切粘贴成功、源没了、目标目录里
-  // 却什么都没有"（见日志 万象指掌_stardict.*）。粘完当场 stat 一次对账——**对不上
-  // 也不要退回复制**（源这时已经被 rename 删了，复制只会再失败一次），直接报失败，
-  // 免得又静默丢一批文件。
-  const bool renamed = st.fmClipCut && Storage.rename(src.c_str(), dst.c_str());
-  if (renamed) {
-    ok = Storage.exists(dst.c_str());
-    if (!ok) ESP_LOGE(TAG, "粘贴: rename 报成功但目标不存在: %s", dst.c_str());
-  } else {
-    ok = rdCopyTree(src, dst);
-    if (ok && st.fmClipCut) {
-      struct stat sb;
-      if (stat(src.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) Storage.removeDir(src.c_str());
-      else Storage.remove(src.c_str());
-    }
-  }
-  ESP_LOGI(TAG, "文件粘贴: %s -> %s (%d)", src.c_str(), dst.c_str(), static_cast<int>(ok));
-  if (ok) {
-    if (st.fmClipCut) fmCloseBookIf(src);
-    st.fmClipPath.clear();
-    st.fmClipName.clear();
-    st.fmClipCut = false;
-    fbScan(st.fbPath);   // 刷新当前目录（粘进子目录时列表不变，但重扫代价可忽略）
-    st.fmStatus = "已粘贴";
-  } else {
-    st.fmStatus = "粘贴失败";
-  }
-  fmBackToBrowser();
-}
-
-// 「+」浮动按钮：复用 FileRename 的输入页（fmMkdir 置位后标题/提交行为都不同）。
-static void fmBeginMkdir() {
-  st.fmMkdir = true;
-  st.fmRenameBuf.clear();
-  st.fmStatus.clear();
-  fmAutoShowVk();
-  ESP_LOGI(TAG, "新建文件夹: 虚拟键盘 %s", st.vkVisible ? "自动弹出" : "不弹(蓝牙键盘已连接)");
-  st.mode = RdMode::FileRename;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-static void fmCommitRename() {
-  // 去掉首尾空白，避免生成 " 名.epub" 这种看不见的脏名字。
-  std::string stem = st.fmRenameBuf;
-  size_t b = stem.find_first_not_of(" \t");
-  size_t en = stem.find_last_not_of(" \t");
-  stem = (b == std::string::npos) ? std::string() : stem.substr(b, en - b + 1);
-
-  if (stem.empty()) { st.fmStatus = "名字不能为空"; fmBackToBrowser(); return; }
-  if (stem.find('/') != std::string::npos) { st.fmStatus = "名字不能含 /"; fmBackToBrowser(); return; }
-
-  if (st.fmMkdir) {
-    const std::string dir = st.fbPath + "/" + stem;
-    if (Storage.exists(dir.c_str())) { st.fmStatus = "同名已存在"; fmBackToBrowser(); return; }
-    const bool ok = Storage.mkdir(dir.c_str(), true);
-    ESP_LOGI(TAG, "文件菜单新建文件夹: %s (%d)", dir.c_str(), static_cast<int>(ok));
-    if (ok) { fbScan(st.fbPath); st.fmStatus = "已新建文件夹"; }
-    else st.fmStatus = "新建失败";
-    fmBackToBrowser();
-    return;
-  }
-
-  const BookEntry *e = fmTarget();
-  if (!e) { fmBackToBrowser(); return; }
-  const std::string oldPath = e->path;
-  const std::string oldName = e->name;
-  const std::string newName = stem + nameExt(oldName);
-  if (newName == oldName) { fmBackToBrowser(); return; }   // 没改，直接回去
-  const std::string newPath = st.fbPath + "/" + newName;
-  if (Storage.exists(newPath.c_str())) { st.fmStatus = "同名文件已存在"; fmBackToBrowser(); return; }
-
-  bool ok = Storage.rename(oldPath.c_str(), newPath.c_str());
-  ESP_LOGI(TAG, "文件菜单重命名: %s -> %s (%d)", oldPath.c_str(), newPath.c_str(), static_cast<int>(ok));
-  if (ok) {
-    // 正在读的就是这本书 → 跟着改名，否则进度/书签按旧路径存，重开对不上。
-    if (st.bookKind == e->kind && st.bookPath == oldPath) st.bookPath = newPath;
-    fbScan(st.fbPath);
-    st.fmStatus = "已重命名";
-  } else {
-    st.fmStatus = "重命名失败";
-  }
-  fmBackToBrowser();
-}
-
-static void fileMenuAction(int i) {
-  int acts[kFileMenuItemMax];
-  const int n = fileMenuActions(acts, kFileMenuItemMax);
-  if (i < 0 || i >= n) { fmBackToBrowser(); return; }
-  switch (acts[i]) {
-    case FM_OPEN: fmOpen(); break;
-    case FM_COPY: fmCopy(false); break;
-    case FM_CUT: fmCopy(true); break;
-    case FM_PASTE: fmPaste(); break;
-    case FM_RENAME: fmBeginRename(); break;
-    case FM_DELETE:
-      if (!st.fmDelArm) { st.fmDelArm = true; st.dirty = 1; break; }
-      fmDeleteConfirmed();
-      break;
-    case FM_INFO:
-      st.mode = RdMode::FileInfo;
-      st.fullRefresh = true;
-      st.dirty = 1;
-      break;
-    default: fmBackToBrowser(); break;
-  }
-}
-
-static void handleFileMenu(int key) {
-  std::vector<std::string> items;
-  fileMenuLabels(items);
-  const int n = static_cast<int>(items.size());
-  if (key == 0x1B || key == KEY_LONG_CONFIRM || key == KEY_BACK) { fmBackToBrowser(); return; }
-  if (key == KEY_UP) { st.fmDelArm = false; st.fmSel = std::max(0, st.fmSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.fmDelArm = false; st.fmSel = std::min(n - 1, st.fmSel + 1); st.dirty = 1; return; }
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      const int top = coverTop();
-      const int itemH = uiLineHeight() + 12;
-      const int row = (y - top) / itemH;
-      if (row >= 0 && row < n) {
-        if (row != st.fmSel) st.fmDelArm = false;   // 换了行就取消待确认
-        st.fmSel = row;
-      }
-    }
-    fileMenuAction(st.fmSel);
-    return;
-  }
-}
-
-// ── 文件详情（只读）────────────────────────────────────────────────────
-static std::string humanSize(long long bytes) {
-  char b[48];
-  if (bytes < 1024) snprintf(b, sizeof(b), "%lld B", bytes);
-  else if (bytes < 1024 * 1024) snprintf(b, sizeof(b), "%.1f KB", bytes / 1024.0);
-  else snprintf(b, sizeof(b), "%.1f MB", bytes / (1024.0 * 1024.0));
-  return b;
-}
-
-static void renderFileInfo() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const int top = drawTitle("文件详情");
-  const BookEntry *e = fmTarget();
-  if (!e) { drawFooter("Esc 返回"); return; }
-
-  struct stat sb;
-  const bool ok = (stat(e->path.c_str(), &sb) == 0);
-  const int lh = uiLineHeight();
-  int y = top;
-  auto row = [&](const char *k, const std::string &v) {
-    drawLineText(MARGIN, y, k, true);
-    const int kx = MARGIN + g_rd.getTextWidth(uiFontId(), k) + 12;
-    drawLineText(kx, y, g_rd.truncatedText(uiFontId(), v.c_str(), w - kx - MARGIN).c_str(), true);
-    y += lh + 8;
-  };
-  const char *typeStr = e->kind < 0 ? "文件夹" : e->kind == 0 ? "EPUB 电子书"
-                        : e->kind == 1 ? "TXT 文本" : e->kind == 2 ? "XTC 漫画"
-                        : e->kind == 3 ? "图片" : "文件";
-  row("名称", e->name);
-  row("类型", typeStr);
-  row("大小", ok ? humanSize(static_cast<long long>(sb.st_size)) : "未知");
-  if (ok) {
-    struct tm tm; localtime_r(&sb.st_mtime, &tm);
-    char tbuf[32]; strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M", &tm);
-    row("修改", tbuf);
-  }
-  // 路径可能很长，单独占一段，按宽度折行显示。
-  y += 4;
-  g_rd.drawLine(MARGIN, y, w - MARGIN, y, true);
-  y += 8;
-  auto pl = g_rd.wrappedText(uiFontId(), e->path.c_str(), w - 2 * MARGIN, 4);
-  for (auto &ln : pl) {
-    if (y + lh > statusTop()) break;
-    drawLineText(MARGIN, y, ln.c_str(), true);
-    y += lh + 2;
-  }
-  drawFooter("Esc 返回");
-}
-
-static void handleFileInfo(int key) {
-  (void)key;   // 只读：任意键都退回文件列表
-  fmBackToBrowser();
-}
-
-// ── 重命名输入（虚拟键盘）──────────────────────────────────────────────
-static void renderFileRename() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const BookEntry *e = fmTarget();
-  const int top = drawTitle(st.fmMkdir ? "新建文件夹" : "重命名");
-  const std::string ext = (!st.fmMkdir && e) ? nameExt(e->name) : std::string();
-
-  int y = top;
-  drawLineText(MARGIN, y, st.fmMkdir ? "文件夹名" : "新名字", true);
-  y += uiLineHeight() + 5;
-  // 输入行：主干 + 固定的扩展名 + 光标。扩展名是灰色概念，这里用普通文字标出来即可。
-  std::string shown = st.fmRenameBuf.empty() ? "点下方键盘输入" : st.fmRenameBuf;
-  drawLineText(MARGIN, y, (shown + "|").c_str(), true);
-  const int tx = MARGIN + g_rd.getTextWidth(uiFontId(), st.fmRenameBuf.c_str());
-  if (!ext.empty()) drawLineText(tx + g_rd.getTextWidth(uiFontId(), "|"), y, ext.c_str(), true);
-  y += uiLineHeight() + 8;
-  g_rd.drawLine(MARGIN, y, w - MARGIN, y, true);
-
-  if (!st.fmStatus.empty()) {
-    y += 8;
-    drawLineText(MARGIN, y, st.fmStatus.c_str(), true);
-  }
-
-  if (st.vkVisible) drawVk();
-  else drawFooter("回车保存   Esc 取消");
-  rdDrawVkIcon();
-}
-
-static void handleFileRename(int key) {
-  if (key == 0x1B || key == KEY_LONG_CONFIRM) {   // 取消
-    IME::getInstance().cancelComposition();
-    st.fmRenameBuf.clear();
-    st.vkVisible = false;
-    fmBackToBrowser();
-    return;
-  }
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      if (rdVkIconHit(x, y)) { st.vkVisible = !st.vkVisible; st.dirty = 1; return; }
-      if (st.vkVisible && y >= vkVkTop()) { vkTap(x, y); st.dirty = 1; return; }
-      if (st.vkVisible) { st.dirty = 1; return; }   // 键盘开着时点正文不提交
-      fmCommitRename();
-      return;
-    }
-    // 无坐标回车（蓝牙键盘/KEY2）：先把组合落地，再存。
-    std::string out;
-    IME::getInstance().handleKey('\n', out);
-    if (!out.empty() && out != "\n") st.fmRenameBuf += out;
-    fmCommitRename();
-    return;
-  }
-  if (key == 0x08) { feedVkBackspace(); st.dirty = 1; return; }
-  if (key >= 0x20 && key <= 0x7E) { feedVkKey(key); st.dirty = 1; return; }
-}
-
-// ── 图片查看器 ───────────────────────────────────────────────────────────
-// 用 vendored 的 PNG/JPEG 解码器直接铺 framebuffer。放大是「取源图上的一个矩形窗口
-// （由 imgZoom 定大小、imgPan* 定位置）+ 按窗口重新适配屏幕」，平移靠改窗口原点。
-// 两个解码器都实现了 RenderConfig::sourceWindow*：PNG 拿它当 cropLeft/visibleWidth，
-// JPEG 把块坐标平移成窗口内坐标（见各自解码器里的注释）。
-static bool rdIsImageName(const std::string &n) {
-  static const char *exts[] = {".png", ".jpg", ".jpeg"};
-  for (const char *x : exts) {
-    size_t l = strlen(x);
-    if (n.size() > l && endsWith(n, x)) return true;
-  }
-  return false;
-}
-
-// 扫描图片所在目录，填充 imgList 并选中 path。
-static void imgBuildList(const std::string &path) {
-  st.imgList.clear();
-  st.imgSel = 0;
-  size_t slash = path.rfind('/');
-  std::string dir = (slash == std::string::npos) ? "/sdcard" : path.substr(0, slash);
-  DIR *dp = opendir(dir.c_str());
-  if (dp) {
-    struct dirent *e;
-    while ((e = readdir(dp)) != nullptr) {
-      std::string name = e->d_name;
-      if (name.empty() || name[0] == '.' || !rdIsImageName(name)) continue;
-      struct stat sb;
-      std::string full = dir + "/" + name;
-      if (stat(full.c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) st.imgList.push_back(full);
-    }
-    closedir(dp);
-  }
-  std::sort(st.imgList.begin(), st.imgList.end());
-  for (size_t i = 0; i < st.imgList.size(); i++) {
-    if (st.imgList[i] == path) { st.imgSel = static_cast<int>(i); break; }
-  }
-}
-
-// ── 图片解码中止 ────────────────────────────────────────────────────────
-// 解码期间主循环完全不采样输入，而 cst836u 只返回"当前"按下状态（没有锁存），一次
-// 快速滑动会整个落进解码窗口里被丢掉 —— 用户侧就是"划了没反应"。所以让解码内核回调
-// 顺便补采一次（input_pending_key() 采到的键暂存，下一次 input_poll() 取走）：一有键
-// 就中止这张图的解码，让主循环立刻处理它。8MP 上限下单张解码是秒级，差别能感觉到。
-// 触摸是 I²C 读，不能每个 MCU 块都问一遍，限流 50ms（响应仍在一帧之内）。
-static bool s_imgDecodeAborted = false;
-static bool s_imgPresentSkipped = false;  // 中止的那一帧是半张图，别推屏
-
-static bool imgDecodeAbortPoll(void *) {
-  static int64_t s_lastPollUs = 0;
-  const int64_t now = esp_timer_get_time();
-  if (now - s_lastPollUs < 50000) return false;
-  s_lastPollUs = now;
-  if (input_pending_key() == 0) return false;
-  s_imgDecodeAborted = true;
-  return true;
-}
-
-// 当前查看器的窗口：源图上可见的那个矩形（比例）。大小由 zoom 定，位置由 imgPan* 定，
-// 并夹住不让窗口跑出源图（zoom=1 时窗口=整图，夹取范围 0，自然没有平移余地）。
-static void imgWindowRect(float *x, float *y, float *w, float *h) {
-  float z = st.imgZoom;
-  if (z < 1.0f) z = 1.0f;
-  const float s = 1.0f / z;
-  float maxOff = 1.0f - s;
-  if (maxOff < 0.0f) maxOff = 0.0f;
-  float px = st.imgPanX, py = st.imgPanY;
-  if (px < 0.0f) px = 0.0f;
-  if (px > maxOff) px = maxOff;
-  if (py < 0.0f) py = 0.0f;
-  if (py > maxOff) py = maxOff;
-  *x = px;
-  *y = py;
-  *w = s;
-  *h = s;
-}
-
-// 窗口铺到屏幕上占多少像素（居中于内容区）。renderImage 与拖动/捏合共用，
-// 免得两边各算一套、比例对不上。
-static void imgDstSize(int srcW, int srcH, int *outW, int *outH) {
-  int sw = g_rd.getScreenWidth();
-  int areaH = g_rd.getScreenHeight() - footerH();
-  if (areaH < 1) areaH = 1;
-  float wx, wy, ww, wh;
-  imgWindowRect(&wx, &wy, &ww, &wh);
-  int visW = static_cast<int>(srcW * ww);
-  int visH = static_cast<int>(srcH * wh);
-  if (visW < 1) visW = 1;
-  if (visH < 1) visH = 1;
-  float s = std::min(static_cast<float>(sw) / visW, static_cast<float>(areaH) / visH);
-  int dstW = static_cast<int>(visW * s);
-  int dstH = static_cast<int>(visH * s);
-  *outW = (dstW < 1) ? 1 : dstW;
-  *outH = (dstH < 1) ? 1 : dstH;
-}
-
-static void renderImage() {
-  g_rd.clearScreen();
-  int sw = g_rd.getScreenWidth();
-  int sh = g_rd.getScreenHeight();
-  int fh = footerH();
-  int areaH = sh - fh;
-  if (areaH < 1) areaH = 1;
-  st.imgFailed = false;
-  s_imgDecodeAborted = false;
-
-  if (st.imgList.empty()) {
-    drawCenteredLine(sh / 2, "无图片");
-    drawFooter("Esc 返回");
-    return;
-  }
-  const std::string &path = st.imgList[st.imgSel];
-
-  ImageToFramebufferDecoder *dec = ImageDecoderFactory::getDecoder(path);
-  ImageDimensions dim = {};
-  bool ok = (dec != nullptr) && dec->getDimensions(path, dim) && dim.width > 0 && dim.height > 0;
-  if (ok) {
-    st.imgSrcW = dim.width;
-    st.imgSrcH = dim.height;
-    float wx, wy, ww, wh;
-    imgWindowRect(&wx, &wy, &ww, &wh);
-    int dstW, dstH;
-    imgDstSize(dim.width, dim.height, &dstW, &dstH);
-
-    RenderConfig cfg;
-    cfg.x = (sw - dstW) / 2;
-    cfg.y = (areaH - dstH) / 2;
-    cfg.maxWidth = dstW;
-    cfg.maxHeight = dstH;
-    cfg.useGrayscale = true;
-    cfg.useDithering = true;
-    cfg.performanceMode = false;
-    cfg.useExactDimensions = true;
-    cfg.bilinearScaling = st.imageBilinear;
-    cfg.sourceWindowX = wx;
-    cfg.sourceWindowY = wy;
-    cfg.sourceWindowW = ww;
-    cfg.sourceWindowH = wh;
-    cfg.cachePath.clear();    // 查看器不写像素缓存
-    cfg.abortPoll = imgDecodeAbortPoll;  // 解码途中按了键就收手（见上方说明）
-    ok = dec->decodeToFramebuffer(path, g_rd, cfg);
-    if (!ok && s_imgDecodeAborted) {
-      // 用户已经按下了下一个键：这一帧只是半张图，不推屏也不报错，
-      // 交给主循环把这个键处理掉、下一轮重新画。
-      s_imgPresentSkipped = true;
-      return;
-    }
-    if (!ok) ESP_LOGE(TAG, "图片解码失败: %s", path.c_str());
-  }
-  st.imgFailed = !ok;
-  if (!ok) drawCenteredLine(areaH / 2, "无法解码此图片");
-
-  // 页脚：索引/文件名/缩放
-  size_t slash = path.rfind('/');
-  std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
-  char info[256];
-  snprintf(info, sizeof(info), "%d/%d %s  %d%%", st.imgSel + 1,
-           static_cast<int>(st.imgList.size()), name.c_str(),
-           static_cast<int>(st.imgZoom * 100.0f + 0.5f));
-  drawFooter(info);
-}
-
-static void imgSet(int idx) {
-  int n = static_cast<int>(st.imgList.size());
-  if (n <= 0) return;
-  st.imgSel = clampI(idx, 0, n - 1);
-  st.imgPanX = 0.0f;  // 换图回到画面中心
-  st.imgPanY = 0.0f;
-  st.dirty = 1;
-  st.fullRefresh = true;  // 换图整块重画，全刷清残影
-}
-
-// 缩放一档。回到 1×（适应屏幕）时平移归零——窗口=整图时本来也无处可平移，
-// 留着旧偏移只会让下一次放大从一个莫名其妙的位置开始。
-static void imgZoomBy(float factor) {
-  float z = st.imgZoom * factor;
-  if (z < 1.0f) z = 1.0f;
-  if (z > 8.0f) z = 8.0f;
-  st.imgZoom = z;
-  if (z <= 1.01f) {
-    st.imgZoom = 1.0f;
-    st.imgPanX = 0.0f;
-    st.imgPanY = 0.0f;
-  }
-  st.dirty = 1;
-  st.fullRefresh = true;
-}
-
-static void handleImage(int key) {
-  if (key == 0x1B || key == KEY_LONG_CONFIRM) {
-    const bool fromReader = st.imgFromReader;
-    st.imgFromReader = false;
-    st.imgZoom = 1.0f;
-    st.imgPanX = 0.0f;
-    st.imgPanY = 0.0f;
-    if (fromReader) {
-      // 从阅读页长按插图进来的：回**原阅读页**（页/章都没动过），不去文件浏览器。
-      st.mode = RdMode::Reading;
-    } else {
-      // 从文件标签打开的：回退时把标签高亮一起摆正。
-      st.tab = 1;
-      st.mode = RdMode::FileBrowser;
-    }
-    st.fullRefresh = true;
-    st.dirty = 1;
-    return;
-  }
-  if (st.imgList.empty()) return;
-
-  // 拖动平移。放大后单指的左右划在抬手时会变成 KEY_LEFT/RIGHT（见 hw/input 的
-  // 滑动判定）——那会被当成"换下一张"，所以下面把翻页键限定在 1× 时才受理。
-  if (key == KEY_TOUCH_DRAG) {
-    int ddx = 0, ddy = 0;
-    if (!input_drag_xy(&ddx, &ddy)) return;
-    if (st.imgZoom <= 1.01f || (ddx == 0 && ddy == 0)) return;
-    if (st.imgSrcW <= 0 || st.imgSrcH <= 0) return;
-    // 窗口铺满 dstW 像素，而窗口本身是源图的 1/zoom → 屏幕 1px = (1/zoom)/dstW。
-    // 内容跟着手指走，所以窗口原点反向移动。
-    int dstW = 0, dstH = 0;
-    imgDstSize(st.imgSrcW, st.imgSrcH, &dstW, &dstH);
-    const float perPxX = (1.0f / st.imgZoom) / (dstW > 0 ? dstW : 1);
-    const float perPxY = (1.0f / st.imgZoom) / (dstH > 0 ? dstH : 1);
-    st.imgPanX = std::clamp(st.imgPanX - ddx * perPxX, 0.0f, 1.0f - 1.0f / st.imgZoom);
-    st.imgPanY = std::clamp(st.imgPanY - ddy * perPxY, 0.0f, 1.0f - 1.0f / st.imgZoom);
-    st.dirty = 1;
-    st.fullRefresh = true;
-    return;
-  }
-
-  if (key == KEY_PINCH_IN) { imgZoomBy(1.25f); return; }
-  if (key == KEY_PINCH_OUT) { imgZoomBy(1.0f / 1.25f); return; }
-  if (key == KEY_UP) { imgZoomBy(1.25f); return; }
-  if (key == KEY_DOWN) { imgZoomBy(1.0f / 1.25f); return; }
-  if (key == '\n') {  // 点按/确认：适应屏幕 ↔ 2× 切换
-    if (st.imgZoom > 1.01f) {
-      st.imgZoom = 1.0f;
-      st.imgPanX = 0.0f;
-      st.imgPanY = 0.0f;
-      st.dirty = 1; st.fullRefresh = true;
-    } else {
-      st.imgZoom = 2.0f;
-      st.dirty = 1; st.fullRefresh = true;
-    }
-    return;
-  }
-  // 翻页只在 1× 时受理：放大状态下横向拖动结束会甩出一个 KEY_LEFT/RIGHT，
-  // 那时用户想的是"看看图的那一边"，不是"换下一张"。
-  if (st.imgZoom > 1.01f) return;
-  if (key == KEY_LEFT) { imgSet(st.imgSel - 1); return; }
-  if (key == KEY_RIGHT) { imgSet(st.imgSel + 1); return; }
-  if (key == KEY_HOME) { imgSet(0); return; }
-  if (key == KEY_END) { imgSet(static_cast<int>(st.imgList.size()) - 1); return; }
-}
-
-// ── 清理缓存 ─────────────────────────────────────────────────────────────
-// 删除 .crossmux 下所有书缓存（封面/排版/书签索引），再重建空目录。
 static void clearReadingCache() {
   int removed = 0;
   DIR *dp = opendir(CACHE_DIR);
@@ -4458,13 +3269,14 @@ static void shelfMenuLabels(std::vector<std::string> &out) {
 static void renderShelfMenu() {
   g_rd.clearScreen();
   int w = g_rd.getScreenWidth();
-  int top = drawTitle("书架菜单");
+  drawTitle("书架菜单");
   std::vector<std::string> items;
   shelfMenuLabels(items);
-  int n = static_cast<int>(items.size());
-  int itemH = uiLineHeight() + 12;
+  const ListView lv = flatMenuListView(static_cast<int>(items.size()), st.shelfMenuSel);
+  int n = lv.count;
+  int itemH = lv.itemH;
   for (int i = 0; i < n; i++) {
-    int y = top + i * itemH;
+    int y = lv.top + i * itemH;
     if (i == st.shelfMenuSel) { g_rd.fillRect(0, y, w, itemH, true); drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, items[i].c_str(), false); }
     else drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, items[i].c_str(), true);
   }
@@ -4523,15 +3335,15 @@ static void handleShelfMenu(int key) {
     st.dirty = 1;
     return;
   }
-  if (key == KEY_UP) { st.shelfDelArm = false; st.shelfMenuSel = std::max(0, st.shelfMenuSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.shelfDelArm = false; st.shelfMenuSel = std::min(n - 1, st.shelfMenuSel + 1); st.dirty = 1; return; }
+  {  // 上下选择在 ui/list_view.h，与 renderShelfMenu 共用 flatMenuListView 几何
+    ListView lv = flatMenuListView(n, st.shelfMenuSel);
+    if (listViewKey(lv, key)) { st.shelfDelArm = false; st.shelfMenuSel = lv.sel; st.dirty = 1; return; }
+  }
   if (key == '\n') {
     int x, y;
     if (input_tap_xy(&x, &y)) {
-      int top = coverTop();
-      int itemH = uiLineHeight() + 12;
-      int row = (y - top) / itemH;
-      if (row >= 0 && row < n) {
+      const int row = listViewHitAt(flatMenuListView(n, st.shelfMenuSel), y);
+      if (row >= 0) {
         if (row != st.shelfMenuSel) st.shelfDelArm = false;  // 换了行就取消待确认
         st.shelfMenuSel = row;
       }
@@ -4547,7 +3359,6 @@ static void handleShelfMenu(int key) {
 // 把书架原样画出来当背景（四周还能看到这是哪一页、选中框在哪），中间叠一个黑底白字
 // 的居中框，风格照 ui_draw_confirm_dialog（黑底 + 1px 白内框 + 白字）。只读，任意键
 // 关掉（handleShelfInfo）。内容全部来自 shelfTarget() 锁定的那一本——不是 st.sel。
-static std::string rdStatsDate(uint32_t epoch);   // 定义见「统计」一节
 
 struct ShelfInfoRow {
   std::string label;
@@ -4643,15 +3454,17 @@ static void handleShelfInfo(int key) {
 // 目录一屏能排几行。renderToc（绘制）、handleToc（翻页/点按）共用同一份几何，
 // 免得"翻一页"和"画一屏"各算各的。
 static int tocRowsPerPage() {
-  const int top = coverTop();
-  const int itemH = uiLineHeight() + 6;
-  const int viewH = statusTop() - top - 8;
-  return std::max(1, viewH / itemH);
+  return titleListView(0, 0, uiLineHeight() + 6, statusTop()).rows;
+}
+
+// 目录列表几何（渲染 / 翻页步长 / 点按命中共用）；翻页步长 = 一屏行数。
+static ListView tocListView(int count, int sel) {
+  return titleListView(count, sel, uiLineHeight() + 6, statusTop(), tocRowsPerPage());
 }
 
 static void renderToc() {
   g_rd.clearScreen();
-  int top = drawTitle("目录");
+  drawTitle("目录");
   std::vector<std::string> items;
   if (st.bookKind == 0 && st.epub) {
     for (int i = 0; i < st.epub->getTocItemsCount(); i++) {
@@ -4663,9 +3476,10 @@ static void renderToc() {
   if (items.empty()) {
     drawCenteredLine(g_rd.getScreenHeight() / 2, "本书无目录");
   } else {
-    int itemH = uiLineHeight() + 6;
-    int maxRows = tocRowsPerPage();
-    int start = clampI(st.tocSel - maxRows / 2, 0, std::max(0, static_cast<int>(items.size()) - maxRows));
+    const ListView lv = tocListView(static_cast<int>(items.size()), st.tocSel);
+    int itemH = lv.itemH;
+    int maxRows = lv.rows;
+    int start = lv.first;
     // 条目走**内容面**（CONTENT_UI_FONT_ID），不走外壳面。目录条目是书里的字——卷名、
     // 回目、繁体书名——而内嵌字体在位时 uiFontId() 退回的 builtin.ttf 只有常用简繁字，
     // 繁体书一开目录就是一片豆腐块。内容面在内嵌字体在位时是**这本书的字面**，没内嵌
@@ -4674,7 +3488,7 @@ static void renderToc() {
     // 不用动，只换字面；抬头「目录」「本书无目录」和底部提示仍是外壳词，照旧走 builtin。
     for (int i = 0; i < maxRows && start + i < static_cast<int>(items.size()); i++) {
       int idx = start + i;
-      int y = top + i * itemH;
+      int y = lv.top + i * itemH;
       if (idx == st.tocSel) {
         g_rd.fillRect(0, y, g_rd.getScreenWidth(), itemH, true);
         drawLineText(MARGIN, y + 3, items[idx].c_str(), false, CONTENT_UI_FONT_ID);
@@ -4689,7 +3503,7 @@ static void renderToc() {
 // ── 阅读菜单：动作 + 动态条目 ───────────────────────────────────────────
 enum class MenuAct {
   Toc, Font, FontFamily, LineSpacing, ParaSpacing, Indent, Align, Margin, Image, ReadingLine, Night, Orient,
-  ToggleBookmark, Bookmarks, Footnotes, FootnoteBack, Percent, Qr,
+  ToggleBookmark, Bookmarks, Footnotes, FootnoteBack, Percent, Qr, LayoutMenu,
   Dict, DictDl, ResDl, Weread, Wifi, Opds, NetShare, KeyMap, StatusBar, About, Standby,
   ClockFace, ShelfStyle, RefreshStrategy, FullEvery, TurnAnim, StyleSource, EmbeddedFont, AutoStandby,
   ToShelf, Back
@@ -4729,10 +3543,158 @@ static bool isCurrentBookmarked() {
   return false;
 }
 
-static std::vector<MenuItem> menuItems() {
+// ── 导出标注 / 书签（Markdown 落 SD）───────────────────────────────────
+// 入口在**笔记标签页**搜索栏右端的「导出」按钮上，导的是**全部书**的笔记 + 书签：
+// 笔记标签本来就是跨书总览（列表按书分组），导出跟着它一个口径。
+// （2026-10-05 之前这是阅读菜单里的一项、只导当前这本；移到这里时改成全库。）
+// 目标 <SD>/exports/标注导出_<年月日_时分秒>.md —— 用时间戳后缀而不是固定文件名，
+// 因为读者常常想比对"上次导出之后又划了哪些"，固定名字会被后一次悄悄覆盖。
+// 写入走 HalStorage（它对 64 字节对齐有要求，别自己 fopen）。
+// 文件名固定，所以不再需要按书名消毒的 rdExportFileSafe（已随单书版一起删掉）；
+// 书名照旧出现在正文的 "## 《书名》" 里，不受 FAT 长文件名的字符限制。
+
+// 多行文本 → Markdown 引用块（逐行加 "> "）。跨行选中的原文本身就带换行，不这么做
+// 后半段会掉出引用块，看起来像另起了一段正文。
+static void rdAppendQuote(std::string &out, const std::string &text) {
+  size_t pos = 0;
+  for (;;) {
+    size_t nl = text.find('\n', pos);
+    if (nl == std::string::npos) nl = text.size();
+    out += "> ";
+    out.append(text, pos, nl - pos);
+    out += "\n";
+    if (nl >= text.size()) break;
+    pos = nl + 1;
+  }
+}
+
+// 标注里的时间戳 → "2026-10-03"；时钟当时不可信就给空串（宁缺勿错）。
+static std::string rdExportNoteDate(int64_t t) {
+  if (t <= 0) return "";
+  const uint32_t epoch = static_cast<uint32_t>(t);
+  if (!RdTime::clockValid(epoch)) return "";
+  char buf[16];
+  RdTime::formatOrdinal(RdTime::dayOrdinal(epoch), buf, sizeof(buf));
+  return buf;
+}
+
+// 导出时某本书显示的名字：笔记里存了书名最准；没有就查书架扫出来的名字；再没有就退回
+// 文件名（去扩展名）。书签表里没有书名这一列，所以书签只能这么反查。
+static std::string rdExportBookTitle(const std::string &path) {
+  for (const auto &n : st.notes) {
+    if (n.path == path && !n.book.empty()) return n.book;
+  }
+  for (const auto &b : st.books) {
+    if (b.path == path && !b.name.empty()) return b.name;
+  }
+  const size_t slash = path.find_last_of('/');
+  std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+  const size_t dot = base.find_last_of('.');
+  if (dot != std::string::npos && dot > 0) base.resize(dot);
+  return base.empty() ? std::string("未知书籍") : base;
+}
+
+static void rdExportAnnot() {
+  // 按书分组：组序 = 笔记里首次出现的顺序，只有书签没有笔记的书追加在后面。
+  // 组按 path 认（stable id），显示名另查（见 rdExportBookTitle）。
+  struct Group {
+    std::string path, title;
+    std::vector<const RdState::RdNote *> notes;
+    std::vector<const RdState::RdBookmark *> marks;
+  };
+  std::vector<Group> groups;
+  auto groupFor = [&groups](const std::string &path) -> Group & {
+    for (auto &g : groups) {
+      if (g.path == path) return g;
+    }
+    groups.push_back(Group{});
+    groups.back().path = path;
+    groups.back().title = rdExportBookTitle(path);
+    return groups.back();
+  };
+  for (const auto &n : st.notes) groupFor(n.path).notes.push_back(&n);
+  for (const auto &b : st.bookmarks) groupFor(b.path).marks.push_back(&b);
+  if (groups.empty()) {
+    rdShowFloat("没有可导出的标注", "阅读时长按正文可标注 / 写笔记", 3000);
+    return;
+  }
+
+  const time_t now = time(nullptr);
+  struct tm tmNow;
+  localtime_r(&now, &tmNow);
+  char stamp[32];
+  strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tmNow);
+
+  std::string md;
+  md.reserve(4096);
+  md += "# 阅读标注导出\n\n";
+  char dateBuf[32];
+  strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d %H:%M", &tmNow);
+  md += std::string("- 导出时间：") + (RdTime::clockValid() ? dateBuf : "时钟未同步") + "\n";
+  md += "- 共 " + std::to_string(groups.size()) + " 本书 · 标注 " + std::to_string(st.notes.size()) +
+        " 条 · 书签 " + std::to_string(st.bookmarks.size()) + " 条\n";
+
+  for (auto &g : groups) {
+    md += "\n## 《" + g.title + "》\n\n";
+    md += "- 来源：`" + g.path + "`\n";
+    if (!g.notes.empty()) {
+      // 组内按记录时间升序；同一秒的多条保持原顺序（stable）。
+      std::stable_sort(g.notes.begin(), g.notes.end(),
+                       [](const RdState::RdNote *a, const RdState::RdNote *b) { return a->time < b->time; });
+      md += "\n### 标注（" + std::to_string(g.notes.size()) + " 条）\n\n";
+      for (const auto *n : g.notes) {
+        rdAppendQuote(md, n->text);
+        md += "\n";
+        if (!n->note.empty()) {
+          rdAppendQuote(md, std::string("**笔记**：") + n->note);
+          md += "\n";
+        }
+        // 位置 + 时间：页码是"记下时"的页，重排/换字号后只作参考，所以不写成可点击的锚。
+        std::string meta = "*第 " + std::to_string(n->page + 1) + " 页 · 第 " + std::to_string(n->spine + 1) +
+                           " 章";
+        const std::string d = rdExportNoteDate(n->time);
+        if (!d.empty()) meta += " · " + d;
+        meta += "*\n\n---\n\n";
+        md += meta;
+      }
+    }
+    if (!g.marks.empty()) {
+      md += "\n### 书签（" + std::to_string(g.marks.size()) + " 条）\n\n";
+      for (const auto *b : g.marks) {
+        char line[64];
+        snprintf(line, sizeof(line), "- 第 %d 页 · %d%%", b->page + 1,
+                 static_cast<int>(b->percent * 100.0f + 0.5f));
+        md += line;
+        // summary 多数是 epub 的 "12/200" 页码串，和上面重复；只有它真的带原文时才跟上。
+        const bool pageOnly = !b->summary.empty() && b->summary.find('/') != std::string::npos &&
+                              b->summary.find_first_not_of("0123456789/") == std::string::npos;
+        if (!b->summary.empty() && !pageOnly) md += " — " + b->summary;
+        md += "\n";
+      }
+    }
+  }
+
+  const std::string dir = "/sdcard/exports";
+  if (!Storage.exists(dir.c_str())) Storage.mkdir(dir.c_str(), true);
+  const std::string path = dir + "/标注导出_" + stamp + ".md";
+  if (!Storage.writeFile(path.c_str(), md)) {
+    rdShowFloat("导出失败", "SD 卡写不进去", 3000);
+    return;
+  }
+  char msg[64];
+  snprintf(msg, sizeof(msg), "标注 %d · 书签 %d · %d 本", static_cast<int>(st.notes.size()),
+           static_cast<int>(st.bookmarks.size()), static_cast<int>(groups.size()));
+  rdShowFloat("已导出到 exports/", msg, 3000);
+  ESP_LOGI(TAG, "导出标注: %s (%zu bytes, %zu 本)", path.c_str(), md.size(), groups.size());
+}
+
+// 「排版设定」子菜单：原来直接铺在阅读菜单里的那九项（字号…阅读线）。动作还是
+// MenuAct 那一批，doMenuAction / 弹层（openRdPick）一行都不用改；改完值弹层收起时
+// st.mode 没动，所以仍然落回本界面——和以前在平铺菜单里按一样，只是多一层返回。
+// 平铺时这九项是菜单里数量最多的一类，把整页撑到要滚动，其它条目全被挤下去，这才拆出来。
+static std::vector<MenuItem> layoutMenuItems() {
   char buf[64];
   std::vector<MenuItem> m;
-  m.push_back({"目录", MenuAct::Toc});
   snprintf(buf, sizeof(buf), "字号: %d", kBodyPx[st.fontLevel]);
   m.push_back({buf, MenuAct::Font});
   // 书内嵌字体生效时内容面装的不是用户选的那个字体，标签就如实写"书内嵌"——
@@ -4746,6 +3708,8 @@ static std::vector<MenuItem> menuItems() {
   // 样式解析选「书籍内嵌」时这两项被书里的 CSS 接管，标签直接标出来，免得以为
   // 调了没反应（值本身保留着，切回「强制指定」立刻按它生效）。
   // TXT/XTC 没有书内 CSS，这个开关对它们没有意义，照旧显示自己的档位。
+  // embedded 的判定必须和 doMenuAction 里 Indent/Align 的守卫一字不差，否则会出现
+  // "标着随书、按下去却真改了"。
   const bool embedded = styleEmbedded() && st.bookKind == 0;
   m.push_back({std::string("缩进: ") +
                    (embedded ? "随书" : (st.indentMode == 0 ? "自动" : st.indentMode == 1 ? "强制" : "取消")),
@@ -4754,6 +3718,16 @@ static std::vector<MenuItem> menuItems() {
   m.push_back({std::string("边距: ") + (st.marginIdx == 0 ? "窄" : st.marginIdx == 1 ? "标准" : "宽"), MenuAct::Margin});
   m.push_back({std::string("图片: ") + (st.imageBilinear ? "双线性" : "最近邻"), MenuAct::Image});
   m.push_back({std::string("阅读线: ") + kReadingLineNames[clampI(st.readingLine, 0, 3)], MenuAct::ReadingLine});
+  return m;
+}
+
+static std::vector<MenuItem> menuItems() {
+  char buf[64];
+  std::vector<MenuItem> m;
+  m.push_back({"目录", MenuAct::Toc});
+  // ‹› 那一对（U+2039/203A）内置字体里都有（见 assets/builtin.ttf 的 cmap；用户字体缺字
+  // 会走替补链），所以行尾那个 › 直接写进标签串就行，不用另画。
+  m.push_back({"排版设定 ›", MenuAct::LayoutMenu});
   // 「夜间」「方向」已搬到主界面设置（夜间模式 / 阅读器方向）——它们本来就是设备级
   // 设定，放在"当前这本书"的菜单里不对路。
   snprintf(buf, sizeof(buf), "书签(%d)", static_cast<int>(st.bookmarks.size()));
@@ -4766,28 +3740,65 @@ static std::vector<MenuItem> menuItems() {
   m.push_back({"词典", MenuAct::Dict});
   // 系统级条目（WiFi/传书/OPDS/词典下载/按键映射/状态栏/方向/待机/关于）都移到了
   // 主界面的「设置」标签，这里只留与「当前这本书」有关的阅读操作。
+  // 导出标注也不在这里：它是**跨书**的，入口在笔记标签页搜索栏右端（见 rdExportAnnot）。
   m.push_back({"返回书架", MenuAct::ToShelf});
   m.push_back({"返回阅读", MenuAct::Back});
   return m;
 }
 
-static void renderMenu() {
+// 「排版设定」在阅读菜单里的行号：从子菜单 Esc 回来时把光标落回它，而不是跳回第一行
+// （那样看起来像菜单被重置了）。找不到就退回第一项之后的位置。
+static int rdMenuLayoutRow() {
+  const auto items = menuItems();
+  for (size_t i = 0; i < items.size(); i++) {
+    if (items[i].act == MenuAct::LayoutMenu) return static_cast<int>(i);
+  }
+  return 1;
+}
+
+// 菜单列表的绘制（阅读菜单与排版子菜单共用一套几何：绘制和点按命中都从 titleListView
+// 取，两处写岔了就会"看到的行"和"点到的行"错位）。
+static void rdDrawMenuList(const std::vector<MenuItem> &items, const char *title, int sel) {
   g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int top = drawTitle("阅读菜单");
-  auto items = menuItems();
-  int itemH = uiLineHeight() + 12;
-  int viewH = statusTop() - top - 8;
-  int maxRows = std::max(1, viewH / itemH);
-  int start = clampI(st.menuSel - maxRows / 2, 0, std::max(0, static_cast<int>(items.size()) - maxRows));
-  for (int i = 0; i < maxRows && start + i < static_cast<int>(items.size()); i++) {
-    int idx = start + i;
-    int y = top + i * itemH;
-    if (idx == st.menuSel) { g_rd.fillRect(0, y, w, itemH, true); drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, items[idx].label.c_str(), false); }
-    else drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, items[idx].label.c_str(), true);
+  const int w = g_rd.getScreenWidth();
+  drawTitle(title);
+  const ListView lv = titleListView(static_cast<int>(items.size()), sel, uiLineHeight() + 12, statusTop());
+  for (int i = 0; i < lv.rows && lv.first + i < static_cast<int>(items.size()); i++) {
+    const int idx = lv.first + i;
+    const int y = lv.top + i * lv.itemH;
+    if (idx == sel) {
+      g_rd.fillRect(0, y, w, lv.itemH, true);
+      drawLineText(MARGIN, y + (lv.itemH - uiLineHeight()) / 2, items[idx].label.c_str(), false);
+    } else {
+      drawLineText(MARGIN, y + (lv.itemH - uiLineHeight()) / 2, items[idx].label.c_str(), true);
+    }
   }
   drawFooter("↑↓ 选择  Enter 确认  Esc 返回");
 }
+
+// 菜单列表的按键：确认时返回选中的行号，否则 -1。Esc 由调用方处理——两个菜单的
+// 返回目标不同（阅读菜单回阅读页，排版子菜单回阅读菜单）。
+static int rdMenuListKey(const std::vector<MenuItem> &items, int &sel, int key) {
+  const int n = static_cast<int>(items.size());
+  {  // 上下/翻页在 ui/list_view.h（与 rdDrawMenuList 共用同一个几何）
+    ListView lv = titleListView(n, sel, uiLineHeight() + 12, statusTop());
+    if (listViewKey(lv, key)) {
+      sel = lv.sel;
+      st.dirty = 1;
+      return -1;
+    }
+  }
+  if (key != '\n') return -1;
+  int x, y;
+  if (input_tap_xy(&x, &y)) {
+    const int row = listViewHitAt(titleListView(n, sel, uiLineHeight() + 12, statusTop()), y);
+    if (row >= 0) sel = row;   // 点哪行就确认哪行，不用先上下移到它
+  }
+  return clampI(sel, 0, n - 1);
+}
+
+static void renderMenu() { rdDrawMenuList(menuItems(), "阅读菜单", st.menuSel); }
+static void renderLayoutMenu() { rdDrawMenuList(layoutMenuItems(), "排版设定", st.layoutSel); }
 
 // ── 词典 ────────────────────────────────────────────────────────────────
 // 查询框的矩形必须**和 renderDict 画出来的一模一样**：renderDict 用
@@ -4798,7 +3809,57 @@ static void renderMenu() {
 // → 走了查词 → 状态栏报"未找到词典"，虚拟键盘也就永远弹不出来。
 // 现在直接取同一个来源，绘制和命中不可能再对不上。
 static int dictQueryTop() { return coverTop(); }
-static int dictQueryH() { return uiLineHeight() + 12; }
+int dictQueryH() { return uiLineHeight() + 12; }
+
+// 查询缓存：同一个词反复查（选词查完退出来再选一次、在释义里来回翻看同一个词）不必
+// 重走一遍索引二分 + .dict.dz 解压 + HTML 折纯文本 —— 那才是查一次词最贵的部分。
+// 键是查询串，值是**一次 lookup 的全部产物**（正文/词头/状态），三者本来就同源，
+// 命中就整份换掉，不会出现"新词头配旧正文"。换词典（openDictionary 失败或重新安装）
+// 时作废：词典文件变了，旧正文就过期了。
+namespace {
+struct RdDictCacheEntry {
+  std::string query;
+  std::string result;
+  std::string headword;
+  std::string status;
+};
+constexpr size_t kDictCacheMaxEntries = 4;
+constexpr size_t kDictCacheMaxBytes = 64 * 1024;   // 单条上限（超长释义不值得占着不放）
+constexpr size_t kDictCacheMaxTotal = 128 * 1024;  // 全部条目合计上限
+std::deque<RdDictCacheEntry> s_dictCache;          // 最近用过的在前
+}  // namespace
+
+void rdDictCacheClear() { s_dictCache.clear(); }
+
+static bool rdDictCacheGet(const std::string &query, std::string &result, std::string &headword, std::string &status) {
+  for (size_t i = 0; i < s_dictCache.size(); i++) {
+    if (s_dictCache[i].query != query) continue;
+    RdDictCacheEntry hit = s_dictCache[i];   // 拷一份再挪到队首（原地 erase/insert 会自伤）
+    s_dictCache.erase(s_dictCache.begin() + static_cast<long>(i));
+    s_dictCache.insert(s_dictCache.begin(), std::move(hit));
+    result = s_dictCache[0].result;
+    headword = s_dictCache[0].headword;
+    status = s_dictCache[0].status;
+    return true;
+  }
+  return false;
+}
+
+static void rdDictCachePut(const std::string &query, const std::string &result, const std::string &headword,
+                           const std::string &status) {
+  if (query.empty() || result.size() > kDictCacheMaxBytes) return;
+  RdDictCacheEntry e{query, result, headword, status};
+  s_dictCache.insert(s_dictCache.begin(), std::move(e));
+  size_t total = 0;
+  for (size_t i = 0; i < s_dictCache.size(); i++) {
+    total += s_dictCache[i].result.size();
+    // 条目数、总字节、单条三种上限任一超出就从队尾丢。
+    if (i + 1 > kDictCacheMaxEntries || total > kDictCacheMaxTotal) {
+      s_dictCache.resize(i);
+      break;
+    }
+  }
+}
 
 // 上一次发现失败时 /sdcard/dictionaries 里到底有什么（空串=还没探过）。串口日志里本来
 // 就有这条（见 openDictionary 的 ESP_LOGW），但**用户看得到的是屏幕上的那一句** ——
@@ -4852,6 +3913,9 @@ static bool openDictionary() {
 }
 
 static void doDictLookup() {
+  // 换词条 = 换正文：作废折行缓存并回到首行。放在最前面（含"未找到词典"的诊断正文），
+  // 否则新释义会从上一次的滚动位置往下画，看着像开头被吃了。
+  rdDictResetScroll();
   if (!openDictionary()) {
     st.dictStatus = "未找到词典：请到「设置→词典下载」安装";
     // 发现阶段失败时，把**看到的目录内容**和合格摆法一起写到正文区（正文是折行画的，
@@ -4865,6 +3929,12 @@ static void doDictLookup() {
     return;
   }
   if (st.dictQuery.empty()) { st.dictStatus.clear(); return; }
+  // 缓存命中：整份复用（含"未找到该词条"这类失败结果，省一次索引二分）。放在
+  // openDictionary 之后：词典在 SD 上被换掉/删掉时，开词典这一步就会失败，缓存自然失效，
+  // 不会拿上一本词典的正文继续糊弄（openDictionary 在已打开时立即返回，几乎不花钱）。
+  if (rdDictCacheGet(st.dictQuery, st.dictResult, st.dictHeadword, st.dictStatus)) return;
+  // 真正要查了：查完把这一份产物整条塞进缓存（下面两条出口都过这里）。
+  const auto cacheIt = [&]() { rdDictCachePut(st.dictQuery, st.dictResult, st.dictHeadword, st.dictStatus); };
   if (st.dict.needsIndex()) {
     st.dictStatus = "首次建立词典索引...";
     st.dict.buildIndex();
@@ -4872,6 +3942,11 @@ static void doDictLookup() {
   Dictionary::LookupResult r;
   if (st.dict.lookup(st.dictQuery.c_str(), st.dictResult, st.dictHeadword, &r)) {
     st.dictStatus = "词条: " + st.dictHeadword;
+    // StarDict 的释义正文没有统一格式：.ifo 写了 sametypesequence=h 的是 HTML，其余多半是
+    // 带 '\n' 的纯文本，还有相当一部分词典根本没写 .ifo。统一折成纯文本再交给 wrappedText
+    // —— 否则 HTML 的标签会原样画到屏上。纯文本输入基本原样通过（见 DictionaryText.cpp）。
+    // 上面"没找到词典"那条诊断文字不走这里，里面的 "<名>.idx" 不会被当标签剥掉。
+    st.dictResult = Dictionary::htmlToPlainText(st.dictResult);
   } else {
     st.dictResult.clear();
     st.dictHeadword.clear();
@@ -4883,6 +3958,7 @@ static void doDictLookup() {
       default: st.dictStatus = "查找失败"; break;
     }
   }
+  cacheIt();
 }
 
 // ── 虚拟键盘：三个模式共用 editor_vk，这里只剩一层薄适配 ──────────────────
@@ -4904,56 +3980,79 @@ static void doDictLookup() {
 // st.vkVisible 仍是可见性的唯一真相（阅读模式有 20 多处地方在翻它），每次绘制/命中
 // 前同步给 editor_vk，避免两边各记一份再慢慢不一致。
 
-static void rdSyncVk() {
+void rdSyncVk() {
   if (editorVkVisible() != st.vkVisible) editorVkSetVisible(st.vkVisible);
 }
 
 // 键盘面板顶边 y。阅读模式原来用固定的 VK_H 算，现在统一问 editor_vk（面板高度
 // 跟随当前字号，横竖屏都现算）。
-static int vkVkTop() { return editorVkTop(); }
+int vkVkTop() { return editorVkTop(); }
 
-static void drawVk() {
+void drawVk() {
   rdSyncVk();
   editorVkDraw();
+}
+
+// 开/收虚拟键盘（用户点状态栏右端那个图标，或点词典的查询框把面板叫回来）。
+// **收起/展开必须整刷**：整块面板出现或消失，区域刷擦不掉旧键框（白底上留一圈灰），
+// 而且收起后正文会重新排下来 —— 这跟键盘上按"换面板/换布局"是同一类"整块换图样"，
+// 那几处也是置 fullRefresh（见 vkTap 的 EVK_PAGE/EVK_LAYOUT/EVK_T9/EVK_LANG）。
+void rdToggleVk() {
+  st.vkVisible = !st.vkVisible;
+  st.fullRefresh = true;
+  st.dirty = 1;
 }
 
 // 状态栏右端的键盘开关图标。绘制与命中都沿用 editor_vk 那一份几何（STATUS_BAR_Y /
 // STATUS_BAR_H / FONT_H 槽宽）——阅读模式的提示栏 statusTop() 与它只差 2px，同一行，
 // 不必再算一遍。**必须在状态栏画完之后调用**，否则会被提示栏的白底盖掉。
 // 反白态取 editor_vk 的 s_visible，所以画之前先把可见性同步过去。
-static void rdDrawVkIcon() {
+void rdDrawVkIcon() {
   rdSyncVk();
   editorVkDrawIcon();
 }
 
-static bool rdVkIconHit(int x, int y) { return editorVkIconHit(x, y); }
+bool rdVkIconHit(int x, int y) { return editorVkIconHit(x, y); }
+
+// ── 实体键盘打字的"输入法条"（编码行 + 候选行）────────────────────────────
+// 面板（drawVk）自带候选条，所以以前只有"弹键盘 / 不弹键盘"两种情形。可一旦接上蓝牙
+// 键盘、或者用户用状态栏那个图标把面板收起来，就只剩一个裸输入框——候选字和编码串
+// 一条都没有：中文能打进去，但人不知道现在拼到哪一步、这一页有哪些候选、按数字键会选
+// 哪个字（本轮报障就是：能正确输入中文，却看不见候选和编码）。写作模式的编辑器一直有
+// 这条（screen_editor.cpp 的 drawIMEUIWithStatusBar），阅读模式缺的只是"画一下"。
+//
+// 保留区的规矩跟编辑器一致（见 screen_editor.cpp 的 reserveIME 注释）：**输入法开着
+// 就留位**，不按"这一刻有没有组合"来判——否则每上屏一次正文就上下跳一行。
+bool rdImeBarOn() {
+  if (st.vkVisible) return false;   // 面板自带候选条，比这条高得多，别叠着画
+  return IME::getInstance().active();
+}
+
+// 正文可用底边。三种情形只能有这一个来源：虚拟键盘弹着 → 面板顶；实体键盘打字 →
+// 输入法条上沿；两者都没有 → 提示行上沿。分开算的话，"留了位没画"或"画了没留位"
+// 都会露馅（正文被条子盖住 / 条子下面空一条）。
+// 前两种都减 6px：面板/条子的顶边就是它那块白底的上沿，正文最后一行贴上去会顶边。
+int rdBodyBottom() {
+  if (st.vkVisible) return vkVkTop() - 6;
+  if (rdImeBarOn()) return statusTop() - imeBarPanelH() - 6;
+  return statusTop();
+}
+
+// 画输入法条：底边贴阅读模式那条提示行的上沿（提示行自己画在 statusTop()）。
+// 必须在正文之后、提示行之前调用。没在组合时 drawIMEUI 自己什么都不画（保留区仍然算，
+// 见 rdBodyBottom），所以这里是"画一下"而不是"判要不要画"。
+void drawRdImeBar() {
+  if (!rdImeBarOn()) return;
+  drawIMEUI(statusTop());
+}
 
 // 前向声明（OPDS/传书界面在文件后段定义，但 VK 的回车提交需要调用它们）。
-static void renderCurrent();
+void renderCurrent();
 static void renderSettingsTab();  // 「设置」标签（定义在菜单动作之后）
-// 「统计」标签与它的子界面（定义在 handleSettingsTab 之后的一大段里）。
-static void renderStatsTab();
-static void handleStatsTab(int key);
-static void renderStatsBook();
-static void handleStatsBook(int key);
-static void renderStatsMore();
-static void handleStatsMore(int key);
-static void renderStatsHeatmap();
-static void handleStatsHeatmap(int key);
-static void renderStatsDay();
-static void handleStatsDay(int key);
-static void renderStatsProfile();
-static void handleStatsProfile(int key);
-static void renderStatsAdjust();
-static void handleStatsAdjust(int key);
-static void renderStatsSettings();
-static void handleStatsSettings(int key);
-static void opdsBeginLoad(const std::string &url);
-static void netShareConnect();
-static void prepareQr();
+void prepareQr();
 static void rdNoteCommit();      // 笔记编辑器保存（定义在文件后段）
 static void renderNotes();       // 「笔记」标签（定义在文件后段）
-static void renderNoteEdit();
+void renderNoteEdit();
 static void rdShelfSearchOpen();  // 打开书架搜索的当前命中（定义在文件后段）
 static void rdNotesSearchOpen();  // 打开笔记搜索的当前命中
 
@@ -4970,53 +4069,41 @@ static std::string *vkTargetString() {
   return nullptr;
 }
 
+// 目标串的 ImeField 形态：阅读模式的字段全是**追加型**（光标恒在末尾），所以 cursor
+// 传 nullptr。vkTargetString 留在阅读模式这边 —— 它按 st.mode 选目标，是阅读模式自己
+// 的状态，不该搬进共享层。
+static ImeField vkTargetField() {
+  return ImeField{vkTargetString(), /*cursor=*/nullptr};
+}
+
 static void commitVk(const std::string &s) {
   if (s.empty()) return;
-  std::string *t = vkTargetString();
-  if (t) *t += s;
+  imeFieldInsert(vkTargetField(), s);   // 无目标字段时是空操作
   // 搜索框里每敲一个字，命中表就变一次；选中项跟着回到第一命中，免得停在
   // 已经被筛掉的第 N 项上（列表本身每帧也会 clamp，这里只是让它更直觉）。
   if (st.mode == RdMode::ShelfSearch || st.mode == RdMode::NotesSearch) st.searchSel = 0;
 }
 
-static void popUtf8(std::string &s) {
-  if (s.empty()) return;
-  size_t i = s.size() - 1;
-  while (i > 0 && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80) i--;
-  s.erase(i);
-}
-
-static void feedVkKey(int c) {
+void feedVkKey(int c) {
+  // 输入法优先，没接住的可打印 ASCII 当裸字符 —— 这条规矩写作/计划/阅读三处一样，
+  // 收在 ime_field 里（少了它，数字面板上的 1..9/0 一个也打不出来）。
+  // 这里不碰 st.dirty：所有调用点在 vkTap/按键处理里都已经置过了。
   std::string out;
-  if (IME::getInstance().handleKey(c, out)) {
-    commitVk(out);
-    return;
-  }
-  // 输入法没接这个键（未组合时的数字与半角标点、英文态下的字母）：直接当裸字符落进
-  // 目标串。写作模式有 screen_editor 的 "ASCII printable" 分支兜底，阅读模式没有，
-  // 少了这一段，数字面板上的 1..9/0 就一个也打不出来。
-  if (c >= 0x20 && c <= 0x7E) {
-    std::string *t = vkTargetString();
-    if (t) {
-      t->push_back(static_cast<char>(c));
-      st.dirty = 1;
-    }
-  }
+  if (imeFieldKeyText(IME::getInstance(), c, /*multiline=*/false, out)) commitVk(out);
 }
 
-static void feedVkBackspace() {
+void feedVkBackspace() {
   auto &ime = IME::getInstance();
   if (ime.composing()) {
     std::string out;
     ime.handleKey('\b', out);
     commitVk(out);
   } else {
-    std::string *t = vkTargetString();
-    if (t) popUtf8(*t);
+    imeFieldBackspace(vkTargetField());
   }
 }
 
-static void vkEnter() {
+void vkEnter() {
   auto &ime = IME::getInstance();
   if (st.mode == RdMode::NoteEdit) {
     // 笔记编辑器：回车=保存。组合中的编码先落地，但换行本身不写进笔记。
@@ -5066,7 +4153,7 @@ static void vkEnter() {
 // 字母返回 'a'..'z' 或一键多字母布局的组码、空格/退格/回车返回 ' ' / '\b' / '\n'，
 // 其余（翻页/中英/布局/Shift/Ctrl）在 editorVkHitTest 内部已经翻转了自身状态，
 // 这里重绘即可。
-static void vkTap(int x, int y) {
+void vkTap(int x, int y) {
   rdSyncVk();
   EditorVkHit hit;
   const int k = editorVkHitTest(x, y, &hit);
@@ -5140,1710 +4227,7 @@ static bool rdVkSwipeScroll(int x, int y, int dir) {
   return editorVkSwipeScroll(x, y, dir);
 }
 
-// ── 渲染：词典 / 微信读书 ───────────────────────────────────────────────
-static void renderDict() {
-  g_rd.clearScreen();
-  int top = drawTitle("词典");
-  int qy = top;
-  int qh = dictQueryH();
-  g_rd.drawRect(MARGIN, qy, g_rd.getScreenWidth() - 2 * MARGIN, qh, true);
-  std::string q = st.dictQuery.empty() ? "点击输入单词/拼音" : st.dictQuery;
-  drawLineText(MARGIN + 8, qy + 6, q.c_str(), true);
-  int ry = qy + qh + 12;
-  int bottom = st.vkVisible ? vkVkTop() : statusTop();
-  if (!st.dictStatus.empty()) { drawLineText(MARGIN, ry, st.dictStatus.c_str(), true); ry += uiLineHeight() + 6; }
-  if (!st.dictResult.empty()) {
-    int maxW = g_rd.getScreenWidth() - 2 * MARGIN;
-    int maxLines = std::max(1, (bottom - ry) / (uiLineHeight() + 4));
-    auto lines = g_rd.wrappedText(uiFontId(), st.dictResult.c_str(), maxW, maxLines);
-    for (auto &ln : lines) {
-      if (ry + uiLineHeight() > bottom) break;
-      drawLineText(MARGIN, ry, ln.c_str(), true);
-      ry += uiLineHeight() + 4;
-    }
-  }
-  if (st.vkVisible) drawVk();
-  else drawFooter("点查询框输入  Enter 查词  Esc 返回");
-  rdDrawVkIcon();
-}
-
-// ── 微信读书 ────────────────────────────────────────────────────────────
-// 状态机由 weDrive() 在按键循环里逐拍推进；这里只做四件事：
-// 书架列表（RdMode::Weread）、扫码（WereadQr）、书目菜单（WereadMenu）、缓存进度（WereadDl）。
-
-static const char *weErrorText(WeReadClient::Error e) {
-  switch (e) {
-    case WeReadClient::Error::Ok: return "完成";
-    case WeReadClient::Error::Cancelled: return "已取消";
-    case WeReadClient::Error::Network: return "网络不可用（先连 WiFi）";
-    case WeReadClient::Error::SessionExpired: return "登录已失效，请重新扫码";
-    case WeReadClient::Error::LoginFailed: return "扫码登录超时或失败";
-    case WeReadClient::Error::Protocol: return "接口返回异常（服务可能已变更）";
-    case WeReadClient::Error::SdCard: return "SD 卡读写失败";
-    case WeReadClient::Error::Integrity: return "数据校验失败";
-    case WeReadClient::Error::Unavailable: return "该书暂不可缓存";
-    case WeReadClient::Error::Clock: return "时钟未同步";
-    case WeReadClient::Error::OutOfMemory: return "内存不足（重启后再试）";
-    case WeReadClient::Error::WholeBookOnly: return "该书只能整本缓存";
-  }
-  return "未知错误";
-}
-
-static const char *weStageName(WeReadClient::Operation::ProgressStage s) {
-  switch (s) {
-    case WeReadClient::Operation::ProgressStage::Chapters: return "缓存章节";
-    case WeReadClient::Operation::ProgressStage::Preparing: return "整理资源";
-    case WeReadClient::Operation::ProgressStage::Images: return "下载图片";
-    case WeReadClient::Operation::ProgressStage::Packaging: return "生成图书";
-  }
-  return "处理中";
-}
-
-static bool weSessionValid() {
-  WeReadStore::Session s;
-  return WeReadStore::loadSession(s);
-}
-
-static void weLoadShelf() {
-  st.weShelf.clear();
-  st.weShelfLoaded = true;
-  HalFile file;
-  uint32_t count = 0;
-  if (!WeReadStore::openShelf(file, count)) return;
-  st.weShelf.reserve(count);
-  for (uint32_t i = 0; i < count; i++) {
-    WeReadStore::ShelfRecord rec;
-    if (!WeReadStore::readShelfRecord(file, i, rec)) break;
-    st.weShelf.push_back(rec);
-  }
-  file.close();
-  st.weSel = clampI(st.weSel, 0, std::max(0, static_cast<int>(st.weShelf.size()) - 1));
-}
-
-static bool readerEnsureWifi(std::string &err);   // 定义在词典下载一节
-
-// 起一个新任务（登录/书架同步 kind=0，整本缓存 kind=1）。
-static void weBeginJob(int kind, const WeReadStore::ShelfRecord *book) {
-  if (!st.weOp) st.weOp = weMakeOperation();
-  if (!st.weOp) { st.weStatus = "内存不足，无法启动"; return; }
-  // 没联网就先用设置里的 SSID/密码连一次（与词典下载同一条路子）。微读这边所有请求
-  // 都是同步阻塞的，不先连上只会从 HTTP 层拿到一句含糊的"网络错误"；这里先连、
-  // 连不上才报错，用户看到的是"正在连接 WiFi..."→ 具体失败原因。
-  if (!g_wifi.isConnected()) {
-    st.weStatus = "正在连接 WiFi...";
-    st.fullRefresh = true;
-    st.dirty = 1;
-    renderCurrent();
-    st.fullRefresh = false;
-    std::string werr;
-    if (!readerEnsureWifi(werr)) {
-      st.weStatus = werr;
-      st.dirty = 1;
-      return;
-    }
-    st.weStatus.clear();
-  }
-  WeReadClient::DownloadOptions options;
-  options.imagePolicy = WeReadStore::ImagePolicy::Embed;
-  options.chapterScope = WeReadClient::DownloadOptions::ChapterScope::WholeBook;
-  const WeReadClient::Operation::Kind k =
-      (kind == 1) ? WeReadClient::Operation::Kind::Download : WeReadClient::Operation::Kind::Sync;
-  st.weKind = kind;
-  st.weStatus.clear();
-  st.weJobTitle = book ? book->title : "";
-  if (!st.weOp->begin(k, book, options)) {
-    st.weStatus = weErrorText(st.weOp->error());
-    st.dirty = 1;
-    return;
-  }
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-// 推进状态机并处理事件。联网请求是同步阻塞的——刷屏已经先画好，用户看到的是
-// 上一次的进度画面，请求返回后立刻重画。
-static void weDrive() {
-  if (!st.weOp) return;
-  const WeReadClient::Operation::Event ev = st.weOp->step();
-  switch (ev) {
-    case WeReadClient::Operation::Event::QrReady:
-      st.weQrUrl = st.weOp->qrUrl();
-      st.mode = RdMode::WereadQr;
-      st.fullRefresh = true;
-      st.dirty = 1;
-      break;
-    case WeReadClient::Operation::Event::Authenticated:
-      st.weStatus = "已扫码，正在同步书架...";
-      st.fullRefresh = true;
-      st.dirty = 1;
-      break;
-    case WeReadClient::Operation::Event::Complete:
-      if (st.weKind == 1) {
-        const std::string path = st.weOp->finalPath();
-        st.weStatus.clear();
-        // 新书刚落进 /sdcard/WeRead，书架列表还是进阅读模式时扫的那一份：
-        // 重扫一遍并夹住选中项，否则读完退出回书架看不到刚缓存的书。
-        scanBooks();
-        if (st.sel >= static_cast<int>(st.books.size())) {
-          st.sel = st.books.empty() ? 0 : static_cast<int>(st.books.size()) - 1;
-        }
-        if (!path.empty() && openBook(path, 0)) {
-          st.mode = RdMode::Reading;
-        } else {
-          st.weStatus = "缓存完成，但打不开这本书";
-          st.mode = RdMode::Weread;
-        }
-      } else {
-        weLoadShelf();
-        st.weStatus.clear();
-        st.mode = RdMode::Weread;
-      }
-      st.fullRefresh = true;
-      st.dirty = 1;
-      break;
-    case WeReadClient::Operation::Event::Cancelled:
-      st.weStatus = "已取消";
-      st.mode = (st.weKind == 1) ? RdMode::WereadMenu : RdMode::Weread;
-      st.fullRefresh = true;
-      st.dirty = 1;
-      break;
-    case WeReadClient::Operation::Event::Failed:
-      st.weStatus = weErrorText(st.weOp->error());
-      st.mode = (st.weKind == 1) ? RdMode::WereadMenu : RdMode::Weread;
-      st.fullRefresh = true;
-      st.dirty = 1;
-      break;
-    case WeReadClient::Operation::Event::DetailReady:
-    case WeReadClient::Operation::Event::ChapterRangeReady:
-    case WeReadClient::Operation::Event::ChapterComplete:
-      st.dirty = 1;   // 进度画面刷新
-      break;
-    case WeReadClient::Operation::Event::None:
-      if (st.mode == RdMode::WereadDl && st.weOp->active()) st.dirty = 1;
-      break;
-  }
-}
-
-// 书架行（两行文字：书名 + 作者/本地状态）。
-static int weItemH() { return uiLineHeight() * 2 + 8; }
-
-static int weBookIndex() {
-  return (st.weSel >= 0 && st.weSel < static_cast<int>(st.weShelf.size())) ? st.weSel : -1;
-}
-
-// 书目菜单：本地已有缓存就给"打开/重新缓存/删除"，否则只有"缓存整本并阅读"。
-static std::vector<std::string> weMenuItems() {
-  const int idx = weBookIndex();
-  bool cached = false;
-  if (idx >= 0) cached = Storage.exists(WeReadStore::finalBookPath(st.weShelf[idx]).c_str());
-  if (cached) return {"打开本书", "重新缓存", "删除本地缓存", "取消"};
-  return {"缓存整本并阅读", "取消"};
-}
-
-// 书目菜单的行高与首行 y（renderWereadMenu 与命中测试共用）。
-static int weMenuItemH() { return uiLineHeight() + 12; }
-static int weMenuFirstY() { return coverTop() + uiLineHeight() + 14; }
-
-static void renderWeread() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const int top = drawTabBar();
-
-  // 还没有登录：先免责声明，再引导扫码。
-  if (!weSessionValid()) {
-    if (!WeReadStore::hasAcceptedDisclaimer()) {
-      drawCenteredLine(top + 24, "微信读书");
-      drawCenteredLine(top + 24 + (uiLineHeight() + 8), "非官方第三方功能");
-      drawCenteredLine(top + 24 + 2 * (uiLineHeight() + 8), "与腾讯/微信读书无关");
-      drawCenteredLine(top + 24 + 3 * (uiLineHeight() + 8), "接口可能随服务端变更失效");
-      drawCenteredLine(top + 24 + 4 * (uiLineHeight() + 8), "账号与数据风险自负");
-      drawFooter("回车 同意并继续   Esc 回书架");
-      return;
-    }
-    drawCenteredLine(top + 40, "未登录");
-    drawCenteredLine(top + 40 + uiLineHeight() + 8, "回车 扫码登录（手机微信扫码）");
-    if (!st.weStatus.empty()) drawCenteredLine(statusTop() - uiLineHeight() - 12, st.weStatus.c_str());
-    drawFooter("回车 扫码登录   ←→ 换标签   Esc 回书架");
-    return;
-  }
-
-  if (!st.weShelfLoaded) weLoadShelf();
-  if (st.weShelf.empty()) {
-    drawCenteredLine(top + 40, "书架是空的");
-    drawCenteredLine(top + 40 + uiLineHeight() + 8, st.weStatus.empty() ? "回车 重新同步" : st.weStatus.c_str());
-    drawFooter("回车 重新同步   ←→ 换标签   Esc 回书架");
-    return;
-  }
-
-  const int bottom = statusTop();
-  const int itemH = weItemH();
-  const int rows = std::max(1, (bottom - top) / itemH);
-  st.weSel = clampI(st.weSel, 0, static_cast<int>(st.weShelf.size()) - 1);
-  st.weScroll = clampI(st.weSel - rows / 2, 0, std::max(0, static_cast<int>(st.weShelf.size()) - rows));
-
-  int y = top;
-  for (int i = st.weScroll; i < static_cast<int>(st.weShelf.size()) && y + itemH <= bottom; i++) {
-    const auto &b = st.weShelf[i];
-    const bool sel = (i == st.weSel);
-    if (sel) g_rd.fillRect(2, y, w - 4, itemH - 2, true);
-    std::string title = b.title[0] ? b.title : "(无书名)";
-    title = g_rd.truncatedText(uiFontId(), title.c_str(), w - 2 * MARGIN, EpdFontFamily::REGULAR);
-    drawLineText(MARGIN, y + 2, title.c_str(), !sel, uiFontId());
-    // 第二行：作者 + 本地是否已有缓存（只查可见行，书架可能有几百本）。
-    const std::string finalPath = WeReadStore::finalBookPath(b);
-    const bool cached = Storage.exists(finalPath.c_str());
-    std::string sub = b.author;
-    if (cached) sub += sub.empty() ? "已缓存" : "  ·  已缓存";
-    sub = g_rd.truncatedText(uiFontId(), sub.c_str(), w - 2 * MARGIN, EpdFontFamily::REGULAR);
-    drawLineText(MARGIN, y + 2 + uiLineHeight() + 2, sub.c_str(), !sel,
-                 uiFontId());
-    y += itemH;
-  }
-  if (!st.weStatus.empty()) drawCenteredLine(statusTop() - uiLineHeight() - 12, st.weStatus.c_str());
-  drawFooter("↑↓ 选择  Enter 打开  ←→ 换标签  Esc 回书架");
-}
-
-static void renderWereadQr() {
-  g_rd.clearScreen();
-  drawTitle("微信读书 扫码登录");
-  const int w = g_rd.getScreenWidth();
-  const int top = coverTop();
-  const int availH = statusTop() - top - 12;
-  const int box = std::min(w - 2 * MARGIN, availH);
-  const int cap = qrcodegen_BUFFER_LEN_FOR_VERSION(40);
-  std::vector<uint8_t> temp(cap), qr(cap);
-  if (box <= 0 || st.weQrUrl.empty() ||
-      !qrcodegen_encodeText(st.weQrUrl.c_str(), temp.data(), qr.data(), qrcodegen_Ecc_LOW, 4, 40,
-                            qrcodegen_Mask_AUTO, true)) {
-    drawCenteredLine(top + 40, "等待登录二维码...");
-    if (!st.weStatus.empty()) drawCenteredLine(top + 40 + uiLineHeight() + 8, st.weStatus.c_str());
-    drawFooter("Esc 取消");
-    return;
-  }
-  const int size = qrcodegen_getSize(qr.data());
-  const int px = std::max(1, box / size);
-  const int dim = size * px;
-  const int x0 = (w - dim) / 2;
-  const int y0 = top + (availH - dim) / 2;
-  for (int cy = 0; cy < size; cy++)
-    for (int cx = 0; cx < size; cx++)
-      if (qrcodegen_getModule(qr.data(), cx, cy)) g_rd.fillRect(x0 + px * cx, y0 + px * cy, px, px, true);
-  drawFooter("用微信扫描二维码  Esc 取消");
-}
-
-static void renderWereadMenu() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const int top = drawTitle("微信读书");
-  const int bi = weBookIndex();
-  if (bi < 0) { drawCenteredLine(top + 20, "书目已失效，返回书架重选"); drawFooter("Esc 返回"); return; }
-  const auto &b = st.weShelf[bi];
-  drawLineText(MARGIN, top, b.title[0] ? b.title : "(无书名)", true);
-  const int ly = top + uiLineHeight() + 6;
-  g_rd.drawLine(0, ly, w, ly, true);
-
-  const std::vector<std::string> items = weMenuItems();
-  const int itemH = weMenuItemH();
-  int y = ly + 8;
-  for (int i = 0; i < static_cast<int>(items.size()); i++) {
-    if (i == st.weMenuSel) {
-      g_rd.fillRect(2, y, w - 4, itemH - 2, true);
-      drawLineText(MARGIN, y + 6, items[i].c_str(), false);
-    } else {
-      drawLineText(MARGIN, y + 6, items[i].c_str(), true);
-    }
-    y += itemH;
-  }
-  if (!st.weStatus.empty()) drawCenteredLine(statusTop() - uiLineHeight() - 12, st.weStatus.c_str());
-  drawFooter("↑↓ 选择  Enter 确定  Esc 返回");
-}
-
-static void renderWereadDl() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const int top = drawTitle("微信读书 缓存图书");
-  std::string title = st.weJobTitle.empty() ? "正在准备" : st.weJobTitle;
-  title = g_rd.truncatedText(uiFontId(), title.c_str(), w - 2 * MARGIN, EpdFontFamily::REGULAR);
-  drawLineText(MARGIN, top + 8, title.c_str(), true);
-
-  uint32_t done = 0, total = 0;
-  const char *stage = "准备中";
-  if (st.weOp) {
-    done = st.weOp->progressCompleted();
-    total = st.weOp->progressTotal();
-    stage = weStageName(st.weOp->progressStage());
-  }
-  int y = top + 8 + uiLineHeight() + 16;
-  g_rd.drawText(uiFontId(), MARGIN, y + uiAsc(), stage, true);
-  y += uiLineHeight() + 10;
-
-  // 进度条（20 段）
-  const int barW = w - 2 * MARGIN;
-  const int barH = uiLineHeight();
-  g_rd.drawRect(MARGIN, y, barW, barH, true);
-  const int pct = (total > 0) ? static_cast<int>((static_cast<uint64_t>(done) * 100) / total) : 0;
-  g_rd.fillRect(MARGIN + 1, y + 1, (barW - 2) * pct / 100, barH - 2, true);
-  y += barH + 8;
-  char buf[64];
-  if (total > 0) snprintf(buf, sizeof(buf), "%u / %u  (%d%%)", static_cast<unsigned>(done),
-                          static_cast<unsigned>(total), pct);
-  else snprintf(buf, sizeof(buf), "处理中...");
-  drawLineText(MARGIN, y, buf, true);
-
-  drawFooter("Esc 取消");
-}
-
-static void handleWeread(int key) {
-  if (key == KEY_LEFT) { switchTab(st.tab - 1); return; }
-  if (key == KEY_RIGHT) { switchTab(st.tab + 1); return; }
-  if (key == 0x1B || key == KEY_LONG_CONFIRM) { switchTab(0); return; }
-  if (key == KEY_UP || key == KEY_DOWN) {
-    if (!st.weShelf.empty()) {
-      st.weSel = clampI(st.weSel + (key == KEY_DOWN ? 1 : -1), 0, static_cast<int>(st.weShelf.size()) - 1);
-    }
-    st.dirty = 1;
-    return;
-  }
-  if (key != '\n') return;
-  // 触摸点按只读一次：input_tap_xy 读后即清，读第二次一定是空的。
-  int x = 0, y = 0;
-  const bool tapped = input_tap_xy(&x, &y);
-  if (tapped) {
-    const int t = tabHit(x, y);
-    if (t >= 0) { switchTab(t); return; }
-  }
-  if (!weSessionValid()) {
-    if (!WeReadStore::hasAcceptedDisclaimer()) {
-      WeReadStore::acceptDisclaimer();
-      st.dirty = 1;
-      return;
-    }
-    weBeginJob(0, nullptr);   // 登录 + 同步书架
-    return;
-  }
-  if (st.weShelf.empty()) { weBeginJob(0, nullptr); return; }
-  // 点按落到哪一行就选哪一行，再进书目菜单。
-  if (tapped && y >= coverTop()) {
-    const int idx = st.weScroll + (y - coverTop()) / weItemH();
-    if (idx >= 0 && idx < static_cast<int>(st.weShelf.size())) st.weSel = idx;
-  }
-  st.weMenuSel = 0;
-  st.weStatus.clear();
-  st.mode = RdMode::WereadMenu;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-static void handleWereadQr(int key) {
-  if (key == 0x1B || key == KEY_LONG_CONFIRM) {
-    if (st.weOp) st.weOp->cancel();
-    return;
-  }
-}
-
-static void handleWereadMenu(int key) {
-  const auto items = weMenuItems();
-  const int n = static_cast<int>(items.size());
-  if (key == KEY_UP || key == KEY_DOWN) {
-    st.weMenuSel = clampI(st.weMenuSel + (key == KEY_DOWN ? 1 : -1), 0, n - 1);
-    st.dirty = 1;
-    return;
-  }
-  if (key == 0x1B || key == KEY_LONG_CONFIRM) {
-    st.weStatus.clear();
-    st.mode = RdMode::Weread;
-    st.fullRefresh = true;
-    st.dirty = 1;
-    return;
-  }
-  if (key != '\n') return;
-  int tx = 0, ty = 0;
-  if (input_tap_xy(&tx, &ty)) {
-    // 点在哪一行就选哪一行；点在菜单外（标题/空白）忽略。
-    const int hit = (ty - weMenuFirstY()) / weMenuItemH();
-    if (ty >= weMenuFirstY() && hit >= 0 && hit < n) st.weMenuSel = hit;
-    else return;
-  }
-  const int idx = weBookIndex();
-  if (idx < 0 || idx >= static_cast<int>(st.weShelf.size())) return;
-  const auto &b = st.weShelf[idx];
-  const std::string finalPath = WeReadStore::finalBookPath(b);
-  const bool cached = Storage.exists(finalPath.c_str());
-  const std::string label = items[clampI(st.weMenuSel, 0, n - 1)];
-
-  if (label == "打开本书") {
-    if (openBook(finalPath, 0)) { st.mode = RdMode::Reading; st.fullRefresh = true; st.dirty = 1; }
-    else { st.weStatus = "打不开已缓存的书"; st.dirty = 1; }
-    return;
-  }
-  if (label == "删除本地缓存") {
-    if (Storage.exists(finalPath.c_str())) Storage.remove(finalPath.c_str());
-    st.weStatus = "已删除本地缓存";
-    st.dirty = 1;
-    return;
-  }
-  if (label == "取消") {
-    st.mode = RdMode::Weread;
-    st.dirty = 1;
-    return;
-  }
-  // 缓存整本 / 重新缓存
-  (void)cached;
-  weBeginJob(1, &b);
-  if (st.weKind == 1 && st.weStatus.empty()) {
-    st.mode = RdMode::WereadDl;
-    st.fullRefresh = true;
-    st.dirty = 1;
-  }
-}
-
-static void handleWereadDl(int key) {
-  if ((key == 0x1B || key == KEY_LONG_CONFIRM) && st.weOp) st.weOp->cancel();
-}
-
-// ── WiFi 管理 ────────────────────────────────────────────────────────────
-static const int kWifiRows = 4;  // SSID / 密码 / 连接 / 断开
-static int wifiListTop() { return coverTop() + (uiLineHeight() + 12); }  // 状态行 + 分隔线
-
-static void renderWifi() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int top = drawTitle("WiFi 管理");
-  int itemH = uiLineHeight() + 12;
-  // 状态行
-  std::string status;
-  if (st.wifiBusy) status = "连接中...";
-  else if (!st.wifiStatus.empty()) status = st.wifiStatus;
-  else if (g_wifi.isConnected()) { std::string ip = g_wifi.getIp(); status = ip.empty() ? "已连接" : ("已连接  IP " + ip); }
-  else status = "未连接";
-  drawLineText(MARGIN, top, status.c_str(), true);
-  int ly = top + itemH;
-  g_rd.drawLine(0, ly, w, ly, true);
-  // 行
-  std::string rows[4];
-  rows[0] = "SSID: " + st.wifiSsidEdit;
-  rows[1] = "密码: " + std::string(st.wifiPassEdit.size(), '*');
-  rows[2] = "连接";
-  rows[3] = "断开";
-  for (int i = 0; i < 4; i++) {
-    int ry = ly + i * itemH;
-    if (i == st.wifiField) {
-      g_rd.fillRect(0, ry, w, itemH, true);
-      drawLineText(MARGIN, ry + 6, rows[i].c_str(), false);
-    } else {
-      drawLineText(MARGIN, ry + 6, rows[i].c_str(), true);
-    }
-  }
-  if (st.vkVisible) drawVk();
-  else drawFooter(st.wifiEditing ? "输入中  Enter 完成  Esc 取消" : "↑↓ 选择  Enter 编辑/执行  Esc 返回");
-  if (st.wifiEditing) rdDrawVkIcon();  // 只有在编辑字段（键盘可用）时才给开关
-}
-
-static void handleWifi(int key) {
-  if (key == 0x1B) {
-    if (st.wifiEditing) {
-      IME::getInstance().cancelComposition();
-      st.wifiEditing = false;
-      st.vkVisible = false;
-      st.dirty = 1;
-    } else {
-      st.mode = st.retMode;
-      st.fullRefresh = true;
-      st.dirty = 1;
-    }
-    return;
-  }
-  if (st.wifiEditing) {
-    if (key == '\n') {
-      int x, y;
-      if (input_tap_xy(&x, &y)) {
-        // 状态栏右端的键盘图标（编辑态才画）：点一下开/收键盘。
-        if (rdVkIconHit(x, y)) {
-          st.vkVisible = !st.vkVisible;
-          st.dirty = 1;
-          return;
-        }
-        if (st.vkVisible) {
-          vkTap(x, y);
-          st.dirty = 1;
-          return;
-        }
-      }
-      vkEnter();  // BLE/KEY3 回车 → 完成；键盘收起时的点按同样走"完成"
-      st.dirty = 1;
-      return;
-    }
-    if (key == 0x08) { feedVkBackspace(); st.dirty = 1; return; }
-    if (key >= 0x20 && key <= 0x7E) { feedVkKey(key); st.dirty = 1; return; }
-    return;
-  }
-  if (key == KEY_UP) { st.wifiField = std::max(0, st.wifiField - 1); st.wifiStatus.clear(); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.wifiField = std::min(kWifiRows - 1, st.wifiField + 1); st.wifiStatus.clear(); st.dirty = 1; return; }
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      int itemH = uiLineHeight() + 12;
-      int row = (y - wifiListTop()) / itemH;
-      if (row >= 0 && row < kWifiRows) st.wifiField = row;
-      st.wifiStatus.clear();
-    }
-    if (st.wifiField == 0 || st.wifiField == 1) {
-      // 进入编辑
-      st.wifiEditing = true;
-      rdVkWantShow();
-      st.dirty = 1;
-    } else if (st.wifiField == 2) {
-      // 连接（阻塞式，最多 10s，与写作模式设置页一致）
-      if (st.wifiSsidEdit.empty()) { st.wifiStatus = "SSID 为空"; st.dirty = 1; return; }
-      g_settings.setWifiSsid(st.wifiSsidEdit);
-      g_settings.setWifiPassword(st.wifiPassEdit);
-      st.wifiBusy = true;
-      st.fullRefresh = true;
-      st.dirty = 1;
-      g_wifi.begin();
-      bool ok = g_wifi.connect(st.wifiSsidEdit.c_str(), st.wifiPassEdit.c_str());
-      st.wifiBusy = false;
-      // 失败时把 reason 码翻成人话贴出来：最常见的是"密码错"与"找不到该 SSID"，两者
-      // 的处理办法完全不同，笼统写"检查 SSID/密码"帮不上忙。
-      st.wifiStatus = ok ? ("已连接  IP " + g_wifi.getIp())
-                         : (std::string("连接失败: ") + g_wifi.lastReasonText());
-      st.dirty = 1;
-    } else if (st.wifiField == 3) {
-      g_wifi.disconnect();
-      st.wifiStatus = "已断开";
-      st.dirty = 1;
-    }
-    return;
-  }
-}
-
-// ── OPDS 书库 ───────────────────────────────────────────────────────────
-// 列表条目来自当前 feed；末行固定为“目录地址”（Enter 进入编辑）。Esc 沿导航栈
-// 逐级返回上一目录，栈空则回阅读菜单。
-static int opdsListTop() { return coverTop() + (uiLineHeight() + 12); }  // 状态行 + 分隔线
-
-// 按屏幕宽度截断（超出加省略号），避免 e-ink 上文字画出屏外。
-static std::string fitWidth(const std::string &s, int maxW) {
-  if (g_rd.getTextWidth(uiFontId(), s.c_str()) <= maxW) return s;
-  std::string out;
-  size_t i = 0;
-  while (i < s.size()) {
-    int n = utf8Len(static_cast<unsigned char>(s[i]));
-    if (i + n > s.size()) break;
-    std::string t = out + s.substr(i, n);
-    if (g_rd.getTextWidth(uiFontId(), (t + "…").c_str()) > maxW) break;
-    out = t;
-    i += n;
-  }
-  return out + "…";
-}
-
-static std::string opdsRowText(int idx) {
-  if (idx >= static_cast<int>(st.opdsEntries.size())) return "目录地址: " + st.opdsUrl;
-  const OpdsEntry &e = st.opdsEntries[idx];
-  if (e.type == OpdsEntryType::BOOK) {
-    std::string s = "[书] " + e.title;
-    if (!e.author.empty()) s += "  — " + e.author;
-    return s;
-  }
-  return "[目录] " + e.title;
-}
-
-// 阻塞拉取一个 feed 并替换当前列表（导航栈不变）。
-static void opdsLoadFeed(const std::string &url) {
-  st.opdsBusy = true;
-  st.opdsStatus = "加载中...";
-  st.fullRefresh = true;
-  st.dirty = 1;
-  renderCurrent();  // 先刷出“加载中”，随后是阻塞式的网络请求
-  st.fullRefresh = false;
-
-  std::vector<OpdsEntry> entries;
-  std::string next, err;
-  bool ok = opdsFetchFeed(url, entries, next, err);
-  st.opdsBusy = false;
-  if (!ok) {
-    st.opdsStatus = "加载失败: " + err;
-    st.dirty = 1;
-    return;
-  }
-  st.opdsUrl = url;
-  st.opdsEntries = std::move(entries);
-  st.opdsSel = 0;
-  st.opdsStatus = std::to_string(st.opdsEntries.size()) + " 条";
-  st.dirty = 1;
-}
-
-static void opdsBeginLoad(const std::string &url) {
-  st.opdsStack.clear();
-  opdsLoadFeed(url);
-}
-
-static void renderOpds() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int itemH = uiLineHeight() + 12;
-
-  if (st.opdsEditing) {
-    int top = drawTitle("OPDS 目录地址");
-    drawLineText(MARGIN, top, "地址:", true);
-    std::string shown = st.opdsUrlEdit.empty() ? "（空）" : st.opdsUrlEdit;
-    drawLineText(MARGIN, top + itemH, fitWidth(shown, w - 2 * MARGIN).c_str(), true);
-    drawLineText(MARGIN, top + 2 * itemH, "例: http://主机:端口/opds", true);
-    if (st.vkVisible) drawVk();
-    else drawFooter("输入中  Enter 完成  Esc 取消");
-    rdDrawVkIcon();
-    return;
-  }
-
-  int top = drawTitle("OPDS 书库");
-  std::string status;
-  if (st.opdsBusy) status = "网络请求中...";
-  else if (!st.opdsStatus.empty()) status = st.opdsStatus;
-  else if (!g_wifi.isConnected()) status = "未连接 WiFi（先到 WiFi 管理连接）";
-  else status = "未设置目录地址";
-  drawLineText(MARGIN, top, fitWidth(status, w - 2 * MARGIN).c_str(), true);
-  int ly = top + itemH;
-  g_rd.drawLine(0, ly, w, ly, true);
-
-  int n = static_cast<int>(st.opdsEntries.size()) + 1;  // 末行 = 地址行
-  int viewH = statusTop() - ly - 8;
-  int maxRows = std::max(1, viewH / itemH);
-  int start = clampI(st.opdsSel - maxRows / 2, 0, std::max(0, n - maxRows));
-  for (int i = 0; i < maxRows && start + i < n; i++) {
-    int idx = start + i;
-    int y = ly + i * itemH;
-    std::string txt = fitWidth(opdsRowText(idx), w - 2 * MARGIN);
-    if (idx == st.opdsSel) {
-      g_rd.fillRect(0, y, w, itemH, true);
-      drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, txt.c_str(), false);
-    } else {
-      drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, txt.c_str(), true);
-    }
-  }
-  drawFooter("↑↓ 选择  Enter 打开/下载  Esc 返回");
-}
-
-static void handleOpds(int key) {
-  if (st.opdsEditing) {
-    if (key == 0x1B) {
-      IME::getInstance().cancelComposition();
-      st.opdsEditing = false;
-      st.vkVisible = false;
-      st.dirty = 1;
-      return;
-    }
-    if (key == '\n') {
-      int x, y;
-      if (input_tap_xy(&x, &y)) {
-        // 状态栏右端的键盘图标：点一下开/收键盘。
-        if (rdVkIconHit(x, y)) {
-          st.vkVisible = !st.vkVisible;
-          st.dirty = 1;
-          return;
-        }
-        if (st.vkVisible) {
-          vkTap(x, y);
-          st.dirty = 1;
-          return;
-        }
-      }
-      vkEnter();  // 非点按回车（BLE/KEY3）→ 保存并加载；键盘收起时的点按同样走"保存"
-      st.dirty = 1;
-      return;
-    }
-    if (key == 0x08) { feedVkBackspace(); st.dirty = 1; return; }
-    if (key >= 0x20 && key <= 0x7E) { feedVkKey(key); st.dirty = 1; return; }
-    return;
-  }
-
-  if (st.opdsBusy) return;  // 阻塞请求期间不接受输入
-
-  int n = static_cast<int>(st.opdsEntries.size()) + 1;
-
-  if (key == 0x1B) {
-    if (!st.opdsStack.empty()) {
-      std::string prev = st.opdsStack.back();
-      st.opdsStack.pop_back();
-      opdsLoadFeed(prev);
-    } else {
-      st.mode = st.retMode;
-      st.fullRefresh = true;
-      st.dirty = 1;
-    }
-    return;
-  }
-  if (key == KEY_UP) { st.opdsSel = std::max(0, st.opdsSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.opdsSel = std::min(n - 1, st.opdsSel + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.opdsSel = std::max(0, st.opdsSel - 8); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.opdsSel = std::min(n - 1, st.opdsSel + 8); st.dirty = 1; return; }
-  if (key != '\n') return;
-
-  int x, y;
-  if (input_tap_xy(&x, &y)) {
-    int itemH = uiLineHeight() + 12;
-    int ly = opdsListTop();
-    int viewH = statusTop() - ly - 8;
-    int maxRows = std::max(1, viewH / itemH);
-    int start = clampI(st.opdsSel - maxRows / 2, 0, std::max(0, n - maxRows));
-    int row = start + (y - ly) / itemH;
-    if (row >= 0 && row < n) st.opdsSel = row;
-    st.dirty = 1;
-    return;
-  }
-
-  if (st.opdsSel >= static_cast<int>(st.opdsEntries.size())) {
-    st.opdsUrlEdit = st.opdsUrl;  // 地址行 → 编辑
-    st.opdsEditing = true;
-    rdVkWantShow();
-    st.dirty = 1;
-    return;
-  }
-
-  const OpdsEntry &e = st.opdsEntries[st.opdsSel];
-  if (e.type == OpdsEntryType::NAVIGATION) {
-    st.opdsStack.push_back(st.opdsUrl);
-    opdsLoadFeed(e.href);
-    return;
-  }
-
-  // 电子书：下载到 /sdcard/books/
-  std::string fname = opdsFilenameFromUrl(e.href);
-  if (fname.empty()) fname = "opds_book.epub";
-  Storage.mkdir("/sdcard/books", true);
-  std::string dest = std::string("/sdcard/books/") + fname;
-  std::string href = e.href;  // 拷贝：下面的 renderCurrent 不再改动 vector，但保险起见
-
-  st.opdsBusy = true;
-  st.opdsStatus = "准备下载 " + fname;
-  st.fullRefresh = true;
-  st.dirty = 1;
-  renderCurrent();
-  st.fullRefresh = false;
-
-  int lastPct = -1;
-  size_t lastBytes = 0;
-  auto progress = [&](size_t got, size_t total) {
-    char b[96];
-    if (total > 0) {
-      int pct = static_cast<int>(got * 100 / total);
-      if (pct < lastPct + 5) return;
-      lastPct = pct;
-      snprintf(b, sizeof(b), "下载 %d%%  %u/%u KB", pct, static_cast<unsigned>(got / 1024),
-               static_cast<unsigned>(total / 1024));
-    } else {
-      if (got < lastBytes + 256 * 1024) return;
-      lastBytes = got;
-      snprintf(b, sizeof(b), "下载 %u KB", static_cast<unsigned>(got / 1024));
-    }
-    st.opdsStatus = b;
-    st.fullRefresh = false;
-    st.dirty = 1;
-    renderCurrent();
-  };
-
-  std::string err;
-  bool ok = opdsDownloadFile(href, dest, progress, err);
-  st.opdsBusy = false;
-  if (ok) {
-    st.opdsStatus = "已下载 " + fname;
-    scanBooks();
-  } else {
-    st.opdsStatus = "下载失败: " + err;
-  }
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-// ── 词典下载 ────────────────────────────────────────────────────────────
-// 清单来自 crossmux 的词典 API（JSON，schema 见 dictionary_store.h），下载后装到
-// /sdcard/dictionaries/<id>/，与阅读菜单里的「词典」查询共用同一个目录。
-// 下载是阻塞式的（44MB 的大词典要几分钟），期间走进度版面。
-static int dictDlRowCount() {
-  return static_cast<int>(st.dictCat.items.size()) + 1;  // 末行 = 重新获取清单
-}
-
-// 确保 WiFi 已连（未连则按设置里的 SSID/密码连一次）。
-static bool readerEnsureWifi(std::string &err) {
-  if (g_wifi.isConnected()) return true;
-  std::string ssid = g_settings.wifiSsid();
-  std::string pass = g_settings.wifiPassword();
-  if (ssid.empty()) {
-    err = "未配置 WiFi（先到 WiFi 管理填写）";
-    return false;
-  }
-  g_wifi.begin();
-  if (!g_wifi.connect(ssid.c_str(), pass.c_str())) {
-    err = "WiFi 连接失败";
-    return false;
-  }
-  return true;
-}
-
-// 用本地目录里的安装状态刷新清单条目。
-static void dictDlRefreshInstalled() {
-  std::vector<DictLocalItem> local;
-  dictListLocal(local);
-  for (auto &it : st.dictCat.items) {
-    it.installedRevision = 0;
-    for (const auto &l : local)
-      if (l.id == it.id) { it.installedRevision = l.revision; break; }
-  }
-  st.dictOpen = false;  // 目录内容变了，查询界面下次重新解析
-}
-
-static std::string dictDlRowText(int idx) {
-  if (idx >= static_cast<int>(st.dictCat.items.size())) return "重新获取清单";
-  const DictCatalogItem &it = st.dictCat.items[idx];
-  std::string s;
-  if (it.updateAvailable()) s = "↑ ";
-  else if (it.installed()) s = "✓ ";
-  else s = "· ";
-  s += it.name;
-  s += "  " + dictFormatSize(it.totalSize);
-  if (it.updateAvailable()) s += " 有更新";
-  return s;
-}
-
-static void dictDlLoadCatalog() {
-  st.dictDlBusy = true;
-  st.dictDlStatus = "加载中...";
-  st.fullRefresh = true;
-  st.dirty = 1;
-  renderCurrent();  // 先刷出“加载中”，随后是阻塞式请求
-  st.fullRefresh = false;
-
-  std::string url = g_settings.getString("dict_manifest_url");
-  if (url.empty()) url = DICT_MANIFEST_DEFAULT;
-
-  // 先连 WiFi 再拉清单：原来这里**不连**，只有下面的下载步骤才连——没网时清单请求
-  // 直接死在 DNS（日志：esp-tls couldn't get hostname … getaddrinfo() returns 202），
-  // 用户看到的是"清单获取失败: ESP_ERR_HTTP_CONNECT"，完全不知道是没联网。
-  if (!g_wifi.isConnected()) {
-    st.dictDlStatus = "正在连接 WiFi...";
-    st.dirty = 1;
-    renderCurrent();
-    std::string werr;
-    if (!readerEnsureWifi(werr)) {
-      st.dictDlBusy = false;
-      st.dictDlStatus = werr;
-      st.dirty = 1;
-      return;
-    }
-    st.dictDlStatus = "加载中...";
-    st.dirty = 1;
-  }
-
-  DictCatalog cat;
-  std::string err;
-  bool ok = dictCatalogFetch(url, cat, err);
-  st.dictDlBusy = false;
-  if (!ok) {
-    st.dictDlStatus = "清单获取失败: " + err;
-    st.dirty = 1;
-    return;
-  }
-  st.dictCat = std::move(cat);
-  st.dictDlSel = 0;
-  st.dictDlDelArm.clear();
-  dictDlRefreshInstalled();
-  st.dictDlStatus = std::to_string(st.dictCat.items.size()) + " 个词典  rev " +
-                    std::to_string(st.dictCat.revision);
-  st.dirty = 1;
-}
-
-// 进度条：边框 + 按比例填充。
-static void drawProgressBar(int x, int y, int w, int h, size_t got, size_t total) {
-  g_rd.drawRect(x, y, w, h, true);
-  if (total == 0 || w <= 6 || h <= 6) return;
-  int fw = static_cast<int>(static_cast<uint64_t>(w - 4) * got / total);
-  if (fw > w - 4) fw = w - 4;
-  if (fw > 0) g_rd.fillRect(x + 2, y + 2, fw, h - 4, true);
-}
-
-static void renderDictDlProgress() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int top = drawTitle("词典下载");
-  int idx = clampI(st.dictDlSel, 0, static_cast<int>(st.dictCat.items.size()) - 1);
-  const char *name = idx >= 0 ? st.dictCat.items[idx].name.c_str() : "";
-
-  drawLineText(MARGIN, top, fitWidth(name, w - 2 * MARGIN).c_str(), true);
-  int y = top + uiLineHeight() + 6;
-
-  char line[128];
-  snprintf(line, sizeof(line), "%s  (%d/%d)", st.dictDlPhase.c_str(), st.dictDlFileIdx + 1,
-           st.dictDlFileCount);
-  drawLineText(MARGIN, y, fitWidth(line, w - 2 * MARGIN).c_str(), true);
-  y += uiLineHeight() + 4;
-
-  int barH = uiLineHeight();
-  drawProgressBar(MARGIN, y, w - 2 * MARGIN, barH, st.dictDlDone, st.dictDlTotal);
-  y += barH + 10;
-
-  size_t pct = st.dictDlTotal ? st.dictDlDone * 100 / st.dictDlTotal : 0;
-  snprintf(line, sizeof(line), "总进度 %u%%   %s / %s", static_cast<unsigned>(pct),
-           dictFormatSize(st.dictDlDone).c_str(), dictFormatSize(st.dictDlTotal).c_str());
-  drawLineText(MARGIN, y, fitWidth(line, w - 2 * MARGIN).c_str(), true);
-  y += uiLineHeight() + 4;
-
-  if (st.dictDlFileTotal) {
-    snprintf(line, sizeof(line), "本文件 %s / %s", dictFormatSize(st.dictDlFileGot).c_str(),
-             dictFormatSize(st.dictDlFileTotal).c_str());
-    drawLineText(MARGIN, y, fitWidth(line, w - 2 * MARGIN).c_str(), true);
-  }
-
-  drawFooter("下载中… 请勿断电");
-}
-
-static void renderDictDl() {
-  if (st.dictDlBusy && st.dictDlTotal > 0) {
-    renderDictDlProgress();
-    return;
-  }
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int itemH = uiLineHeight() + 12;
-  int top = drawTitle("词典下载");
-
-  std::string status;
-  if (st.dictDlBusy) status = "网络请求中...";
-  else if (!st.dictDlStatus.empty()) status = st.dictDlStatus;
-  else if (!g_wifi.isConnected()) status = "未连接 WiFi（先到 WiFi 管理连接）";
-  else status = "正在获取清单...";
-  drawLineText(MARGIN, top, fitWidth(status, w - 2 * MARGIN).c_str(), true);
-  int ly = top + itemH;
-  g_rd.drawLine(0, ly, w, ly, true);
-
-  int n = dictDlRowCount();
-  int viewH = statusTop() - ly - 8;
-  int maxRows = std::max(1, viewH / itemH);
-  int start = clampI(st.dictDlSel - maxRows / 2, 0, std::max(0, n - maxRows));
-  for (int i = 0; i < maxRows && start + i < n; i++) {
-    int idx = start + i;
-    int y = ly + i * itemH;
-    std::string txt = fitWidth(dictDlRowText(idx), w - 2 * MARGIN);
-    if (idx == st.dictDlSel) {
-      g_rd.fillRect(0, y, w, itemH, true);
-      drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, txt.c_str(), false);
-    } else {
-      drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, txt.c_str(), true);
-    }
-  }
-  drawFooter("↑↓ 选择  Enter 下载/更新  长按 删除  Esc 返回");
-}
-
-static void dictDlInstall() {
-  int idx = clampI(st.dictDlSel, 0, static_cast<int>(st.dictCat.items.size()) - 1);
-  if (idx < 0) return;
-  const DictCatalogItem &item = st.dictCat.items[idx];
-
-  if (!g_wifi.isConnected()) {
-    st.dictDlStatus = "正在连接 WiFi...";
-    st.fullRefresh = true;
-    st.dirty = 1;
-    renderCurrent();
-    st.fullRefresh = false;
-    std::string werr;
-    if (!readerEnsureWifi(werr)) {
-      st.dictDlStatus = werr;
-      st.dirty = 1;
-      return;
-    }
-  }
-
-  st.dictDlBusy = true;
-  st.dictDlPhase = "准备中";
-  st.dictDlDone = 0;
-  st.dictDlTotal = item.totalSize;
-  st.dictDlFileIdx = 0;
-  st.dictDlFileCount = item.fileCount();
-  st.dictDlFileGot = st.dictDlFileTotal = 0;
-  st.fullRefresh = true;
-  st.dirty = 1;
-  renderCurrent();
-  st.fullRefresh = false;
-
-  int lastBucket = -1;
-  std::string id = item.id;
-  auto progress = [&](int fi, int fc, size_t got, size_t total, const char *phase) {
-    size_t done = got;
-    for (int k = 0; k < fi && k < item.fileCount(); k++) done += item.files[k].size;
-    size_t all = item.totalSize ? item.totalSize : 1;
-    st.dictDlPhase = phase;
-    st.dictDlFileIdx = fi;
-    st.dictDlFileCount = fc;
-    st.dictDlFileGot = got;
-    st.dictDlFileTotal = total;
-    st.dictDlDone = done;
-    int bucket = static_cast<int>(done * 20 / all);  // 5% 一档，避免每 4KB 重刷一次
-    if (bucket == lastBucket) return;
-    lastBucket = bucket;
-    st.fullRefresh = false;
-    st.dirty = 1;
-    renderCurrent();
-  };
-
-  std::string err;
-  bool ok = dictInstall(st.dictCat, idx, progress, err);
-  st.dictDlBusy = false;
-  st.dictDlTotal = 0;
-  if (ok) {
-    // 首次安装时把它设为当前词典，省得再去设置里选。
-    if (g_settings.getString("reader_dict").empty()) g_settings.setString("reader_dict", id);
-    dictDlRefreshInstalled();
-    st.dictDlStatus = "已安装 " + item.name;
-  } else {
-    st.dictDlStatus = "下载失败: " + err;
-  }
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-static void handleDictDl(int key) {
-  if (st.dictDlBusy) return;  // 阻塞请求期间不接受输入
-  int n = dictDlRowCount();
-
-  if (key == 0x1B) {
-    st.dictDlDelArm.clear();
-    st.mode = st.retMode;
-    st.fullRefresh = true;
-    st.dirty = 1;
-    return;
-  }
-  if (key == KEY_UP) { st.dictDlSel = std::max(0, st.dictDlSel - 1); st.dictDlDelArm.clear(); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.dictDlSel = std::min(n - 1, st.dictDlSel + 1); st.dictDlDelArm.clear(); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.dictDlSel = std::max(0, st.dictDlSel - 8); st.dictDlDelArm.clear(); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.dictDlSel = std::min(n - 1, st.dictDlSel + 8); st.dictDlDelArm.clear(); st.dirty = 1; return; }
-
-  // 长按中间键删除本地词典：第一次置位并提示，再长按一次才真删。
-  if (key == KEY_LONG_CONFIRM) {
-    if (st.dictDlSel >= static_cast<int>(st.dictCat.items.size())) return;
-    const DictCatalogItem &it = st.dictCat.items[st.dictDlSel];
-    if (!it.installed()) {
-      st.dictDlStatus = "未安装，无需删除";
-      st.dirty = 1;
-      return;
-    }
-    if (st.dictDlDelArm != it.id) {
-      st.dictDlDelArm = it.id;
-      st.dictDlStatus = "再长按一次删除 " + it.name;
-      st.dirty = 1;
-      return;
-    }
-    std::string err;
-    bool ok = dictDelete(it.id, err);
-    st.dictDlDelArm.clear();
-    if (ok) {
-      dictDlRefreshInstalled();
-      st.dictDlStatus = "已删除 " + it.name;
-    } else {
-      st.dictDlStatus = "删除失败: " + err;
-    }
-    st.fullRefresh = true;
-    st.dirty = 1;
-    return;
-  }
-
-  if (key != '\n') return;
-
-  int x, y;
-  if (input_tap_xy(&x, &y)) {
-    int itemH = uiLineHeight() + 12;
-    int ly = coverTop() + itemH;
-    int viewH = statusTop() - ly - 8;
-    int maxRows = std::max(1, viewH / itemH);
-    int start = clampI(st.dictDlSel - maxRows / 2, 0, std::max(0, n - maxRows));
-    int row = start + (y - ly) / itemH;
-    if (row >= 0 && row < n) st.dictDlSel = row;
-    st.dictDlDelArm.clear();
-    st.dirty = 1;
-    return;
-  }
-
-  if (st.dictDlSel >= static_cast<int>(st.dictCat.items.size())) {
-    dictDlLoadCatalog();
-    return;
-  }
-  dictDlInstall();
-}
-
-// ── 资源下载 ────────────────────────────────────────────────────────────
-// 原写作模式设置的「资源下载」分类（词典清单地址 / 字体下载地址 / 下载字体），
-// 按用户要求整类搬到阅读设置的标签下。清单地址就是「词典下载」读取的那一个键
-// （dict_manifest_url，空=内置默认），所以放这儿正对着它的使用方；字体下完落到
-// /sdcard/fonts/，再回「字体」设置里挑。布局与 WiFi 管理同构（状态行 + 字段行）。
-static const int kResRows = 3;                                          // 清单地址 / 字体地址 / 下载
-static int resListTop() { return coverTop() + (uiLineHeight() + 12); }  // 状态行 + 分隔线
-
-// 编辑中的字段显示尾巴（正在输入的是末尾），其余字段显示开头并截断——地址很长时
-// 两者都不至于把行画到屏外。
-static std::string resRowText(const std::string &s, bool tail) {
-  const int maxW = g_rd.getScreenWidth() - 2 * MARGIN;
-  if (g_rd.getTextWidth(uiFontId(), s.c_str()) <= maxW) return s;
-  std::string out;
-  if (!tail) {
-    size_t i = 0;
-    while (i < s.size()) {
-      int n = utf8Len(static_cast<unsigned char>(s[i]));
-      if (i + n > s.size()) break;
-      std::string t = out + s.substr(i, n);
-      if (g_rd.getTextWidth(uiFontId(), (t + "…").c_str()) > maxW) break;
-      out = t;
-      i += n;
-    }
-    return out + "…";
-  }
-  size_t i = s.size();
-  while (i > 0) {
-    size_t p = i - 1;
-    while (p > 0 && (static_cast<unsigned char>(s[p]) & 0xC0) == 0x80) p--;
-    std::string t = "…" + s.substr(p);
-    if (g_rd.getTextWidth(uiFontId(), t.c_str()) > maxW) break;
-    out = s.substr(p);
-    i = p;
-  }
-  return "…" + out;
-}
-
-static void renderResDl() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int top = drawTitle("资源下载");
-  int itemH = uiLineHeight() + 12;
-  std::string status;
-  if (st.resBusy) status = "正在下载字体 " + std::to_string(st.resPct) + "%";
-  else if (!st.resStatus.empty()) status = st.resStatus;
-  else if (!g_wifi.isConnected()) status = "未连接 WiFi（下载前会先连）";
-  else { std::string ip = g_wifi.getIp(); status = ip.empty() ? "已连接" : ("已连接  IP " + ip); }
-  drawLineText(MARGIN, top, fitWidth(status, w - 2 * MARGIN).c_str(), true);
-  int ly = top + itemH;
-  g_rd.drawLine(0, ly, w, ly, true);
-  std::string rows[kResRows];
-  rows[0] = "词典清单地址: " + (st.resDictEdit.empty() ? std::string("(内置默认)") : st.resDictEdit);
-  rows[1] = "字体下载地址: " + (st.resFontEdit.empty() ? std::string("(未设置)") : st.resFontEdit);
-  rows[2] = "下载字体";
-  for (int i = 0; i < kResRows; i++) {
-    int ry = ly + i * itemH;
-    const bool sel = (i == st.resField);
-    std::string t = (i == 2) ? rows[i]
-                             : resRowText(rows[i], sel && st.resEditing);  // 编辑时看尾巴
-    if (sel) {
-      g_rd.fillRect(0, ry, w, itemH, true);
-      drawLineText(MARGIN, ry + 6, t.c_str(), false);
-    } else {
-      drawLineText(MARGIN, ry + 6, t.c_str(), true);
-    }
-  }
-  if (st.vkVisible) drawVk();
-  else drawFooter(st.resEditing ? "输入中  Enter 完成  Esc 取消"
-                                : "↑↓ 选择  Enter 编辑/下载  Esc 返回");
-  if (st.resEditing) rdDrawVkIcon();  // 只有在编辑字段（键盘可用）时才给开关
-}
-
-// 下载字体：地址→文件名（强制 .ttf，ttf_font_scan 只认它）→ 必要时先连 WiFi →
-// 阻塞下载（每 20% 刷一次）→ 校验 sfnt 头再收下。逻辑与写作设置里那份一致。
-static void resDlInstallFont() {
-  // 顺手把用户刚改过的两个地址落盘：下面要用到字体地址，而清单地址与它同屏。
-  g_settings.setString("dict_manifest_url", st.resDictEdit);
-  g_settings.setString("font_dl_url", st.resFontEdit);
-  const std::string url = st.resFontEdit;
-  if (url.empty()) { st.resStatus = "请先填字体下载地址"; st.dirty = 1; return; }
-
-  std::string fname = opdsFilenameFromUrl(url);
-  if (fname.empty()) fname = "font";
-  if (fname.size() < 4 || strcasecmp(fname.c_str() + fname.size() - 4, ".ttf") != 0) fname += ".ttf";
-  Storage.mkdir("/sdcard/fonts", true);  // 已存在则忽略
-  const std::string dest = std::string("/sdcard/fonts/") + fname;
-
-  if (!g_wifi.isConnected()) {
-    st.resStatus = "正在连接 WiFi...";
-    st.fullRefresh = true;
-    st.dirty = 1;
-    renderCurrent();
-    st.fullRefresh = false;
-    std::string werr;
-    if (!readerEnsureWifi(werr)) { st.resStatus = werr; st.dirty = 1; return; }
-  }
-
-  st.resBusy = true;
-  st.resPct = 0;
-  st.resStatus.clear();
-  st.fullRefresh = true;
-  st.dirty = 1;
-  renderCurrent();
-  st.fullRefresh = false;
-
-  int lastPct = -20;
-  auto progress = [&](size_t got, size_t total) {
-    if (total == 0) return;
-    int pct = static_cast<int>(got * 100 / total);
-    if (pct < lastPct + 20) return;  // 每 20% 刷一次，别把 e-ink 刷爆
-    lastPct = pct;
-    st.resPct = pct;
-    st.dirty = 1;
-    renderCurrent();
-  };
-  std::string err;
-  bool ok = opdsDownloadFile(url, dest, progress, err);
-  st.resBusy = false;
-  std::string msg;
-  if (ok) {
-    // 只认四种 sfnt 头，避免把 HTML 错误页存成 .ttf 后扫描器读崩。
-    FILE *fp = fopen(dest.c_str(), "rb");
-    uint8_t magic[4] = {0};
-    if (fp) { size_t n = fread(magic, 1, 4, fp); fclose(fp); (void)n; }
-    uint32_t m = (uint32_t)magic[0] << 24 | magic[1] << 16 | magic[2] << 8 | magic[3];
-    bool isFont = (m == 0x00010000u) || (m == 0x74727565u) ||  // \x00\x01\x00\x00 / "true"
-                  (m == 0x4F54544Fu) || (m == 0x74797031u);   // "OTTO" / "typ1"
-    if (!isFont) {
-      remove(dest.c_str());
-      msg = "不是有效的 TTF 文件";
-    } else {
-      ttf_font_scan();
-      msg = "已下载 " + fname + "（到字体设置里选）";
-    }
-  } else {
-    msg = "下载失败: " + err;
-  }
-  st.resStatus = msg;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-static void handleResDl(int key) {
-  if (st.resBusy) return;  // 阻塞下载期间不接受输入
-  if (key == 0x1B) {
-    if (st.resEditing) {
-      IME::getInstance().cancelComposition();
-      st.resEditing = false;
-      st.vkVisible = false;
-      st.dirty = 1;
-    } else {
-      st.mode = st.retMode;
-      st.fullRefresh = true;
-      st.dirty = 1;
-    }
-    return;
-  }
-  if (st.resEditing) {
-    if (key == '\n') {
-      int x, y;
-      if (input_tap_xy(&x, &y)) {
-        if (rdVkIconHit(x, y)) { st.vkVisible = !st.vkVisible; st.dirty = 1; return; }
-        if (st.vkVisible) { vkTap(x, y); st.dirty = 1; return; }
-      }
-      vkEnter();  // 提交并退出编辑（vkEnter 的 ResDl 分支里已落盘、已清 resEditing）
-      st.dirty = 1;
-      return;
-    }
-    if (key == 0x08) { feedVkBackspace(); st.dirty = 1; return; }
-    if (key >= 0x20 && key <= 0x7E) { feedVkKey(key); st.dirty = 1; return; }
-    return;
-  }
-  if (key == KEY_UP) { st.resField = std::max(0, st.resField - 1); st.resStatus.clear(); st.dirty = 1; return; }
-  if (key == KEY_DOWN) {
-    st.resField = std::min(kResRows - 1, st.resField + 1);
-    st.resStatus.clear();
-    st.dirty = 1;
-    return;
-  }
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      int itemH = uiLineHeight() + 12;
-      int row = (y - resListTop()) / itemH;
-      if (row >= 0 && row < kResRows) st.resField = row;
-      st.resStatus.clear();
-    }
-    if (st.resField == 0 || st.resField == 1) {
-      st.resEditing = true;
-      rdVkWantShow();
-      st.dirty = 1;
-    } else if (st.resField == 2) {
-      resDlInstallFont();
-    }
-    return;
-  }
-}
-
-// ── BLE 按键映射 ────────────────────────────────────────────────────────
-// 把蓝牙键盘/遥控器上的任意一个键绑到阅读动作（翻页/确认/返回/上下左右）。
-// 廉价遥控器/翻页器只发消费类(HID Consumer Control)报告，键码是
-// KEY_CONSUMER_BASE|usage（见 bt_keyboard.cpp），不映射就完全没反应。
-// 映射只在阅读模式内生效——翻译发生在 screen_reader_handle 顶部，写作模式不受影响。
-static void renderKeyMap() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int itemH = uiLineHeight() + 12;
-  int top = drawTitle("按键映射");
-
-  std::string status;
-  if (st.keyMapCapture >= 0) status = "请按遥控器/键盘上要绑定的键…（Esc 取消）";
-  else if (!st.keyMapStatus.empty()) status = st.keyMapStatus;
-  else if (!g_bt.isConnected()) status = "未连接蓝牙设备（先到「蓝牙管理」配对）";
-  else status = "选中一行按 Enter，再按要绑定的键";
-  drawLineText(MARGIN, top, fitWidth(status, w - 2 * MARGIN).c_str(), true);
-  int ly = top + itemH;
-  g_rd.drawLine(0, ly, w, ly, true);
-
-  for (int i = 0; i < BLE_ACT_COUNT; i++) {
-    int y = ly + i * itemH;
-    BleAct a = static_cast<BleAct>(i);
-    int src = bleKeymapSrcOf(a);
-    std::string txt = std::string(bleKeymapActLabel(a)) + "  →  " +
-                      (src ? bleKeymapKeyName(src) : std::string("未绑定"));
-    txt = fitWidth(txt, w - 2 * MARGIN);
-    if (i == st.keyMapSel) {
-      g_rd.fillRect(0, y, w, itemH, true);
-      drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, txt.c_str(), false);
-    } else {
-      drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, txt.c_str(), true);
-    }
-  }
-  drawFooter(st.keyMapCapture >= 0 ? "按遥控器/键盘上的键绑定  Esc 取消"
-                                   : "↑↓ 选择  Enter 绑定  长按 解绑  Esc 返回");
-}
-
-static void handleKeyMap(int key) {
-  // 捕获中：下一个来自蓝牙的键就是要绑的源键。
-  if (st.keyMapCapture >= 0) {
-    if (key == 0x1B) { st.keyMapCapture = -1; st.keyMapStatus.clear(); st.fullRefresh = true; st.dirty = 1; return; }
-    if (!g_key_from_ble) return;  // 触摸点按（以 '\n' 到达）不参与绑定
-    BleAct a = static_cast<BleAct>(st.keyMapCapture);
-    bool ok = bleKeymapBind(key, a);
-    st.keyMapStatus = ok ? (std::string("已绑定 ") + bleKeymapActLabel(a) + " → " + bleKeymapKeyName(key))
-                         : std::string("绑定失败（写入 SD 卡出错）");
-    st.keyMapCapture = -1;
-    st.fullRefresh = true;
-    st.dirty = 1;
-    return;
-  }
-
-  // 长按中间键解绑当前动作。
-  if (key == KEY_LONG_CONFIRM) {
-    BleAct a = static_cast<BleAct>(st.keyMapSel);
-    if (bleKeymapSrcOf(a) == 0) { st.keyMapStatus = "未绑定，无需解绑"; st.dirty = 1; return; }
-    bleKeymapClear(a);
-    st.keyMapStatus = std::string("已解绑 ") + bleKeymapActLabel(a);
-    st.fullRefresh = true;
-    st.dirty = 1;
-    return;
-  }
-
-  if (key == 0x1B) { st.keyMapStatus.clear(); st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
-  if (key == KEY_UP) { st.keyMapSel = std::max(0, st.keyMapSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.keyMapSel = std::min(BLE_ACT_COUNT - 1, st.keyMapSel + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.keyMapSel = 0; st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.keyMapSel = BLE_ACT_COUNT - 1; st.dirty = 1; return; }
-
-  if (key != '\n') return;
-
-  int x, y;
-  if (input_tap_xy(&x, &y)) {
-    int itemH = uiLineHeight() + 12;
-    int ly = coverTop() + itemH;
-    int row = (y - ly) / itemH;
-    if (row >= 0 && row < BLE_ACT_COUNT) st.keyMapSel = row;
-    st.dirty = 1;
-    return;
-  }
-  st.keyMapCapture = st.keyMapSel;  // 开始捕获
-  st.keyMapStatus.clear();
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-// ── 自定义状态栏（设置界面）──────────────────────────────────────────────
-// 逐行选择阅读页底部状态栏显示的内容。左右键（或 Enter）轮转取值，Esc 存盘返回——
-// 每改一项立刻写 settings，回到阅读页即生效。
-static const char *const kSbTitleNames[] = {"书名", "章节", "隐藏"};
-static const char *const kSbPageNames[] = {"章节", "全书", "隐藏"};
-static const char *const kSbShowNames[] = {"显示", "隐藏"};
-static const char *const kSbBarNames[] = {"全书", "章节", "隐藏"};
-static const char *const kSbThickNames[] = {"细", "中", "粗"};
-static const char *const kSbClockNames[] = {"隐藏", "右侧", "左侧"};
-
-struct SbRow {
-  const char *key;
-  const char *label;
-  int def;
-  const char *const *names;
-  int nameCount;
-};
-static const SbRow kSbRows[] = {
-    {"reader_sb_title", "标题", 0, kSbTitleNames, 3},
-    {"reader_sb_page", "页码", 1, kSbPageNames, 3},
-    {"reader_sb_pct", "百分比", 0, kSbShowNames, 2},
-    {"reader_sb_bar", "进度条", 2, kSbBarNames, 3},
-    {"reader_sb_thick", "进度条粗细", 1, kSbThickNames, 3},
-    {"reader_sb_batt", "电量", 0, kSbShowNames, 2},
-    {"reader_sb_clock", "时钟", 0, kSbClockNames, 3},
-};
-static const int kSbRowCount = static_cast<int>(sizeof(kSbRows) / sizeof(kSbRows[0]));
-
-static void renderStatusBarSet() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int itemH = uiLineHeight() + 12;
-  int top = drawTitle("状态栏");
-
-  int n = kSbRowCount;
-  int viewH = statusTop() - top - 8;
-  int maxRows = std::max(1, viewH / itemH);
-  int start = clampI(st.sbSel - maxRows / 2, 0, std::max(0, n - maxRows));
-  for (int i = 0; i < maxRows && start + i < n; i++) {
-    int idx = start + i;
-    const SbRow &r = kSbRows[idx];
-    int v = sbCount(r.key, r.def, r.nameCount);
-    int y = top + i * itemH;
-    std::string txt = fitWidth(std::string(r.label) + ":  " + r.names[v], w - 2 * MARGIN);
-    if (idx == st.sbSel) {
-      g_rd.fillRect(0, y, w, itemH, true);
-      drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, txt.c_str(), false);
-    } else {
-      drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, txt.c_str(), true);
-    }
-  }
-  drawFooter("↑↓ 选择  ←→/Enter 修改  Esc 返回阅读");
-}
-
-static void handleStatusBarSet(int key) {
-  // Esc 直接回阅读页：这些是显示项，回不去就看不到效果，就地返回最顺手。
-  // 但若是从「设置」标签进来的（retMode==Settings），那里没有阅读页可回，退回设置标签。
-  if (key == 0x1B) {
-    st.mode = (st.retMode == RdMode::Settings) ? RdMode::Settings : RdMode::Reading;
-    st.fullRefresh = true;
-    st.dirty = 1;
-    return;
-  }
-  if (key == KEY_UP) { st.sbSel = std::max(0, st.sbSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.sbSel = std::min(kSbRowCount - 1, st.sbSel + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.sbSel = 0; st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.sbSel = kSbRowCount - 1; st.dirty = 1; return; }
-
-  if (key != KEY_LEFT && key != KEY_RIGHT && key != '\n') return;
-
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {  // 点按：先选中该行，不直接改值
-      int itemH = uiLineHeight() + 12;
-      int ly = coverTop();
-      int row = (y - ly) / itemH;
-      if (row >= 0 && row < kSbRowCount) st.sbSel = row;
-      st.dirty = 1;
-      return;
-    }
-  }
-
-  const SbRow &r = kSbRows[st.sbSel];
-  int v = sbCount(r.key, r.def, r.nameCount);
-  int d = (key == KEY_LEFT) ? -1 : 1;  // Enter 等同 +1（轮转）
-  v = (v + d + r.nameCount) % r.nameCount;
-  g_settings.setString(r.key, std::to_string(v));
-  st.dirty = 1;
-}
-
-// ── 关于 ────────────────────────────────────────────────────────────────
-// 设备信息页（对应 crossmux 的 AboutActivity）：固件/版本/芯片/MAC/运行时间/内存/SD/电量。
-// 行数固定，值在渲染时现取（SD 用量、电量这类要读硬件）。
-static const int kAboutRowCount = 10;
-
-struct AboutRow {
-  const char *label;
-  std::string value;
-};
-
-static void fillAboutRows(std::vector<AboutRow> &rows) {
-  rows.clear();
-  auto add = [&](const char *l, const std::string &v) { rows.push_back({l, v}); };
-  char buf[128];
-
-  add("固件", "Yan Reader");
-  add("主题", "研读 | 研墨 | 研虑");
-  add("版本", PJOURNAL_VERSION "  (" __DATE__ " " __TIME__ ")");
-
-  esp_chip_info_t ci;
-  esp_chip_info(&ci);
-  snprintf(buf, sizeof(buf), "ESP32-S3 v%d.%d · %d 核", ci.revision / 100, ci.revision % 100, ci.cores);
-  add("芯片", buf);
-
-  uint8_t mac[6] = {0};
-  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
-    snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    add("WiFi MAC", buf);
-  } else {
-    add("WiFi MAC", "不可用");
-  }
-
-  long long up = static_cast<long long>(esp_timer_get_time() / 1000000);
-  snprintf(buf, sizeof(buf), "%lld 时 %lld 分", up / 3600, (up / 60) % 60);
-  add("运行时间", buf);
-
-  add("内部 RAM 空闲", dictFormatSize(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
-  add("PSRAM 空闲", dictFormatSize(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
-
-  struct statvfs sv;
-  if (statvfs("/sdcard", &sv) == 0 && sv.f_blocks > 0) {
-    uint64_t total = static_cast<uint64_t>(sv.f_blocks) * sv.f_frsize;
-    uint64_t avail = static_cast<uint64_t>(sv.f_bavail) * sv.f_frsize;
-    snprintf(buf, sizeof(buf), "%s / %s", dictFormatSize(total - avail).c_str(), dictFormatSize(total).c_str());
-    add("SD 卡", buf);
-  } else {
-    add("SD 卡", "未挂载");
-  }
-
-  int pct = battery_pct();
-  if (pct >= 0) {
-    snprintf(buf, sizeof(buf), "%d%%", pct);
-    add("电量", buf);
-  } else {
-    add("电量", "未知");
-  }
-}
-
-static void renderAbout() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int itemH = uiLineHeight() + 8;
-  int top = drawTitle("关于");
-
-  std::vector<AboutRow> rows;
-  fillAboutRows(rows);
-  int n = static_cast<int>(rows.size());
-  int viewH = statusTop() - top - 8;
-  int maxRows = std::max(1, viewH / itemH);
-  int start = clampI(st.aboutTop, 0, std::max(0, n - maxRows));
-
-  for (int i = 0; i < maxRows && start + i < n; i++) {
-    const AboutRow &r = rows[start + i];
-    int y = top + i * itemH;
-    drawLineText(MARGIN, y, r.label, true);
-    int lw = g_rd.getTextWidth(uiFontId(), r.label);
-    int avail = w - 2 * MARGIN - lw - 16;
-    std::string v = (avail > 0) ? g_rd.truncatedText(uiFontId(), r.value.c_str(), avail) : std::string();
-    if (!v.empty()) {
-      int vw = g_rd.getTextWidth(uiFontId(), v.c_str());
-      drawLineText(w - MARGIN - vw, y, v.c_str(), true);
-    }
-  }
-  drawFooter("↑↓ 滚动  Esc 返回");
-}
-
-static void handleAbout(int key) {
-  if (key == 0x1B) { st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
-  int itemH = uiLineHeight() + 8;
-  int maxRows = std::max(1, (statusTop() - coverTop() - 8) / itemH);
-  int maxTop = std::max(0, kAboutRowCount - maxRows);
-  if (key == KEY_UP) { st.aboutTop = std::max(0, st.aboutTop - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.aboutTop = std::min(maxTop, st.aboutTop + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.aboutTop = std::max(0, st.aboutTop - maxRows); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.aboutTop = std::min(maxTop, st.aboutTop + maxRows); st.dirty = 1; return; }
-}
-
-// ── WiFi 传书 ───────────────────────────────────────────────────────────
-// 复用写作模式的 web 文件管理器（main/file_manager_server.cpp）：手机/电脑浏览器
-// 打开 http://<IP>/ 即可浏览 /sdcard，把 epub/txt 传进 /sdcard/books。
-static const int kNetRows = 3;  // 启动 / 停止 / 二维码
-static int netListTop() { return coverTop() + (uiLineHeight() + 12); }
-
-static void netShareConnect() {
-  st.netBusy = true;
-  st.netStatus = "处理中...";
-  st.fullRefresh = true;
-  st.dirty = 1;
-  renderCurrent();
-  st.fullRefresh = false;
-
-  // 连 WiFi（与文件浏览页浮动按钮共用 rdWifiEnsure，失败原因它已经写进 st.netStatus）。
-  if (!rdWifiEnsure()) {
-    st.netBusy = false;
-    st.dirty = 1;
-    return;
-  }
-  bool ok = file_manager_server_start(80);
-  st.netServerUp = ok;
-  st.netBusy = false;
-  st.netStatus = ok ? ("服务已启动  " + g_wifi.getIp()) : "服务启动失败(端口被占用?)";
-  if (ok && !g_wifi.getIp().empty()) rdShowFloat("网络文件管理已开启", "http://" + g_wifi.getIp() + "/", 8000);
-  st.dirty = 1;
-}
-
-static void renderNetShare() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int itemH = uiLineHeight() + 12;
-  int top = drawTitle("WiFi 传书");
-
-  std::string ip = g_wifi.isConnected() ? g_wifi.getIp() : std::string();
-  std::string status;
-  if (st.netBusy) status = "处理中...";
-  else if (!st.netStatus.empty()) status = st.netStatus;
-  else if (g_wifi.isConnected()) status = ip.empty() ? "WiFi 已连接" : ("WiFi 已连接  " + ip);
-  else status = "未连接 WiFi";
-  drawLineText(MARGIN, top, fitWidth(status, w - 2 * MARGIN).c_str(), true);
-  int ly = top + itemH;
-  g_rd.drawLine(0, ly, w, ly, true);
-
-  const char *rows[kNetRows] = {"启动服务（浏览器传书）", "停止服务", "显示地址二维码"};
-  for (int i = 0; i < kNetRows; i++) {
-    int ry = ly + i * itemH;
-    if (i == st.netSel) {
-      g_rd.fillRect(0, ry, w, itemH, true);
-      drawLineText(MARGIN, ry + (itemH - uiLineHeight()) / 2, rows[i], false);
-    } else {
-      drawLineText(MARGIN, ry + (itemH - uiLineHeight()) / 2, rows[i], true);
-    }
-  }
-  if (st.netServerUp && !ip.empty()) {
-    std::string url = "http://" + ip + "/";
-    drawCenteredLine(ly + kNetRows * itemH + 10, fitWidth(url, w - 2 * MARGIN).c_str(), true);
-  }
-  // 传输进度顶掉底栏提示：这个界面待着不动的时候，只有进度能说明"还在动"。
-  // 传输结束/刚起服务的短提示走中间的浮动框（与文件浏览页一致），不占底栏。
-  if (const std::string xf = rdNetXferText(); !xf.empty()) { drawFooter(xf.c_str()); return; }
-  drawFooter("↑↓ 选择  Enter 执行  Esc 返回");
-}
-
-static void handleNetShare(int key) {
-  if (st.netBusy) return;
-  if (key == 0x1B) { st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
-  if (key == KEY_UP) { st.netSel = std::max(0, st.netSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.netSel = std::min(kNetRows - 1, st.netSel + 1); st.dirty = 1; return; }
-  if (key != '\n') return;
-
-  int x, y;
-  if (input_tap_xy(&x, &y)) {
-    int itemH = uiLineHeight() + 12;
-    int row = (y - netListTop()) / itemH;
-    if (row >= 0 && row < kNetRows) st.netSel = row;
-    st.dirty = 1;
-    return;
-  }
-
-  if (st.netSel == 0) {
-    netShareConnect();
-  } else if (st.netSel == 1) {
-    file_manager_server_stop();
-    st.netServerUp = false;
-    st.netStatus = "服务已停止";
-    st.dirty = 1;
-  } else {
-    if (!g_wifi.isConnected()) {
-      st.netStatus = "未连接 WiFi";
-      st.dirty = 1;
-      return;
-    }
-    st.qrText = "http://" + g_wifi.getIp() + "/";
-    prepareQr();
-    st.mode = RdMode::Qr;
-    st.fullRefresh = true;
-    st.dirty = 1;
-  }
-}
-
-// ── 分发渲染 ────────────────────────────────────────────────────────────
-// ── 方向切换 ─────────────────────────────────────────────────────────────
+// ── 渲染：词典 ─────────────────────────────────────────────────────────
 static void applyReaderOrientation() {
   if (st.orientation == "portrait") {
     board_force_portrait();
@@ -6859,8 +4243,8 @@ static void applyReaderOrientation() {
 // HalDisplay::displayBuffer()（见那里的注释），一次罩住所有界面。这里只负责把
 // 全局设置同步到那个标志。**绝不能**再自己逐字节取反 fb —— 会和出口处的取反叠加，
 // 两次相消等于没开。读 settings 而非 st.night：设置界面里改的键才是唯一真源。
-static void applyNightMode() {
-  display.setInverted(g_settings.nightMode());
+void applyNightMode() {
+  board_set_night(g_settings.nightMode());
 }
 
 // ── 书签 ────────────────────────────────────────────────────────────────
@@ -6947,7 +4331,7 @@ static void toggleBookmark() {
 }
 
 // 把 epub 当前 spine 排到 target 页为止（跳转书签/脚注/百分比用）。
-static void buildToPage(int target) {
+void buildToPage(int target) {
   if (!st.section) return;
   while (static_cast<int>(st.section->pageCount) < target + 1 && !st.section->isBuildComplete()) {
     st.section->buildSomeMore(16);
@@ -7032,6 +4416,43 @@ static void saveProgress() {
     f.write(reinterpret_cast<const uint8_t *>(line.data()), line.size());
   }
   f.close();
+}
+
+// ── 书架按最近阅读排序（声明在 scanBooks 之前）────────────────────────────
+// "最近阅读时间"的唯一真源是 reader_progress.txt 的**行序**：那个文件最新在前，每次
+// 翻页/换书都把当前书挪到表头（见上面这段的 insert(begin())），所以文件本身就已经是
+// "按最近阅读排好序"的一份快照 —— 行号就是名次，不必再存时间戳字段（存了还要解 NVS
+// 时间的坑，而且翻页时写盘的那一行会变长）。
+//
+// 没读过的书（刚拷进来的，或读了 kProgressMax 本之后被挤出表的）排在读过的**之后**，
+// 组内按文件名排 —— 不能让 readdir 的返回顺序决定书架顺序，否则每次重扫书架都可能跳
+// 一下。用 stable_sort 保证同名同组的相对次序也是确定的。
+static void rdSortShelfByRecency() {
+  if (st.books.size() < 2) return;
+  loadProgress();
+  auto lower = [](const std::string &s) {
+    std::string r = s;
+    for (char &c : r) c = (char)tolower((unsigned char)c);
+    return r;
+  };
+  // 路径 → 名次（越小越近）。键取小写：books/Books 是同一个 FAT 目录（见 scanBooks
+  // 的去重注释），进度表里存的是打开时拼出来的那个大小写，可能和这里扫出来的一致也可能
+  // 不一致。emplace 不覆盖 → 同一本书只留最靠前的那条。
+  std::map<std::string, int> rank;
+  for (size_t i = 0; i < s_progress.size(); i++) {
+    rank.emplace(lower(s_progress[i].path), static_cast<int>(i));
+  }
+  const int kUnread = 1 << 30;   // 进度表里没有这本书（没读过 / 已被挤出表）
+  auto rankOf = [&](const BookEntry &b) -> int {
+    auto it = rank.find(lower(b.path));
+    return it == rank.end() ? kUnread : it->second;
+  };
+  std::stable_sort(st.books.begin(), st.books.end(), [&](const BookEntry &a, const BookEntry &b) {
+    const int ra = rankOf(a), rb = rankOf(b);
+    if (ra != rb) return ra < rb;
+    if (ra == kUnread) return lower(a.name) < lower(b.name);   // 都没读过：按文件名
+    return false;                                              // 都读过则保持原序
+  });
 }
 
 // ── 待机表盘「书籍封面」的出口（声明见 screen_reader.h）────────────────────
@@ -7179,572 +4600,6 @@ static void gotoBookmark(int idx) {
 }
 
 // ── 脚注 ────────────────────────────────────────────────────────────────
-static bool loadCurrentFootnotes() {
-  st.footnoteNums.clear();
-  st.footnoteHrefs.clear();
-  if (st.bookKind != 0 || !st.section) return false;
-  auto page = st.section->loadPage(st.page);
-  if (!page) return false;
-  for (const auto &fn : page->footnotes) {
-    st.footnoteNums.push_back(fn.number[0] ? fn.number : "[链接]");
-    st.footnoteHrefs.push_back(fn.href);
-  }
-  if (st.footnoteHrefs.empty()) {
-    // 临时诊断：页里明明有上标号，脚注表却是空的。两种可能——(a) 解析时注号被记到了
-    // 邻页（pendingFootnotes 的页归属差一行）；(b) 这一页是旧版解析器落下的页缓存。
-    // 打页码+章节号，配合 `点注:` 那行就能分辨。
-    ESP_LOGW(TAG, "点注诊断: 第%d页(spine %d)脚注表为空，本页词 %u 个",
-             st.page, st.spineIndex, (unsigned)(g_pageText.valid ? g_pageText.words.size() : 0));
-  }
-  return !st.footnoteHrefs.empty();
-}
-
-// 锚点 → 页码，查不到就把本节多排一会儿再查。
-// 为什么需要：本节是**惰性排版**的（空闲帧只领先读者 kPrebuildAhead 页），而注释正文
-// 常常压在**本节末尾**——晋书的校勘记就是正文后一整块 `<p id="note-001">`，最后一处
-// 正文引用在源文件的 83% 处。读者停在第 4 页点注号时，本节只排到第 9 页，锚点那一页
-// 压根没排出来 → 锚点表里没有 → 原来 getPageForAnchor 直接返回空，弹注/跳转全落空
-// （日志 `注号对上了但取不到注文`，然后按键落进左右 1/3 翻页，这正是用户看到的"点注
-// 变成翻页"）。
-// 这里先查一次（活构建 + 磁盘锚点表），没查到且本节还在排就有界地继续排，边排边查。
-// 预算按**时间**封顶而不是按页数：一次翻页的排版量级是几十毫秒，这个预算足够覆盖
-// "注释就在后面几页"的常见情形；真遇到超长章节也只是退化回原来的行为，不会把按键
-// 处理卡到没法用。
-static std::optional<Section::AnchorPos> rdFindFootnotePage(const std::string &anchor) {
-  if (st.bookKind != 0 || !st.section || anchor.empty()) return std::nullopt;
-  auto pos = st.section->findAnchorPos(anchor);  // 活构建优先，其次磁盘锚点表
-  if (pos) return pos;
-  if (!st.section->isBuilding() || st.section->isBuildComplete()) return std::nullopt;
-  constexpr int64_t kBudgetUs = 2500 * 1000;
-  const int64_t deadline = esp_timer_get_time() + kBudgetUs;
-  while (esp_timer_get_time() < deadline) {
-    if (!st.section->buildSomeMore(4)) break;
-    pos = st.section->findAnchorPos(anchor);
-    if (pos) return pos;
-    if (st.section->isBuildComplete()) break;
-  }
-  return pos;
-}
-
-// 注号归一化区的两个工具函数（定义在本文件后半段，这一段先用）。
-static int rdUtf8Len(unsigned char c);
-static std::string rdNormalizeNoteNumber(const std::string &s);
-static void rdRememberNoteRef(const std::string &num, int spine, int page);  // 定义在 footnoteReturn 之后
-
-static void jumpToFootnote(int idx) {
-  if (idx < 0 || idx >= static_cast<int>(st.footnoteHrefs.size())) return;
-  std::string href = st.footnoteHrefs[idx];
-  // 跳走之前先把"上标在哪"记下来：此刻读者正待在那个上标所在的那一页上。
-  // 有了这条，到了注文区点行首的注号就能跳回来（见 rdGotoNoteRef）。
-  rdRememberNoteRef(st.footnoteNums[idx], st.spineIndex, st.page);
-  size_t hash = href.rfind('#');
-  if (hash == std::string::npos || !st.section) return;
-  std::string anchor = href.substr(hash + 1);
-  auto pg = rdFindFootnotePage(anchor);
-  if (!pg) return;
-  st.footnoteRetSpine = st.spineIndex;
-  st.footnoteRetPage = st.page;
-  st.footnoteRetValid = true;
-  buildToPage(static_cast<int>(pg->page));
-  st.mode = RdMode::Reading;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-static void footnoteReturn() {
-  if (!st.footnoteRetValid) return;
-  if (st.spineIndex != st.footnoteRetSpine) openSpine(st.footnoteRetSpine);
-  buildToPage(st.footnoteRetPage);
-  st.footnoteRetValid = false;
-  st.mode = RdMode::Reading;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-// ── 注文 → 正文上标 的反查（点注文条目行首的注号跳回上标处） ──────────────
-//
-// 为什么不能只靠 footnoteRet*：那套是"刚跳过来的那一条"的**一次性**返回点，跳完就清，
-// 而且只认那一个注号 —— 在注文区多翻两页、去点别的注文条目的注号，就什么都不认了
-// （用户反馈"翻页后跳转功能就失效了"）。这里换成按**注号**查表：任何一条注文条目的
-// 行首注号，只要认得出注号，就能跳到它对应的那个上标。
-//
-// 表是**学**出来的，分两处学（都满足"此刻读者正站在上标那一页上"）：
-//   * 点上标开弹注      → rdTapOnFootnote 的命中处
-//   * 从注文跳注（列表/弹注的 Enter）→ jumpToFootnote 里，跳走之前
-// 学不到的（比如从目录直接翻到注文区）就往前扫本节的页脚注表兜底，见 rdSearchNoteRefPage。
-static constexpr int kMaxNoteRefs = 64;
-
-static void rdRememberNoteRef(const std::string &num, int spine, int page) {
-  const std::string norm = rdNormalizeNoteNumber(num);
-  if (norm.empty()) return;
-  for (auto &r : st.noteRefs)
-    if (r.num == norm) { r.spine = spine; r.page = page; return; }   // 只更新，不重复记
-  if (static_cast<int>(st.noteRefs.size()) >= kMaxNoteRefs)
-    st.noteRefs.erase(st.noteRefs.begin());   // 满了丢最旧的：走扫页兜底照样能找到
-  st.noteRefs.push_back({norm, spine, page});
-}
-
-static bool rdLookupNoteRef(const std::string &norm, int *spine, int *page) {
-  for (const auto &r : st.noteRefs)
-    if (r.num == norm) { *spine = r.spine; *page = r.page; return true; }
-  return false;
-}
-
-// 兜底：没学过这条注的上标位置，就从**当前页往前**扫本节的页脚注表，找第一个记着同一
-// 注号的页 —— 上标永远排在注文区**前面**，所以从当前页往回走，撞见的第一个就是它
-// （各章的注号会重复，取"离得最近的前一个"才落在本章）。
-// 只扫当前页及之前：这些页读者是一路看过来的，早就排好了，命中通常只要翻几页。
-// 时间和页数都封顶，扫不到就老实认输（调用方退回不跳），绝不把界面卡住。
-static bool rdSearchNoteRefPage(const std::string &norm, int *outPage) {
-  if (!st.section || norm.empty()) return false;
-  constexpr int kMaxPages = 120;
-  constexpr int64_t kBudgetUs = 300 * 1000;
-  const int64_t deadline = esp_timer_get_time() + kBudgetUs;
-  const int last = std::max(0, st.page - kMaxPages);
-  for (int p = st.page; p >= last; p--) {
-    if (esp_timer_get_time() > deadline) break;
-    auto page = st.section->loadPage(p);
-    if (!page) continue;
-    for (const auto &fn : page->footnotes)
-      if (rdNormalizeNoteNumber(fn.number) == norm) { *outPage = p; return true; }
-  }
-  return false;
-}
-
-// 按注号跳到正文里的那个上标处。返回 false = 这条注号反查不到（调用方照旧往下走）。
-// 认出来就把位置记下（下次同一注号直接命中），然后跟 jumpToFootnote 一样翻页过去。
-static bool rdGotoNoteRef(const std::string &num) {
-  const std::string norm = rdNormalizeNoteNumber(num);
-  if (norm.empty()) return false;
-  int spine = st.spineIndex, page = 0;
-  if (!rdLookupNoteRef(norm, &spine, &page)) {
-    if (!rdSearchNoteRefPage(norm, &page)) return false;
-    rdRememberNoteRef(norm, spine, page);
-  }
-  if (st.spineIndex != spine) openSpine(spine);
-  buildToPage(page);
-  st.footnoteRetValid = false;   // 手已经落在上标上了，旧的一次性返回点就过期了
-  st.mode = RdMode::Reading;
-  st.fullRefresh = true;
-  st.dirty = 1;
-  return true;
-}
-
-// ── 脚注弹注（弹窗显示注释正文，不跳走） ─────────────────────────────────
-// FootnoteEntry 里只有序号和 href，**没有注释正文**，所以正文得自己在目标锚点所在的
-// 那一页上捞回来：href 的锚点 → getPageForAnchor → 该页的 PageLine 逐个取词拼成一段。
-//
-// 拼词时空格靠**版式量出来的间距**判断，不靠字符集猜：CJK 的"词"是单字紧挨着排的
-// （wordXpos 首尾相接，一个缝都没有），英文才有真实的空格缝。规则是"缝够大、或换了行，
-// 且缝两边都是 ASCII"才补一个空格——中文行尾换行因此不会凭空多出一个空格。
-static bool rdAsciiByte(char c) { return (static_cast<unsigned char>(c) & 0x80) == 0; }
-
-// 段首的"号码串"：从段首起，跳过括号/空白/句点，收下连续的号码字符（〇一二三…/0-9），
-// 遇到第一个真正的字就停。`〔一〕以義熙元年…` → "一"；`1. 說明…` → "1"；`　　注文…` → ""。
-// 只用来**选段**，不做精确解析，所以号码表取得保守（罗马数字、天干地支一律不认）。
-static void rdLeadingNoteMarker(const std::string &text, std::string *out) {
-  static const char *kNum[] = {"〇", "零", "一", "二", "三", "四", "五", "六",
-                               "七", "八", "九", "十", "百", "千"};
-  // 收尾括号**终止**号码串，不能当普通标点跳过：`〔一〕三世必大昌` 跳过 `〕` 会接着
-  // 把正文里的"三"吞进来算成"一三"，跟真正的 `〔一三〕` 撞上（离线仿真 4638 条注文里
-  // 有 24 条就栽在这）。开括号前面没有号码，跳过它不影响。
-  static const char *kClose[] = {"〕", "]", ")", "）", "】", "｝", "」", "》"};
-  out->clear();
-  for (size_t i = 0; i < text.size();) {
-    const int len = rdUtf8Len(static_cast<unsigned char>(text[i]));
-    if (i + static_cast<size_t>(len) > text.size()) break;
-    const std::string ch = text.substr(i, len);
-    i += len;
-    for (const char *c : kClose)
-      if (ch == c) return;
-    const std::string n = rdNormalizeNoteNumber(ch);
-    if (n.empty()) continue;  // 开括号/空白/句点：既不属于号码串，也不终止它
-    bool numeral = n.size() == 1 && n[0] >= '0' && n[0] <= '9';
-    for (const char *d : kNum)
-      if (!numeral && n == d) numeral = true;
-    if (!numeral) break;
-    *out += n;
-  }
-}
-
-// 段首是不是"括号开头的号码"（〔一〕/ [1] / （1）/ 【一】）。正文段落极少这么开头，
-// 所以这一档几乎不会误伤——用来在多个同号段之间先挑最像注文的那一个。
-static bool rdStartsBracketed(const std::string &text) {
-  static const char *kOpen[] = {"〔", "[", "(", "（", "【", "｛", "「", "《"};
-  for (size_t i = 0; i < text.size();) {
-    const int len = rdUtf8Len(static_cast<unsigned char>(text[i]));
-    if (i + static_cast<size_t>(len) > text.size()) break;
-    const std::string ch = text.substr(i, len);
-    i += len;
-    if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n" || ch == "　") continue;
-    for (const char *o : kOpen)
-      if (ch == o) return true;
-    return false;
-  }
-  return false;
-}
-
-// 已拼出的注号是不是**读到闭括号**了（〔一二〕/（1）/[1]）。回跳拼词时用它判断
-// 括号注号收全没有 —— 闭括号本身也可能单独成词（见 rdTapOnNoteBack）。
-static bool rdHeadBracketClosed(const std::string &text) {
-  static const char *kClose[] = {"〕", "]", ")", "）", "】", "｝", "」", "》"};
-  for (size_t i = 0; i < text.size();) {
-    const int len = rdUtf8Len(static_cast<unsigned char>(text[i]));
-    if (i + static_cast<size_t>(len) > text.size()) break;
-    const std::string ch = text.substr(i, len);
-    i += len;
-    for (const char *c : kClose)
-      if (ch == c) return true;
-  }
-  return false;
-}
-
-// 页面拆成"行"。**一行 = 同一 yPos 的一串 PageLine**（ParsedText::extractLine 每行
-// makeUniqueNoThrow 一个新 TextBlock，所以同一段的每行各是一个块、但 yPos 相同或递增）。
-// lines[i] 是这行拼出来的文字，lineStart[i] 是这行第一个 PageLine 在 page.elements 里的
-// 下标（给下面 elementIdx 定位用）。
-//
-// 拼词时空格靠**版式量出来的间距**判断，不靠字符集猜：CJK 的"词"是单字紧挨着排的
-// （wordXpos 首尾相接，一个缝都没有），英文才有真实的空格缝。规则是"缝够大 且 缝两边
-// 都是 ASCII"才补一个空格——中文行尾换行因此不会凭空多出一个空格。
-//
-// `lineParaStart`（可空）逐行回传 TextBlock::isParagraphStart()：**这一行是不是源段落的首行**。
-// 排版时每个 <p>/<li>/<div>/<br> 都新起一个 ParsedText（ChapterHtmlSlimParser::
-// startNewTextBlock），其第一行才带这个标记；段内折行、以及跨页后的续行都不带。弹注取文
-// 就靠它划界（见 rdNoteText）。
-static void rdSplitPageLines(const Page &page, int fontId, std::vector<std::string> *lines,
-                             std::vector<int> *lineStart, std::vector<uint8_t> *lineParaStart = nullptr) {
-  lines->clear();
-  if (lineStart) lineStart->clear();
-  if (lineParaStart) lineParaStart->clear();
-  int prevLineY = 0, prevRight = 0;
-  for (size_t ei = 0; ei < page.elements.size(); ei++) {
-    const auto &el = page.elements[ei];
-    if (el->getTag() != TAG_PageLine) continue;
-    const auto &line = static_cast<const PageLine &>(*el);
-    const auto &blk = line.getBlock();
-    if (!blk || !blk->valid()) continue;
-    if (lines->empty() || el->yPos != prevLineY) {  // 换行：起一条新的，间距状态归零
-      lines->emplace_back();
-      if (lineStart) lineStart->push_back(static_cast<int>(ei));
-      if (lineParaStart) lineParaStart->push_back(blk->isParagraphStart() ? 1 : 0);
-      prevRight = 0;
-    }
-    std::string &out = lines->back();
-    for (uint16_t i = 0; i < blk->wordCount(); i++) {
-      const char *word = blk->wordText(i);
-      if (!word || !word[0]) continue;
-      const int x = el->xPos + blk->wordXpos(i);
-      const char prevCh = out.empty() ? '\0' : out[out.size() - 1];
-      if (!out.empty() && rdAsciiByte(prevCh) && rdAsciiByte(word[0]) && x - prevRight > 2) out += ' ';
-      out += word;
-      prevRight = x + g_rd.getTextWidth(fontId, word, blk->wordStyle(i));
-    }
-    prevLineY = el->yPos;
-  }
-}
-
-// 【已废弃】"这一行是不是下一条注文的开头"曾经是个**行首启发式**，两条路：
-//   ① 行首够格的注号写法：号码串带括号收尾（〔二〕 / （2） / [2]）或紧跟顿号句点（1. / 一、 / 二：）
-//      —— 晋书/趙州録式。光秃秃一个"一"开头的续行不算（离线统计《老子想尔注》1100 条注文，
-//      有 38 条栽在"…尽得楚国货赂。”一是指贿赂…"这种折行上）；
-//   ② 行首的"回引号" ※ ＊ * ↑ —— 祖堂集/多看的 `<p class="footnote"><a href="#noteref_N">※</a>順之：…</p>`。
-// 这套启发式认不出"行首信号 ≠ 段落边界"：注文正文里回引别的注号（「…参见前注〔三〕…」）只要
-// 折行到行首，就被当成下一条注文，正文在那儿被腰斩——这正是用户报的那个 bug。根子在于页面模型
-// 里根本没有段落界限，只能拿行首长相猜。
-//
-// 现在 TextBlock::isParagraphStart() 把这个界限补上了（排版时每个 <p>/<li>/<div>/<br> 新起一个
-// ParsedText，只有它的首行带标记；段内折行与跨页续行都不带），于是终止判定改由**源段落**说话，
-// 行首启发式整体退役。上面的 ① ② 两条判据保留在此仅作背景——rdFindNoteStartLine 定位**起点**
-// 时仍在用同一族的 rdLeadingNoteMarker/rdStartsBracketed。
-// 在一页的行里找"本条注文从哪一行开始"。返回 -1 = 本页认不出来（调用方退一页再找 /
-// 退回整页）。`anchorLate`（可空）回传"锚点行在、但它的段首号码跟要取的注号对不上"——
-// 调用方靠这个决定要不要退到上一页去找。
-//
-// 两条线索，按可靠度排序：
-//  1) **锚点记下的页内元素序号**（elementIdx）：解析器在"锚点所在块开始排版"那一刻
-//     记下该页已有几个元素，正是这一段第一行在页 elements 里的下标。直接命中，唯一说话。
-//  2) 段首号码：拿被点的注号去比段首的号码串。两级，先只用"括号开头的号码"（晋书
-//     〔一〕、Duokan [1]/（1）），正文段落极少这么开头；一个都没认着再放宽到任何行首号码。
-//
-// **但 1) 有个例外：行内锚点。** id 落在 <a> 上时（趙州録校注全是
-// `<p><span><a id="10" href="#7">〔一〕</a>太阿：…`），解析器只能等**下一个块边界**
-// 才把这条待记锚点 flush 掉（flushPendingAnchor 是在 startNewTextBlock 里、makePages()
-// **之后**调的），而那时本段的行早排进页里了 —— 记下的序号于是落到**后一段**。用户侧
-// 看到的就是"点〔四〕弹出来的却是〔五〕的注文"，一整组注释错位一格。晋书/Duokan 的 id
-// 都挂在 <p>/<li> 这些块元素上，跟 startNewTextBlock 是同一次调用，不受影响——所以只有
-// 这本来报错。
-//
-// 因此这里不无条件相信 1)：锚点行的段首号码**明确和要取的不一样**时，改取它**前面**
-// 最近的一条同号行（错位一格时那正是注文自己那一行）。锚点行没有号码可认（Duokan 的
-// ※ 注文）时只在近处（12 行内）回溯 —— 免得把远处正文里形似号码的段首误当成注文；
-// 号码对得上、或什么都认不出，仍旧信锚点行。
-static int rdFindNoteStartLine(const std::vector<std::string> &lines,
-                               const std::vector<int> &lineStart, int elementIdx,
-                               const std::string &noteNum, int elementCount,
-                               bool *anchorLate = nullptr) {
-  if (anchorLate) *anchorLate = false;
-  const std::string want = rdNormalizeNoteNumber(noteNum);
-
-  int anchorLine = -1;
-  if (!lineStart.empty() && elementIdx >= 0 && elementIdx < elementCount) {
-    for (size_t i = 0; i < lines.size() && i < lineStart.size(); i++) {
-      const int s = lineStart[i];
-      const int e = (i + 1 < lineStart.size()) ? lineStart[i + 1] : elementCount;
-      if (elementIdx >= s && elementIdx < e) { anchorLine = static_cast<int>(i); break; }
-    }
-  }
-  bool late = false;  // 锚点行在，但它的段首号码不是我们要的那个 → 锚点记晚了一段
-  if (anchorLine >= 0 && !want.empty()) {
-    std::string mark;
-    rdLeadingNoteMarker(lines[anchorLine], &mark);
-    late = !mark.empty() && rdNormalizeNoteNumber(mark) != want;
-  }
-  if (anchorLate) *anchorLate = late;
-
-  if (!want.empty()) {
-    constexpr int kNearLines = 12;  // 锚点行没号码可认时允许回溯的行数
-    for (int strict = 1; strict >= 0; strict--) {
-      int before = -1, first = -1, hits = 0;
-      for (size_t i = 0; i < lines.size(); i++) {
-        if (strict && !rdStartsBracketed(lines[i])) continue;
-        std::string mark;
-        rdLeadingNoteMarker(lines[i], &mark);
-        if (mark.empty() || rdNormalizeNoteNumber(mark) != want) continue;
-        const int idx = static_cast<int>(i);
-        ++hits;
-        if (anchorLine < 0) {
-          if (first < 0) first = idx;
-        } else if (idx <= anchorLine && idx > before) {
-          before = idx;  // 离锚点行最近的、不晚于它的同号行
-        }
-      }
-      if (anchorLine < 0) {
-        if (hits == 1) return first;  // 没有锚点可依：必须唯一命中，撞多条宁可退回整页
-        if (hits > 1) break;          // 这一档就撞了，放宽一档只会更多
-        continue;
-      }
-      if (before >= 0 && (late || anchorLine - before <= kNearLines)) return before;
-    }
-  }
-
-  if (anchorLine >= 0 && !late) return anchorLine;  // 号码帮不上忙：仍旧信锚点行
-  return -1;                                        // 锚点行号码对不上又找不到注文
-}
-
-// 取一条注释的**全部**正文。核心是**跨页**：注释条目常常正好排在翻页处，只读锚点那一页，
-// 正文会在页边界处被硬生生截断——这正是"同一条注文有的显示完整、有的只剩两行"的区别所在
-// （少的就是落在下一页的那几行）。所以这里从锚点那一行起一路读下去，直到**撞上源段落的边界**
-// （TextBlock::isParagraphStart，见 rdSplitPageLines）或空行，就接着读下一页，直到终止或到达
-// 页数上限（注释再长也不会跨 4 页，上限纯粹是防跑飞）。
-//
-// 终止判据曾经是"行首长相"（够格的注号写法 / 回引号 ※，见上面那段【已废弃】的说明）——那只是
-// 段落界限的替代品，且会把注文正文里折行到行首的回引注号（「…参见前注〔三〕…」）误当成下一条
-// 注文，正文在那儿被腰斩。现在段落界限是排版时记下的真数据，标准电子书里每条注文各自一个
-// <p>/<br>，段首即注文边界；段内折行与跨页续行都不是段首，天然不会被误判。
-//
-// 参数用 Section& 而不是 Page&：跨页要继续 loadPage 下一页，所以非拿这一节不可。
-static std::string rdNoteText(Section &sec, int pageIdx, int elementIdx, int fontId,
-                              const std::string &noteNum) {
-  constexpr int kMaxExtraPages = 3;  // 锚点页之外最多再读 3 页
-  constexpr int kMaxLines = 240;     // 总行数上限，防跑飞
-
-  // 先定位"注文从哪一页、哪一行开始"。锚点序号指的是**锚点页**；行内锚点会被解析器记到
-  // 后一段（见 rdFindNoteStartLine 的说明），极端情况下本段正排在页尾、整段被推到下一页，
-  // 那锚点页上就一行都对不上、而注文留在**上一页**。所以只有"锚点行在、号码却对不上"
-  // 这一种确凿的错位才退一页再找；那一趟不带锚点序号（它属于下一页），只按注号唯一命中。
-  int startPage = pageIdx, startCur = -1;
-  for (int probe = 0; probe < 2 && startCur < 0; probe++) {
-    const int p = (probe == 0) ? pageIdx : pageIdx - 1;
-    if (p < 0) break;
-    auto page = sec.loadPage(p);
-    if (!page) continue;
-    std::vector<std::string> lines;
-    std::vector<int> lineStart;
-    rdSplitPageLines(*page, fontId, &lines, &lineStart);
-    if (lines.empty()) continue;
-    bool late = false;
-    const int cur = rdFindNoteStartLine(lines, lineStart, probe == 0 ? elementIdx : -1, noteNum,
-                                        static_cast<int>(page->elements.size()), &late);
-    if (cur >= 0) {
-      startPage = p;
-      startCur = cur;
-    } else if (!late) {
-      break;  // 锚点页上不是"错位"（只是认不出来）：退一页也找不着
-    }
-  }
-  if (startCur < 0) {  // 认不出来：退回锚点页整页（老行为），总比什么都不给强
-    auto page = sec.loadPage(pageIdx);
-    if (!page) return std::string();
-    std::vector<std::string> lines;
-    std::vector<int> lineStart;
-    rdSplitPageLines(*page, fontId, &lines, &lineStart);
-    std::string all;
-    for (const std::string &p : lines) all += p;
-    return all;
-  }
-
-  std::string out;
-  int collected = 0;
-  bool needStart = true;  // 还在第一页、还没定位到注文首行
-
-  for (int extra = 0; extra <= kMaxExtraPages; extra++) {
-    auto page = sec.loadPage(startPage + extra);
-    if (!page) break;
-    std::vector<std::string> lines;
-    std::vector<int> lineStart;
-    std::vector<uint8_t> lineParaStart;
-    rdSplitPageLines(*page, fontId, &lines, &lineStart, &lineParaStart);
-    if (lines.empty()) break;
-
-    int cur = 0;
-    if (needStart) {
-      cur = startCur;
-      if (cur >= static_cast<int>(lines.size())) break;
-      if (lines.size() == 1) return lines[cur];  // 整页就这一行：没有"下一行"可判终止
-      out = lines[cur];
-      collected = 1;
-      cur++;
-      needStart = false;
-    }
-
-    // 收续行：下一行**起新段**（= 下一条注文）或空行就收工，否则是本条注文的续行。
-    // 注意这里只看段落界限，不再看行首长相 —— 见函数头的说明。
-    bool terminated = false;
-    for (; cur < static_cast<int>(lines.size()); cur++) {
-      if (lines[cur].empty() || (cur < static_cast<int>(lineParaStart.size()) && lineParaStart[cur])) {
-        terminated = true;
-        break;
-      }
-      if (!out.empty() && rdAsciiByte(out[out.size() - 1]) && rdAsciiByte(lines[cur][0])) out += ' ';
-      out += lines[cur];
-      if (++collected >= kMaxLines) { terminated = true; break; }
-    }
-    if (terminated) return out;
-    // 本页读完还没见着结尾 → 注文跨页了，接着读下一页（下一轮 cur 从 0 起）
-  }
-  return out;
-}
-
-// 取出第 idx 条脚注的正文并开弹注。返回 false = 这条注释不在本章里（calibre 常见的
-// notes.xhtml#fn1 那种跨文件的注释就是这种），调用方退回"直接跳转"那条老路。
-// 判据现成：锚点表只覆盖当前这一章，跨章/跨文件的 href 在这儿查不到。
-static bool openFootnotePopup(int idx) {
-  if (idx < 0 || idx >= static_cast<int>(st.footnoteHrefs.size())) return false;
-  if (st.bookKind != 0 || !st.section) return false;
-  const std::string &href = st.footnoteHrefs[idx];
-
-  // QQ 阅读器的弹注**没有正文段落**，注释文字就藏在 <img alt="…"> 里。解析器把它
-  // 以 "alt:" 哨兵前缀塞进 href（见 ChapterHtmlSlimParser 的 IMAGE_TAGS 分支），
-  // 这里直接取用 —— 不用去锚点表里找。
-  if (href.rfind("alt:", 0) == 0) {
-    if (href.size() <= 4) return false;
-    st.fnPopNum = st.footnoteNums[idx];
-    st.fnPopText = href.substr(4);
-    st.fnPopScroll = 0;
-    st.fnPopIdx = idx;
-    return true;
-  }
-
-  const size_t hash = href.rfind('#');
-  if (hash == std::string::npos) return false;
-  const std::string anchor = href.substr(hash + 1);
-  if (anchor.empty()) return false;
-
-  std::string text;
-  auto pg = rdFindFootnotePage(anchor);
-  if (pg)
-    text = rdNoteText(*st.section, pg->page, pg->element, BODY_FONT_ID_BASE + st.fontLevel,
-                      st.footnoteNums[idx]);
-
-  // 本章查不到 → 注释可能在**别的 spine**（calibre 常见的 notes.xhtml#fn1 那种）。
-  // 用现成的 resolveHrefToSpineIndex（它只对"带文件名"的跨文件 href 返回有效值，
-  // 纯 #anchor 的同文件引用返回 -1）定位，单独开一节把锚点取回来。这条只在本节
-  // 失败时才走，所以既慢不了日常阅读，也不会碰到用户的三种书。
-  if (text.empty() && st.epub) {
-    const int target = st.epub->resolveHrefToSpineIndex(href);
-    if (target >= 0 && target != st.spineIndex) {
-      auto sec = std::make_unique<Section>(st.epub, target, g_rd);
-      auto pg2 = sec->getAnchorPosForAnchor(anchor);
-      if (pg2)
-        text = rdNoteText(*sec, pg2->page, pg2->element, BODY_FONT_ID_BASE + st.fontLevel,
-                          st.footnoteNums[idx]);
-    }
-  }
-  if (text.empty()) return false;
-
-  st.fnPopNum = st.footnoteNums[idx];
-  st.fnPopText = std::move(text);
-  st.fnPopScroll = 0;
-  st.fnPopIdx = idx;
-  return true;
-}
-
-// 弹注浮层。画在正文页之上、busy/瞬时浮层之下（后两个都在正中间，优先级更高），
-// 且在 applyNightMode() 之前 —— 夜间模式连它一起反色，不会留一块刺眼的白。
-// 白底 + 双线边框 + 现行宽现断行，非交互部分全在这里，滚动窗口由 fnPopScroll 定。
-static void drawFootnotePopup() {
-  if (st.fnPopNum.empty()) return;
-  const int w = g_rd.getScreenWidth(), h = g_rd.getScreenHeight();
-  // 注释正文是**书里的文字**，必须跟正文用同一套字面：内嵌字体的书，字面是按本书
-  // 正文子集化出来的，拿外壳的内置字体去画就是整段豆腐块（"弹注用的不是内嵌字体…
-  // 有太多缺字"）。抬头/底部提示相反 —— 那几个是 UI 词（脚注、翻页、关闭），书的
-  // 子集里多半没有，仍旧走外壳字体。
-  const int bodyId = BODY_FONT_ID_BASE + st.fontLevel;
-  const int lh = std::max(1, g_rd.getLineHeight(bodyId)), gap = 4, pad = 14;
-  const int boxX = MARGIN, boxW = w - 2 * MARGIN, bodyW = boxW - 2 * pad;
-  const int headH = std::max(uiLineHeight(), lh) + 12, hintH = uiLineHeight() + 12;
-  // 弹窗最高占屏幕 3/4，其余留给"底下还是那页正文"的观感。
-  const int maxBody = std::max(1, (h * 3 / 4 - headH - hintH - 2 * pad) / (lh + gap));
-  auto lines = g_rd.wrappedText(bodyId, st.fnPopText.c_str(), bodyW, 4096);
-  const int total = static_cast<int>(lines.size());
-  st.fnPopScroll = clampI(st.fnPopScroll, 0, std::max(0, total - maxBody));  // 越界在这里夹回
-  const int scroll = st.fnPopScroll;
-  const int shown = std::min(maxBody, total - scroll);
-  const int boxH = pad + headH + shown * (lh + gap) + hintH + pad;
-  const int boxY = std::max(RD_TOP_INSET, (h - boxH) / 2);
-  st.fnPopBoxX = boxX;
-  st.fnPopBoxY = boxY;
-  st.fnPopBoxW = boxW;
-  st.fnPopBoxH = boxH;
-  g_rd.fillRect(boxX, boxY, boxW, boxH, false);  // 先铺白：把底下的正文盖掉
-  g_rd.drawRect(boxX, boxY, boxW, boxH, true);
-  g_rd.drawRect(boxX + 3, boxY + 3, boxW - 6, boxH - 6, true);  // 双线，像一张浮起来的纸片
-  int y = boxY + pad;
-  // "脚注"走外壳字体、编号走书字体（编号是从书里抓的，比如"〔一〕"），两者**共用一条
-  // 基线**才不会一个高一个低 —— drawText 的 y 是基线，不能各按自己的 ascender 顶对齐。
-  // 标题整条居中：「脚注 」+ 编号 两段字体不同，各量各的宽再加起来算左端。
-  const char *headLabel = "脚注 ";
-  const int baseY = y + g_rd.getFontAscenderSize(uiFontId());
-  const int labW = g_rd.getTextWidth(uiFontId(), headLabel);
-  const int numW = g_rd.getTextWidth(bodyId, st.fnPopNum.c_str());
-  int hx = boxX + (boxW - (labW + numW)) / 2;
-  if (hx < boxX + pad) hx = boxX + pad;
-  g_rd.drawText(uiFontId(), hx, baseY, headLabel, true);
-  hx += labW;
-  g_rd.drawText(bodyId, hx, baseY, st.fnPopNum.c_str(), true);
-  y += headH;
-  for (int i = 0; i < shown; i++) {
-    drawLineText(boxX + pad, y, lines[scroll + i].c_str(), true, bodyId);
-    y += lh + gap;
-  }
-  char hint[80];
-  if (total > maxBody)
-    snprintf(hint, sizeof(hint), "↑↓ 翻页 %d-%d/%d   Enter 跳注  Esc 关闭", scroll + 1, scroll + shown, total);
-  else
-    snprintf(hint, sizeof(hint), "Enter 跳注  Esc 关闭");
-  drawLineText(boxX + pad, boxY + boxH - pad - lh, hint, true);
-}
-
-// 关掉弹注。改回正文页需要整屏重绘（弹窗底下那页要恢复原样），所以置 fullRefresh。
-static void closeFootnotePopup() {
-  st.fnPopNum.clear();
-  st.fnPopText.clear();
-  st.fnPopScroll = 0;
-  st.fnPopIdx = -1;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
 
 // ── 百分比跳转 ───────────────────────────────────────────────────────────
 static void jumpToPercent(int pct) {
@@ -7778,7 +4633,7 @@ static void jumpToPercent(int pct) {
 }
 
 // ── 二维码 ───────────────────────────────────────────────────────────────
-static void prepareQr() {
+void prepareQr() {
   st.qrText.clear();
   if (st.bookKind == 0 && st.section) st.qrText = st.section->getTextFromSectionFile();
   else if (st.bookKind == 1) st.qrText = st.txtUtf8.substr(0, 4000);
@@ -7820,25 +4675,34 @@ static void renderQr() {
 }
 
 // ── 书签/脚注/百分比/二维码 界面 ─────────────────────────────────────────
+// 书签 / 脚注两屏的列表几何（行高 8，居中式窗口）。渲染与点按命中共用。
+static ListView bookmarkListView() {
+  return titleListView(static_cast<int>(st.bookmarks.size()), st.bookmarkSel, uiLineHeight() + 8, statusTop());
+}
+
+static ListView footnoteListView() {
+  return titleListView(static_cast<int>(st.footnoteNums.size()), st.footnoteSel, uiLineHeight() + 8, statusTop());
+}
+
 static void renderBookmarks() {
   g_rd.clearScreen();
   int w = g_rd.getScreenWidth();
-  int top = drawTitle("书签");
+  drawTitle("书签");
   if (st.bookmarks.empty()) {
     drawCenteredLine(g_rd.getScreenHeight() / 2, "暂无书签");
     drawFooter("Esc 返回");
     return;
   }
-  int itemH = uiLineHeight() + 8;
-  int viewH = statusTop() - top - 8;
-  int maxRows = std::max(1, viewH / itemH);
-  int start = clampI(st.bookmarkSel - maxRows / 2, 0, std::max(0, static_cast<int>(st.bookmarks.size()) - maxRows));
+  const ListView lv = bookmarkListView();
+  int itemH = lv.itemH;
+  int maxRows = lv.rows;
+  int start = lv.first;
   for (int i = 0; i < maxRows && start + i < static_cast<int>(st.bookmarks.size()); i++) {
     int idx = start + i;
     auto &b = st.bookmarks[idx];
     char line[160];
     snprintf(line, sizeof(line), "%d%%  %s", static_cast<int>(b.percent * 100), b.summary.c_str());
-    int y = top + i * itemH;
+    int y = lv.top + i * itemH;
     if (idx == st.bookmarkSel) { g_rd.fillRect(0, y, w, itemH, true); drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, line, false); }
     else drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, line, true);
   }
@@ -7849,20 +4713,15 @@ static void handleBookmarks(int key) {
   int n = static_cast<int>(st.bookmarks.size());
   if (key == 0x1B) { st.mode = RdMode::Menu; st.fullRefresh = true; st.dirty = 1; return; }
   if (n == 0) return;
-  if (key == KEY_UP) { st.bookmarkSel = std::max(0, st.bookmarkSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.bookmarkSel = std::min(n - 1, st.bookmarkSel + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.bookmarkSel = std::max(0, st.bookmarkSel - 8); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.bookmarkSel = std::min(n - 1, st.bookmarkSel + 8); st.dirty = 1; return; }
+  {  // 上下/翻页在 ui/list_view.h（与 renderBookmarks 共用同一个几何）
+    ListView lv = bookmarkListView();
+    if (listViewKey(lv, key)) { st.bookmarkSel = lv.sel; st.dirty = 1; return; }
+  }
   if (key == '\n') {
     int x, y;
     if (input_tap_xy(&x, &y)) {
-      int top = coverTop();
-      int itemH = uiLineHeight() + 8;
-      int viewH = statusTop() - top - 8;
-      int maxRows = std::max(1, viewH / itemH);
-      int start = clampI(st.bookmarkSel - maxRows / 2, 0, std::max(0, n - maxRows));
-      int row = start + (y - top) / itemH;
-      if (row >= 0 && row < n) st.bookmarkSel = row;
+      const int row = listViewHitAt(bookmarkListView(), y);
+      if (row >= 0) st.bookmarkSel = row;
     }
     gotoBookmark(st.bookmarkSel);
     st.dirty = 1;
@@ -7873,19 +4732,19 @@ static void handleBookmarks(int key) {
 static void renderFootnotes() {
   g_rd.clearScreen();
   int w = g_rd.getScreenWidth();
-  int top = drawTitle("脚注");
+  drawTitle("脚注");
   if (st.footnoteNums.empty()) {
     drawCenteredLine(g_rd.getScreenHeight() / 2, "本页无脚注");
     drawFooter("Esc 返回");
     return;
   }
-  int itemH = uiLineHeight() + 8;
-  int viewH = statusTop() - top - 8;
-  int maxRows = std::max(1, viewH / itemH);
-  int start = clampI(st.footnoteSel - maxRows / 2, 0, std::max(0, static_cast<int>(st.footnoteNums.size()) - maxRows));
+  const ListView lv = footnoteListView();
+  int itemH = lv.itemH;
+  int maxRows = lv.rows;
+  int start = lv.first;
   for (int i = 0; i < maxRows && start + i < static_cast<int>(st.footnoteNums.size()); i++) {
     int idx = start + i;
-    int y = top + i * itemH;
+    int y = lv.top + i * itemH;
     if (idx == st.footnoteSel) { g_rd.fillRect(0, y, w, itemH, true); drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, st.footnoteNums[idx].c_str(), false); }
     else drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, st.footnoteNums[idx].c_str(), true);
   }
@@ -7896,30 +4755,20 @@ static void handleFootnotes(int key) {
   int n = static_cast<int>(st.footnoteNums.size());
   if (key == 0x1B) { st.mode = RdMode::Menu; st.fullRefresh = true; st.dirty = 1; return; }
   if (n == 0) return;
-  if (key == KEY_UP) { st.footnoteSel = std::max(0, st.footnoteSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.footnoteSel = std::min(n - 1, st.footnoteSel + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.footnoteSel = std::max(0, st.footnoteSel - 8); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.footnoteSel = std::min(n - 1, st.footnoteSel + 8); st.dirty = 1; return; }
+  {  // 上下/翻页在 ui/list_view.h（与 renderFootnotes 共用同一个几何）
+    ListView lv = footnoteListView();
+    if (listViewKey(lv, key)) { st.footnoteSel = lv.sel; st.dirty = 1; return; }
+  }
   if (key == '\n') {
     int x, y;
     if (input_tap_xy(&x, &y)) {
-      int top = coverTop();
-      int itemH = uiLineHeight() + 8;
-      int viewH = statusTop() - top - 8;
-      int maxRows = std::max(1, viewH / itemH);
-      int start = clampI(st.footnoteSel - maxRows / 2, 0, std::max(0, n - maxRows));
-      int row = start + (y - top) / itemH;
-      if (row >= 0 && row < n) st.footnoteSel = row;
+      const int row = listViewHitAt(footnoteListView(), y);
+      if (row >= 0) st.footnoteSel = row;
     }
     // 默认真弹注：在书里就地看一眼注释，不跳走（跳走再回来得走"返回脚注跳转前"）。
     // 注释不在本章（跨文件的 notes.xhtml）时弹不出来，退回老行为直接跳。
     const int sel = st.footnoteSel;
-    if (openFootnotePopup(sel)) {
-      st.mode = RdMode::Reading;  // 弹注是盖在**正文页**上的浮层，先回正文
-      st.fullRefresh = true;
-    } else {
-      jumpToFootnote(sel);
-    }
+    if (!rdOpenFootnote(sel, false)) jumpToFootnote(sel);
     st.dirty = 1;
     return;
   }
@@ -8011,6 +4860,17 @@ static int refreshStrategy() {
   return 1;  // 局刷
 }
 
+// 弹注浮层（盖在正文页上的一块）开/关时用哪一档刷。
+// 原来这两处一律 st.fullRefresh = true → GC16 整屏全刷：面板要闪一下，一次一两秒，
+// 用户侧就是"每次弹注都很慢"。而浮层底下的正文页一个像素没动，差分刷天然既能把浮层
+// 画上去、也能在关掉时擦干净（擦不净的部分记进 s_ghostAccum，攒够预算自己全刷清账，
+// 见下面的自适应档）。所以它跟正文翻页是同一类帧，交给用户的刷新策略决定就好。
+// 唯一例外是"全局"（策略 0）——那是用户明选的"每屏都清干净"，照旧全刷。
+void rdOverlayRefresh() {
+  if (refreshStrategy() == 0) st.fullRefresh = true;
+  st.dirty = 1;
+}
+
 // ── 全刷频率（设置 → 全刷频率）──────────────────────────────────────────
 // 每翻多少页强制一次全刷，0 表示"跟随策略"（由刷新策略自己决定，即现在的行为：
 // 局刷/快刷不主动全刷，自适应按残影预算攒够了才清）。选 5/10/15/20 就是不论策略
@@ -8065,7 +4925,20 @@ static int rdFrameChangePermille() {
   return hadBaseline ? changed * 1000 / RD_SAMPLE_COUNT : 1000;
 }
 
-static void renderCurrent() {
+// 阅读器整条绘制路径直画 epdiy 的 front_fb（见 screen_reader_init），但 u8g2 shim 的
+// fb 指针是 **core1 渲染任务**的地盘：那条路径每帧开头都会把它指向自己的工作缓冲
+// （ui_render.cpp 的 ui_render_begin_frame → u8g2_set_fb），离开时没人拨回来。于是进
+// 阅读器之前推过的最后一帧 UI 会把 shim 落在 s_fb[idx] 上，此后凡是走 u8g2/FontRenderer
+// 的绘制 —— editor_vk 的**整个键盘面板与键帽字形**、drawIMEUI 的编码/候选条 —— 全都画进
+// 那块**永远不会被推屏**的缓冲：屏上什么都看不到（输入本身不走绘制，所以中文照打，
+// 只有"画出来的"东西消失，正是"看不到候选字和编码区但能正确输入"的样子）。
+// 阅读器本来就直画 front_fb，shim 跟着它走即可。每帧钉一次，另在 init 里补一次。
+static void rdPinShimFb() {
+  if (g_u8g2) u8g2_set_fb(g_u8g2, g_rd.getFrameBuffer());
+}
+
+void renderCurrent() {
+  rdPinShimFb();
   // 翻页手感排查用的分段计时：绘制（含栅格化） / 决策+测量 / 刷屏 三段。
   // 只在阅读页打，菜单/列表页刷屏快慢与翻页无关，不值得占日志。
   const int64_t s_t0 = esp_timer_get_time();
@@ -8074,6 +4947,7 @@ static void renderCurrent() {
     case RdMode::Reading: renderReading(); break;
     case RdMode::Toc: renderToc(); break;
     case RdMode::Menu: renderMenu(); break;
+    case RdMode::LayoutMenu: renderLayoutMenu(); break;
     case RdMode::Bookmarks: renderBookmarks(); break;
     case RdMode::Footnotes: renderFootnotes(); break;
     case RdMode::Percent: renderPercent(); break;
@@ -8163,6 +5037,11 @@ static void renderCurrent() {
   // 一键之间有整段等待，抢不到那点刷新时间，DU 的低画质反而把残影留在屏上；那种场景
   // 与其他界面一样走常规局刷(GL16)。
   const bool physTyping = rdTypingScreen() && !st.vkVisible && g_bt.isConnected();
+  // 虚拟键盘打字帧：键盘弹着，而且当前确实有一个可编辑的字段（vkTargetString 的
+  // 集合恰好就是会画键盘的那 8 个界面——重命名页不在 rdTypingScreen 里，它走的是
+  // 这一条）。这种帧不走整屏 HALF：整屏 GL16 会被 display 侧的"GL16 恒全像素"规则
+  // 升级成整屏全像素，每按一个键闪一屏。改走区域刷，见下面 displayBufferVk。
+  const bool vkTyping = st.vkVisible && vkTargetString() != nullptr;
   // 阅读页：先量一下和上一帧的差异（顺便把基准刷成当前帧，别的策略下也保持新鲜，
   // 这样临时切到"自适应"不会因为基准过时而误判一次大变化）。
   int frameChange = -1;
@@ -8282,7 +5161,14 @@ static void renderCurrent() {
     const bool textLike = (frameChange >= 0 && frameChange < 300);
     reader_hint_page_turn(turnDirFor(turn), textLike ? 1 : 0);
   }
-  g_rd.displayBuffer(m);
+  if (vkTyping && !st.fullRefresh) {
+    // 虚拟键盘打字帧：只驱动与上一帧有差异的那块矩形（编码/候选两行快刷，键盘区与
+    // 文本输入区局刷），与写作模式的虚拟键盘同一套判据 —— 见 reader_vk_present。
+    // st.fullRefresh 那一帧不走这条：进界面首帧本来就该整屏 GC16 清场（那是应该的整屏刷）。
+    display.displayBufferVk(vkVkTop(), editorVkCandH());
+  } else {
+    g_rd.displayBuffer(m);
+  }
   if (st.mode == RdMode::Reading) {
     const int64_t tEnd = esp_timer_get_time();
     ESP_LOGI(TAG, "翻页耗时: 绘制 %lldms 决策 %lldms 刷屏 %lldms 合计 %lldms",
@@ -8347,7 +5233,7 @@ static void renderCurrent() {
 // 先刷一帧"正在…"（当前界面 + 居中浮层）再进阻塞段。openBook 会建元数据、解 zip、
 // 分章排版，大书要好几秒；e-ink 上这几秒整屏不动，用户会以为死机。
 // renderCurrent 收尾已经把 fullRefresh/dirty 复位，这里不用再管。
-static void rdShowBusy(const char *msg, const std::string &sub) {
+void rdShowBusy(const char *msg, const std::string &sub) {
   st.busyMsg = msg;
   st.busySub = sub;
   st.fullRefresh = true;   // 浮层首帧走全刷，免得和上一屏的残影叠在一起
@@ -8356,7 +5242,7 @@ static void rdShowBusy(const char *msg, const std::string &sub) {
   st.busySub.clear();
 }
 
-static void rdShowFloat(const std::string &msg, const std::string &sub, int ms) {
+void rdShowFloat(const std::string &msg, const std::string &sub, int ms) {
   if (msg.empty()) return;
   st.floatMsg = msg;
   st.floatSub = sub;
@@ -8501,6 +5387,17 @@ static void gotoBookshelf() {
   st.bookFontLocal.clear();
   st.bookFontTag = 0;
   st.tab = 0;
+  // 书架按最近阅读排序：刚读完的这本已经在进度表表头了，重排一次让它跳回最前面，
+  // 并把光标停在它身上 —— 排序会移动下标，光标不跟过去的话就指着另一本书了。
+  {
+    const std::string justRead = st.bookPath;
+    rdSortShelfByRecency();
+    if (!justRead.empty()) {
+      for (size_t i = 0; i < st.books.size(); i++) {
+        if (st.books[i].path == justRead) { st.sel = static_cast<int>(i); break; }
+      }
+    }
+  }
   st.mode = RdMode::Browser;
   st.fullRefresh = true;
   st.dirty = 1;
@@ -8582,7 +5479,7 @@ static bool rdTapOnAnnotation(int x, int y) {
 }
 
 // UTF-8 首字节 → 该字符字节数（非法字节按 1 计，够用）。
-static int rdUtf8Len(unsigned char c) {
+int rdUtf8Len(unsigned char c) {
   if (c < 0x80) return 1;
   if ((c & 0xE0) == 0xC0) return 2;
   if ((c & 0xF0) == 0xE0) return 3;
@@ -8593,7 +5490,7 @@ static int rdUtf8Len(unsigned char c) {
 // 注号归一化：把各种写法的注号压成同一串再比。
 // 晋书是 〔一〕、Duokan 是 [1]/1、有的书是 (1) / （1）/ 1. —— 去掉空白与各类括号/
 // 句点后：〔一〕→"一"、[1]→"1"、1.→"1"。比对时两边都过一遍这个函数。
-static std::string rdNormalizeNoteNumber(const std::string &s) {
+std::string rdNormalizeNoteNumber(const std::string &s) {
   static const char *kDrop[] = {"〔", "〕", "（", "）", "【", "】", "｛", "｝", "「", "」", "　", "《", "》"};
   std::string out;
   out.reserve(s.size());
@@ -8653,16 +5550,36 @@ static bool rdTapOnLink(int x, int y) {
   if (!hit || hit->href.empty()) return false;
   const std::string href = hit->href;
 
+  // ⓪ 合成注号的**私有链接**："fn:<序号>"。解析器在发那颗上标字的时候就把这条边接好
+  //    了（见 ChapterHtmlSlimParser::appendAltFootnoteMarker），序号与页脚注表里的
+  //    number 同源。这里按 id 直取 —— 不再拿被点中的**字形**去比号码串。字形比对正是
+  //    "点 8 弹出 86"的来源：注号排完版会被切成几段、还会跟邻号的号码撞前缀。顺带
+  //    靠链接矩形（而非字形）拿命中面积，半个字宽的上标也点得中。
+  //    斐洞/QQ 阅读器那种"注号是一张小图、书里没有成对的 id"的书走的就是这条路。
+  if (href.rfind("fn:", 0) == 0) {
+    const std::string serial = href.substr(3);
+    if (loadCurrentFootnotes()) {
+      for (int i = 0; i < static_cast<int>(st.footnoteNums.size()); i++) {
+        if (st.footnoteNums[i] != serial) continue;
+        if (!rdOpenFootnote(i, false)) return false;
+        rdRememberNoteRef(st.footnoteNums[i], st.spineIndex, st.page);
+        ESP_LOGI(TAG, "点注号链接: 'fn:%s' → 弹注第 %d 条", serial.c_str(), i);
+        return true;
+      }
+    }
+    ESP_LOGW(TAG, "点注号链接: 'fn:%s' 本页脚注表里没有这条", serial.c_str());
+    return false;
+  }
+
   // ① 正向注号：本页脚注表里有同一条 href。
   if (loadCurrentFootnotes()) {
     for (int i = 0; i < static_cast<int>(st.footnoteHrefs.size()); i++) {
       if (st.footnoteHrefs[i] != href) continue;
-      if (!openFootnotePopup(i)) break;  // 条目在、正文取不到 → 落回下面按锚点跳
+      // 条目在、正文取不到（且排不出来）→ 落回下面按锚点跳。
+      // 挂起态（Pending）返回 true：浮层已经摆好，按键到此为止，不再落进翻页。
+      if (!rdOpenFootnote(i, false)) break;
       // 记下上标位置，注文区那边按注号回跳时就能直接命中（见 rdGotoNoteRef）。
       rdRememberNoteRef(st.footnoteNums[i], st.spineIndex, st.page);
-      st.mode = RdMode::Reading;
-      st.fullRefresh = true;
-      st.dirty = 1;
       ESP_LOGI(TAG, "点链接: '%s' → 弹注第 %d 条 (注号 '%s')", href.c_str(), i, st.footnoteNums[i].c_str());
       return true;
     }
@@ -8815,13 +5732,10 @@ static bool rdTapOnFootnote(int x, int y) {
     i = runEnd;
   }
   if (bestFound >= 0) {
-    if (openFootnotePopup(bestFound)) {
+    if (rdOpenFootnote(bestFound, false)) {
       // 点中的就是正文里的上标，此刻这一页就是它的位置 —— 记下来，好让注文区那边
-      // 点行首注号能跳回来（见 rdGotoNoteRef）。
+      // 点行首注号能跳回来（见 rdGotoNoteRef）。挂起态也一样：人还站在这一页上。
       rdRememberNoteRef(st.footnoteNums[bestFound], st.spineIndex, st.page);
-      st.mode = RdMode::Reading;  // 弹注是盖在正文页上的浮层
-      st.fullRefresh = true;
-      st.dirty = 1;
       return true;
     }
     return noHit("注号对上了但取不到注文");
@@ -9245,21 +6159,17 @@ static void handleToc(int key) {
   const int n = (st.bookKind == 1) ? static_cast<int>(st.txtChapterTitles.size())
                                    : (st.epub ? st.epub->getTocItemsCount() : 0);
   if (key == 0x1B) { st.mode = RdMode::Menu; st.fullRefresh = true; st.dirty = 1; return; }
-  if (key == KEY_UP) { st.tocSel = std::max(0, st.tocSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.tocSel = std::min(n - 1, st.tocSel + 1); st.dirty = 1; return; }
-  // 上下滑 = 目录整屏翻。选区每帧都被拉回屏幕正中（见 renderToc 的 start 计算），
-  // 所以按一屏走一格，列表就正好前进/后退一屏，跟翻书一样。
-  if (key == KEY_PAGE_UP) { st.tocSel = std::max(0, st.tocSel - tocRowsPerPage()); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.tocSel = std::min(n - 1, st.tocSel + tocRowsPerPage()); st.dirty = 1; return; }
+  // 上下滑 = 目录整屏翻。选区每帧都被拉回屏幕正中（居中窗口，见 tocListView），
+  // 所以按一屏走一格，列表就正好前进/后退一屏，跟翻书一样。算术在 ui/list_view.h。
+  {  // 上下/翻页在 ui/list_view.h（与 renderToc 共用同一个 tocListView 几何）
+    ListView lv = tocListView(n, st.tocSel);
+    if (listViewKey(lv, key)) { st.tocSel = lv.sel; st.dirty = 1; return; }
+  }
   if (key == '\n') {
     int x, y;
     if (input_tap_xy(&x, &y) && n > 0) {
-      int top = coverTop();
-      int itemH = uiLineHeight() + 6;
-      int maxRows = tocRowsPerPage();
-      int start = clampI(st.tocSel - maxRows / 2, 0, std::max(0, n - maxRows));
-      int row = start + (y - top) / itemH;
-      if (row >= 0 && row < n) st.tocSel = row;
+      const int row = listViewHitAt(tocListView(n, st.tocSel), y);
+      if (row >= 0) st.tocSel = row;
     }
     if (n > 0) {
       st.tocSel = clampI(st.tocSel, 0, n - 1);
@@ -9301,10 +6211,7 @@ static void doMenuAction(MenuAct act) {
       }
       break;
     case MenuAct::Font:
-      st.fontLevel = (st.fontLevel + 1) % kUserFontLevels;
-      g_settings.setString("reader_font_level_v2", std::to_string(st.fontLevel));
-      reopenBook();
-      st.fullRefresh = true;
+      openRdPick(static_cast<int>(MenuAct::Font));
       break;
     case MenuAct::FontFamily: {
       // 本书在用内嵌字体时，这个键改的是**用户全局字体**，对当前这本没有可见效果
@@ -9314,26 +6221,9 @@ static void doMenuAction(MenuAct act) {
         rdShowFloat("本书使用内嵌字体", "设置 → 内嵌字体 可关闭", 3000);
         break;
       }
-      // 内建 → SD 扫描到的字体 → 回到内建（与写作模式设置里的列表一致）。
-      // GfxRenderer 文本路径直接调 ttf_font_*，故 ttf_font_open 后即生效；
-      // 需重排正文（字形度量变了）。
-      int n = ttf_font_scan();
-      const char *cur = ttf_font_path();
-      int curIdx = 0;
-      if (cur && !ttf_font_path_is_builtin(cur)) {
-        for (int i = 0; i < n; i++)
-          if (strcmp(cur, ttf_font_item(i)->path) == 0) { curIdx = i + 1; break; }
-      }
-      int nextIdx = (curIdx + 1) % (n + 1);
-      const char *nextPath = (nextIdx == 0) ? "" : ttf_font_item(nextIdx - 1)->path;
-      app_settings_set_font_path(nextPath);
-      if (ttf_font_open(nextPath) != 0) {
-        ESP_LOGW(TAG, "字体打开失败，回落内建: %s", nextPath ? nextPath : "(builtin)");
-        (void)ttf_font_open_builtin();
-        app_settings_set_font_path("");
-      }
-      reopenBook();
-      st.fullRefresh = true;
+      // 弹出式选择（内建 + SD 里扫到的字体，与「设置 → 字体」同一份清单）。
+      // 原来的循环制在卡上放好几款字体时要按十几次才轮到目标，看不出有哪些可选。
+      openRdPick(static_cast<int>(MenuAct::FontFamily));
       break;
     }
     case MenuAct::LineSpacing:
@@ -9387,7 +6277,7 @@ static void doMenuAction(MenuAct act) {
     case MenuAct::Night:  // 菜单项已移除（夜间在 主界面设置）；保留分支供旧路径兜底
       st.night = !g_settings.nightMode();
       g_settings.setNightMode(st.night);
-      display.setInverted(st.night);
+      board_set_night(st.night);
       st.fullRefresh = true;
       break;
     case MenuAct::Orient:
@@ -9404,6 +6294,12 @@ static void doMenuAction(MenuAct act) {
     case MenuAct::Bookmarks:
       st.bookmarkSel = 0;
       st.mode = RdMode::Bookmarks;
+      st.fullRefresh = true;
+      break;
+    case MenuAct::LayoutMenu:
+      // 排版子菜单：只是换个列表画，动作还是上面那一批 case，底下不用加任何东西。
+      st.layoutSel = 0;
+      st.mode = RdMode::LayoutMenu;
       st.fullRefresh = true;
       break;
     case MenuAct::Footnotes:
@@ -9431,6 +6327,7 @@ static void doMenuAction(MenuAct act) {
       st.dictResult.clear();
       st.dictHeadword.clear();
       st.dictStatus.clear();
+      rdDictResetScroll();
       rdVkWantShow();
       st.mode = RdMode::Dictionary;
       st.fullRefresh = true;
@@ -9560,29 +6457,31 @@ static void doMenuAction(MenuAct act) {
 }
 
 static void handleMenu(int key) {
-  auto items = menuItems();
-  int n = (int)items.size();
   if (key == 0x1B) { st.mode = RdMode::Reading; st.fullRefresh = true; st.dirty = 1; return; }
-  if (key == KEY_UP) { st.menuSel = std::max(0, st.menuSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.menuSel = std::min(n - 1, st.menuSel + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.menuSel = std::max(0, st.menuSel - 8); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.menuSel = std::min(n - 1, st.menuSel + 8); st.dirty = 1; return; }
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      int top = coverTop();
-      int itemH = uiLineHeight() + 12;
-      int viewH = statusTop() - top - 8;
-      int maxRows = std::max(1, viewH / itemH);
-      int start = clampI(st.menuSel - maxRows / 2, 0, std::max(0, n - maxRows));
-      int row = start + (y - top) / itemH;
-      if (row >= 0 && row < n) st.menuSel = row;
-    }
-    st.retMode = RdMode::Menu;  // 从这里进的子界面，Esc 回阅读菜单
-    doMenuAction(items[st.menuSel].act);
+  auto items = menuItems();
+  const int row = rdMenuListKey(items, st.menuSel, key);
+  if (row < 0) return;
+  st.retMode = RdMode::Menu;  // 从这里进的子界面，Esc 回阅读菜单
+  doMenuAction(items[row].act);
+  st.dirty = 1;
+}
+
+static void handleLayoutMenu(int key) {
+  if (key == 0x1B) {
+    st.mode = RdMode::Menu;
+    st.fullRefresh = true;
     st.dirty = 1;
+    st.menuSel = rdMenuLayoutRow();   // 光标落回「排版设定」那一行（见 rdMenuLayoutRow）
     return;
   }
+  auto items = layoutMenuItems();
+  const int row = rdMenuListKey(items, st.layoutSel, key);
+  if (row < 0) return;
+  // 本子菜单里的动作（字号/字体/行距/…）都不会切界面，改完值仍停在这一屏；
+  // retMode 只是留给"以后在这儿加一个会切界面的条目"时有个正确的落点。
+  st.retMode = RdMode::LayoutMenu;
+  doMenuAction(items[row].act);
+  st.dirty = 1;
 }
 
 // ── 「设置」标签（系统级设置集合）────────────────────────────────────────
@@ -9648,16 +6547,16 @@ static std::vector<MenuItem> settingsItems() {
 static void renderSettingsTab() {
   g_rd.clearScreen();
   int w = g_rd.getScreenWidth();
-  int top = drawTabBar();
+  drawTabBar();
   auto items = settingsItems();
   int n = static_cast<int>(items.size());
-  int itemH = uiLineHeight() + 12;
-  int viewH = tabBottom() - top - 8;
-  int maxRows = std::max(1, viewH / itemH);
-  int start = clampI(st.setSel - maxRows / 2, 0, std::max(0, n - maxRows));
+  const ListView lv = titleListView(n, st.setSel, uiLineHeight() + 12, tabBottom());
+  int itemH = lv.itemH;
+  int maxRows = lv.rows;
+  int start = lv.first;
   for (int i = 0; i < maxRows && start + i < n; i++) {
     int idx = start + i;
-    int y = top + i * itemH;
+    int y = lv.top + i * itemH;
     if (idx == st.setSel) { g_rd.fillRect(0, y, w, itemH, true); drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, items[idx].label.c_str(), false); }
     else drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, items[idx].label.c_str(), true);
   }
@@ -9671,22 +6570,17 @@ static void handleSettingsTab(int key) {
   if (key == KEY_LEFT) { switchTab(st.tab - 1); return; }
   if (key == KEY_RIGHT) { switchTab(st.tab + 1); return; }
   if (key == 0x1B || key == KEY_LONG_CONFIRM) { switchTab(0); return; }
-  if (key == KEY_UP) { st.setSel = std::max(0, st.setSel - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.setSel = std::min(n - 1, st.setSel + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.setSel = std::max(0, st.setSel - 8); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.setSel = std::min(n - 1, st.setSel + 8); st.dirty = 1; return; }
+  {  // 上下/翻页在 ui/list_view.h（与 renderSettingsTab 共用同一个几何）
+    ListView lv = titleListView(n, st.setSel, uiLineHeight() + 12, tabBottom());
+    if (listViewKey(lv, key)) { st.setSel = lv.sel; st.dirty = 1; return; }
+  }
   if (key == '\n') {
     int x, y;
     if (input_tap_xy(&x, &y)) {
       int t = tabHit(x, y);
       if (t >= 0) { switchTab(t); return; }
-      int top = coverTop();
-      int itemH = uiLineHeight() + 12;
-      int viewH = tabBottom() - top - 8;
-      int maxRows = std::max(1, viewH / itemH);
-      int start = clampI(st.setSel - maxRows / 2, 0, std::max(0, n - maxRows));
-      int row = start + (y - top) / itemH;
-      if (row >= 0 && row < n) st.setSel = row;
+      const int row = listViewHitAt(titleListView(n, st.setSel, uiLineHeight() + 12, tabBottom()), y);
+      if (row >= 0) st.setSel = row;
     }
     st.retMode = RdMode::Settings;  // 从这里进的子界面，Esc 回设置标签
     doMenuAction(items[st.setSel].act);
@@ -9735,11 +6629,29 @@ static int rdPickRowTop(int by, int i) {
 static void rdPickFill(int act) {
   st.pickLabels.clear();
   st.pickValues.clear();
-  auto add = [](const char *label, const std::string &value) {
+  auto add = [](const std::string &label, const std::string &value) {
     st.pickLabels.push_back(label);
     st.pickValues.push_back(value);
   };
   switch (static_cast<MenuAct>(act)) {
+    case MenuAct::Font:
+      // 字号档（kBodyPx 的像素高就是用户看得懂的那个数，菜单标签一直这么写）。
+      st.pickTitle = "字号";
+      for (int i = 0; i < kUserFontLevels; i++) add(std::to_string(kBodyPx[i]), std::to_string(i));
+      break;
+    case MenuAct::FontFamily:
+      // 与「设置 → 字体」同一份清单：内建 + ttf_font_scan() 扫到的 SD 字体。值的字面量
+      // 也必须一致（""=内建，其余=字体文件路径），否则弹层认不出当前档、● 会落错行。
+      st.pickTitle = "字体";
+      add("内建", "");
+      {
+        const int n = ttf_font_scan();
+        for (int i = 0; i < n; i++) {
+          const ttf_font_item_t *it = ttf_font_item(i);
+          if (it) add(it->name, it->path);
+        }
+      }
+      break;
     case MenuAct::ShelfStyle:
       st.pickTitle = "书架风格";
       for (int i = 0; i < kShelfStyleCount; i++) add(kShelfStyleNames[i], kShelfStyleKeys[i]);
@@ -9771,6 +6683,7 @@ static void rdPickFill(int act) {
       add(standbyFaceLabel(StandbyFace::Clock), standbyFaceKey(StandbyFace::Clock));
       add(standbyFaceLabel(StandbyFace::Almanac), standbyFaceKey(StandbyFace::Almanac));
       add(standbyFaceLabel(StandbyFace::Cover), standbyFaceKey(StandbyFace::Cover));
+      add(standbyFaceLabel(StandbyFace::Image), standbyFaceKey(StandbyFace::Image));
       break;
     case MenuAct::AutoStandby:
       st.pickTitle = "自动待机";
@@ -9785,6 +6698,14 @@ static void rdPickFill(int act) {
 // 这一项现在是什么值（用来把弹层的选中行落在当前档上，并画那个 ●）。
 static std::string rdPickCurValue(int act) {
   switch (static_cast<MenuAct>(act)) {
+    case MenuAct::Font: return std::to_string(st.fontLevel);
+    case MenuAct::FontFamily: {
+      // 用户**设置里**选的那个字体（持久化的那份），不是 ttf_font_path()：后者读的是
+      // 内容面，正在读的书有内嵌字体时它返回的是书里的字体文件，扫出来的 SD 字体一个都
+      // 匹配不上，● 会跳回"内建"。与「设置 → 字体」用同一个来源（screen_settings.cpp）。
+      const char *cur = font_store_get_path();
+      return (cur && !ttf_font_path_is_builtin(cur)) ? std::string(cur) : std::string();
+    }
     case MenuAct::ShelfStyle: return kShelfStyleKeys[clampI(static_cast<int>(shelfStyle()), 0, kShelfStyleCount - 1)];
     case MenuAct::StyleSource: return kStyleSrcKeys[clampI(styleSource(), 0, kStyleSrcCount - 1)];
     case MenuAct::EmbeddedFont: return kEmbFontKeys[clampI(embeddedFontMode(), 0, kEmbFontCount - 1)];
@@ -9832,6 +6753,25 @@ static void closeRdPick() {
 // （改值 → 落盘 → reopenBook/标全刷），只是现在是"一次跳到目标档"。
 static void applyRdPick(int act, const std::string &value) {
   switch (static_cast<MenuAct>(act)) {
+    case MenuAct::Font:
+      // 一次跳到目标档（原来要按好几次才轮到）。值就是档位下标。
+      st.fontLevel = clampI(atoi(value.c_str()), 0, kUserFontLevels - 1);
+      g_settings.setString("reader_font_level_v2", std::to_string(st.fontLevel));
+      reopenBook();
+      st.fullRefresh = true;
+      break;
+    case MenuAct::FontFamily:
+      // 照搬原来循环版的收尾：落盘 → 立刻重新 ttf_font_open（GfxRenderer 直接调
+      // ttf_font_*，开完即生效；字形度量变了所以还要重排）→ 打不开就回落内建。
+      font_store_set_path(value.c_str());
+      if (ttf_font_open(value.c_str()) != 0) {
+        ESP_LOGW(TAG, "字体打开失败，回落内建: %s", value.c_str());
+        (void)ttf_font_open_builtin();
+        font_store_set_path("");
+      }
+      reopenBook();
+      st.fullRefresh = true;
+      break;
     case MenuAct::ShelfStyle:
       // 自动 → 2x2 → 3x3 → 列表；选中项由 st.sel 派生页码，改完不会跑出屏。
       g_settings.setString("reader_shelf_style", value);
@@ -9875,6 +6815,23 @@ static void applyRdPick(int act, const std::string &value) {
     }
     case MenuAct::ClockFace:
       g_settings.setString("clock_face", value);
+      // 刚切成「书籍封面」：开书那一趟故意没做的那张整屏封面，在这里补出来
+      // （手上正好有这本书）。别的表盘不用这张图。
+      // 这一趟要解原图+写盘（~3s），画面会停在设置页上，做完下一帧照常重绘。
+      if (standbyFaceFromKey(value.c_str()) == StandbyFace::Cover) {
+        rdBuildStandbyCoverForOpenBook();
+      } else if (standbyFaceFromKey(value.c_str()) == StandbyFace::Image) {
+        // 刚切成「图片」：这屏上没有选图的入口（选图在文件管理里），所以只在这里
+        // 把缓存补出来 —— 转屏作废、清缓存之后都可能没有。一张都没选过就提示去哪选。
+        const std::string img = g_settings.getString("standby_image");
+        if (img.empty()) {
+          rdShowFloat("还没选待机图片", "文件管理里长按一张图 → 设为待机画面", 2500);
+        } else if (!Storage.exists(standbyImageCacheFor(SCREEN_W, SCREEN_H).c_str())) {
+          std::string err;
+          rdBuildStandbyImageCache(img, err);
+          if (!err.empty()) rdShowFloat(std::string("待机图片: ") + err, "", 2000);
+        }
+      }
       st.fullRefresh = true;
       break;
     case MenuAct::AutoStandby:
@@ -9963,1258 +6920,6 @@ static void handleSettingPicker(int key) {
   st.dirty = 1;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// 阅读统计（第 5 个根标签）
-//
-// 数据层在 main/reading_stats.{h,cpp}（记录口径/常量与 crossmux 一致，见那边的注释），
-// 这一段只画界面。版式基准：本移植里 GfxRenderer 的 fillRoundedRect / drawRoundedRect /
-// fillRectDither / drawTextRotated90CW 全是 stub（圆角被忽略、灰阶退化成黑白、旋转不转），
-// 所以：卡片一律直角描边；柱状图用描边矩形＋基线；需要"深浅"的地方（热力图）用
-// drawGrayscale16Pixel 直接写 4bpp 灰阶——封面的面积平均缩放走的就是同一条路。
-//
-// 子界面全部照 renderAbout/handleAbout 的三联形状：st.retMode 单层回退 +
-// st.fullRefresh/st.dirty 触发重绘，不发明新机制。
-// ═══════════════════════════════════════════════════════════════════════════
-
-static const int kStatsCards = 6;
-static const int kStatsCardH = 96;
-static const int kStatsCardGap = 8;
-
-// 按扩展名认书的类型（openBook 要 kind；统计里只存了 path）。
-static int rdStatsKindFor(const std::string &path) {
-  if (endsWith(path, ".epub")) return 0;
-  if (endsWith(path, ".txt")) return 1;
-  if (endsWith(path, ".xtc")) return 2;
-  return -1;
-}
-
-// 时间戳 → "2026-10-03"（时钟不可信时给一句人话）。
-static std::string rdStatsDate(uint32_t epoch) {
-  if (!RdTime::clockValid(epoch)) return "未记录";
-  char buf[16];
-  RdTime::formatOrdinal(RdTime::dayOrdinal(epoch), buf, sizeof(buf));
-  return buf;
-}
-
-// 日序号 → "2026-10-03"，0 给空串（热力图里那些跨月的格子用不着日期）。
-static std::string rdStatsOrdinalLabel(uint32_t ordinal) {
-  if (ordinal == 0) return "";
-  char buf[16];
-  RdTime::formatOrdinal(ordinal, buf, sizeof(buf));
-  return buf;
-}
-
-// 某一天的合计时长（聚合日表里查）。
-static uint64_t rdStatsDayMs(uint32_t ordinal) {
-  if (ordinal == 0) return 0;
-  for (const auto &d : ReadingStats::readingDays()) {
-    if (d.dayOrdinal == ordinal) return d.readingMs;
-  }
-  return 0;
-}
-
-// 某一天读过（≥3 分钟）的书，按时长降序。
-struct RdDayBook {
-  const ReadingBookStats *book;
-  uint64_t ms;
-};
-static std::vector<RdDayBook> rdStatsBooksOnDay(uint32_t ordinal) {
-  std::vector<RdDayBook> out;
-  if (ordinal == 0) return out;
-  const uint64_t minMs = 3ULL * 60ULL * 1000ULL;
-  for (const auto &b : ReadingStats::books()) {
-    for (const auto &d : b.readingDays) {
-      if (d.dayOrdinal == ordinal && d.readingMs >= minMs) {
-        out.push_back({&b, d.readingMs});
-        break;
-      }
-    }
-  }
-  std::sort(out.begin(), out.end(), [](const RdDayBook &a, const RdDayBook &b) {
-    if (a.ms != b.ms) return a.ms > b.ms;
-    return a.book->title < b.book->title;
-  });
-  return out;
-}
-
-// 参考日序号：时钟可信就用今天；否则退回已有记录的最后一天；再没有就是 0。
-static uint32_t rdStatsRefOrdinal() {
-  const uint32_t today = RdTime::todayOrdinal();
-  if (today != 0) return today;
-  const auto &days = ReadingStats::readingDays();
-  return days.empty() ? 0 : days.back().dayOrdinal;
-}
-
-// 一张概览卡：数值在上、标签在下，居中。非交互，选中态不落在卡片上。
-static void rdStatsCard(int x, int y, int w, int h, const std::string &value, const std::string &label) {
-  g_rd.drawRect(x, y, w, h, true);
-  const int lh = uiLineHeight();
-  const std::string v = fitWidth(value, w - 12);
-  drawLineText(x + (w - g_rd.getTextWidth(uiFontId(), v.c_str())) / 2, y + 8, v.c_str(), true);
-  const std::string l = fitWidth(label, w - 12);
-  drawLineText(x + (w - g_rd.getTextWidth(uiFontId(), l.c_str())) / 2, y + h - lh - 6, l.c_str(), true);
-}
-
-// 一排概览卡（cols 由屏宽定），返回卡片区的下一个空位 y。
-static int rdStatsCardGrid(int top, const std::vector<std::string> &values,
-                           const std::vector<std::string> &labels) {
-  const int w = g_rd.getScreenWidth();
-  const int cols = (w >= 900) ? 3 : 2;
-  const int n = static_cast<int>(values.size());
-  const int rows = (n + cols - 1) / cols;
-  const int cardW = (w - 2 * MARGIN - (cols - 1) * kStatsCardGap) / cols;
-  for (int i = 0; i < n; i++) {
-    const int cx = MARGIN + (i % cols) * (cardW + kStatsCardGap);
-    const int cy = top + (i / cols) * (kStatsCardH + kStatsCardGap);
-    rdStatsCard(cx, cy, cardW, kStatsCardH, values[i], labels[i]);
-  }
-  return top + rows * (kStatsCardH + kStatsCardGap);
-}
-
-// 统计主页里卡片区占几行（render 与命中要算同一个数）。
-static int rdStatsCardRows() {
-  const int cols = (g_rd.getScreenWidth() >= 900) ? 3 : 2;
-  return (kStatsCards + cols - 1) / cols;
-}
-// 主页交互列表的顶边。
-static int rdStatsListTop() {
-  return coverTop() + rdStatsCardRows() * (kStatsCardH + kStatsCardGap) + 6;
-}
-
-// ── 主页：概览卡 + 入口列表 + 已开始的书籍 ──────────────────────────────
-struct RdStatRow {
-  std::string label;
-  std::string right;
-  int act;             // 0 更多详情 1 热力图 2 档案 3 调整时长 4 统计设置 5 书籍 6 小标题
-  std::string path;    // act==5 的书路径
-};
-
-static std::string rdStatsBookRowRight(const ReadingBookStats &b) {
-  return ReadingStats::formatDurationHm(b.totalReadingMs) + " · " + std::to_string(b.lastProgressPercent) + "%";
-}
-
-static void rdStatsRows(std::vector<RdStatRow> &rows) {
-  rows.clear();
-  rows.push_back({"更多详情", "", 0, ""});
-  rows.push_back({"阅读热力图", "", 1, ""});
-  rows.push_back({"阅读档案", "", 2, ""});
-  rows.push_back({"调整阅读时长", "", 3, ""});
-  rows.push_back({"统计设置", "", 4, ""});
-  rows.push_back({"已开始的书籍 (" + std::to_string(ReadingStats::booksStarted()) + ")", "", 6, ""});
-  for (const auto &b : ReadingStats::books()) {
-    rows.push_back({b.title.empty() ? b.path : b.title, rdStatsBookRowRight(b), 5, b.path});
-  }
-}
-
-// 选中行移动（跳过小标题行）。
-static void rdStatsMoveSel(const std::vector<RdStatRow> &rows, int delta) {
-  const int n = static_cast<int>(rows.size());
-  if (n == 0) return;
-  int i = clampI(st.statsSel, 0, n - 1);
-  for (int k = 0; k < n; k++) {
-    i = (i + delta + n) % n;
-    if (rows[i].act != 6) break;
-  }
-  st.statsSel = i;
-  st.dirty = 1;
-}
-
-static void rdStatsOpenBook(const std::string &path, RdMode ret) {
-  if (path.empty()) return;
-  st.statsBookPath = path;
-  st.statsTop = 0;
-  st.retMode = ret;
-  st.mode = RdMode::StatsBook;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-static void rdStatsHeatmapEnter();
-static void rdStatsAdjustEnter(const std::string &path);
-
-// 从主页进某个子界面。
-static void rdStatsActivate(const std::vector<RdStatRow> &rows) {
-  if (rows.empty()) return;
-  const int i = clampI(st.statsSel, 0, static_cast<int>(rows.size()) - 1);
-  const RdStatRow &r = rows[i];
-  st.retMode = RdMode::Stats;
-  switch (r.act) {
-    case 0: st.statsTop = 0; st.mode = RdMode::StatsMore; st.fullRefresh = true; break;
-    case 1: rdStatsHeatmapEnter(); return;
-    case 2: st.statsTop = 0; st.mode = RdMode::StatsProfile; st.fullRefresh = true; break;
-    case 3: rdStatsAdjustEnter(r.path); return;
-    case 4: st.mode = RdMode::StatsSettings; st.fullRefresh = true; break;
-    case 5: rdStatsOpenBook(r.path, RdMode::Stats); return;
-    default: return;
-  }
-  st.dirty = 1;
-}
-
-static void renderStatsTab() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  int top = drawTabBar();
-
-  const bool goalMet = ReadingStats::todayReadingMs() >= ReadingStats::goalMs();
-  std::vector<std::string> values = {
-      std::to_string(ReadingStats::currentStreakDays()) + "d", std::to_string(ReadingStats::maxStreakDays()) + "d",
-      ReadingStats::formatDurationHm(ReadingStats::todayReadingMs()) + " / " +
-          ReadingStats::formatDurationHm(ReadingStats::goalMs()),
-      ReadingStats::formatDurationHm(ReadingStats::totalReadingMs()),
-      std::to_string(ReadingStats::booksFinished()), std::to_string(ReadingStats::booksStarted())};
-  std::vector<std::string> labels = {"连续阅读", "最长连续", goalMet ? "今日 / 目标 ✓" : "今日 / 目标", "阅读总时长",
-                                     "读完书籍", "开始书籍"};
-  const int listTop = rdStatsCardGrid(top, values, labels) + 6;
-  g_rd.drawLine(MARGIN, listTop - 3, w - MARGIN, listTop - 3, true);
-
-  std::vector<RdStatRow> rows;
-  rdStatsRows(rows);
-  const int n = static_cast<int>(rows.size());
-  const int itemH = uiLineHeight() + 12;
-  const int maxRows = std::max(1, (tabBottom() - listTop - 6) / itemH);
-  const int start = clampI(st.statsSel - maxRows / 2, 0, std::max(0, n - maxRows));
-  for (int i = 0; i < maxRows && start + i < n; i++) {
-    const RdStatRow &r = rows[start + i];
-    const int y = listTop + i * itemH;
-    const int ty = y + (itemH - uiLineHeight()) / 2;
-    if (r.act == 6) {
-      drawLineText(MARGIN, ty, r.label.c_str(), true);
-      continue;
-    }
-    const bool sel = (start + i) == st.statsSel;
-    if (sel) g_rd.fillRect(0, y, w, itemH, true);
-    std::string label = r.label;
-    if (r.act == 5 && !st.statsDelPath.empty() && st.statsDelPath == r.path) label += "  再长按删除";
-    const int rw = r.right.empty() ? 0 : g_rd.getTextWidth(uiFontId(), r.right.c_str());
-    const std::string l = g_rd.truncatedText(uiFontId(), label.c_str(), w - 2 * MARGIN - rw - 16);
-    drawLineText(MARGIN, ty, l.c_str(), !sel);
-    if (rw > 0) drawLineText(w - MARGIN - rw, ty, r.right.c_str(), !sel);
-  }
-}
-
-// 主页里 y 落在哪一行（触摸命中用；与 renderStatsTab 同一套数学）。
-static int rdStatsRowAt(int y) {
-  std::vector<RdStatRow> rows;
-  rdStatsRows(rows);
-  const int n = static_cast<int>(rows.size());
-  const int itemH = uiLineHeight() + 12;
-  const int listTop = rdStatsListTop();
-  const int maxRows = std::max(1, (tabBottom() - listTop - 6) / itemH);
-  const int start = clampI(st.statsSel - maxRows / 2, 0, std::max(0, n - maxRows));
-  if (y < listTop) return -1;
-  const int row = start + (y - listTop) / itemH;
-  return (row >= 0 && row < n) ? row : -1;
-}
-
-static void handleStatsTab(int key) {
-  std::vector<RdStatRow> rows;
-  rdStatsRows(rows);
-  const int n = static_cast<int>(rows.size());
-  const int itemH = uiLineHeight() + 12;
-  const int listTop = rdStatsListTop();
-  const int maxRows = std::max(1, (tabBottom() - listTop - 6) / itemH);
-
-  // ←→ 切标签，Esc/长按回书架（与「设置」标签一致）。
-  if (key == KEY_LEFT) { switchTab(st.tab - 1); return; }
-  if (key == KEY_RIGHT) { switchTab(st.tab + 1); return; }
-  if (key == 0x1B) { st.statsDelPath.clear(); switchTab(0); return; }
-  if (key == KEY_UP) { st.statsDelPath.clear(); rdStatsMoveSel(rows, -1); return; }
-  if (key == KEY_DOWN) { st.statsDelPath.clear(); rdStatsMoveSel(rows, +1); return; }
-  if (key == KEY_PAGE_UP) { st.statsDelPath.clear(); st.statsSel = std::max(0, st.statsSel - maxRows); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.statsDelPath.clear(); st.statsSel = std::min(n - 1, st.statsSel + maxRows); st.dirty = 1; return; }
-
-  // 长按书籍行 = 从统计里删掉这本书（二次确认：第一次长按就位，第二次才真删）。
-  if (key == KEY_LONG_CONFIRM || key == KEY_TOUCH_LONG) {
-    const int i = clampI(st.statsSel, 0, std::max(0, n - 1));
-    if (i < n && rows[i].act == 5) {
-      if (st.statsDelPath == rows[i].path) {
-        ReadingStats::removeBook(rows[i].path);
-        st.statsDelPath.clear();
-        st.statsSel = clampI(st.statsSel, 0, std::max(0, static_cast<int>(ReadingStats::booksStarted()) + 5 - 1));
-        rdShowFloat("已从统计中删除", rows[i].label, 3000);
-      } else {
-        st.statsDelPath = rows[i].path;
-      }
-      st.fullRefresh = true;
-      st.dirty = 1;
-      return;
-    }
-    st.statsDelPath.clear();
-    switchTab(0);
-    return;
-  }
-
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      const int t = tabHit(x, y);
-      if (t >= 0) { switchTab(t); return; }
-      const int row = rdStatsRowAt(y);
-      if (row >= 0) st.statsSel = row;
-    }
-    rdStatsActivate(rows);
-    st.dirty = 1;
-    return;
-  }
-}
-
-// main.cpp 的全局「长按中间确认键 = 待机」要放行三个把它当**动作键**的子界面
-// （见 pjournal_app.h 的声明）：
-//   ① 词典管理：长按 = 删本地词典（二次确认）；
-//   ② 按键映射：长按 = 解绑当前动作；
-//   ③ 阅读统计主页：长按 = 从统计里删掉选中的那本书（二次确认）。
-// ③ 只在这一行确实是一本书（rdStatsRows 里 act==5 的行）时才放行——选中卡片/占位行
-// 时它的长按只是"回书架"的另一条路（Esc 也是同一条路），那种场合让给待机更合理。
-static bool rdStatsLongConfirmIsDelete() {
-  std::vector<RdStatRow> rows;
-  rdStatsRows(rows);
-  const int n = static_cast<int>(rows.size());
-  const int i = clampI(st.statsSel, 0, std::max(0, n - 1));
-  return i < n && rows[i].act == 5;
-}
-
-bool screen_reader_long_confirm_is_action() {
-  switch (st.mode) {
-    case RdMode::DictDl: return true;
-    case RdMode::KeyMap: return true;
-    case RdMode::Stats: return rdStatsLongConfirmIsDelete();
-    default: return false;
-  }
-}
-
-// ── 单本书的统计详情 ────────────────────────────────────────────────────
-// 预计剩余时间：总时长 / 进度 × (100 − 进度)，向上圆整到 5 分钟。读得太少
-// （不足 10 分钟或进度 < 5%）不估——那时候的线性外推纯属噪声。
-static std::string rdStatsEstimate(const ReadingBookStats &b) {
-  if (b.completed || b.lastProgressPercent >= 100) return "已读完";
-  const uint64_t tenMin = 10ULL * 60ULL * 1000ULL;
-  const uint64_t fiveMin = 5ULL * 60ULL * 1000ULL;
-  if (b.totalReadingMs < tenMin || b.lastProgressPercent < 5) return "多读一会儿再估";
-  const uint64_t est = (b.totalReadingMs * 100ULL + b.lastProgressPercent - 1) / b.lastProgressPercent;
-  if (est <= b.totalReadingMs) return "多读一会儿再估";
-  uint64_t remaining = est - b.totalReadingMs;
-  remaining = ((remaining + fiveMin - 1) / fiveMin) * fiveMin;
-  std::string s = "约 " + ReadingStats::formatDurationHm(remaining);
-  if (b.sessions > 0) {
-    const uint64_t avg = b.totalReadingMs / b.sessions;
-    if (avg >= fiveMin) {
-      const uint64_t left = (remaining + avg - 1) / avg;
-      if (left > 0) s += " / " + std::to_string(left) + " 次";
-    }
-  }
-  return s;
-}
-
-struct RdKvRow {
-  std::string label;
-  std::string value;
-  int bar;   // -1 不画进度条，否则 0..100
-};
-
-static void rdStatsBookRows(const ReadingBookStats &b, std::vector<RdKvRow> &rows) {
-  rows.clear();
-  rows.push_back({"全书进度", std::to_string(b.lastProgressPercent) + "%", b.lastProgressPercent});
-  rows.push_back({"章节进度", std::to_string(b.chapterProgressPercent) + "%", b.chapterProgressPercent});
-  rows.push_back({"当前章节", b.chapterTitle.empty() ? "未记录" : b.chapterTitle, -1});
-  rows.push_back({"阅读总时长", ReadingStats::formatDurationHm(b.totalReadingMs), -1});
-  rows.push_back({"阅读次数", std::to_string(b.sessions) + " 次", -1});
-  rows.push_back({"上次阅读", b.lastSessionMs > 0 ? ReadingStats::formatDurationHm(b.lastSessionMs) : "—", -1});
-  rows.push_back({"预计还需", rdStatsEstimate(b), -1});
-  rows.push_back({"状态", b.completed ? "已读完" : "阅读中", -1});
-  rows.push_back({"最后阅读", rdStatsDate(b.lastReadAt), -1});
-  rows.push_back({"开始 → 读完", (RdTime::clockValid(b.firstReadAt) ? rdStatsDate(b.firstReadAt) : std::string("?")) +
-                                      " → " + (b.completedAt ? rdStatsDate(b.completedAt) : std::string("?")) + " ",
-                  -1});
-}
-
-static void renderStatsBook() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const ReadingBookStats *b = ReadingStats::findBook(st.statsBookPath);
-  if (!b) {
-    int top = drawTitle("书籍统计");
-    drawCenteredLine(top + 20, "这本书已不在统计里");
-    return;
-  }
-  const std::string title = b->title.empty() ? b->path : b->title;
-  const int top = drawTitle(fitWidth(title, w - 2 * MARGIN).c_str());
-
-  std::vector<RdKvRow> rows;
-  rdStatsBookRows(*b, rows);
-  const int n = static_cast<int>(rows.size());
-  const int itemH = uiLineHeight() + 12;
-  const int maxRows = std::max(1, (statusTop() - top - 8) / itemH);
-  const int start = clampI(st.statsTop, 0, std::max(0, n - maxRows));
-
-  for (int i = 0; i < maxRows && start + i < n; i++) {
-    const RdKvRow &r = rows[start + i];
-    const int y = top + i * itemH;
-    drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, r.label.c_str(), true);
-    const int lw = g_rd.getTextWidth(uiFontId(), r.label.c_str());
-    const std::string v = g_rd.truncatedText(uiFontId(), r.value.c_str(), w - 2 * MARGIN - lw - 16);
-    if (!v.empty()) {
-      const int vw = g_rd.getTextWidth(uiFontId(), v.c_str());
-      drawLineText(w - MARGIN - vw, y + (itemH - uiLineHeight()) / 2, v.c_str(), true);
-    }
-    // 进度条：槽描边 + 已读实心，颜色用灰阶（和状态带那条进度条同一套画法）。
-    if (r.bar >= 0) {
-      const int barY = y + itemH - 8;
-      const int barW = w - 2 * MARGIN;
-      g_rd.drawRect(MARGIN, barY, barW, 5, true);
-      const int fillW = barW * clampI(r.bar, 0, 100) / 100;
-      if (fillW > 0) g_rd.fillRect(MARGIN + 1, barY + 1, std::max(0, fillW - 2), 3, true);
-    }
-  }
-  drawFooter("↑↓ 滚动  Esc 返回  回车 打开");
-}
-
-static void handleStatsBook(int key) {
-  if (key == 0x1B) { st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
-  const ReadingBookStats *b = ReadingStats::findBook(st.statsBookPath);
-  if (!b) { st.mode = st.retMode; st.dirty = 1; return; }
-  int n = 0;
-  { std::vector<RdKvRow> rows; rdStatsBookRows(*b, rows); n = static_cast<int>(rows.size()); }
-  const int itemH = uiLineHeight() + 12;
-  const int maxRows = std::max(1, (statusTop() - coverTop() - 8) / itemH);
-  const int maxTop = std::max(0, n - maxRows);
-  if (key == KEY_UP) { st.statsTop = std::max(0, st.statsTop - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.statsTop = std::min(maxTop, st.statsTop + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.statsTop = std::max(0, st.statsTop - maxRows); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.statsTop = std::min(maxTop, st.statsTop + maxRows); st.dirty = 1; return; }
-  if (key == '\n') {
-    // 回车 = 打开这本书接着读（统计里点开一本书，多半就是想读它）。
-    const int kind = rdStatsKindFor(st.statsBookPath);
-    if (kind >= 0 && Storage.exists(st.statsBookPath.c_str()) && openBook(st.statsBookPath, kind)) {
-      st.mode = RdMode::Reading;
-      st.fullRefresh = true;
-    } else {
-      rdShowFloat("打不开这本书", st.statsBookPath, 3000);
-    }
-    st.dirty = 1;
-    return;
-  }
-}
-
-// ── 柱状图 ──────────────────────────────────────────────────────────────
-// 描边柱 + 基线刻度（0 不画柱）。柱顶一行数值、柱底一行标签，都是水平文字
-// ——本移植里 drawTextRotated90CW 是 stub，转不了，所以标签一律控制在 2~3 字符。
-static void rdStatsChart(int x, int y, int w, int h, const std::vector<uint64_t> &values,
-                         const std::vector<std::string> &topLabels, const std::vector<std::string> &botLabels) {
-  const int n = static_cast<int>(values.size());
-  if (n == 0) return;
-  uint64_t maxV = 1;
-  for (uint64_t v : values) maxV = std::max(maxV, v);
-
-  const int lh = uiLineHeight();
-  const int baseY = y + h - lh - 4;
-  const int chartH = std::max(10, baseY - y - lh);
-  const int gap = (n <= 7) ? 12 : 6;
-  const int slot = (w - (n - 1) * gap) / n;
-  int barW = std::min(slot, (n <= 7) ? 72 : 44);
-  if (barW < 6) barW = 6;
-  const int totalW = n * barW + (n - 1) * gap;
-  const int bx = x + (w - totalW) / 2;
-
-  for (int i = 0; i < n; i++) {
-    const int px = bx + i * (barW + gap);
-    if (values[i] == 0) {
-      g_rd.fillRect(px, baseY - 2, barW, 3, true);
-    } else {
-      int bh = static_cast<int>(values[i] * static_cast<uint64_t>(chartH) / maxV);
-      if (bh < 6) bh = 6;
-      g_rd.drawRect(px, baseY - bh, barW, bh, true);
-    }
-    if (i < static_cast<int>(topLabels.size()) && !topLabels[i].empty()) {
-      const std::string t = fitWidth(topLabels[i], barW + gap - 2);
-      const int tw = g_rd.getTextWidth(uiFontId(), t.c_str());
-      drawLineText(px + (barW - tw) / 2, baseY - chartH - lh, t.c_str(), true);
-    }
-    if (i < static_cast<int>(botLabels.size()) && !botLabels[i].empty()) {
-      const std::string t = fitWidth(botLabels[i], barW + gap - 2);
-      const int tw = g_rd.getTextWidth(uiFontId(), t.c_str());
-      drawLineText(px + (barW - tw) / 2, baseY + 4, t.c_str(), true);
-    }
-  }
-  g_rd.drawLine(x, baseY, x + w, baseY, true);
-}
-
-// 柱顶数值的短标签："45m"；年度图按 crossmux 的规则取整（<1h 用分钟、<24h 用小时、否则用天）。
-static std::string rdStatsMinutesLabel(uint64_t ms) {
-  const uint64_t minutes = ms / 60000ULL;
-  if (minutes == 0) return "";
-  return std::to_string(minutes) + "m";
-}
-static std::string rdStatsRoundedLabel(uint64_t ms) {
-  if (ms == 0) return "";
-  const uint64_t minutes = ms / 60000ULL;
-  if (minutes < 60) return std::to_string(std::max<uint64_t>(1, minutes)) + "m";
-  const uint64_t hours = (ms + 30ULL * 60ULL * 1000ULL) / (60ULL * 60ULL * 1000ULL);
-  if (hours < 24) return std::to_string(std::max<uint64_t>(1, hours)) + "h";
-  const uint64_t days = (ms + 12ULL * 60ULL * 60ULL * 1000ULL) / (24ULL * 60ULL * 60ULL * 1000ULL);
-  return std::to_string(std::max<uint64_t>(1, days)) + "d";
-}
-
-// ── 更多详情：两张区间卡 + 每日/年度柱状图 ───────────────────────────────
-static void renderStatsMore() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const int top = drawTabBar();
-  const uint32_t ref = rdStatsRefOrdinal();
-
-  std::vector<std::string> values = {
-      std::to_string(ReadingStats::currentStreakDays()) + "d", std::to_string(ReadingStats::maxStreakDays()) + "d",
-      ReadingStats::formatDurationHm(ReadingStats::todayReadingMs()) + " / " +
-          ReadingStats::formatDurationHm(ReadingStats::goalMs()),
-      ReadingStats::formatDurationHm(ReadingStats::totalReadingMs()),
-      std::to_string(ReadingStats::booksFinished()), std::to_string(ReadingStats::booksStarted())};
-  std::vector<std::string> labels = {"连续阅读", "最长连续", "今日 / 目标", "阅读总时长", "读完书籍", "开始书籍"};
-  int y = rdStatsCardGrid(top, values, labels);
-
-  std::vector<std::string> rangeVals = {ReadingStats::formatDurationHm(ReadingStats::recentReadingMs(7)),
-                                        ReadingStats::formatDurationHm(ReadingStats::recentReadingMs(30))};
-  std::vector<std::string> rangeLabels = {"近 7 天", "近 30 天"};
-  y = rdStatsCardGrid(y, rangeVals, rangeLabels) + 4;
-
-  // 每日阅读：参考日往前 7 天（从旧到新）。表头带日期范围，柱子下面只写日号。
-  const int dayAreaH = std::max(90, uiLineHeight() * 4);
-  std::vector<uint64_t> dayVals;
-  std::vector<std::string> dayTop, dayBot;
-  for (int i = 6; i >= 0; i--) {
-    const uint32_t ord = (ref >= static_cast<uint32_t>(i)) ? ref - i : 0;
-    dayVals.push_back(rdStatsDayMs(ord));
-    dayTop.push_back(rdStatsMinutesLabel(rdStatsDayMs(ord)));
-    int yy = 0;
-    unsigned mm = 0, dd = 0;
-    if (ord != 0 && RdTime::dateFromOrdinal(ord, yy, mm, dd)) {
-      dayBot.push_back(std::to_string(dd));  // 只写日号：竖屏一根柱不到 90px，放不下 "10/03"
-    } else {
-      dayBot.push_back("");
-    }
-  }
-  std::string dayTitle = "每日阅读";
-  if (ref != 0) {
-    const uint32_t startOrd = (ref >= 6) ? ref - 6 : 0;
-    dayTitle += "  " + rdStatsOrdinalLabel(startOrd).substr(5) + " ~ " + rdStatsOrdinalLabel(ref).substr(5);
-  }
-  drawLineText(MARGIN, y, dayTitle.c_str(), true);
-  y += uiLineHeight() + 6;
-  rdStatsChart(MARGIN, y, w - 2 * MARGIN, dayAreaH, dayVals, dayTop, dayBot);
-  y += dayAreaH + 14;
-
-  // 年度阅读：参考年 12 个月。
-  int year = 0;
-  unsigned refM = 1, refD = 1;
-  if (ref != 0) RdTime::dateFromOrdinal(ref, year, refM, refD);
-  std::string yearTitle = "年度阅读";
-  if (year != 0) yearTitle += "  " + std::to_string(year);
-  drawLineText(MARGIN, y, yearTitle.c_str(), true);
-  y += uiLineHeight() + 6;
-  std::vector<uint64_t> monthVals(12, 0);
-  std::vector<std::string> monthTop(12), monthBot(12);
-  if (year != 0) {
-    for (const auto &d : ReadingStats::readingDays()) {
-      int dy = 0;
-      unsigned dm = 0, dd = 0;
-      if (!RdTime::dateFromOrdinal(d.dayOrdinal, dy, dm, dd)) continue;
-      if (dy == year && dm >= 1 && dm <= 12) monthVals[dm - 1] += d.readingMs;
-    }
-  }
-  for (int i = 0; i < 12; i++) {
-    monthTop[i] = rdStatsRoundedLabel(monthVals[i]);
-    char b[4];
-    snprintf(b, sizeof(b), "%d", i + 1);
-    monthBot[i] = b;
-  }
-  rdStatsChart(MARGIN, y, w - 2 * MARGIN, dayAreaH, monthVals, monthTop, monthBot);
-
-  drawFooter("↑↓ 滚动  Esc 返回");
-}
-
-// 更多详情整页内容高度（滚动上限用）。
-static int rdStatsMoreContentH() {
-  const int lh = uiLineHeight();
-  const int cardRowsFor = (g_rd.getScreenWidth() >= 900) ? 2 : 3;  // 6 张卡
-  const int grid1 = cardRowsFor * (kStatsCardH + kStatsCardGap);
-  const int grid2 = 1 * (kStatsCardH + kStatsCardGap);  // 2 张区间卡：无论横竖都是 1 行
-  const int area = std::max(90, lh * 4);
-  return grid1 + 4 + grid2 + 4 + lh + 6 + area + 14 + lh + 6 + area + 8;
-}
-
-static void handleStatsMore(int key) {
-  if (key == 0x1B) { st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
-  if (key == KEY_LEFT || key == KEY_RIGHT) { st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
-  const int viewH = statusTop() - coverTop() - 8;
-  const int maxTop = std::max(0, rdStatsMoreContentH() - viewH);
-  const int step = uiLineHeight() + 12;
-  if (key == KEY_UP || key == KEY_PAGE_UP) { st.statsTop = std::max(0, st.statsTop - step); st.dirty = 1; return; }
-  if (key == KEY_DOWN || key == KEY_PAGE_DOWN) { st.statsTop = std::min(maxTop, st.statsTop + step); st.dirty = 1; return; }
-}
-
-// ── 阅读热力图（月历 6×7 热力格）─────────────────────────────────────────
-// 强度档（分钟）：0 无 / <15 无 / <30 1 / <60 2 / <120 3 / <240 4 / ≥240 5。
-// 本移植没有真的抖动绘制，档位直接映射成 4bpp 灰阶（0=最黑）。
-static int rdStatsHeatLevel(uint64_t ms) {
-  const uint64_t minutes = ms / 60000ULL;
-  if (ms == 0 || minutes < 15) return 0;
-  if (minutes < 30) return 1;
-  if (minutes < 60) return 2;
-  if (minutes < 120) return 3;
-  if (minutes < 240) return 4;
-  return 5;
-}
-static uint8_t rdStatsHeatGray(int level) {
-  switch (level) {
-    case 1: return 13;
-    case 2: return 11;
-    case 3: return 8;
-    case 4: return 4;
-    case 5: return 0;
-    default: return 15;
-  }
-}
-
-static void rdStatsFillGray(int x, int y, int w, int h, uint8_t gray) {
-  if (gray == 15) return;  // 白 = 不画，省一遍整块写
-  for (int yy = y; yy < y + h; yy++) {
-    for (int xx = x; xx < x + w; xx++) g_rd.drawGrayscale16Pixel(xx, yy, gray);
-  }
-}
-
-static void rdStatsHeatmapEnter() {
-  uint32_t ref = rdStatsRefOrdinal();
-  int y = 2026;
-  unsigned m = 1, d = 1;
-  if (ref != 0) RdTime::dateFromOrdinal(ref, y, m, d);
-  st.statsMonthY = y;
-  st.statsMonthM = static_cast<int>(m);
-  st.statsDay = ref != 0 ? ref : RdTime::ordinalForDate(y, m, 1);
-  st.statsTop = 0;
-  st.retMode = RdMode::Stats;
-  st.mode = RdMode::StatsHeatmap;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-static void renderStatsHeatmap() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const int top = drawTabBar();
-  const int lh = uiLineHeight();
-
-  const int year = st.statsMonthY ? st.statsMonthY : 2026;
-  const int month = (st.statsMonthM >= 1 && st.statsMonthM <= 12) ? st.statsMonthM : 1;
-  const int firstOrd = static_cast<int>(RdTime::ordinalForDate(year, static_cast<unsigned>(month), 1));
-  // 周一为一周之首：1970-01-01（序号 0）是周四 → (ordinal + 3) % 7。
-  const int firstWeekday = ((firstOrd + 3) % 7 + 7) % 7;
-  const int gridStart = firstOrd - firstWeekday;
-
-  char mbuf[16];
-  RdTime::formatMonth(year, static_cast<unsigned>(month), mbuf, sizeof(mbuf));
-  drawLineText(MARGIN, top, mbuf, true);
-  {
-    const std::string sel = rdStatsOrdinalLabel(st.statsDay);
-    if (!sel.empty()) {
-      const int sw = g_rd.getTextWidth(uiFontId(), sel.c_str());
-      drawLineText(w - MARGIN - sw, top, sel.c_str(), true);
-    }
-  }
-
-  // 月份合计 / 阅读天数 / 最佳一天 / 连续
-  uint64_t monthTotal = 0, bestDay = 0;
-  int bestDom = 0, readDays = 0;
-  for (const auto &d : ReadingStats::readingDays()) {
-    int dy = 0;
-    unsigned dm = 0, dd = 0;
-    if (!RdTime::dateFromOrdinal(d.dayOrdinal, dy, dm, dd)) continue;
-    if (dy != year || static_cast<int>(dm) != month) continue;
-    monthTotal += d.readingMs;
-    if (d.readingMs > 0) readDays++;
-    if (d.readingMs > bestDay) { bestDay = d.readingMs; bestDom = static_cast<int>(dd); }
-  }
-  std::vector<std::string> sv = {ReadingStats::formatDurationHm(monthTotal), std::to_string(readDays),
-                                 bestDay > 0 ? ReadingStats::formatDurationHm(bestDay) + " (" +
-                                                   std::to_string(bestDom) + "日)"
-                                             : "—",
-                                 std::to_string(ReadingStats::currentStreakDays()) + "d"};
-  std::vector<std::string> sl = {"本月合计", "阅读天数", "最佳一天", "连续阅读"};
-  const int cardsBot = rdStatsCardGrid(top + lh + 6, sv, sl);
-
-  // 图例（5 档 + 文字）
-  int ly = cardsBot + 4;
-  drawLineText(MARGIN, ly, "15m+", true);
-  int lx = MARGIN + g_rd.getTextWidth(uiFontId(), "15m+") + 8;
-  for (int level = 1; level <= 5; level++) {
-    g_rd.fillRect(lx, ly + 4, 22, 22, false);
-    rdStatsFillGray(lx + 1, ly + 5, 20, 20, rdStatsHeatGray(level));
-    g_rd.drawRect(lx, ly + 4, 22, 22, true);
-    lx += 30;
-  }
-  drawLineText(lx + 4, ly, "240m+", true);
-
-  // 月历格：7 列 × 6 行
-  const int gridTop = ly + lh + 8;
-  const int gridW = w - 2 * MARGIN;
-  int cellW = gridW / 7;
-  const int availH = tabBottom() - gridTop - 6;
-  int cellH = std::min(availH / 6, cellW * 3 / 2);
-  if (cellH < 24) cellH = 24;
-  const int gridX = MARGIN + (gridW - cellW * 7) / 2;
-  const uint32_t todayOrd = RdTime::todayOrdinal();
-
-  for (int i = 0; i < 42; i++) {
-    const uint32_t ord = static_cast<uint32_t>(gridStart + i);
-    const int gx = gridX + (i % 7) * cellW;
-    const int gy = gridTop + (i / 7) * cellH;
-    int dy = 0;
-    unsigned dm = 0, dd = 0;
-    const bool valid = ord != 0 && RdTime::dateFromOrdinal(ord, dy, dm, dd);
-    if (!valid) continue;
-    const bool inMonth = (dy == year && static_cast<int>(dm) == month);
-    const uint64_t ms = rdStatsDayMs(ord);
-    const int level = inMonth ? rdStatsHeatLevel(ms) : 0;
-    if (inMonth && level > 0) rdStatsFillGray(gx + 1, gy + 1, cellW - 2, cellH - 2, rdStatsHeatGray(level));
-    g_rd.drawRect(gx, gy, cellW, cellH, true);
-    // 日号：深档反白。跨月的格子只写日号、不填色（灰淡一点不必，黑白本来就一样）
-    char dbuf[4];
-    snprintf(dbuf, sizeof(dbuf), "%u", dd);
-    const bool white = inMonth && level >= 4;
-    drawLineText(gx + 4, gy + 2, dbuf, !white);
-    if (inMonth && ms > 0) {
-      // 时长只写"分钟数"，字号放不下完整 "45m"
-      const std::string m2 = std::to_string(ms / 60000ULL) + "m";
-      const std::string t = g_rd.truncatedText(uiFontId(), m2.c_str(), cellW - 8);
-      drawLineText(gx + 4, gy + cellH - lh - 2, t.c_str(), !white);
-    }
-    // 达标勾选 / 今天 / 选中
-    if (inMonth && ms >= ReadingStats::goalMs()) {
-      g_rd.fillRect(gx + cellW - 12, gy + 3, 8, 8, !white);
-    }
-    if (ord == todayOrd) g_rd.drawRect(gx + 2, gy + 2, cellW - 4, cellH - 4, true);
-    if (ord == st.statsDay) g_rd.drawRect(gx + 1, gy + 1, cellW - 2, cellH - 2, 2, true);
-  }
-
-  drawFooter("←→ 换月  ↑↓ 选日  回车 当天进详情  Esc 返回");
-}
-
-static void handleStatsHeatmap(int key) {
-  if (key == 0x1B) { st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
-
-  auto shiftMonth = [](int dir) {
-    int y = st.statsMonthY ? st.statsMonthY : 2026;
-    int m = st.statsMonthM;
-    m += dir;
-    if (m < 1) { m = 12; y--; }
-    if (m > 12) { m = 1; y++; }
-    st.statsMonthY = y;
-    st.statsMonthM = m;
-    // 选中日跟着挪到新月，日号超出当月天数就夹到月末。
-    int sy = 0;
-    unsigned sm = 0, sd = 0;
-    if (st.statsDay != 0 && RdTime::dateFromOrdinal(st.statsDay, sy, sm, sd)) {
-      const unsigned dim = RdTime::daysInMonth(y, static_cast<unsigned>(m));
-      if (sd > dim) sd = dim;
-      st.statsDay = RdTime::ordinalForDate(y, static_cast<unsigned>(m), sd);
-    } else {
-      st.statsDay = RdTime::ordinalForDate(y, static_cast<unsigned>(m), 1);
-    }
-    st.fullRefresh = true;
-    st.dirty = 1;
-  };
-
-  if (key == KEY_LEFT) { shiftMonth(-1); return; }
-  if (key == KEY_RIGHT) { shiftMonth(+1); return; }
-  if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-    const int dir = (key == KEY_DOWN || key == KEY_PAGE_DOWN) ? +1 : -1;
-    const uint32_t cur = st.statsDay ? st.statsDay : RdTime::ordinalForDate(st.statsMonthY, static_cast<unsigned>(st.statsMonthM), 1);
-    const uint32_t next = (dir > 0) ? cur + 1 : (cur > 1 ? cur - 1 : cur);
-    int ny = 0;
-    unsigned nm = 0, nd = 0;
-    if (RdTime::dateFromOrdinal(next, ny, nm, nd)) {
-      st.statsDay = next;
-      // 跨月：跟着把视图挪过去（和 crossmux 一样，选中日走出当月就换月）。
-      if (ny != st.statsMonthY || static_cast<int>(nm) != st.statsMonthM) {
-        st.statsMonthY = ny;
-        st.statsMonthM = static_cast<int>(nm);
-        st.fullRefresh = true;
-      }
-    }
-    st.dirty = 1;
-    return;
-  }
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      const int seg = tabHit(x, y);
-      if (seg >= 0) { switchTab(seg); return; }
-    }
-    st.statsTop = 0;
-    st.retMode = RdMode::StatsHeatmap;
-    st.mode = RdMode::StatsDay;
-    st.fullRefresh = true;
-    st.dirty = 1;
-    return;
-  }
-}
-
-// ── 某一天的阅读详情 ────────────────────────────────────────────────────
-// 日详情列表的顶边：概览卡一行 + 分隔 + "当天读过的书" 标题行。render 与触摸命中
-// 必须用同一个数，否则点按会错行。
-static int rdStatsDayListTop() {
-  return coverTop() + (kStatsCardH + kStatsCardGap) + 6 + uiLineHeight() + 8;
-}
-
-static void renderStatsDay() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const int top = drawTitle(("阅读日 " + rdStatsOrdinalLabel(st.statsDay)).c_str());
-
-  const auto books = rdStatsBooksOnDay(st.statsDay);
-  std::vector<std::string> values = {ReadingStats::formatDurationHm(rdStatsDayMs(st.statsDay)),
-                                     std::to_string(books.size())};
-  std::vector<std::string> labels = {"当日合计", "读过的书"};
-  int y = rdStatsCardGrid(top, values, labels) + 6;
-  drawLineText(MARGIN, y, "当天读过的书", true);
-  y = rdStatsDayListTop();
-
-  const int itemH = uiLineHeight() + 14;
-  const int maxRows = std::max(1, (statusTop() - y - 6) / itemH);
-  const int n = static_cast<int>(books.size());
-  const int start = clampI(st.statsTop, 0, std::max(0, n - maxRows));
-  if (n == 0) {
-    drawCenteredLine(y + 20, "这一天没有阅读记录");
-  }
-  for (int i = 0; i < maxRows && start + i < n; i++) {
-    const RdDayBook &db = books[start + i];
-    const int ry = y + i * itemH;
-    std::string title = db.book->title.empty() ? db.book->path : db.book->title;
-    const std::string right = ReadingStats::formatDurationHm(db.ms);
-    const int rw = g_rd.getTextWidth(uiFontId(), right.c_str());
-    title = g_rd.truncatedText(uiFontId(), title.c_str(), w - 2 * MARGIN - rw - 16);
-    drawLineText(MARGIN, ry + (itemH - uiLineHeight()) / 2, title.c_str(), true);
-    drawLineText(w - MARGIN - rw, ry + (itemH - uiLineHeight()) / 2, right.c_str(), true);
-  }
-  drawFooter("↑↓ 滚动  Esc 返回");
-  (void)w;
-}
-
-static void handleStatsDay(int key) {
-  if (key == 0x1B) { st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
-  const int n = static_cast<int>(rdStatsBooksOnDay(st.statsDay).size());
-  const int itemH = uiLineHeight() + 14;
-  const int listTop = rdStatsDayListTop();
-  const int maxRows = std::max(1, (statusTop() - listTop - 6) / itemH);
-  const int maxTop = std::max(0, n - maxRows);
-  if (key == KEY_UP) { st.statsTop = std::max(0, st.statsTop - 1); st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.statsTop = std::min(maxTop, st.statsTop + 1); st.dirty = 1; return; }
-  if (key == KEY_PAGE_UP) { st.statsTop = std::max(0, st.statsTop - maxRows); st.dirty = 1; return; }
-  if (key == KEY_PAGE_DOWN) { st.statsTop = std::min(maxTop, st.statsTop + maxRows); st.dirty = 1; return; }
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      const int seg = tabHit(x, y);
-      if (seg >= 0) { switchTab(seg); return; }
-      const auto books = rdStatsBooksOnDay(st.statsDay);
-      if (!books.empty() && y >= listTop) {
-        const int row = st.statsTop + (y - listTop) / itemH;
-        if (row >= 0 && row < static_cast<int>(books.size())) {
-          rdStatsOpenBook(books[row].book->path, RdMode::StatsDay);
-          return;
-        }
-      }
-    }
-    return;
-  }
-}
-
-// ── 阅读档案：4 轴雷达 + 总分 + 分轴指标 ────────────────────────────────
-struct RdProfileAxis {
-  std::string name;
-  int score = 0;
-  std::string m1Label, m1Value;
-  std::string m2Label, m2Value;
-};
-
-static int rdRoundDiv(int n, int d) { return d == 0 ? 0 : (n + d / 2) / d; }
-static int rdClampPct(int v) { return v < 0 ? 0 : (v > 100 ? 100 : v); }
-
-// 近 7 天的档案评分，逐行对齐 crossmux 的 buildReadingProfileSummary（去掉成就）。
-static void rdStatsProfileBuild(int &total, std::vector<RdProfileAxis> &axes) {
-  axes.clear();
-  total = 0;
-  const uint32_t ref = rdStatsRefOrdinal();
-  const int kDays = 7;
-  RdProfileAxis habit, stability, engagement, depth;
-  habit.name = "习惯";
-  stability.name = "稳定";
-  engagement.name = "投入";
-  depth.name = "深度";
-  if (ref == 0) {
-    habit.m1Label = "读书天"; habit.m1Value = "0/7";
-    habit.m2Label = "达标天"; habit.m2Value = "0/7";
-    stability.m1Label = "连读"; stability.m1Value = "0d";
-    stability.m2Label = "最佳占比"; stability.m2Value = "0%";
-    engagement.m1Label = "次数"; engagement.m1Value = "0";
-    engagement.m2Label = "次/读书天"; engagement.m2Value = "0";
-    depth.m1Label = "<10m"; depth.m1Value = "0%";
-    depth.m2Label = "10-29m"; depth.m2Value = "0%";
-    axes = {habit, stability, engagement, depth};
-    return;
-  }
-
-  const uint32_t startOrd = ref >= (uint32_t)(kDays - 1) ? ref - (kDays - 1) : 0;
-  const uint64_t goal = ReadingStats::goalMs();
-  uint64_t byDay[kDays] = {0};
-  for (const auto &d : ReadingStats::readingDays()) {
-    if (d.dayOrdinal < startOrd) continue;
-    if (d.dayOrdinal > ref) continue;
-    const size_t idx = static_cast<size_t>(d.dayOrdinal - startOrd);
-    if (idx < kDays) byDay[idx] += d.readingMs;
-  }
-
-  uint64_t weekly = 0, maxDay = 0;
-  int daysRead = 0, goalDays = 0, longestStreak = 0, run = 0;
-  for (int i = 0; i < kDays; i++) {
-    weekly += byDay[i];
-    maxDay = std::max(maxDay, byDay[i]);
-    if (byDay[i] > 0) {
-      daysRead++;
-      if (byDay[i] >= goal) {
-        goalDays++;
-        run++;
-        longestStreak = std::max(longestStreak, run);
-      } else {
-        run = 0;
-      }
-    } else {
-      run = 0;
-    }
-  }
-
-  int bestDayShare = 0;
-  if (weekly > 0) bestDayShare = rdRoundDiv(static_cast<int>(maxDay * 100ULL), static_cast<int>(weekly));
-
-  // 近 7 天的会话日志（不足则退回"每天一场"的估算，和 crossmux 一致）。
-  std::vector<uint32_t> sessions;
-  const auto &log = ReadingStats::sessionLog();
-  for (auto it = log.rbegin(); it != log.rend(); ++it) {
-    if (it->dayOrdinal < startOrd) break;
-    if (it->dayOrdinal <= ref) sessions.push_back(it->sessionMs);
-  }
-  if (sessions.empty() && daysRead > 0) {
-    for (int i = 0; i < kDays; i++) {
-      if (byDay[i] > 0) sessions.push_back(static_cast<uint32_t>(std::min<uint64_t>(byDay[i], 0xFFFFFFFFULL)));
-    }
-  }
-
-  const uint32_t kTen = 10 * 60 * 1000, kThirty = 30 * 60 * 1000;
-  int under10 = 0, mid = 0, over = 0;
-  for (uint32_t s : sessions) {
-    if (s < kTen) under10++;
-    else if (s < kThirty) mid++;
-    else over++;
-  }
-  const int nSessions = static_cast<int>(sessions.size());
-  int perDayTenths = daysRead > 0 ? rdRoundDiv(nSessions * 10, daysRead) : 0;
-  int pUnder = 0, pMid = 0, pOver = 0;
-  if (nSessions > 0) {
-    pUnder = rdRoundDiv(under10 * 100, nSessions);
-    pMid = rdRoundDiv(mid * 100, nSessions);
-    if (pUnder + pMid > 100) {
-      if (pMid >= pUnder) pMid = 100 - pUnder;
-      else pUnder = 100 - pMid;
-    }
-    pOver = rdClampPct(100 - pUnder - pMid);
-  }
-
-  const int habitScore = rdClampPct(rdRoundDiv(daysRead * 65 + goalDays * 35, kDays));
-  const int streakScore = goalDays > 0 ? rdRoundDiv(longestStreak * 100, goalDays) : 0;
-  int balanceScore = 0;
-  if (daysRead > 1 && weekly > 0) {
-    const double best = static_cast<double>(maxDay) / static_cast<double>(weekly);
-    const double ideal = 1.0 / static_cast<double>(daysRead);
-    const double norm = 1.0 - ((best - ideal) / (1.0 - ideal));
-    balanceScore = rdClampPct(static_cast<int>(norm * 100.0 + 0.5));
-  }
-  const int stabilityScore = rdClampPct((streakScore + balanceScore + 1) / 2);
-  const int sessionsScore = std::min(100, nSessions * 10);
-  const int perDayScore = daysRead > 0 ? std::min(100, rdRoundDiv(nSessions * 100, daysRead * 3)) : 0;
-  const int engagementScore = rdClampPct((sessionsScore * 60 + perDayScore * 40 + 50) / 100);
-  const int depthScore = rdClampPct(rdRoundDiv(pMid * 50 + pOver * 100, 100));
-  total = rdClampPct((habitScore + stabilityScore + engagementScore + depthScore + 2) / 4);
-
-  auto pctLabel = [](int v) { return std::to_string(v) + "%"; };
-  habit.score = habitScore;
-  habit.m1Label = "读书天"; habit.m1Value = std::to_string(daysRead) + "/" + std::to_string(kDays);
-  habit.m2Label = "达标天"; habit.m2Value = std::to_string(goalDays) + "/" + std::to_string(kDays);
-  stability.score = stabilityScore;
-  stability.m1Label = "连读"; stability.m1Value = std::to_string(longestStreak) + "d";
-  stability.m2Label = "最佳占比"; stability.m2Value = pctLabel(bestDayShare);
-  engagement.score = engagementScore;
-  engagement.m1Label = "次数"; engagement.m1Value = std::to_string(nSessions);
-  engagement.m2Label = "次/读书天";
-  engagement.m2Value = std::to_string(perDayTenths / 10) + (perDayTenths % 10 ? "." + std::to_string(perDayTenths % 10) : "");
-  depth.score = depthScore;
-  depth.m1Label = "<10m"; depth.m1Value = pctLabel(pUnder);
-  depth.m2Label = "10-29m"; depth.m2Value = pctLabel(pMid);
-  axes = {habit, stability, engagement, depth};
-}
-
-static void renderStatsProfile() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const int h = g_rd.getScreenHeight();
-  const int top = drawTabBar();
-
-  int total = 0;
-  std::vector<RdProfileAxis> axes;
-  rdStatsProfileBuild(total, axes);
-
-  // 雷达图：4 条轴在 45/135/225/315 度，环 25/50/75/100。
-  const int cx = w / 2;
-  const int cy = top + (tabBottom() - top) / 2 - uiLineHeight();
-  int R = std::min(w / 4, (tabBottom() - top - uiLineHeight() * 4) / 3);
-  if (R < 40) R = 40;
-  const double kPi = 3.14159265358979;
-  auto axisAngle = [&](int i) { return kPi * 0.25 + i * kPi * 0.5; };
-
-  for (int ring = 1; ring <= 4; ring++) {
-    int rx[4], ry[4];
-    for (int i = 0; i < 4; i++) {
-      const double a = axisAngle(i);
-      rx[i] = cx + static_cast<int>(R * ring / 4 * std::cos(a));
-      ry[i] = cy + static_cast<int>(R * ring / 4 * std::sin(a));
-    }
-    for (int i = 0; i < 4; i++) g_rd.drawLine(rx[i], ry[i], rx[(i + 1) % 4], ry[(i + 1) % 4], true);
-  }
-  int ax[4], ay[4];
-  for (int i = 0; i < 4; i++) {
-    const double a = axisAngle(i);
-    ax[i] = cx + static_cast<int>(R * std::cos(a));
-    ay[i] = cy + static_cast<int>(R * std::sin(a));
-    g_rd.drawLine(cx, cy, ax[i], ay[i], true);
-  }
-  int px[4], py[4];
-  for (int i = 0; i < 4; i++) {
-    const double a = axisAngle(i);
-    const int r = R * rdClampPct(axes[i].score) / 100;
-    px[i] = cx + static_cast<int>(r * std::cos(a));
-    py[i] = cy + static_cast<int>(r * std::sin(a));
-  }
-  g_rd.fillPolygon(px, py, 4, true);
-  for (int i = 0; i < 4; i++) g_rd.fillRect(px[i] - 3, py[i] - 3, 6, 6, true);
-
-  // 轴名 + 分数
-  for (int i = 0; i < 4; i++) {
-    const std::string t = axes[i].name + " " + std::to_string(axes[i].score);
-    const int tw = g_rd.getTextWidth(uiFontId(), t.c_str());
-    int tx = ax[i] + (ax[i] >= cx ? 6 : -tw - 6);
-    tx = clampI(tx, MARGIN, std::max(MARGIN, w - MARGIN - tw));
-    int ty = ay[i] + (ay[i] >= cy ? 0 : -uiLineHeight());
-    drawLineText(tx, ty, t.c_str(), true);
-  }
-
-  // 总分（居中，压在雷达图下面）
-  {
-    const std::string t = "综合评分 " + std::to_string(total) + " / 100";
-    drawLineText((w - g_rd.getTextWidth(uiFontId(), t.c_str())) / 2, std::min(tabBottom() - uiLineHeight() - 4, cy + R + 8),
-                 t.c_str(), true);
-  }
-
-  // 分轴指标：每轴一行，四行排在雷达图下面（滚动看更多）
-  const int itemH = uiLineHeight() + 10;
-  int y = cy + R + uiLineHeight() + 14;
-  for (int i = 0; i < 4 && y + itemH <= tabBottom(); i++) {
-    const RdProfileAxis &a = axes[i];
-    const std::string left =
-        a.name + "  " + a.m1Label + " " + a.m1Value + "   " + a.m2Label + " " + a.m2Value;
-    const std::string l = g_rd.truncatedText(uiFontId(), left.c_str(), w - 2 * MARGIN);
-    drawLineText(MARGIN, y, l.c_str(), true);
-    y += itemH;
-  }
-  (void)h;
-  drawFooter("Esc 返回");
-}
-
-static void handleStatsProfile(int key) {
-  if (key == 0x1B || key == KEY_LEFT || key == KEY_RIGHT) {
-    st.mode = st.retMode;
-    st.fullRefresh = true;
-    st.dirty = 1;
-  }
-}
-
-// ── 调整某本书某一天的阅读时长 ──────────────────────────────────────────
-static const int kStatsAddMinutes[4] = {15, 30, 45, 60};
-
-static void rdStatsAdjustEnter(const std::string &path) {
-  // 从主页进来时用当前选中的那本书；为空就用最近读的那本。
-  std::string p = path;
-  if (p.empty() && !ReadingStats::books().empty()) p = ReadingStats::books().front().path;
-  if (p.empty()) {
-    rdShowFloat("还没有可调整的书", "先读一会儿再来", 3000);
-    return;
-  }
-  st.statsBookPath = p;
-  st.statsAdjField = 0;
-  st.statsAdjOp = 0;
-  st.statsAdjAmt = 1;
-  st.statsAdjFailed = false;
-  const uint32_t ref = rdStatsRefOrdinal();
-  st.statsAdjDay = ref;
-  st.retMode = RdMode::Stats;
-  st.mode = RdMode::StatsAdjust;
-  st.fullRefresh = true;
-  st.dirty = 1;
-}
-
-static void renderStatsAdjust() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const ReadingBookStats *b = ReadingStats::findBook(st.statsBookPath);
-  const int top = drawTitle("调整阅读时长");
-  drawLineText(MARGIN, top, b ? (b->title.empty() ? b->path : b->title).c_str() : "（这本书已不在统计里）", true);
-
-  const int itemH = uiLineHeight() + 16;
-  int y = top + uiLineHeight() + 12;
-  const char *names[3] = {"操作", "日期", "数量"};
-  std::string vals[3];
-  vals[0] = st.statsAdjOp == 0 ? "增加" : "减少";
-  vals[1] = rdStatsOrdinalLabel(st.statsAdjDay);
-  if (vals[1].empty()) vals[1] = "未设置";
-  vals[2] = std::to_string(kStatsAddMinutes[clampI(st.statsAdjAmt, 0, 3)]) + " 分钟";
-
-  for (int i = 0; i < 3; i++) {
-    const int ry = y + i * itemH;
-    if (i == st.statsAdjField) g_rd.fillRect(0, ry, w, itemH, true);
-    const bool black = (i != st.statsAdjField);
-    drawLineText(MARGIN, ry + (itemH - uiLineHeight()) / 2, names[i], black);
-    const int vw = g_rd.getTextWidth(uiFontId(), vals[i].c_str());
-    drawLineText(w - MARGIN - vw, ry + (itemH - uiLineHeight()) / 2, vals[i].c_str(), black);
-    // 左右箭头提示（只有当前字段可调）
-    if (i == st.statsAdjField) {
-      drawLineText(MARGIN + g_rd.getTextWidth(uiFontId(), names[i]) + 12, ry + (itemH - uiLineHeight()) / 2, "◀ ▶", black);
-    }
-  }
-  y += 3 * itemH + 8;
-
-  // 预览：那天现在的合计 → 调整后；不足则明确说不给减。
-  const uint64_t cur = rdStatsDayMs(st.statsAdjDay);
-  const uint64_t delta = static_cast<uint64_t>(kStatsAddMinutes[clampI(st.statsAdjAmt, 0, 3)]) * 60ULL * 1000ULL;
-  std::string preview;
-  if (!b) {
-    preview = "这本书已不在统计里";
-  } else if (st.statsAdjDay == 0) {
-    preview = "先设置日期";
-  } else if (st.statsAdjOp == 0) {
-    preview = "当日合计 " + ReadingStats::formatDurationHm(cur) + " → " + ReadingStats::formatDurationHm(cur + delta);
-  } else if (cur < delta) {
-    preview = "当日合计 " + ReadingStats::formatDurationHm(cur) + "（不够减）";
-  } else {
-    preview = "当日合计 " + ReadingStats::formatDurationHm(cur) + " → " + ReadingStats::formatDurationHm(cur - delta);
-  }
-  drawLineText(MARGIN, y, preview.c_str(), true);
-  y += uiLineHeight() + 8;
-  if (st.statsAdjFailed) drawLineText(MARGIN, y, "改不了：这一天没有这么多记录", true);
-
-  drawFooter("↑↓ 选字段  ←→ 改值  回车 应用  Esc 返回");
-}
-
-static void handleStatsAdjust(int key) {
-  if (key == 0x1B) { st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
-  if (key == KEY_UP) { st.statsAdjField = (st.statsAdjField + 2) % 3; st.dirty = 1; return; }
-  if (key == KEY_DOWN) { st.statsAdjField = (st.statsAdjField + 1) % 3; st.dirty = 1; return; }
-  if (key == KEY_LEFT || key == KEY_RIGHT) {
-    const int dir = (key == KEY_RIGHT) ? +1 : -1;
-    if (st.statsAdjField == 0) st.statsAdjOp ^= 1;
-    else if (st.statsAdjField == 1) {
-      if (st.statsAdjDay == 0) st.statsAdjDay = rdStatsRefOrdinal();
-      else {
-        const uint32_t next = (dir > 0) ? st.statsAdjDay + 1 : (st.statsAdjDay > 1 ? st.statsAdjDay - 1 : st.statsAdjDay);
-        st.statsAdjDay = next;
-      }
-    } else {
-      st.statsAdjAmt = (st.statsAdjAmt + dir + 4) % 4;
-    }
-    st.statsAdjFailed = false;
-    st.dirty = 1;
-    return;
-  }
-  if (key == '\n') {
-    const int64_t amount = static_cast<int64_t>(kStatsAddMinutes[clampI(st.statsAdjAmt, 0, 3)]) * 60LL * 1000LL;
-    const int32_t delta = static_cast<int32_t>(st.statsAdjOp == 0 ? amount : -amount);
-    if (st.statsAdjDay == 0 || !ReadingStats::adjustBookReadingTime(st.statsBookPath, st.statsAdjDay, delta)) {
-      st.statsAdjFailed = true;
-      st.dirty = 1;
-      return;
-    }
-    rdShowFloat("已调整", ReadingStats::formatDurationHm(rdStatsDayMs(st.statsAdjDay)), 3000);
-    st.mode = st.retMode;
-    st.fullRefresh = true;
-    st.dirty = 1;
-    return;
-  }
-}
-
-// ── 统计设置：每日目标 ──────────────────────────────────────────────────
-static const int kStatsGoals[4] = {15, 30, 45, 60};
-
-static void renderStatsSettings() {
-  g_rd.clearScreen();
-  const int w = g_rd.getScreenWidth();
-  const int top = drawTitle("统计设置");
-  drawLineText(MARGIN, top, "每日目标（达标的天才计入连续与热力图勾选）", true);
-
-  const int cur = g_settings.dailyGoalMinutes();
-  const int itemH = uiLineHeight() + 14;
-  int y = top + uiLineHeight() + 14;
-  for (int i = 0; i < 4; i++) {
-    const int ry = y + i * itemH;
-    const bool sel = (kStatsGoals[i] == cur);
-    if (sel) g_rd.fillRect(0, ry, w, itemH, true);
-    const std::string label = std::to_string(kStatsGoals[i]) + " 分钟";
-    drawLineText(MARGIN, ry + (itemH - uiLineHeight()) / 2, label.c_str(), !sel);
-    if (sel) {
-      const std::string mark = "当前";
-      drawLineText(w - MARGIN - g_rd.getTextWidth(uiFontId(), mark.c_str()), ry + (itemH - uiLineHeight()) / 2, mark.c_str(),
-                   false);
-    }
-  }
-  drawFooter("回车 选定  Esc 返回");
-}
-
-static void handleStatsSettings(int key) {
-  if (key == 0x1B) { st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
-  const int itemH = uiLineHeight() + 14;
-  const int top = coverTop() + uiLineHeight() + 14;
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      const int seg = tabHit(x, y);
-      if (seg >= 0) { switchTab(seg); return; }
-      if (y >= top) {
-        const int row = (y - top) / itemH;
-        if (row >= 0 && row < 4) {
-          g_settings.setString("daily_goal", std::to_string(kStatsGoals[row]).c_str());
-          ReadingStats::save();
-          rdShowFloat("每日目标已更新", std::to_string(kStatsGoals[row]) + " 分钟", 3000);
-          st.fullRefresh = true;
-          st.dirty = 1;
-        }
-      }
-      return;
-    }
-    return;
-  }
-  // 数字键 1..4 直接选（和设置页的选项行同一个习惯）。
-  if (key >= '1' && key <= '4') {
-    const int row = key - '1';
-    g_settings.setString("daily_goal", std::to_string(kStatsGoals[row]).c_str());
-    ReadingStats::save();
-    rdShowFloat("每日目标已更新", std::to_string(kStatsGoals[row]) + " 分钟", 3000);
-    st.fullRefresh = true;
-    st.dirty = 1;
-  }
-}
 
 static void handleDict(int key) {
   if (key == 0x1B) {
@@ -11225,13 +6930,30 @@ static void handleDict(int key) {
     st.dirty = 1;
     return;
   }
+  // 释义正文滚动。触摸竖滑在 main.cpp/screen_reader_handle 里被展平成翻页键，
+  // 词典和目录/书架一样保留原键（见 screen_reader_handle 的例外名单），所以
+  // KEY_PAGE_UP/DOWN = 整屏翻页、KEY_UP/DOWN（BLE/方向键）= 单行。
+  // 上限用渲染时算出的 dictScrollMax；键盘展开时竖滑起点落在面板上会被键盘先吃掉，
+  // 收到这里的一定是正文区的滑动。
+  if (key == KEY_UP) { st.dictScroll = std::max(0, st.dictScroll - 1); st.dirty = 1; return; }
+  if (key == KEY_DOWN) { st.dictScroll = std::min(st.dictScrollMax, st.dictScroll + 1); st.dirty = 1; return; }
+  if (key == KEY_PAGE_UP) {
+    st.dictScroll = std::max(0, st.dictScroll - std::max(1, st.dictPageLines));
+    st.dirty = 1;
+    return;
+  }
+  if (key == KEY_PAGE_DOWN) {
+    st.dictScroll = std::min(st.dictScrollMax, st.dictScroll + std::max(1, st.dictPageLines));
+    st.dirty = 1;
+    return;
+  }
   if (key == '\n') {
     int x, y;
     if (input_tap_xy(&x, &y)) {
       // 状态栏右端的键盘图标：先判它。它在键盘面板底边之下一点点，面板收起时才露出来；
       // 面板展开时点它则收起键盘（与写作模式键盘的开关同序，见 screen_editor.cpp）。
       if (rdVkIconHit(x, y)) {
-        st.vkVisible = !st.vkVisible;
+        rdToggleVk();
       } else if (y >= dictQueryTop() && y < dictQueryTop() + dictQueryH()) {
         rdVkWantShow();   // 点到查询框：展开键盘（蓝牙键盘连着时给一次浮动提示）
       } else if (st.vkVisible) {
@@ -11329,7 +7051,7 @@ static void renderNotes() {
   g_rd.clearScreen();
   int w = g_rd.getScreenWidth();
   drawTabBar();
-  rdDrawSearchBar(false);   // 笔记搜索栏（暂时只有搜索图标）
+  rdDrawSearchBar(false);   // 笔记搜索栏（放大镜 + 右端「导出」按钮）
   int top = rdBarContentTop();
   auto rows = rdNoteRows();
   if (rows.empty()) {
@@ -11420,6 +7142,9 @@ static void handleNotes(int key) {
     if (input_tap_xy(&x, &yy)) {
       int t = tabHit(x, yy);
       if (t >= 0) { switchTab(t); return; }
+      // 「导出」按钮排在栏体命中之前：两者在栏右端有一小段重叠，先判按钮才不会被
+      // 当成"点了搜索框"（结果就是点了导出却弹出搜索）。
+      if (rdNotesExportHit(x, yy)) { rdExportAnnot(); return; }
       if (rdBarIconHit(x, yy, false) >= 0 || rdBarBodyHit(x, yy, false)) {
         rdEnterSearch(RdMode::NotesSearch);
         return;
@@ -11437,7 +7162,7 @@ static void handleNotes(int key) {
 
 // ── 笔记编辑器 ──────────────────────────────────────────────────────────
 // 上半屏显示选中的原文，下半屏是笔记正文；蓝牙键盘没连时自动弹虚拟键盘。
-static void renderNoteEdit() {
+void renderNoteEdit() {
   g_rd.clearScreen();
   int w = g_rd.getScreenWidth();
   const bool editing = (st.noteEditIdx >= 0 && st.noteEditIdx < static_cast<int>(st.notes.size()));
@@ -11460,7 +7185,7 @@ static void renderNoteEdit() {
   g_rd.drawLine(MARGIN, y, w - MARGIN, y, true);
   y += 12;
 
-  const int bottom = st.vkVisible ? (vkVkTop() - 6) : statusTop();
+  const int bottom = rdBodyBottom();
   if (st.noteEditBuf.empty()) {
     drawLineText(MARGIN, y, "点下方键盘输入，或连蓝牙键盘直接打字", true);
   } else {
@@ -11474,7 +7199,10 @@ static void renderNoteEdit() {
     }
   }
   if (st.vkVisible) drawVk();
-  else drawFooter("回车保存   Esc 取消");
+  else {
+    drawRdImeBar();   // 蓝牙键盘打字：候选条照样要有（见 drawRdImeBar）
+    drawFooter("回车保存   Esc 取消");
+  }
   rdDrawVkIcon();
 }
 
@@ -11494,13 +7222,13 @@ static void handleNoteEdit(int key) {
     int x, y;
     if (input_tap_xy(&x, &y)) {
       // 状态栏右端的键盘图标：点一下开/收键盘（收起来之后接着点正文才提交）。
-      if (rdVkIconHit(x, y)) { st.vkVisible = !st.vkVisible; st.dirty = 1; return; }
+      if (rdVkIconHit(x, y)) { rdToggleVk(); return; }
       if (st.vkVisible && y >= vkVkTop()) { vkTap(x, y); st.dirty = 1; return; }
       if (st.vkVisible) { st.dirty = 1; return; }   // 键盘开着时点正文不提交
       rdNoteCommit();
       return;
     }
-    if (!st.vkVisible && rdVkWantShow()) { st.dirty = 1; return; }
+    // 无坐标回车 = 保存（同 handleShelfSearch：不顺手把键盘叫回来，面板开关归状态栏图标）。
     rdNoteCommit();
     return;
   }
@@ -11541,6 +7269,19 @@ static int rdDrawSearchHeader(const char *title, const std::string &q, const cha
 }
 static int rdSearchListTop() { return coverTop() + uiLineHeight() + 12; }
 
+// 搜索页结果列表的几何（书架搜索 / 笔记搜索共用）：居中式窗口，底边随虚拟键盘升降。
+// top == rdDrawSearchHeader 的返回值（抬头那条分隔线之下）。渲染与点按命中共用。
+static ListView searchListView(int count, int sel, int itemH) {
+  ListView lv;
+  lv.top = rdSearchListTop();
+  lv.itemH = itemH;
+  lv.count = count;
+  lv.rows = std::max(1, (rdBodyBottom() - lv.top) / lv.itemH);
+  lv.sel = sel;
+  listViewCenter(lv);
+  return lv;
+}
+
 // ── 书架搜索 ────────────────────────────────────────────────────────────
 // 书名子串匹配（ASCII 大小写不敏感，中文不受影响）。空查询=全部命中，这样刚进搜索
 // 时列表就是整个书架，删字也能自然回到全集，不会突然空屏。
@@ -11574,17 +7315,17 @@ static void renderShelfSearch() {
   const int top = rdDrawSearchHeader("搜索书架", st.shelfQuery, "输入书名关键字");
   auto hits = rdShelfHits();
   const int n = static_cast<int>(hits.size());
-  const int bottom = st.vkVisible ? (vkVkTop() - 6) : statusTop();
-  const int itemH = uiLineHeight() + 6;
   if (n == 0) {
     drawCenteredLine(top + 30, "没有匹配的书");
   } else {
-    st.searchSel = clampI(st.searchSel, 0, n - 1);
-    const int maxRows = std::max(1, (bottom - top) / itemH);
-    const int start = clampI(st.searchSel - maxRows / 2, 0, std::max(0, n - maxRows));
+    const ListView lv = searchListView(n, st.searchSel, uiLineHeight() + 6);
+    st.searchSel = lv.sel;  // 照旧把夹好的选中项写回（渲染顺带做归一）
+    const int itemH = lv.itemH;
+    const int maxRows = lv.rows;
+    const int start = lv.first;
     for (int i = 0; i < maxRows && start + i < n; i++) {
       const int idx = hits[start + i];
-      const int y = top + i * itemH;
+      const int y = lv.top + i * itemH;
       const bool sel = (start + i == st.searchSel);
       if (sel) g_rd.fillRect(0, y, w, itemH, true);
       // 命中结果用 UI 字体画（书名可能含 builtin 子集外的字，但这里和书架列表一致，
@@ -11594,7 +7335,10 @@ static void renderShelfSearch() {
     }
   }
   if (st.vkVisible) drawVk();
-  else drawFooter("↑↓ 选择  Enter 打开  Esc 取消");
+  else {
+    drawRdImeBar();   // 搜索框在打拼音：编码行 + 候选行
+    drawFooter("↑↓ 选择  Enter 打开  Esc 取消");
+  }
   rdDrawVkIcon();
 }
 
@@ -11607,29 +7351,18 @@ static void handleShelfSearch(int key) {
     st.dirty = 1;
     return;
   }
-  if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-    const int n = static_cast<int>(rdShelfHits().size());
-    if (n <= 0) return;
-    int step = (key == KEY_UP) ? -1 : (key == KEY_DOWN) ? 1 : (key == KEY_PAGE_DOWN ? 8 : -8);
-    st.searchSel = clampI(st.searchSel + step, 0, n - 1);
-    st.dirty = 1;
-    return;
+  {  // 上下/翻页在 ui/list_view.h（与 renderShelfSearch 共用同一个几何）
+    ListView lv = searchListView(static_cast<int>(rdShelfHits().size()), st.searchSel, uiLineHeight() + 6);
+    if (listViewKey(lv, key)) { st.searchSel = lv.sel; st.dirty = 1; return; }
   }
   if (key == '\n') {
     int x, y;
     if (input_tap_xy(&x, &y)) {
-      if (rdVkIconHit(x, y)) { st.vkVisible = !st.vkVisible; st.dirty = 1; return; }
+      if (rdVkIconHit(x, y)) { rdToggleVk(); return; }
       if (st.vkVisible && y >= vkVkTop()) { vkTap(x, y); st.dirty = 1; return; }
       // 键盘面板之上（或键盘收起时）点结果行 → 直接打开那一本
-      auto hits = rdShelfHits();
-      const int n = static_cast<int>(hits.size());
-      const int top = rdSearchListTop();
-      const int itemH = uiLineHeight() + 6;
-      const int bottom = st.vkVisible ? (vkVkTop() - 6) : statusTop();
-      const int maxRows = std::max(1, (bottom - top) / itemH);
-      const int start = n > 0 ? clampI(st.searchSel - maxRows / 2, 0, std::max(0, n - maxRows)) : 0;
-      const int row = start + (y - top) / itemH;
-      if (y >= top && row >= 0 && row < n) {
+      const int row = listViewHitAt(searchListView(static_cast<int>(rdShelfHits().size()), st.searchSel, uiLineHeight() + 6), y);
+      if (row >= 0) {
         st.searchSel = row;
         rdShelfSearchOpen();
         return;
@@ -11637,8 +7370,9 @@ static void handleShelfSearch(int key) {
       st.dirty = 1;
       return;
     }
-    // 非点按回车：蓝牙键盘连上时键盘面板是收起的，这里就是唯一的"确认"。
-    if (!st.vkVisible && rdVkWantShow()) { st.dirty = 1; return; }
+    // 无坐标回车（蓝牙键盘的回车，或面板上那个回车）：打开当前命中。**这里不再尝试
+    // 把虚拟键盘叫回来**——面板的开/关由用户在状态栏图标上定，rdVkWantShow() 现在
+    // 一律置可见，留着那句会让"收起键盘后按回车确认"变成"键盘又弹回来"。
     rdShelfSearchOpen();
     return;
   }
@@ -11677,18 +7411,19 @@ static void renderNotesSearch() {
   const int top = rdDrawSearchHeader("搜索笔记", st.notesQuery, "输入关键字（原文/笔记/书名）");
   auto hits = rdNotesHits();
   const int n = static_cast<int>(hits.size());
-  const int bottom = st.vkVisible ? (vkVkTop() - 6) : statusTop();
-  const int itemH = uiLineHeight() * 2 + 6;   // 两行：原文 / 《书名》+笔记正文
   if (n == 0) {
     drawCenteredLine(top + 30, "没有匹配的笔记");
   } else {
-    st.searchSel = clampI(st.searchSel, 0, n - 1);
-    const int maxRows = std::max(1, (bottom - top) / itemH);
-    const int start = clampI(st.searchSel - maxRows / 2, 0, std::max(0, n - maxRows));
+    // 行高两行：原文 / 《书名》+笔记正文
+    const ListView lv = searchListView(n, st.searchSel, uiLineHeight() * 2 + 6);
+    st.searchSel = lv.sel;  // 照旧把夹好的选中项写回（渲染顺带做归一）
+    const int itemH = lv.itemH;
+    const int maxRows = lv.rows;
+    const int start = lv.first;
     const int maxW = w - 2 * MARGIN - 12;
     for (int i = 0; i < maxRows && start + i < n; i++) {
       const RdState::RdNote &nt = st.notes[hits[start + i]];
-      const int y = top + i * itemH;
+      const int y = lv.top + i * itemH;
       const bool sel = (start + i == st.searchSel);
       if (sel) g_rd.fillRect(2, y, w - 4, itemH - 2, true);
       std::string l1 = g_rd.truncatedText(uiFontId(), nt.text.c_str(), maxW, EpdFontFamily::REGULAR);
@@ -11700,7 +7435,10 @@ static void renderNotesSearch() {
     }
   }
   if (st.vkVisible) drawVk();
-  else drawFooter("↑↓ 选择  Enter 跳转  Esc 取消");
+  else {
+    drawRdImeBar();   // 搜索框在打拼音：编码行 + 候选行
+    drawFooter("↑↓ 选择  Enter 跳转  Esc 取消");
+  }
   rdDrawVkIcon();
 }
 
@@ -11713,28 +7451,18 @@ static void handleNotesSearch(int key) {
     st.dirty = 1;
     return;
   }
-  if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-    const int n = static_cast<int>(rdNotesHits().size());
-    if (n <= 0) return;
-    int step = (key == KEY_UP) ? -1 : (key == KEY_DOWN) ? 1 : (key == KEY_PAGE_DOWN ? 8 : -8);
-    st.searchSel = clampI(st.searchSel + step, 0, n - 1);
-    st.dirty = 1;
-    return;
+  {  // 上下/翻页在 ui/list_view.h（与 renderNotesSearch 共用同一个几何）
+    ListView lv = searchListView(static_cast<int>(rdNotesHits().size()), st.searchSel, uiLineHeight() * 2 + 6);
+    if (listViewKey(lv, key)) { st.searchSel = lv.sel; st.dirty = 1; return; }
   }
   if (key == '\n') {
     int x, y;
     if (input_tap_xy(&x, &y)) {
-      if (rdVkIconHit(x, y)) { st.vkVisible = !st.vkVisible; st.dirty = 1; return; }
+      if (rdVkIconHit(x, y)) { rdToggleVk(); return; }
       if (st.vkVisible && y >= vkVkTop()) { vkTap(x, y); st.dirty = 1; return; }
-      auto hits = rdNotesHits();
-      const int n = static_cast<int>(hits.size());
-      const int top = rdSearchListTop();
-      const int itemH = uiLineHeight() * 2 + 6;
-      const int bottom = st.vkVisible ? (vkVkTop() - 6) : statusTop();
-      const int maxRows = std::max(1, (bottom - top) / itemH);
-      const int start = n > 0 ? clampI(st.searchSel - maxRows / 2, 0, std::max(0, n - maxRows)) : 0;
-      const int row = start + (y - top) / itemH;
-      if (y >= top && row >= 0 && row < n) {
+      const int row = listViewHitAt(
+          searchListView(static_cast<int>(rdNotesHits().size()), st.searchSel, uiLineHeight() * 2 + 6), y);
+      if (row >= 0) {
         st.searchSel = row;
         rdNotesSearchOpen();
         return;
@@ -11742,7 +7470,7 @@ static void handleNotesSearch(int key) {
       st.dirty = 1;
       return;
     }
-    if (!st.vkVisible && rdVkWantShow()) { st.dirty = 1; return; }
+    // 同 handleShelfSearch：回车就是"打开命中"，不顺手把键盘叫回来。
     rdNotesSearchOpen();
     return;
   }
@@ -11895,6 +7623,13 @@ void screen_reader_init() {
   // front_fb，刷屏直接调 epd_hl_update_screen（都是本任务、同步）。所以进阅读器前
   // 必须等在飞的那一帧推完 —— 否则 core0 一边画 front_fb、core1 一边在
   // epd_hl_update_* 里读它，既会撕裂画面，也会踩坏 epdiy 的单份全局 render_context。
+  //
+  // 光 drain 不够：渲染任务里还挂着两份**会被它自己后期消费**的记账 —— 输入法那两行
+  // 的残影清理（s_clean_dirty，到点由 ime_clean_tick 在 core1 直呼 epdiy）和延后的
+  // 局刷（s_ime_deferred）。drain 只等"队列空 + 缓冲归还"，这两份记账不清；若上一个
+  // 界面刚打完字就切进来，core1 会在这之后自己去 epd_hl_update_area_full，与 core0 的
+  // 阅读器刷新同时进 epdiy。先 invalidate 让渲染任务把它们丢掉，再 drain 等它跑完。
+  ui_render_invalidate();
   ui_render_drain();
 
   // 阅读器方向：默认横屏 1216×684，可在菜单里切竖屏；退出时 board_restore_orientation
@@ -11915,6 +7650,9 @@ void screen_reader_init() {
   // 显示 HAL + 渲染器初始化（display 由 main 经 crossmux_platform_set_display 注入）。
   g_rd.begin();
   applyReaderOrientation();
+
+  // g_rd.begin() 之后 frameBuffer 才有效，立刻把 u8g2 shim 也钉上去（理由见 rdPinShimFb）。
+  rdPinShimFb();
 
   // UI 字体（菜单/书架/词典）跟随写作模式共享字号；正文字体 5 档独立。
   // 像素高 ≈ 字号 * 2.1：22pt→46 / 20pt→42 / 18pt→38。阅读器的整套界面版式都从
@@ -11959,7 +7697,7 @@ void screen_reader_init() {
   st.imageBilinear = g_settings.getString("reader_image_scaling", "1") != "0";
   ImageBlock::setBilinearScaling(st.imageBilinear);
   st.night = g_settings.nightMode();  // 全设备夜间（旧键 reader_night 由访问器迁移）
-  display.setInverted(st.night);      // 进阅读模式时套用一次，保证与其他界面同向
+  board_set_night(st.night);          // 进阅读模式时套用一次，保证与其他界面同向
   loadBookmarks();
   loadRecent();
   loadNotes();
@@ -12084,6 +7822,17 @@ void screen_reader_exit() {
   st.opdsStack.shrink_to_fit();
 }
 
+// main.cpp 的 kScreens 生命周期钩子：就是上面两个函数的适配层（签名要能塞进表里）。
+void screen_reader_enter(ScreenContext &ctx) {
+  (void)ctx;
+  screen_reader_init();
+}
+
+void screen_reader_leave(AppState next) {
+  (void)next;
+  screen_reader_exit();
+}
+
 AppState screen_reader_handle(int key, ScreenContext &ctx) {
   (void)ctx;
 
@@ -12092,6 +7841,16 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 这样"卡在哪一段"是量出来的。stage 变量在下面各段之间赋值。
   const int64_t rdT0 = esp_timer_get_time();
   int64_t rdTa = rdT0, rdTb = rdT0, rdTc = rdT0, rdTd = rdT0;
+
+  // 用户动不动手的锚点（书架空闲预建用）：任何非空按键都算，包括震动全刷、长按、
+  // 微信读书那几拍 tick。空转 tick（key==0）不算——空闲帧本来就是"没动手"的证据。
+  if (key != 0) {
+    s_rdLastInputUs = esp_timer_get_time();
+    s_rdSawKey = true;
+    // 用户又动手了 → 挂起的弹注作废（他多半是等不及、点了别处）。挂起态只活在
+    // "没人按键"的那些空闲帧里，这样它绝不会在用户已经翻到别处之后突然弹出来。
+    if (st.fnWaitIdx >= 0) rdFootnoteWaitCancel();
+  }
 
   // 微信读书任务在跑时独占输入：空转 tick（key==0）推进状态机，其余按键里
   // 只有 Esc/长按有意义（取消）。状态机是同步阻塞的——这一步进去前先把画面
@@ -12126,6 +7885,12 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     // 排版余量也挂这里：空闲帧是"读者在看书、没按任何键"的唯一节拍源，正好用来
     // 把排版推到当前页前面 kPrebuildAhead 页，翻页那一拍就只剩取页+绘制+推屏。
     rdPrebuildAhead();
+    // 书架空闲预建（把冷开一本书的一次性产物提前做掉，见函数头）。放在排版余量后面：
+    // 阅读页里 rdPrebuildAhead 才是主角，书架那一支它自己会早退。
+    rdShelfIdlePrebuild();
+    // 待机「图片」表盘的缓存补做（转屏后 / 网页设的图）。它自己带停手闸，别被这里的
+    // "空闲帧"名义骗了——里面解一张大图是秒级的。
+    rdStandbyImageIdlePrebuild();
     return APP_READER;
   }
 
@@ -12218,10 +7983,11 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
 
   // 触摸上下滑的翻页键（KEY_PAGE_UP/DOWN，主循环不再替阅读模式回退成单步）：
   // 目录和**书架**认它——目录几千章、书架一屏四本（横屏十二本），"一格一格选"或
-  // "一行一行挪"都走不动，上下滑要整页翻。其余子界面（正文/菜单/词典/书签/笔记…）
-  // 保持原来的单步上下语义。
+  // "一行一行挪"都走不动，上下滑要整页翻。**词典**也认它：释义正文常常整屏放不下，
+  // 上下滑要按屏滚（handleDict 收原键）。其余子界面（正文/菜单/书签/笔记…）保持
+  // 原来的单步上下语义。
   if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-    if (st.mode != RdMode::Toc && st.mode != RdMode::Browser)
+    if (st.mode != RdMode::Toc && st.mode != RdMode::Browser && st.mode != RdMode::Dictionary)
       key = (key == KEY_PAGE_UP) ? KEY_UP : KEY_DOWN;
   }
 
@@ -12242,6 +8008,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     case RdMode::Reading: handleReading(key); break;
     case RdMode::Toc: handleToc(key); break;
     case RdMode::Menu: handleMenu(key); break;
+    case RdMode::LayoutMenu: handleLayoutMenu(key); break;
     case RdMode::Bookmarks: handleBookmarks(key); break;
     case RdMode::Footnotes: handleFootnotes(key); break;
     case RdMode::Percent: handlePercent(key); break;

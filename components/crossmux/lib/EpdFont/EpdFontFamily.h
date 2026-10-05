@@ -7,7 +7,14 @@ class EpdFontFamily {
   // Bits 0-1 select the font variant (BOLD/ITALIC); bits 2-5 are decoration/positioning overlays
   // applied at render time without changing the underlying font. getFont() ignores all bits
   // above bit 1 so decorations compose freely with bold/italic (e.g. BOLD | UNDERLINE | SUP).
-  enum Style : uint8_t {
+  //
+  // 2026-10-05：位宽从 uint8_t 加宽到 uint16_t。低 8 位当时已经**一个不剩**
+  // （BOLD/ITALIC/UNDERLINE/STRIKETHROUGH/SUP/SUB/RUBY_CONTINUE/ALT_FONT），而古籍
+  // EPUB 的书名线要跟专名线区分（波浪 vs 直线），必须再要一位。加宽的代价是每个词的
+  // 样式从 1 字节变 2 字节（ParsedText::wordStyles 与 TextBlock 的 arena 各一份），
+  // 并且 arena 是**逐字节落盘**的（TextBlock::serialize），所以必须同步 bump
+  // Section.cpp 的 SECTION_FILE_VERSION。getFont() 只看低两位，新位不影响字体选择。
+  enum Style : uint16_t {
     REGULAR = 0,
     BOLD = 1,
     ITALIC = 2,
@@ -21,8 +28,12 @@ class EpdFontFamily {
     // 只改选哪个字面(role)，不改字号、不加任何装饰 —— GfxRenderer 据此把 ttf 角色
     // 切到次字面；次字面没打开时静默回到内容面，绘制力与不加这一位时完全一致。
     ALT_FONT = 128,
+    // 波浪下划线（书名线）。跟 UNDERLINE 是**互斥的两种画法**，不是叠加：两者都置位时
+    // 按波浪画（见 TextBlock::render 的 tracker）。来自 CSS 的
+    // `text-decoration: duokan-wavyline` / `text-decoration-style: wavy` / border-image。
+    WAVY_UNDERLINE = 256,
   };
-  static constexpr uint8_t TEXT_DECORATION_MASK = static_cast<uint8_t>(UNDERLINE | STRIKETHROUGH);
+  static constexpr uint16_t TEXT_DECORATION_MASK = static_cast<uint16_t>(UNDERLINE | STRIKETHROUGH | WAVY_UNDERLINE);
 
   explicit EpdFontFamily(const EpdFont* regular, const EpdFont* bold = nullptr, const EpdFont* italic = nullptr,
                          const EpdFont* boldItalic = nullptr)
@@ -38,7 +49,7 @@ class EpdFontFamily {
   int8_t getKerning(uint32_t leftCp, uint32_t rightCp, Style style = REGULAR) const;
   uint32_t applyLigatures(uint32_t cp, const char*& text, Style style = REGULAR) const;
   static constexpr bool hasTextDecoration(const Style style) {
-    return (static_cast<uint8_t>(style) & TEXT_DECORATION_MASK) != 0;
+    return (static_cast<uint16_t>(style) & TEXT_DECORATION_MASK) != 0;
   }
 
  private:

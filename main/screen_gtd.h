@@ -2,12 +2,19 @@
 
 #include "pjournal_app.h"
 
+// 进入 / 离开计划模式（main.cpp 的 kScreens 生命周期钩子）。**只在本模式本次开机
+// 第一次进入时**跑 screen_gtd_init()（它会把当前 tab/项目下钻/光标清成收集箱首页），
+// 之后每次重进只补一次方向 —— 这条"故意不清"的规则跟着这两个函数一起住在屏幕自己的
+// 文件里，不再散在 main.cpp 的注释里。
+void screen_gtd_enter(ScreenContext &ctx);
+void screen_gtd_leave(AppState next);
+
 void screen_gtd_init();
 // 退出计划模式：把方向还给全局设置（本模式可以有自己的方向，见 .cpp 的说明）。
 void screen_gtd_exit();
 // 重新套用本模式的方向设置。**每次进入计划模式都要调**（screen_gtd_exit 把方向还给
 // 全局了），但 screen_gtd_init() 只在本模式本次开机第一次进入时才跑——它会把当前
-// tab/项目下钻/光标清成收集箱首页（见 main.cpp 的说明）。切模式回来时只调本函数。
+// tab/项目下钻/光标清成收集箱首页（见 .cpp 的说明）。切模式回来时只调本函数。
 void screen_gtd_apply_orientation();
 AppState screen_gtd_handle(int key, ScreenContext &ctx);
 // 返回是否处于 GTD 列表浏览模式(该模式下物理按键导航快捷键生效)

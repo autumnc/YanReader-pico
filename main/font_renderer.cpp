@@ -13,7 +13,10 @@ static const char *TAG = "Font";
 
 // g_font / g_content_font 的文本面就是内容面（默认参数）—— 界面文本也要用用户选的
 // 字体。g_vk_font 例外：虚拟键盘固定内置字体（见 font_renderer.h）。
-FontRenderer g_font;
+// g_font 还把**拉丁**钉回内置等宽路（第二个参数）：用户字体的比例拉丁塞进半格会
+// 溢出到邻格、相邻字母叠在一起，界面上的拉丁（设置项里的字体名等）尤其难看；
+// CJK 不受影响，仍走用户字体。正文那类内容实例不钉 —— 见 drawCellGlyph 的说明。
+FontRenderer g_font(TTF_ROLE_CONTENT, /*latinBuiltin=*/true);
 FontRenderer g_content_font;
 FontRenderer g_vk_font(TTF_ROLE_UI);
 
@@ -24,6 +27,13 @@ int  FontRenderer::ascent_      = 44;
 int  FontRenderer::descent_     = 6;
 int  FontRenderer::px_          = 50;
 bool FontRenderer::loaded_      = false;
+
+// 界面（UI 档）格子的 px 高，由 setSize() 记录 —— setGridPx() **不碰它**，所以
+// 正文作用域一开一关不会把它带走。见 uiPxHeight()。
+// 初值**必须与 px_ 的初值相同**（=50）：setSize() 被调用之前两边就该相等，否则上电
+// 早期那一小段（开机动画等）会被 uiFontGuard 当成"界面字号没钉回"误报。
+static int s_ui_px = 50;
+int FontRenderer::uiPxHeight() { return s_ui_px; }
 
 // 定义于 main.cpp / ui_helpers（u8g2 shim 句柄，含 epdiy framebuffer 指针）
 
@@ -96,7 +106,7 @@ bool FontRenderer::setSize(int fontSize) {
 
     px_ = line_height_;
     font_size_ = fontSize;
-
+    s_ui_px = px_;   // 界面格子的 px 高：正文作用域里"钉回界面字号"用的就是它
     // 格子几何永远由**内置面**定义：换用户字体时标题基线/反白块高度不漂移，
     // 且 main.cpp 各处 setSize 语义不变。见头文件"共享格子模型"。
     ttf_set_role(TTF_ROLE_UI);
@@ -118,6 +128,39 @@ bool FontRenderer::reloadFont() {
     int sz = font_size_;
     font_size_ = 0;  // 强制 setSize 用当前字体重算 asc/desc
     return setSize(sz);         // 内部会把角色切回 UI 量格子
+}
+
+// ── 共享格子的作用域快照（见头文件 GridSnapshot / FontScope）──────────────
+FontRenderer::GridSnapshot FontRenderer::snapshotGrid() {
+    return GridSnapshot{font_size_, line_height_, ascent_, descent_, px_, loaded_};
+}
+
+void FontRenderer::restoreGrid(const GridSnapshot &s) {
+    font_size_   = s.size;
+    line_height_ = s.lineH;
+    ascent_      = s.asc;
+    descent_     = s.desc;
+    px_          = s.px;
+    loaded_      = s.loaded;
+}
+
+// 按 px 直接定格子高。字形缓存是按 (codepoint, size) 存的（见 ttf_font.c 的
+// cache_bucket），所以来回换字号只是多几份缓存条目，不会串号；也正因为如此这里
+// **不清缓存** —— 清一次会把整段的 CJK 位图全丢掉，正文/界面来回换就是每帧重光栅化。
+void FontRenderer::setGridPx(int px) {
+    if (px < FONT_GRID_PX_MIN) px = FONT_GRID_PX_MIN;
+    if (px > FONT_GRID_PX_MAX) px = FONT_GRID_PX_MAX;
+    line_height_ = px;
+    px_          = px;
+    // 格子几何恒由**内置面**定义（同 setSize）：换用户字体不漂移。font_size_ 不动，
+    // 理由见头文件。
+    ttf_set_role(TTF_ROLE_UI);
+    int asc = ttf_ascender_px(px_);
+    if (asc <= 0 || asc >= px_) asc = px_ * 78 / 100;  // 未就绪时用 0.78em 近似
+    ascent_  = asc;
+    descent_ = px_ - ascent_;
+    if (descent_ < 0) descent_ = 0;
+    loaded_  = true;
 }
 
 uint32_t FontRenderer::utf8Decode(const char *&str) {
@@ -336,12 +379,17 @@ void FontRenderer::drawCellGlyph(int x, int y, int cellW, uint32_t cp,
     }
 
     // 拉丁字母/数字/标点：装了外置字体(内容面不是内置)就用**用户字体的字形**，
-    // 仍然画进这个固定半格 —— 格子模型(1 格 = halfAdvance)与所有测量纹丝不动，
-    // 字形在格内居中。用户选的字体是比例拉丁，宽字母(W/M)在窄格里会挤一些，
-    // 这是定下的取舍；缺字由 ttf 层自动回落到内置面补(见 ttf_font.c 的替补)。
-    // 没装外置字体时走原路：NF-Propo 等宽 0.5em，逐像素与从前一致。
+    // 仍然画进这个固定半格 —— 格子模型(1 格 = halfAdvance)与所有测量纹丝不动。
+    // 但比例拉丁塞进半格会**溢出到邻格**：字形按 px_(=行高)光栅，宽字母(w/m/W)有
+    // 40px 量级，而格宽只有 halfAdvance(≈25px)，下面 dx = x + (cellW-gw)/2 直接变成
+    // 负数 → 相邻字母叠在一起（"英文字连在一起"）。这正是界面实例 g_font 用
+    // latin_builtin_ 把拉丁钉回内置等宽路的原因（NF-Propo 0.5em，逐像素与没装外置
+    // 字体时一致）。正文/候选那类内容实例不钉：在那儿用用户字体的比例拉丁是想要的
+    // 样子，且整行英文的步进同样是半格，取舍与从前一致。
+    // 缺字一律由 ttf 层自动回落到内置面补(见 ttf_font.c 的替补)。
     // 虚拟键盘那个实例文本面是 UI(role_ == TTF_ROLE_UI)，所以键盘的字母不受影响。
-    const bool user_latin = (cp < 0x80) && role_ == TTF_ROLE_CONTENT && !ttf_font_is_builtin();
+    const bool user_latin = (cp < 0x80) && role_ == TTF_ROLE_CONTENT &&
+                            !latin_builtin_ && !ttf_font_is_builtin();
     if (cp < 0x80 && !user_latin) {
         // ASCII（等宽 0.5em）按基线对齐，与 CJK 同基线，避免拉丁字符高低不平。
         icon_font_draw_baseline(fb, x, y, cellW, line_height_, cp, invert);
@@ -374,10 +422,10 @@ void FontRenderer::drawCellGlyph(int x, int y, int cellW, uint32_t cp,
     uint8_t fg = invert ? 15 : 0;
     uint8_t bg = invert ? 0 : 15;
     if (bold) {
-        ttf_draw_text_px(fb, dx + 1, y, px_, ch, EPD_DRAW_ALIGN_LEFT, fg, bg);
-        ttf_draw_text_px(fb, dx, y + 1, px_, ch, EPD_DRAW_ALIGN_LEFT, fg, bg);
+        ttf_draw_text_px(fb, dx + 1, y, px_, ch, TTF_ALIGN_LEFT, fg, bg);
+        ttf_draw_text_px(fb, dx, y + 1, px_, ch, TTF_ALIGN_LEFT, fg, bg);
     }
-    ttf_draw_text_px(fb, dx, y, px_, ch, EPD_DRAW_ALIGN_LEFT, fg, bg);
+    ttf_draw_text_px(fb, dx, y, px_, ch, TTF_ALIGN_LEFT, fg, bg);
 }
 
 int FontRenderer::drawText(int x, int y, const char *text, bool invert) {

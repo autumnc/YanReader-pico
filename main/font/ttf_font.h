@@ -13,8 +13,20 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "epdiy.h"
 #include "esp_err.h"
+
+// ⚠ 本头**刻意不 include epdiy.h**（架构整改 P1.3）。理由：
+//
+// 1) epdiy.h 连带 epd_internals.h，其中 typedef 的 EpdGlyph / EpdUnicodeInterval /
+//    EpdFont 与 crossmux 的 EpdFontData.h / EpdFont.h（EpdFont 是 class）在同一 TU
+//    里撞名 —— 阅读模式的 TU 一个都不能碰 epdiy.h。
+// 2) 而 ttf_* 是**跨组件契约**：main 的界面层和 crossmux 的 GfxRenderer.cpp 都要声明它。
+//    以前它拉 epdiy.h，于是每个"不能吃 epdiy"的 TU 只能手抄一份接口
+//    （screen_reader.cpp 曾整段照抄，连 ttf_font_item_t / ttf_bench_stats_t 都字段级复制）。
+// 现在只剩 stdint / stdbool / esp_err 三个轻量依赖，任何 TU 都能直接包含。
+//
+// 唯一曾经需要 epdiy 的是下面几个原型里的 `enum EpdFontFlags align` 参数 —— 已改成
+// `int`，见 ttf_draw_text_px 上方的说明。
 
 #ifdef __cplusplus
 extern "C" {
@@ -120,19 +132,30 @@ bool ttf_font_ready(void);
 int ttf_ascender(int size);
 int ttf_ascender_px(int pixel_height);
 
+/// 水平对齐标志。**值刻意与 epdiy 的 EPD_DRAW_ALIGN_*** 相同（LEFT=0x2 /
+/// RIGHT=0x4 / CENTER=0x8，另有 BACKGROUND=0x1 本层用不到），但名字是这一层自己的：
+/// epdiy 的 enum EpdFontFlags 归 epdiy 所有，本头不能 include 它、也不能重定义一份
+/// （同名的第二个定义会在同时见到 epd_internals.h 的 TU 里撞重定义）。于是 ttf_draw_*
+/// 的 align 形参是 int，调用方传这三个之一；数值一致，ABI 与语义零变化。
+enum TtfDrawAlign {
+    TTF_ALIGN_LEFT   = 0x2,
+    TTF_ALIGN_RIGHT  = 0x4,
+    TTF_ALIGN_CENTER = 0x8,
+};
+
 void ttf_draw_text(
     uint8_t* framebuffer, int x, int y, int size, const char* text,
-    enum EpdFontFlags align, uint8_t fg, uint8_t bg
+    int align, uint8_t fg, uint8_t bg
 );
 
 void ttf_draw_text_px(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
-    enum EpdFontFlags align, uint8_t fg, uint8_t bg
+    int align, uint8_t fg, uint8_t bg
 );
 /// 覆盖率过半才落墨，像素只有 fg/bg。/ Ink only when coverage is over half; pixels are fg/bg only.
 void ttf_draw_text_px_bw(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
-    enum EpdFontFlags align, uint8_t fg, uint8_t bg
+    int align, uint8_t fg, uint8_t bg
 );
 
 /// 把整段文本用到的字形块一次性预取到 PSRAM 块缓存里，随后逐词绘制不再碰 SD。

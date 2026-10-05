@@ -1,13 +1,12 @@
 #include "flomo_client.h"
 #include "settings_manager.h"
 #include "json_utils.h"
+#include "net/http.h"
 #include <cstring>
 #include <cstdio>
 #include <ctime>
 #include <vector>
 #include <esp_log.h>
-#include <esp_http_client.h>
-#include <esp_crt_bundle.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "esp_rom_md5.h"
@@ -229,40 +228,23 @@ std::string FlomoClient::login() {
             "\",\"platform\":\"" + FLOMO_PLATFORM +
             "\",\"webp\":\"1\",\"sign\":\"" + sign + "\"}";
 
-        esp_http_client_config_t cfg = {};
-        cfg.url = FLOMO_API_BASE "/user/login_by_email";
-        cfg.method = HTTP_METHOD_POST;
-        cfg.timeout_ms = 30000;
-        cfg.skip_cert_common_name_check = true;
-        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+        net::Request req;
+        req.url = FLOMO_API_BASE "/user/login_by_email";
+        req.method = net::Method::Post;
+        req.headers = {{"Content-Type", "application/json"},
+                       {"User-Agent", "pjournal-esp32/1.0"}};
+        req.body = body;
+        req.cap = MAX_FLOMO_RESPONSE_SIZE;  // 软上限
+        // 跑在主任务上（设置页登录）：必须有墙钟上限，否则对端挂住即永久卡死。
+        req.deadline_ms = 45000;
 
-        esp_http_client_handle_t client = esp_http_client_init(&cfg);
-        if (!client) {
-            lastError_ = "系统繁忙";
-            return "";
-        }
-
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        esp_http_client_set_header(client, "User-Agent", "pjournal-esp32/1.0");
-
-        std::string response;
-        int status = 0;
-        esp_err_t err = esp_http_client_open(client, (int)body.size());
-        if (err == ESP_OK) {
-            esp_http_client_write(client, body.c_str(), (int)body.size());
-            esp_http_client_fetch_headers(client);
-            status = esp_http_client_get_status_code(client);
-            char buf[512];
-            int len;
-            while ((len = esp_http_client_read(client, buf, sizeof(buf) - 1)) > 0) {
-                response.append(buf, len);
-                if (response.size() > MAX_FLOMO_RESPONSE_SIZE) break;
-            }
-        } else {
-            ESP_LOGW(TAG, "Login open failed: %d", err);
+        net::Response resp = net::request(req);
+        const std::string &response = resp.body;
+        const int status = resp.status;
+        if (resp.err != ESP_OK) {
+            ESP_LOGW(TAG, "Login open failed: %s", esp_err_to_name(resp.err));
             lastError_ = "网络连接失败";
         }
-        esp_http_client_cleanup(client);
 
         if (status == 200) {
             token = extractToken(response);
@@ -337,61 +319,32 @@ bool FlomoClient::createMemo(const std::string &token, const std::string &conten
         ts, FLOMO_API_KEY, FLOMO_APP_VERSION, FLOMO_PLATFORM,
         escapedContent.c_str(), sign.c_str());
 
-    esp_http_client_config_t cfg = {};
-    cfg.url = FLOMO_API_BASE "/memo";
-    cfg.method = HTTP_METHOD_PUT;
-    cfg.timeout_ms = 30000;
-    cfg.skip_cert_common_name_check = true;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    net::Request req;
+    req.url = FLOMO_API_BASE "/memo";
+    req.method = net::Method::Put;
+    req.headers = {{"Content-Type", "application/json"},
+                   {"User-Agent", "pjournal-esp32/1.0"},
+                   {"Authorization", "Bearer " + token}};
+    req.body = body;
+    req.cap = MAX_FLOMO_RESPONSE_SIZE;  // 软上限
+    // 同上：send() 由编辑器主任务调用（g_flomo.send），没有上限就会永久卡住。
+    req.deadline_ms = 45000;
 
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return false;
-
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "User-Agent", "pjournal-esp32/1.0");
-    std::string bearer = "Bearer " + token;
-    esp_http_client_set_header(client, "Authorization", bearer.c_str());
-
-    bool ok = false;
-    std::string response;
-    esp_err_t err = esp_http_client_open(client, (int)strlen(body));
-    if (err == ESP_OK) {
-        esp_http_client_write(client, body, (int)strlen(body));
-        int content_length = esp_http_client_fetch_headers(client);
-        int status = esp_http_client_get_status_code(client);
-        if (status == 200) {
-            char buf[256];
-            int len;
-            while ((len = esp_http_client_read(client, buf, sizeof(buf) - 1)) > 0) {
-                buf[len] = 0;
-                response += buf;
-                if (response.size() > MAX_FLOMO_RESPONSE_SIZE) break;
-            }
-            // Parse code field from JSON response
-            auto codePos = response.find("\"code\":0");
-            if (codePos != std::string::npos) {
-                ok = true;
-            } else {
-                ESP_LOGW(TAG, "Memo 200 but code not 0: %.*s", (int)response.size(), response.c_str());
-            }
-        } else {
-            ESP_LOGW(TAG, "Memo returned HTTP %d (content-length: %d)", status, content_length);
-            char buf[256];
-            int len;
-            while ((len = esp_http_client_read(client, buf, sizeof(buf) - 1)) > 0) {
-                buf[len] = 0;
-                response += buf;
-                if (response.size() > MAX_FLOMO_RESPONSE_SIZE) break;
-            }
-            if (!response.empty())
-                ESP_LOGW(TAG, "Memo response: %.*s", (int)response.size(), response.c_str());
-        }
-    } else {
-        ESP_LOGW(TAG, "Memo open failed: %d", err);
+    net::Response resp = net::request(req);
+    if (resp.err != ESP_OK) {
+        ESP_LOGW(TAG, "Memo open failed: %s", esp_err_to_name(resp.err));
+        return false;
     }
-
-    esp_http_client_cleanup(client);
-    return ok;
+    if (resp.status == 200) {
+        // Parse code field from JSON response
+        if (resp.body.find("\"code\":0") != std::string::npos) return true;
+        ESP_LOGW(TAG, "Memo 200 but code not 0: %.*s", (int)resp.body.size(), resp.body.c_str());
+        return false;
+    }
+    ESP_LOGW(TAG, "Memo returned HTTP %d", resp.status);
+    if (!resp.body.empty())
+        ESP_LOGW(TAG, "Memo response: %.*s", (int)resp.body.size(), resp.body.c_str());
+    return false;
 }
 
 FlomoResult FlomoClient::send(const std::string &text) {

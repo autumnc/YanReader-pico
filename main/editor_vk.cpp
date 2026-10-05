@@ -45,22 +45,14 @@
 // 编码行(行 0)仍按 UI 字号画，但行高跟候选行保持一致——两行不等高时那条分隔线会
 // 看着歪，翻页起划的判定带也跟着变窄。
 //
-// evkCandFontPx() 每次都现读设置：按键才重绘，几十分之一毫秒的 map 查找无所谓，
+// **字号/度量/测宽/直绘**（imeCandFontPx/imeCandAscent/imeCandStrW/imeCandDrawText）
+// 已经搬到 ui_helpers.cpp：实体键盘的输入法条也要按同一个候选字号画，两处必须逐像素
+// 同一份（输入法按那份宽度分页）。留在本文件的只有**行高**——那是版面自己的事：键盘
+// 面板要指尖点得着，行高给到 px+20；输入法条是贴身一条，px+8（见 imeBarRowH）。
+// imeCandFontPx() 每次都现读设置：按键才重绘，几十分之一毫秒的 map 查找无所谓，
 // 换来的是"改完设置立刻生效"，不必在屏间来回传状态。标准档 45 = 20pt 的 line_height，
 // 与旧行为逐像素一致。
-static int evkCandFontPx() {
-    int px = atoi(g_settings.getString("ime_cand_size", "45").c_str());
-    if (px < 28) px = 45;      // 没设过/写坏 → 回标准档
-    if (px > 96) px = 96;      // 上限：再大面板就吃光正文了
-    return px;
-}
-// 候选字的 ascent。照 FontRenderer::setSize 的口径：字体没就绪时用 0.78em 近似。
-static int evkCandAscent() {
-    const int px = evkCandFontPx();
-    int a = ttf_ascender_px(px);
-    if (a <= 0 || a >= px) a = px * 78 / 100;
-    return a;
-}
+//
 // 候选区两行的高度：
 //   行 0（编码 / 拼音串）用**界面字号**画（g_content_font），所以它的下限是 FONT_H+20；
 //   行 1（候选）跟着「候选字大小」走，px+20 —— 这块设置真正要改的就是这一行。
@@ -68,7 +60,7 @@ static int evkCandAscent() {
 // 栏，看着就跟没生效一样。分行取高以后四档都跟得上：小 65+54、标准 65+65、
 // 大 76+76、特大 88+88。
 static int evkCandRowH(int row) {
-    const int byFont = evkCandFontPx() + 20;
+    const int byFont = imeCandFontPx() + 20;
     if (row == 1) return byFont;      // 候选行：只跟候选字号，不受界面字号下限牽制
     const int minh = FONT_H + 20;     // 编码行：至少要放得下界面字号那一行字
     return byFont < minh ? minh : byFont;
@@ -406,84 +398,19 @@ static int evkCandRowY(int row)   { return editorVkTop() + (row == 0 ? 0 : evkCa
 // 行内基线：候选行按候选字自己的像素高居中（ascent 也取那个字号），编码行仍是 UI 字号。
 static int evkCandTextBaseline(int row) {
     const int rh = evkCandRowH(row);
-    if (row == 1) return evkCandRowY(row) + (rh - evkCandFontPx()) / 2 + evkCandAscent();
+    if (row == 1) return evkCandRowY(row) + (rh - imeCandFontPx()) / 2 + imeCandAscent();
     return evkCandRowY(row) + (rh + g_vk_font.ascent() - g_vk_font.descent()) / 2;
 }
 // 反白块(高 = 候选字高)在行内的 y。候选行用它；编码行不用。
-static int evkCandHlY(int row)    { return evkCandRowY(row) + (evkCandRowH(row) - evkCandFontPx()) / 2; }
-static int evkCandHlH()           { return evkCandFontPx(); }
+static int evkCandHlY(int row)    { return evkCandRowY(row) + (evkCandRowH(row) - imeCandFontPx()) / 2; }
+static int evkCandHlH()           { return imeCandFontPx(); }
 
-// 候选串在候选字号下的像素宽：ASCII = 半格（0.5em），其余取该字号下的字形宽。
-// 与 FontRenderer 的等宽 cell 模型同口径，只是把 line_height_ 换成候选字号。
-static int evkCandStrW(const char *s) {
-    const int px = evkCandFontPx();
-    int w = 0;
-    while (*s) {
-        const unsigned char c = static_cast<unsigned char>(*s);
-        if (c < 0x80) {
-            w += px / 2;
-            s += 1;
-            continue;
-        }
-        const int m = (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
-        char ch[5];
-        memcpy(ch, s, m);
-        ch[m] = '\0';
-        w += ttf_text_width_px(px, ch);
-        s += m;
-    }
-    return w;
-}
-
-// 给输入法分页用的测宽口子：键盘在画候选的时候，一行放几个候选必须按候选字号算，
-// 不能按界面字号算（main.cpp 的 setWidthFn 就靠 editorVkVisible() 二选一）。
-// 传进来的字符串是候选原文，不含 "N." 前缀；输入法那边会把前缀宽度另加 —— 见
-// IME::buildPage 里 numWidths 的算法。这里逐字符量，口径与 evkCandStrW 同一份。
-int editorVkCandidateWidth(const char *text) {
-    if (!text) return 0;
-    return evkCandStrW(text);
-}
-
-// 按候选字号画一段候选串：ASCII 走 NF-Propo 等宽（同 FontRenderer 的路由），
-// CJK 走 TTF 直绘。invert = 反白（外部已填黑底，这里把字画白）。
+// 候选串的字号/测宽/直绘全在 ui_helpers.cpp（imeCandFontPx / imeCandStrW /
+// imeCandDrawText）：实体键盘的输入法条要按同一个字号画同一串字，两处只能有一份。
+// 这里只留一行别名，免得下面几十处调用点全改名。
+static int evkCandStrW(const char *s) { return imeCandStrW(s); }
 static void evkCandDrawText(int x, int baseline, const char *s, bool invert) {
-    const int px = evkCandFontPx();
-    uint8_t *fb = u8g2_GetBufferPtr(g_u8g2);
-    const uint8_t fg = invert ? 15 : 0;
-    const uint8_t bg = invert ? 0 : 15;
-    // 候选串是**输入法正文**，走内容面（= 用户选的字体），与编辑器正文同一路。
-    // 必须显式选面：键帽是 g_vk_font 画的，s_cur 大概率正停在内置面上，不选就会
-    // 让候选字顶着内置字体渲染。画完还原，不动调用方的面。
-    const int prev_role = ttf_get_role();
-    ttf_set_role(TTF_ROLE_CONTENT);
-    // 拉丁字母按 FontRenderer 同一口径：装了外置字体就用用户字体的字形，仍旧半格
-    // 宽、格内居中（evkCandStrW 量的正是这半格，两边不会打架）。
-    const bool user_latin = !ttf_font_is_builtin();
-    while (*s) {
-        const unsigned char c = static_cast<unsigned char>(*s);
-        if (c < 0x80) {
-            if (user_latin) {
-                char ch[2] = {static_cast<char>(c), '\0'};
-                const int gw = ttf_text_width_px(px, ch);
-                ttf_draw_text_px(fb, x + (px / 2 - gw) / 2, baseline, px, ch,
-                                 EPD_DRAW_ALIGN_LEFT, fg, bg);
-            } else {
-                icon_font_draw_baseline(fb, x, baseline, px / 2, px, c, invert);
-            }
-            x += px / 2;
-            s += 1;
-            continue;
-        }
-        const int m = (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
-        char ch[5];
-        memcpy(ch, s, m);
-        ch[m] = '\0';
-        const int gw = ttf_text_width_px(px, ch);
-        ttf_draw_text_px(fb, x + (px - gw) / 2, baseline, px, ch, EPD_DRAW_ALIGN_LEFT, fg, bg);
-        x += px;   // CJK advance = 一个字号宽，与原 line_height_ 口径一致
-        s += m;
-    }
-    ttf_set_role(prev_role);   // 还原调用方的面（见函数头）
+    imeCandDrawText(x, baseline, s, invert);
 }
 
 // 候选行布局缓存(绘制与命中测试共用)。
@@ -748,12 +675,22 @@ bool editorVkPumpTap(bool imeActive, int *outKey, bool *outTurnImeOn) {
     return true;
 }
 
-int editorVkTop() { return STATUS_BAR_Y - evkPanelH(); }
-int editorVkCandH() { return evkCandH(); }
+int editorVkTop() {
+    // 键盘面板是**界面框架**：这一族函数会被编辑器正文作用域调到（算正文底边、命中
+    // 键盘区），几何恒按界面字号，不跟正文字号一起长。见 screen_editor_handle 的说明。
+    FontScope ui(FontRenderer::uiPxHeight());
+    return STATUS_BAR_Y - evkPanelH();
+}
+// 候选区总高：同样是**界面框架**几何（evkCandRowH 里有 FONT_H + 20 的下限），
+// 必须自己钉回界面字号 —— 调用它的是 ui_render 的候选区矩形和阅读器的
+// displayBufferVk，两处都不在编辑器正文作用域里，不钉就会拿正文字号算出一个跟
+// editorVkTop()（已钉）不配套的高度。
+int editorVkCandH() { FontScope ui(FontRenderer::uiPxHeight()); return evkCandH(); }
 
-int editorVkIconSlotW() { return FONT_H; }
+int editorVkIconSlotW() { FontScope ui(FontRenderer::uiPxHeight()); return FONT_H; }
 
 bool editorVkIconHit(int x, int y) {
+    FontScope ui(FontRenderer::uiPxHeight());
     int slot = editorVkIconSlotW();
     return slot > 0 && y >= STATUS_BAR_Y && x >= SCREEN_W - slot;
 }
@@ -894,6 +831,9 @@ static const char *evkPanelKeyLabel(int which) {
 }
 
 void editorVkDraw() {
+    // 键盘面板是界面框架：在编辑器正文作用域里也会被调到，钉回界面字号。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     if (!s_visible) return;
     int w = SCREEN_W;
     int top = editorVkTop();
@@ -909,16 +849,20 @@ void editorVkDraw() {
     u8g2_DrawHLine(g_u8g2, 0, top + evkCandH(), w);
 
     // ── 候选区上行：编码(拼音串)。右端挂页号，>1 页时才画 ──
+    // 和 ui_helpers 的 drawIMEUI 同一条编码行，必须用同一套字体口径：**g_font**
+    // （CONTENT 面 + 拉丁钉回内置等宽）。用 g_content_font 的话，用户选了非内置字体时
+    // 比例拉丁会被居中塞进恒定的半格里 —— 字母间距忽疏忽密。量宽/画字两处都换成 g_font，
+    // 免得页号量得出来、画出来对不上（静态格子共用，行高基线不受影响）。
     IME &ime = IME::getInstance();
     std::string code = ime.displayCode();
-    if (!code.empty()) g_content_font.drawText(6, evkCandTextBaseline(0), code.c_str(), false);
+    if (!code.empty()) g_font.drawText(6, evkCandTextBaseline(0), code.c_str(), false);
     int pages = ime.totalPages();
     if (pages > 1) {
         // "< 1/3 >"：左右两个尖括号就是"往左右划"的提示，比再写一行说明省地方。
         std::string pg = "< " + std::to_string(ime.currentPage()) + "/" +
                          std::to_string(pages) + " >";
-        int tw = g_vk_font.textWidth(pg.c_str());
-        g_content_font.drawText(w - 6 - tw, evkCandTextBaseline(0), pg.c_str(), false);
+        int tw = g_font.textWidth(pg.c_str());
+        g_font.drawText(w - 6 - tw, evkCandTextBaseline(0), pg.c_str(), false);
     }
 
     // ── 候选区下行：候选(高亮项反白)，整行宽度都归它 ──
@@ -1043,6 +987,8 @@ void editorVkDraw() {
 }
 
 void editorVkDrawIcon() {
+    FontScope ui(FontRenderer::uiPxHeight());   // 状态栏右端的键盘开关图标：界面框架
+    UI_FONT_GUARD();
     int slot = editorVkIconSlotW();
     if (slot <= 0) return;
     int h = STATUS_BAR_H - 2;
@@ -1421,9 +1367,16 @@ static int evkT9Hit(int x, int y, int w, EditorVkHit *hit) {
 }
 
 int editorVkHitTest(int x, int y, EditorVkHit *hit) {
+    // 键位命中必须与 editorVkDraw 画出来的格子逐像素对齐 —— 那是界面字号下的几何，
+    // 所以这里也要钉回界面字号（本函数在编辑器正文作用域里被调到）。
+    FontScope ui(FontRenderer::uiPxHeight());
     if (!s_visible) return EVK_NONE;
     int w = SCREEN_W;
     int top = editorVkTop();
+    // 与 editorVkDraw 同一道门：屏太小/候选字号太大导致面板放不下时，编辑器根本不画
+    // 键盘。这时不能再把这片区域的点按翻译成按键 —— 否则看不见的空格/回车照样往正文
+    // 里塞字（画的和认的两套几何必须同进退）。
+    if (top < FONT_H || STATUS_BAR_Y - top < 16) return EVK_NONE;
     if (y < top || y >= STATUS_BAR_Y) return EVK_NONE;
 
     // 候选区：上行编码没有可点的东西(整行吞掉，别漏给下面的键区)，下行是候选块。
@@ -1693,6 +1646,10 @@ static int evkNumPanelHit(int x, int y, int w, EditorVkHit *hit) {
 // 只看**起点**不看终点：手指从候选行划出去也算划候选——"按住哪一行就是操作哪一行"，
 // 而且抬手时手指多半已经离开候选行了，按终点判会一半手势失效。
 bool editorVkSwipePage(int x, int y, int dir) {
+    // 识别带必须与 editorVkDraw 画出来的格子逐像素对齐 —— 那是界面字号下的几何，
+    // 而本函数在编辑器正文作用域里被调到（见 screen_editor_handle），不钉就会按
+    // 正文字号算候选行高，整条带子跟着正文字号上/下移。
+    FontScope ui(FontRenderer::uiPxHeight());
     if (!s_visible) return false;
     int top = editorVkTop();
     if (y < top + evkCandRowH(0) || y >= top + evkCandH()) return false;   // 只认候选行
@@ -1712,6 +1669,8 @@ bool editorVkSwipePage(int x, int y, int dir) {
 // 返回 true = 这一划被面板吃掉了，调用方必须把 KEY_PAGE_UP/DOWN 丢掉，否则同一划
 // 还会顺手把书翻一页/把正文滚一屏。面板没展开时返回 false，上下滑照旧是翻页。
 bool editorVkSwipeScroll(int x, int y, int dir) {
+    // 同 editorVkSwipePage：手势识别带要与画出来的一致，钉回界面字号。
+    FontScope ui(FontRenderer::uiPxHeight());
     if (!s_visible) return false;
     const int w = SCREEN_W;
     // 九宫格：组合中左列就是分音节选择列，上下滑滚它（和 T9 面板共用 s_t9CodeTop
@@ -1784,6 +1743,9 @@ void editorVkMarkPressed(const EditorVkHit &hit) {
 void editorVkClearPressed() { s_pressedValid = false; }
 
 std::string editorVkTruncateToWidth(const std::string &s, int maxWidth) {
+    // 给状态栏文字截宽用的，按**界面字号**量 —— 调用方可能正在正文作用域里
+    // （editorStatusBar），但状态栏那一行是界面字号，量法必须跟着它。
+    FontScope ui(FontRenderer::uiPxHeight());
     if (maxWidth <= 0) return std::string();
     if (g_vk_font.textWidth(s.c_str()) <= maxWidth) return s;
     std::string out;

@@ -86,6 +86,22 @@ class ChapterHtmlSlimParser {
   std::string imageBasePath;
   int imageCounter = 0;
 
+  // 「内联小图其实就是注号」的尺寸上限，见 .cpp 里 IMAGE_TAGS 分支的第三条判据。
+  // 实测注号是 48×48（斐洞），分数图 18×54；正经插图都是几百像素，闸放到 96 也误伤不着。
+  static constexpr int16_t FOOTNOTE_MARKER_MAX_PX = 96;
+  // 那张图"小不小"的判定缓存：src → tiny。同一章几百枚注号共用同一张图，只探一次
+  // （探测要开一次 zip entry，一次几毫秒，807 枚不记账就是几秒）。条目个位数，用 vector。
+  struct TinyImageProbe {
+    std::string src;
+    bool tiny;
+  };
+  std::vector<TinyImageProbe> tinyImageProbes;
+  [[nodiscard]] bool isTinyMarkerImage(const std::string& resolvedSrc);
+  // 把"后缀小图就是一条注、注文压在 alt 里"这件事登记掉：发一个上标序号词，注文存进
+  // FootnoteEntry 的 "alt:" 哨兵前缀（读端见 screen_reader.cpp::openFootnotePopup，
+  // 弹注时直接从 href 取正文，不去锚点表里找）。
+  void appendAltFootnoteMarker(const std::string& altText);
+
   // Style tracking (replaces depth-based approach)
   struct StyleStackEntry {
     int depth = 0;
@@ -148,6 +164,22 @@ class ChapterHtmlSlimParser {
   int completedPageCount = 0;
   std::vector<AnchorRecord> anchorData;
   std::string pendingAnchorId;          // deferred until after previous text block is flushed
+  // **行内**锚点（id 挂在 `<a>` 这类行内元素上、落在段落中间）的精确落点。
+  // 记下"这个 id 出现在**哪一块**的第几个词"，等那一块排版时在 addLineToPage 里精确
+  // 换算成"本页第几个元素"。不这么干就只能延后到下一个块边界才记，那时本段的行早排进
+  // 页里，序号落到**后一段**去 —— 读者侧就是"点〔四〕弹出〔五〕的注文，整组错位一格"。
+  // 块级 id（`<p id="note_5">`、`<aside id="fn1">`）不走这条，它们在块边界记本来就是准的。
+  // 一个段落里可能挂好几条（`<p><a id="10"…>〔一〕</a>…<a id="11"…>〔二〕</a>…`），
+  // 所以是**一组**，不是一个。
+  struct InlineAnchorArm {
+    const ParsedText* block = nullptr;
+    int wordOffset = 0;
+    std::string id;
+  };
+  std::vector<InlineAnchorArm> inlineAnchorArms;
+  void armInlineAnchor(const std::string& id, const char* elementName);
+  // 这一行落页时，把落在这一行上的行内锚点结算成 (页, 元素序号)。
+  void resolveInlineAnchors(TextBlock* line);
   std::vector<std::string> tocAnchors;  // the list of anchors that are TOC chapter boundaries
   uint16_t xpathParagraphIndex = 0;
   uint16_t xpathListItemIndex = 0;
@@ -177,6 +209,18 @@ class ChapterHtmlSlimParser {
   int currentFootnoteLinkTextLen = 0;
   std::vector<std::pair<int, FootnoteEntry>> pendingFootnotes;  // <wordIndex, entry>
   int wordsExtractedInBlock = 0;
+  // 合成注号的**全章唯一**计数器（三条合成注号的路都走它：QQ 阅读器的 class 注号、
+  // Duokan 的脚注内链、斐洞的"小图 + alt 正文"）。
+  // 原来取的是 pendingFootnotes.size() + 1 —— pending 一旦被冲进页就归零，于是**同一页
+  // 上两条注号都叫 "1" 是常态**（中间隔几行没有注号就重新从 1 数）。读端点注是拿按中的
+  // 上标词去比**本页**注号表（见 screen_reader.cpp::rdTapOnFootnote），重号就只会弹第一
+  // 条。斐洞一章 800+ 枚注号、一页十几枚，必撞；改成全章单调递增，重号从根上没有了。
+  int footnoteMarkerSerial = 0;
+  [[nodiscard]] std::string nextFootnoteMarker() { return std::to_string(++footnoteMarkerSerial); }
+  // 合成注号那一颗字挂在哪个链接上。读端**不比对字形**，直接顺着这个链接的 href 取
+  // 脚注（href 用私有 scheme "fn:<序号>"，见 appendAltFootnoteMarker）。只在发注号
+  // 那一刻非零，flushPartWordBuffer 用完即清。
+  uint8_t syntheticMarkerLinkId = 0;
 
   // 回引（注文 → 正文注号）识别。注号链接**自己的**锚点 id 存在这里：Duokan 是
   // `<a id="noteref_1" href="#note_1">` 的 noteref_1，趙州録是 `<a id="1" href="#2">` 的 1，

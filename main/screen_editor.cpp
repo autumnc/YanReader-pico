@@ -17,6 +17,7 @@
 #include "builtin_prompts.h"    // 状态栏模式标记点一下=取一条内置提示词
 #include "qrcodegen.h"  // 「二维码」菜单项：把全文编成码给手机扫
 #include "ime/IME.h"
+#include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与计划/阅读共用一份）
 #include <cstdio>
 #include <cstdlib>   // rand()：状态栏模式标记/Ctrl+P 取内置提示词
 #include <cstring>
@@ -71,6 +72,8 @@ struct EditorState {
     bool vrowsDirty = true;
     std::vector<VRow> cachedVrows;
     bool cachedFirstLineIndent = false;
+    // 折行缓存是按哪个**正文字号**算出来的（"显示与版式 → 正文字号"改了就要重排）。
+    int cachedBodyPx = 0;
     int cachedWordCount = 0;
     bool wordCountDirty = true;
     bool mdInfoDirty = true;
@@ -333,7 +336,10 @@ static bool moveCursorVertical(int step, const std::vector<VRow> &vrows) {
 
 // 一屏可显示的行数(减去状态栏并留一行上下文), 作为 PageUp/PageDown 的翻页步长。
 static int editorPageRows() {
-    int rows = (STATUS_Y - FONT_H + LINE_SPACING - 1) / LINE_SPACING - 1;
+    // 底边(状态栏上沿)是**界面字号**下的量,行高是**正文字号**的 —— 分开算,别一起放大。
+    int statusY;
+    { FontScope ui(FontRenderer::uiPxHeight()); statusY = STATUS_Y; }
+    int rows = (statusY - FONT_H + LINE_SPACING - 1) / LINE_SPACING - 1;
     if (rows < 1) rows = 1;
     return rows;
 }
@@ -342,7 +348,14 @@ static const std::vector<MdLineInfo>& getMdInfo(bool mdOn);
 
 static const std::vector<VRow>& getVrows() {
     bool firstLineIndent = g_settings.firstLineIndent();
-    if (g_editor.vrowsDirty || g_editor.cachedFirstLineIndent != firstLineIndent) {
+    // 折行宽度走 buildVrows 内部的 g_font.halfAdvance()，也就是**正文字号**的半个字宽。
+    // 本函数可能被界面字号的上下文调到（screen_editor_handle 的第一句就是它），也可能
+    // 在正文作用域里被调到，所以自己钉一次字号：缓存的 vrow 永远是正文口径，谁读都对。
+    const int bodyPx = editorBodyFontPx();
+    if (g_editor.vrowsDirty || g_editor.cachedFirstLineIndent != firstLineIndent ||
+        g_editor.cachedBodyPx != bodyPx) {
+        FontScope body(bodyPx);
+        g_editor.cachedBodyPx = bodyPx;
         g_editor.cachedFirstLineIndent = firstLineIndent;
         // 传缓存避免重复 classify;md 渲染关闭时缓存全零,须传 nullptr 让
         // buildVrows 自行 classify(首行缩进仍需区分标题/列表)。
@@ -592,6 +605,12 @@ static int utf8Count(const std::string &s) {
     int n = 0;
     for (int i = 0; i < (int)s.length(); i = utf8Next(s, i)) n++;
     return n;
+}
+
+// 正文当前行 + 光标 —— ImeField 形态。跨行合行、撤销快照、脏标记这些宿主逻辑不进
+// 共享层；这里只把"落串/退格/光标左右移"的 UTF-8 算术交出去。
+static ImeField editorLineField() {
+    return ImeField{&g_editor.lines[g_editor.cy], &g_editor.cx};
 }
 
 // 喂给输入法的"文档上下文":光标之前的正文尾部约 200 字。从末行往前拼、拼够就停,
@@ -907,6 +926,9 @@ static void drawSearchMatchLine(int idx, int y, bool isCurrent) {
 }
 
 static void drawSearchPanel() {
+    // 查找浮层是界面框架，几何按界面字号（它会在正文作用域里被调到）。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     g_editor.drawnOnce = true;
     ui_clear();
     auto &sh = g_editor.search;
@@ -1025,32 +1047,16 @@ static void searchClose() {
     if (g_editor.imeActive) g_ime.setDocumentContext(editorImeContextText());
 }
 
-static void searchInsertFocused(const std::string &ins) {
+// 搜索框当前聚焦的那个框（替换框 / 查找框）。
+static ImeField searchField() {
     auto &sh = g_editor.search;
-    if (sh.focusRep) { sh.rep.insert(sh.repCur, ins); sh.repCur += (int)ins.length(); }
-    else { sh.term.insert(sh.termCur, ins); sh.termCur += (int)ins.length(); }
+    return sh.focusRep ? ImeField{&sh.rep, &sh.repCur} : ImeField{&sh.term, &sh.termCur};
 }
 
-static void searchBackspaceFocused() {
-    auto &sh = g_editor.search;
-    if (sh.focusRep) {
-        if (sh.repCur > 0) { int prev = utf8Prev(sh.rep, sh.repCur); sh.rep.erase(prev, sh.repCur - prev); sh.repCur = prev; }
-    } else {
-        if (sh.termCur > 0) { int prev = utf8Prev(sh.term, sh.termCur); sh.term.erase(prev, sh.termCur - prev); sh.termCur = prev; }
-    }
-}
-
-static void searchMoveFocusedLeft() {
-    auto &sh = g_editor.search;
-    if (sh.focusRep) { if (sh.repCur > 0) sh.repCur = utf8Prev(sh.rep, sh.repCur); }
-    else { if (sh.termCur > 0) sh.termCur = utf8Prev(sh.term, sh.termCur); }
-}
-
-static void searchMoveFocusedRight() {
-    auto &sh = g_editor.search;
-    if (sh.focusRep) { if (sh.repCur < (int)sh.rep.length()) sh.repCur = utf8Next(sh.rep, sh.repCur); }
-    else { if (sh.termCur < (int)sh.term.length()) sh.termCur = utf8Next(sh.term, sh.termCur); }
-}
+static void searchInsertFocused(const std::string &ins) { imeFieldInsert(searchField(), ins); }
+static void searchBackspaceFocused() { imeFieldBackspace(searchField()); }
+static void searchMoveFocusedLeft() { imeFieldMoveLeft(searchField()); }
+static void searchMoveFocusedRight() { imeFieldMoveRight(searchField()); }
 
 static void drawEditor();
 
@@ -1119,9 +1125,9 @@ static AppState screen_editor_search_handle(int key, ScreenContext &ctx) {
     } else if (key == KEY_RIGHT) {
         searchMoveFocusedRight();
     } else if (key == KEY_HOME) {
-        if (sh.focusRep) sh.repCur = 0; else sh.termCur = 0;
+        searchField().setCur(0);
     } else if (key == KEY_END) {
-        if (sh.focusRep) sh.repCur = (int)sh.rep.length(); else sh.termCur = (int)sh.term.length();
+        imeFieldMoveEnd(searchField());
     } else if (key >= 0x20 && key <= 0x7E) {
         searchInsertFocused(std::string(1, (char)key));
         if (!sh.focusRep) searchAfterTermChange();
@@ -1164,10 +1170,16 @@ static const int HELP_COUNT = (int)(sizeof(HELP_LINES) / sizeof(HELP_LINES[0]));
 
 // 帮助可见行数(标题下到状态栏之间)。
 static int helpMaxVis() {
+    // 帮助浮层是界面框架,几何恒按界面字号(本函数被 drawHelpPanel 与 help 的按键处理
+    // 两条路调,后者在正文作用域里)。
+    FontScope ui(FontRenderer::uiPxHeight());
     return (STATUS_Y - FONT_H - LINE_SPACING + LINE_SPACING - 1) / LINE_SPACING;
 }
 
 static void drawHelpPanel() {
+    // 帮助浮层是界面框架（会在正文作用域里被调到）。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     g_editor.drawnOnce = true;
     ui_clear();
     const int rowH = LINE_SPACING;
@@ -1311,6 +1323,8 @@ static void editorToggleWritingMode() {
 // modeTarget = 左端这个是"写作模式"标记（可点切换），记下命中区域供点按/长按查。
 static void editorStatusBar(const char *left, std::string right, uint32_t leftIcon = 0,
                             bool modeTarget = false) {
+    // 状态栏是界面框架：底边、行高、字号全按**界面字号**，不跟正文一起放大。
+    FontScope ui(FontRenderer::uiPxHeight());
     int slot = editorVkIconSlotW();
     if (slot > 0) {
         right = editorVkTruncateToWidth(right, SCREEN_W - slot - 16);
@@ -1398,17 +1412,22 @@ static VerticalLayoutMetrics editorVerticalVm() {
     if (pRows > 0) y += (pRows + 1) * LINE_SPACING;
     bool reserveIME = g_editor.imeActive;
     int contentEndY;
-    if (editorVkActive()) {
-        // 虚拟键盘面板比 IME 候选条高得多,且自带候选条,正文直接裁到面板顶边。
-        contentEndY = editorVkTop();
-    } else if (reserveIME) {
-        // 候选条底边锚定分割线(276)后,编码行白框上沿 = 265 - 2*字号
-        // (22pt:221 / 20pt:225 / 18pt:229,18pt 实测再 +3)。竖排正文下探到编码行上沿
-        // 附近,行数随之变化(锚定 STATUS_Y 时更多)。
-        const int fs = g_font.fontSize();
-        contentEndY = (fs == 18) ? 232 : (265 - 2 * fs);
-    } else {
-        contentEndY = STATUS_Y;
+    {
+        // 底边这一组(键盘面板顶 / 候选条上沿 / 状态栏上沿)全是**界面字号**下的量,
+        // 正文字号改了不该带着它们跑。行高那半边(上面的 y)才是正文字号。
+        FontScope ui(FontRenderer::uiPxHeight());
+        if (editorVkActive()) {
+            // 虚拟键盘面板比 IME 候选条高得多,且自带候选条,正文直接裁到面板顶边。
+            contentEndY = editorVkTop();
+        } else if (reserveIME) {
+            // 候选条底边锚定分割线(276)后,编码行白框上沿 = 265 - 2*字号
+            // (22pt:221 / 20pt:225 / 18pt:229,18pt 实测再 +3)。竖排正文下探到编码行上沿
+            // 附近,行数随之变化(锚定 STATUS_Y 时更多)。
+            const int fs = g_font.fontSize();
+            contentEndY = (fs == 18) ? 232 : (265 - 2 * fs);
+        } else {
+            contentEndY = STATUS_Y;
+        }
     }
     // 竖排首字墨迹顶边与横排首行对齐(横排首行基线 y,顶边 y-ascent);
     // 竖排基线 = vm.y + ascent,故 vm.y 取 y-ascent,顶部不留整行空白
@@ -1433,6 +1452,9 @@ static int editorBodyTopY() {
 // 正文区底边：虚拟键盘在时贴键盘顶（按钮条就落在键盘上面那条），否则让给
 // IME 候选条 / 状态栏。与 drawEditor 里 contentEndY 的算法一致。
 static int editorBodyBottomY() {
+    // 整条算式都是**界面字号**下的量(键盘面板顶 / 候选条上沿 / 状态栏上沿),与正文字号
+    // 无关。本函数会被正文作用域调到,所以自己钉一次界面字号,谁调用都拿到同一个底边。
+    FontScope ui(FontRenderer::uiPxHeight());
     if (editorVkActive()) return editorVkTop();
     if (g_editor.imeActive) {
         if (editorVertical()) {
@@ -1891,6 +1913,10 @@ static void drawEditorTouchOverlays() {
 }
 
 static void drawEditor() {
+    // 正文整块按「显示与版式 → 正文字号」排版：行高、行距、字宽、光标/选区几何一次全对。
+    // 界面框架（状态栏 / 输入法条 / 虚拟键盘 / 各种浮层）在**各自函数里**显式钉回界面
+    // 字号，所以下面照常调用它们即可，不必在这里进进出出。
+    FontScope body(editorBodyFontPx());
     g_editor.drawnOnce = true;
     reconcileFoldsForCursor();
     int y = FONT_H;
@@ -1995,8 +2021,15 @@ static void drawEditor() {
     // IME 开启期间恒定保留候选条区域,选字后候选条隐藏不再引起正文重排跳动
     bool reserveIME = g_editor.imeActive;
     // 虚拟键盘面板自带候选条、且比 IME 条高得多,同时显示时以键盘为准。
-    int contentEndY = vkOn ? editorVkTop()
+    // 底边与状态栏上沿都是**界面字号**下的量，正文放大不该带着它们跑；行数 =
+    // (底边 - 正文顶 y) / 正文行距。
+    int contentEndY, statusY;
+    {
+        FontScope ui(FontRenderer::uiPxHeight());
+        statusY = STATUS_Y;
+        contentEndY = vkOn ? editorVkTop()
                            : (reserveIME ? imeStatusPanelTopY() : STATUS_Y);
+    }
     int visibleVrows = (contentEndY - y + LINE_SPACING - 1) / LINE_SPACING;
     if (visibleVrows < 1) visibleVrows = 1;
 
@@ -2008,7 +2041,7 @@ static void drawEditor() {
         }
     }
 
-    int normalVisibleVrows = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
+    int normalVisibleVrows = (statusY - y + LINE_SPACING - 1) / LINE_SPACING;
     int effectiveVisibleVrows = vkOn ? visibleVrows
                                      : (reserveIME ? (normalVisibleVrows - 2) : normalVisibleVrows);
     if (effectiveVisibleVrows < 1) effectiveVisibleVrows = 1;
@@ -2242,8 +2275,10 @@ static AppState finishEditor(ScreenContext &ctx) {
 static const char *kEditorMenuItems[] = {"全文润色", "发送到Flomo", "二维码", "保存并返回"};
 static const int kEditorMenuCount = 4;
 // 行高随字号变（FONT_H 是运行时宏），所以只能现算，不能存成 static const。
-static int editorMenuRowH() { return FONT_H + 12; }
-static int editorMenuTitleH() { return FONT_H + 10; }
+// 快捷菜单是界面框架(浮在正文之上),几何恒按界面字号——它也被正文作用域里的触摸
+// 命中路径调到,所以在这里钉回,不让菜单随正文字号一起长。
+static int editorMenuRowH() { FontScope ui(FontRenderer::uiPxHeight()); return FONT_H + 12; }
+static int editorMenuTitleH() { FontScope ui(FontRenderer::uiPxHeight()); return FONT_H + 10; }
 
 static void editorQrOpen();
 static void drawEditorQr();
@@ -2274,6 +2309,9 @@ static int editorMenuRowAt(int tx, int ty) {
 
 // 浮在已画好的编辑器之上（调用方负责 ui_clear + drawEditor）。
 static void drawEditorMenuBox() {
+    // 快捷菜单浮层：界面字号（它会在正文作用域里被调到）。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     int x, y, w, h;
     editorMenuRect(x, y, w, h);
     // 3px 黑框 + 白底：正文在下面，这里把面板范围挖白，文字才点得清。
@@ -2372,6 +2410,9 @@ static void editorQrOpen() {
 }
 
 static void drawEditorQr() {
+    // 二维码页是界面框架（会在正文作用域里被调到）。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     g_editor.drawnOnce = true;
     ui_clear();
     ui_draw_text(4, FONT_H, "二维码", false, true);
@@ -2426,6 +2467,8 @@ static AppState screen_editor_qr_handle(int key, ScreenContext &ctx) {
 
 // ── Screen entry points ──────────────────────────────────────────────────
 void screen_editor_init(ScreenContext &ctx) {
+    // 编辑器整个界面按**正文字号**跑（见 screen_editor_handle 处的说明）。
+    FontScope body(editorBodyFontPx());
     g_editor.lines.clear();
     g_editor.autoSaveTime = 0;
     g_editor.savedFilename = ctx.editFilename;
@@ -2859,6 +2902,21 @@ static int s_lastTapX = -1000;
 static int s_lastTapY = -1000;
 
 AppState screen_editor_handle(int key, ScreenContext &ctx) {
+    // ── 编辑器的字号切分 ────────────────────────────────────────────────────
+    // 「显示与版式 → 正文字号」只管**正文那一块**。做法是把 FontRenderer 的共享格子
+    // 在**整个编辑器界面**上换成正文的 px，出去自动还原——这样正文的排版、换行、光标、
+    // 选区、触摸命中、竖排导航（全都读那套派生式）一次全对，一个调用点都不用改。
+    //
+    // 代价：界面框架在正文作用域里会被一起放大，所以它们必须**自己钉回界面字号**——
+    // 状态栏(editorStatusBar)、输入法条(drawIMEUI)、虚拟键盘(editorVk*)、快捷菜单
+    // (editorMenu*)、查找/帮助/二维码浮层、轻提示(ui_toast_draw)，以及那几个混着
+    // 界面量的度量函数（editorBodyBottomY / editorVerticalVm / editorPageRows /
+    // helpMaxVis）。新加"框架里画的东西"时照此办理：函数开头一行
+    // `FontScope ui(FontRenderer::uiPxHeight());`。
+    //
+    // 放在 handle/idle/init 三个入口而不是 drawEditor 一个地方：命中测试与绘制必须
+    // 同源，而 handle 里到处是正文几何。
+    FontScope body(editorBodyFontPx());
     const auto& vrows = getVrows();
     s_vkAteCommitClick = false;
 
@@ -3380,8 +3438,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     if (key == KEY_SHIFT_LEFT) {
         if (g_editor.cx > 0) {
             extendSelection();
-            g_editor.cx--;
-            while (g_editor.cx > 0 && ((unsigned char)g_editor.lines[g_editor.cy][g_editor.cx] & 0xC0) == 0x80) g_editor.cx--;
+            imeFieldMoveLeft(editorLineField());
         } else if (g_editor.cy > 0) {
             extendSelection();
             g_editor.cy--;
@@ -3394,8 +3451,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     if (key == KEY_SHIFT_RIGHT) {
         if (g_editor.cx < (int)g_editor.lines[g_editor.cy].length()) {
             extendSelection();
-            g_editor.cx++;
-            while (g_editor.cx < (int)g_editor.lines[g_editor.cy].length() && ((unsigned char)g_editor.lines[g_editor.cy][g_editor.cx] & 0xC0) == 0x80) g_editor.cx++;
+            imeFieldMoveRight(editorLineField());
         } else if (g_editor.cy < (int)g_editor.lines.size() - 1) {
             extendSelection();
             g_editor.cy++;
@@ -3508,10 +3564,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             deleteSelection();
         } else if (g_editor.cx > 0) {
             recordUndoSnapshot(UndoGroup::Delete);
-            int prev = g_editor.cx - 1;
-            while (prev > 0 && ((unsigned char)g_editor.lines[g_editor.cy][prev] & 0xC0) == 0x80) prev--;
-            g_editor.lines[g_editor.cy].erase(prev, g_editor.cx - prev);
-            g_editor.cx = prev;
+            imeFieldBackspace(editorLineField());
             if (g_editor.imeActive) g_ime.handleHostBackspace();
         } else if (g_editor.cy > 0) {
             recordUndoSnapshot(UndoGroup::Delete);
@@ -3528,8 +3581,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     } else if (key >= 0x20 && key <= 0x7E) { // ASCII printable
         recordUndoSnapshot(UndoGroup::Typing);
         if (g_editor.hasSelection) deleteSelection();
-        g_editor.lines[g_editor.cy].insert(g_editor.cx, 1, (char)key);
-        g_editor.cx++;
+        imeFieldInsert(editorLineField(), std::string(1, (char)key));
         g_editor.targetCx = -1;
         markDirty();
         g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
@@ -3539,8 +3591,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     } else if (key == KEY_LEFT) {
         clearSelection();
         if (g_editor.cx > 0) {
-            g_editor.cx--;
-            while (g_editor.cx > 0 && ((unsigned char)g_editor.lines[g_editor.cy][g_editor.cx] & 0xC0) == 0x80) g_editor.cx--;
+            imeFieldMoveLeft(editorLineField());
         } else if (g_editor.cy > 0) {
             g_editor.cy--;
             g_editor.cx = (int)g_editor.lines[g_editor.cy].length();
@@ -3549,8 +3600,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     } else if (key == KEY_RIGHT) {
         clearSelection();
         if (g_editor.cx < (int)g_editor.lines[g_editor.cy].length()) {
-            g_editor.cx++;
-            while (g_editor.cx < (int)g_editor.lines[g_editor.cy].length() && ((unsigned char)g_editor.lines[g_editor.cy][g_editor.cx] & 0xC0) == 0x80) g_editor.cx++;
+            imeFieldMoveRight(editorLineField());
         } else if (g_editor.cy < (int)g_editor.lines.size() - 1) {
             g_editor.cy++;
             g_editor.cx = 0;
@@ -3595,11 +3645,11 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         }
     } else if (key == KEY_HOME) {
         clearSelection();
-        g_editor.cx = 0;
+        editorLineField().setCur(0);
         g_editor.targetCx = -1;
     } else if (key == KEY_END) {
         clearSelection();
-        g_editor.cx = (int)g_editor.lines[g_editor.cy].length();
+        imeFieldMoveEnd(editorLineField());
         g_editor.targetCx = -1;
     } else if (key == KEY_PAGE_UP) {
         clearSelection();
@@ -3622,6 +3672,8 @@ static bool s_toastShown = false;
 
 bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw) {
     (void)ctx;
+    // 正文作用域：见 screen_editor_handle 处的说明。
+    FontScope body(editorBodyFontPx());
     // 提示框不会动，所以不必每帧重画：只在"画/不画"翻转的那一下补一帧就够了——
     // 过期那次重绘正好把白框抹掉。编辑器空闲会跳过重绘，这一补只能在这里做；
     // 顺着 forceRedraw 走是为了让当时开着的模态面板（查找/帮助/快捷菜单/恢复提示）
@@ -3776,6 +3828,56 @@ void app_toggle_ime_delete_mode() {
 
 static bool g_editorNeedsReinit = false;
 
+// ── 进入 / 离开编辑器（main.cpp 的 kScreens 生命周期钩子）───────────────────
+// 这两条策略原来长在 main.cpp 的 scrEditor() 里（一份 `static bool editorInited`
+// 外加一串"去哪儿才重置"的判断）。搬到编辑器自己的文件里：判据（哪些界面只是盖在
+// 编辑器之上的一层）和状态（g_editor / 暂存会话）在同一个文件，改一处就够。
+static bool s_editorInited = false;    // 本"进入会话"是否已经 init 过
+static bool s_keepOnReturn = false;    // 上一处离开是去浮层（灵感/润色/历史）
+
+void screen_editor_enter(ScreenContext &ctx) {
+    // 本轮切换进编辑器时屏幕已被上一层盖过：置脏，这一帧必须整屏重绘（否则屏幕停在
+    // 上一个界面画面上，直到按第一个键才动）。原来这一句在主循环里按 currentState 判，
+    // 现在跟着"进入"这个事件走 —— 从浮层回来同样要重绘，所以放在重建判断**之前**。
+    screen_editor_reset_drawn();
+    // 从浮层回来**不重建**：灵感/润色/历史只是盖在编辑器之上的一层，正文/光标/选区
+    // 都还在（浮层走之前已经 stash 过会话，见 app_editor_stash_session 的调用点）。
+    if (s_keepOnReturn) {
+        s_keepOnReturn = false;
+        return;
+    }
+    // 其余来源一律重建。app_editor_needs_reinit() 是**显式**的重建信号（往编辑器里塞
+    // 新内容时投递，调用点在别的界面：screen_flomo / screen_inspiration / history），
+    // 而且全都发生在"返回 APP_EDITOR 之前"——所以在这里问一次和一帧一帧地问等价。
+    if (!s_editorInited || app_editor_needs_reinit()) {
+        screen_editor_init(ctx);
+        s_editorInited = true;
+    }
+}
+
+void screen_editor_leave(AppState next) {
+    if (next == APP_INSPIRATION || next == APP_POLISH || next == APP_HISTORY) {
+        s_keepOnReturn = true;    // 只是被浮层盖住：会话原样留着，回来接着用
+        return;
+    }
+    if (next == APP_SYNC_SEND_FLOMO) return;   // 转发到 flomo：会话留着，回来接着用
+    // 切模式（电源键）走的是**另一条路**：它在派发之前就把 currentState 改了，本函数
+    // 得到的 next 是另一个模式的落点（阅读/计划）。那种情况必须**保住**会话——原来的
+    // main.cpp 里 `editorInited = false` 只写在 APP_EDITOR 的 case 体里，切模式那帧根本
+    // 不进这个 case，所以它天然保住了会话（见 [[mode-switch-session]]）。现在 leave 被
+    // 所有路径共用，就得把这条判据写出来：**目的地跨了模式 → 是切模式，保住**。
+    if (appModeOfState(next) != appModeOfState(APP_EDITOR)) {
+        // 切模式：会话留住，但触摸选区/按钮条/粘贴板列表这些"挂在屏幕上的东西"要收掉
+        // （切回来是直接用留住的会话，不收就会挂上一次的选区）。这一句原来在 main.cpp
+        // 的电源键分支里（cur==1 && currentState==APP_EDITOR）。
+        app_editor_leave_cleanup();
+        return;
+    }
+    // 同模式内的离开（Esc 回写作菜单 / 去文件管理 / 设置…）才是真的走了：下次进来重跑
+    // init（新内容 / 新文件）。需要"回来看到新内容"的入口会显式调 app_editor_request_reinit()。
+    s_editorInited = false;
+}
+
 void app_editor_request_reinit() {
     g_editorNeedsReinit = true;
 }
@@ -3822,8 +3924,7 @@ void editorInsertText(const std::string &text) {
     if (text.empty()) return;
     recordUndoSnapshot(UndoGroup::Typing);
     if (g_editor.hasSelection) deleteSelection();
-    g_editor.lines[g_editor.cy].insert(g_editor.cx, text);
-    g_editor.cx += (int)text.length();
+    imeFieldInsert(editorLineField(), text);   // 删除选区可能并了行，字段要在它之后取
     g_editor.targetCx = -1;
     markDirty();
     g_editor.autoSaveTime = esp_timer_get_time() + 3000000;

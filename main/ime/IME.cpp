@@ -438,7 +438,10 @@ static std::string pinyinInitialCodeCompat(const std::string &code) {
     if (!init.empty()) return init;
     const char *wc = code.c_str();
     int cl = (int)code.length();
-    char fallback[13]; int o = 0;
+    // 容量按"最大写到的下标"算：循环入口 o ≤ 11，下面 zh/ch/sh 那个分支一次进 2，
+    // 可把 o 推到 13，最后 `fallback[o] = 0` 就落在下标 13 —— 所以数组至少要 14。
+    // 原来写 13，双写路径会越界写 1 字节（栈上）。
+    char fallback[14]; int o = 0;
     for (int i = 0; i < cl && o < 12; ) {
         if (strchr("aeiouv", wc[i])) {
             while (i < cl && strchr("aeiouvngr", wc[i]) && o < 12)
@@ -1042,6 +1045,11 @@ static int utf8TextCharCount(const std::string &text) {
         count++;
     }
     return count;
+}
+
+// 单个汉字。「最近删除」名单靠它划边界，见 IME::recentlyDeletedWord。
+static bool isSingleCjkChar(const std::string &text) {
+    return utf8TextCharCount(text) == 1 && isCjkChar(text);
 }
 
 static bool allSameCjkChars(const std::string &text) {
@@ -2591,8 +2599,19 @@ void IME::appendRecentCommitCandidates(const std::string &code,
     }
 }
 
+// ── 「最近删除」名单的作用范围 ─────────────────────────────────────────────
+// **单字永不进名单，也永不因名单被过滤。** 名单唯一的下游是 appendCandidate()，那
+// 是**所有**候选的唯一出口——内置单字表、词库、用户词、联想、整句都在那儿汇合。名单里
+// 放一个单字，等于把那个字从这一屏的每一处抹掉，用户手上就再也打不出它：上屏「残」
+// → 删掉 → 之后任何布局的 can 都没有「残」（这就是名单当初被放宽的代价）。
+//
+// 边界按"这个字是不是内置单字表的一员"划：单字一律是（学出来的单字，源头也是内置表
+// 里的那个字），所以名单只收**多字词**——那是删词模式真从动态词库里删掉的东西，"别
+// 再学回来"才有意义。收窄之后：删掉一个学歪的词仍会被 blocked 重新学习（见
+// bumpFrequency / rememberRecentCommit / learnAutoPhraseFromSingle / bumpPredictFrequency
+// 四处调用），但不可能再让内置表里的任何一个字消失。
 bool IME::recentlyDeletedWord(const std::string &word) const {
-    if (word.empty()) return false;
+    if (word.empty() || isSingleCjkChar(word)) return false;
     uint32_t h = candidateHash(word);
     for (size_t i = 0; i < _recentDeletedHashes.size(); i++) {
         if (_recentDeletedHashes[i] == h && i < _recentDeletedWords.size() &&
@@ -2611,7 +2630,9 @@ bool IME::recentlyDeletedWordHash(uint32_t hash) const {
 }
 
 void IME::rememberDeletedWord(const std::string &word) {
-    if (word.empty()) return;
+    // 单字根本不入名单（见 recentlyDeletedWord 的说明）：它在删词模式里已经从动态词库
+    // 真删掉了，剩下的"别再出现"由 penalizePredictWord 做，不该再动内置单字表。
+    if (word.empty() || isSingleCjkChar(word)) return;
     uint32_t h = candidateHash(word);
     for (size_t i = 0; i < _recentDeletedWords.size(); i++) {
         if (_recentDeletedHashes[i] == h && _recentDeletedWords[i] == word) {
@@ -3028,6 +3049,17 @@ void IME::clearCandidates() {
     _candLen.clear();
     _candidateWidths.clear();
     _predictCandidateKeys.clear();
+    // _partialStart/_remainder 是候选表的元数据：前者是 _all 里的下标、后者是配套的余码，
+    // 都描述**上一次** lookup() 的 Phase 8「逐字」批次。以前只靠 Phase 8 自己刷新（4101-4102），
+    // 但本次按键若在更早的相位撞到候选上限就 return（如 3818 的 phrase-limit 早退），
+    // Phase 8 根本不执行，这两个值就原样留到 commit()。commit() 的 partial 判据
+    // （_remainder 非空 && idx >= _partialStart - _pageStart）于是对**整页**候选恒真：
+    // 整词「这个」（_candLen 明明是正确的 5）被误判成"只吃了半截码"，走续接分支时
+    // 又因 partial 为真不重算余码，直接把上一键遗留的 _remainder 当成 _code——
+    // 打 zhege 选「这个」后编码区剩下上一键 zheg 留下的 "g"，再选就拼成「这个个」。
+    // 候选表都换掉了，这两个值必须跟着归零。lookupAmbiguous() 结尾早就这么做（5179-5181）。
+    _partialStart = 0;
+    _remainder.clear();
     if (_all.capacity() > MAX_CANDIDATES * 2) _all.shrink_to_fit();
     else if (_all.capacity() < MAX_CANDIDATES / 3) _all.reserve(MAX_CANDIDATES / 3);
 }
@@ -3043,7 +3075,12 @@ void IME::rebuildCandidateHashes() {
 bool IME::appendCandidate(const std::string &text, int candLen) {
     if (_all.size() >= _candidateLimit) return false;
     uint32_t h = candidateHash(text);
-    if (recentlyDeletedWordHash(h) && recentlyDeletedWord(text)) return false;
+    // 「最近删除」名单在这里是唯一会**删候选**的地方（其余调用点只影响学习/加分）。
+    // 所以这里是"名单不许碰内置表"的最后一道闸：单字直接放行（名单也不收单字，见
+    // recentlyDeletedWord 那段说明——不这么写，"删掉一个学歪的单字 → 该字再也打不出"
+    // 就会从删词模式那条路复活，退格那条路以前踩过同一个坑，见 handleHostBackspace）。
+    if (!isSingleCjkChar(text) && recentlyDeletedWordHash(h) && recentlyDeletedWord(text))
+        return false;
     rebuildCandidateHashes();
     if (hasCandidate(text, h)) return false;
     _all.push_back(text);
@@ -5685,7 +5722,37 @@ bool IME::handleFullwidthChar(int key, std::string &out) {
     return false;
 }
 
+// 句读（换句 / 换气的地方）：，。！？；：、……—— 和中英文混排时的半角 ,.!?;:。
+// 敲完这些用户**天然会停一下**去组织下一句 —— 这是打字过程中最可预期的一次停顿，
+// 拿它当"清残影"的时机比等一个固定阈值准（见 ui_render.cpp 的 IME_CLEAN_PUNCT_PAUSE_US）。
+// 只看吐出来那一段的**最后一个字符**：句读总是整段落在尾部（「，」单发、英文词尾补标点、
+// 预测模式下的标点），前缀是不是词不影响判定。
+static bool isPausePunctTail(const std::string &text) {
+    if (text.empty()) return false;
+    const std::string last = lastUtf8Char(text);
+    static const char *kPunct[] = {"，", "。", "！", "？", "；", "：", "、", "…", "—",
+                                   ",",  ".",  "!",  "?",  ";",  ":"};
+    for (const char *p : kPunct) {
+        if (last == p) return true;
+    }
+    return false;
+}
+
+// handleKey 的外壳：只做一件事 —— 认这一次按键是不是吐出了一个句读。
+//
+// 为什么不在发射点上埋计数器：句读是**直通**进正文的，不经过候选上屏，发射点散在
+// handleFullwidthPunct / imePunctForKey（预测分支）/ v 模式符号 / 英文组合的词尾补标点
+// 好几处，逐个埋迟早漏一个。出口只有一个：handleKey 的返回。所以把"最终吐出来的这一段
+// 是不是落在句读上"这一问放在这里，一次覆盖全部路径（含以后新加的）。
 bool IME::handleKey(int key, std::string &out) {
+    const bool handled = handleKeyImpl(key, out);
+    // handled=true 而 out 没被动过（翻页键之类）时 out 保持原样：调用方都是拿一个
+    // 新声明的空串进来的，所以这里既不会误判也不会覆盖内容。
+    if (handled && isPausePunctTail(out)) _punctSeq++;
+    return handled;
+}
+
+bool IME::handleKeyImpl(int key, std::string &out) {
     if (!_active) return false;
     flushUserDictSaves(false);
     // 虚拟键盘的「一键多字母」键（14/18/9 键布局）走这条支路。物理键盘永远不发这些码，
@@ -5726,8 +5793,13 @@ bool IME::handleKey(int key, std::string &out) {
             return true;
         }
         if (key >= '1' && key <= '9') {
-            const int flat = _pageStart + (key - '1');
-            if (flat >= 0 && flat < (int)_ambigSrc.size()) {
+            const int idx = key - '1';
+            const int flat = _pageStart + idx;
+            // 上界必须按**当前页**算：commit() 收的是页内下标，而 _ambigSrc 是全局候选
+            // 表。只查 _ambigSrc 的话，本页不足 9 条时按一个越页的数字键，会用**别的
+            // 候选**的展开码改写 _code 并记进 _ambigPreferred（用户没看见那个读音），
+            // 之后上屏/学词都跟着这个错码走。
+            if (idx < (int)_page.size() && flat >= 0 && flat < (int)_ambigSrc.size()) {
                 const uint8_t src = _ambigSrc[flat];
                 if (src < _ambigCodes.size()) {
                     if (_ambigPreferred.size() > 256) _ambigPreferred.clear();   // 简单封顶

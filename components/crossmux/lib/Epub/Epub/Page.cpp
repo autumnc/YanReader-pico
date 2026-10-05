@@ -21,7 +21,7 @@ void renderFilteredPageElements(const std::vector<std::unique_ptr<PageElement>>&
 
 }  // namespace
 
-void Page::addFootnote(const char* number, const char* href) {
+void Page::addFootnote(const char* number, const std::string& href) {
   if (footnotes.size() >= MAX_FOOTNOTES_PER_PAGE || footnotes.allocationFailed()) return;
 
   auto* entry = footnotes.append();
@@ -32,8 +32,8 @@ void Page::addFootnote(const char* number, const char* href) {
   }
   strncpy(entry->number, number, sizeof(entry->number) - 1);
   entry->number[sizeof(entry->number) - 1] = '\0';
-  strncpy(entry->href, href, sizeof(entry->href) - 1);
-  entry->href[sizeof(entry->href) - 1] = '\0';
+  // 不截断：href 是 std::string（普通锚点几十字节，"alt:" 哨兵的整段注文最长见过 ~2.8 KB）
+  entry->href = href;
 }
 
 bool Page::addLink(const char* href, const int16_t x, const int16_t y, const int16_t width, const int16_t height) {
@@ -58,7 +58,15 @@ bool Page::addLink(const char* href, const int16_t x, const int16_t y, const int
 }
 
 void PageLine::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) {
-  block->render(renderer, fontId, xPos + xOffset, yPos + yOffset);
+  // yPos 是**行顶**（排版游标 currentPageNextY：按行高逐行推进、页高预算按它算、PageLink
+  // 矩形也以它为上沿），而 TextBlock::render 收的 y 是**基线** —— 本移植版的 ttf 渲染器
+  // 直接把它当基线（`ttf_draw_text_px`，同 TextBlock.cpp 装饰线那段注释）。所以这里必须
+  // 补一跳 ascender，少了它整页文字被抬高一整个 ascender：正文只表现为"顶边留白比标称的
+  // 少 40px"（不显眼），字号大的标题就直接顶出屏幕被切掉 —— 晋书 h1 经 CSS 阶梯顶到
+  // 64px（ascender≈56），首行基线 50 再减 56 就是 -6，那 6px 正是被截掉的部分。
+  // 用**这一行自己的**字体号：CSS 放大过的标题 ascender 更大，差这一档就白修了。
+  const int lineFontId = block->renderFontId() ? block->renderFontId() : fontId;
+  block->render(renderer, fontId, xPos + xOffset, yPos + yOffset + renderer.getFontAscenderSize(lineFontId));
 }
 
 bool PageLine::serialize(HalFile& file) {
@@ -214,11 +222,12 @@ bool Page::serialize(HalFile& file) const {
   serialization::writePod(file, fnCount);
   for (uint16_t i = 0; i < fnCount; i++) {
     const auto& fn = footnotes[i];
-    if (file.write(fn.number, sizeof(fn.number)) != sizeof(fn.number) ||
-        file.write(fn.href, sizeof(fn.href)) != sizeof(fn.href)) {
+    // number 定长，href 变长（uint32 长度前缀 + 正文，见 serialization::writeString）
+    if (file.write(fn.number, sizeof(fn.number)) != sizeof(fn.number)) {
       LOG_ERR("PGE", "Failed to write footnote");
       return false;
     }
+    serialization::writeString(file, fn.href);
   }
 
   const uint16_t linkCount = std::min<uint16_t>(links.size(), MAX_LINKS_PER_PAGE);
@@ -291,24 +300,35 @@ std::unique_ptr<Page> Page::deserialize(HalFile& file, const bool collectTouchLi
     return nullptr;
   }
   if (!page->footnotes.resize(fnCount)) {
-    const size_t bytesToSkip = static_cast<size_t>(fnCount) * sizeof(FootnoteEntry);
-    const size_t position = file.position();
+    // 分配失败（页脚注表要 16 条，见 FootnoteList）。href 变长之后不能再按固定尺寸往后跳，
+    // 只能逐条读**长度前缀**、跳过正文；这条路上不分配，所以依旧不会 OOM。
+    LOG_ERR("PGE", "OOM: dropping %u footnotes", fnCount);
     const size_t fileSize = file.size();
-    LOG_ERR("PGE", "OOM: dropping %u footnotes (%u bytes)", fnCount, static_cast<unsigned>(bytesToSkip));
-    if (position > fileSize || bytesToSkip > fileSize - position || !file.seek(position + bytesToSkip)) {
-      LOG_ERR("PGE", "Failed to skip footnotes after OOM");
-      return nullptr;
+    for (uint16_t i = 0; i < fnCount; i++) {
+      uint32_t len = 0;
+      if (!serialization::readPod(file, len)) {
+        LOG_ERR("PGE", "Failed to skip footnote %u after OOM", i);
+        return nullptr;
+      }
+      const size_t position = file.position();
+      if (len > FOOTNOTE_MAX_TEXT_BYTES || position > fileSize || len > fileSize - position ||
+          !file.seek(position + len)) {
+        LOG_ERR("PGE", "Failed to skip footnote %u after OOM", i);
+        return nullptr;
+      }
     }
   }
   for (uint16_t i = 0; i < page->footnotes.size(); i++) {
     auto& entry = page->footnotes[i];
-    if (file.read(entry.number, sizeof(entry.number)) != sizeof(entry.number) ||
-        file.read(entry.href, sizeof(entry.href)) != sizeof(entry.href)) {
+    if (file.read(entry.number, sizeof(entry.number)) != sizeof(entry.number)) {
       LOG_ERR("PGE", "Failed to read footnote %u", i);
       return nullptr;
     }
     entry.number[sizeof(entry.number) - 1] = '\0';
-    entry.href[sizeof(entry.href) - 1] = '\0';
+    if (!serialization::readString(file, entry.href, FOOTNOTE_MAX_TEXT_BYTES)) {
+      LOG_ERR("PGE", "Failed to read footnote %u", i);
+      return nullptr;
+    }
   }
 
   uint16_t linkCount = 0;

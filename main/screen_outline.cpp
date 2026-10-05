@@ -7,6 +7,7 @@
 #include "ui_helpers.h"
 #include "ui_render.h"
 #include "ime/IME.h"
+#include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划/阅读共用一份）
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -132,6 +133,13 @@ static struct {
     int pickerField = -1;
     std::set<int> pickerToggled;
 } g;
+
+// ── 当前编辑缓冲的 ImeField 形态 ────────────────────────────────────────
+// 每个都是当场构造的两个指针（串 + 光标），不拷贝不接管，只为把 UTF-8 边界算术
+// 收进 ui/ime_field.h 那一份；筛选框没有光标成员，是纯追加字段，所以 cursor 传 nullptr。
+static ImeField olEditField()   { return ImeField{&g.editBuf, &g.editCur}; }
+static ImeField olNoteField()   { return ImeField{&g.noteLines[g.noteRow], &g.noteCol}; }
+static ImeField olFilterField() { return ImeField{&g.filterText, /*cursor=*/nullptr}; }
 
 // ── 编辑态虚拟键盘 ────────────────────────────────────────────────────────
 // 与写作/计划模式共用同一套键盘（editor_vk）：没连蓝牙键盘时自动弹出、连上自动
@@ -325,7 +333,14 @@ static std::string safeFilename(const std::string &title) {
             out += c;
     }
     if (out.empty()) out = "untitled";
-    if (out.size() > 40) out = out.substr(0, 40);
+    if (out.size() > 40) {
+        // 按字节切会劈开一个多字节字符：退到字符边界再切。切出非法 UTF-8 不只是
+        // 文件名难看 —— 它被写进 node["file"]，还会让两个前 40 字节相同的标题
+        // 共用同一个 .txt 正文文件，互相覆盖。
+        size_t cut = 40;
+        while (cut > 0 && ((unsigned char)out[cut] & 0xC0) == 0x80) cut--;   // 退过续字节
+        out.resize(cut);
+    }
     return out + ".txt";
 }
 
@@ -1021,8 +1036,12 @@ static void drawOutline() {
     if (!g.filterTags.empty() && g.filterText.empty()) {
         char fb[64];
         int fn = snprintf(fb, sizeof(fb), "标签:");
-        for (auto &ft : g.filterTags)
+        for (auto &ft : g.filterTags) {
+            // snprintf 返回的是"本该写入的长度"，拿它当已写长度去续写，一旦超界
+            // `sizeof(fb) - fn` 就下溢成巨大的 size_t，下一句直接往栈上写。装不下就停。
+            if (fn >= (int)sizeof(fb) - 1) break;
             fn += snprintf(fb + fn, sizeof(fb) - fn, " #%s", ft.c_str());
+        }
         ui_draw_text(4, STATUS_Y - LINE_SPACING + 2, fb, true);
     }
 
@@ -1039,12 +1058,17 @@ static void drawOutline() {
             if (idx >= 0 && (size_t)idx < g.nodeCount) {
                 auto &node = (*g.nodes)[idx];
                 std::string kw = node["keywords"].asString();
-                if (!kw.empty()) n += snprintf(sl + n, sizeof(sl) - n, " | %s", kw.c_str());
+                // 同上：每次续写前先夹住，n 可能已被上一条的"本该长度"顶到 cap 之外。
+                if (!kw.empty() && n < (int)sizeof(sl) - 1)
+                    n += snprintf(sl + n, sizeof(sl) - n, " | %s", kw.c_str());
                 auto &tt = node["tags"];
                 if (tt.isArray() && tt.size() > 0) {
-                    if (kw.empty()) n += snprintf(sl + n, sizeof(sl) - n, " |");
-                    for (int j = 0; j < (int)tt.size(); j++)
+                    if (kw.empty() && n < (int)sizeof(sl) - 1)
+                        n += snprintf(sl + n, sizeof(sl) - n, " |");
+                    for (int j = 0; j < (int)tt.size(); j++) {
+                        if (n >= (int)sizeof(sl) - 1) break;
                         n += snprintf(sl + n, sizeof(sl) - n, " #%s", tt[j].asString().c_str());
+                    }
                 }
             }
         }
@@ -1196,62 +1220,14 @@ void screen_outline_init() {
 }
 
 // ── Main handle ──────────────────────────────────────────────────────────
-AppState screen_outline_handle(int key, ScreenContext &ctx) {
-    // 切进"要打字"的模式（新建/重命名/编辑备注/筛选）时，自动把虚拟键盘弹出来
-    // （没连蓝牙键盘的话）。只在**模式切换**的那一刻自动展示：用户在本模式里手动
-    // 点状态栏图标收起后，不会被下一帧又弹回来。与计划模式同款。
-    static int s_prevMode = M_PROJECTS;
-    if (g.mode != s_prevMode && olVkEditing()) editorVkAutoShow();
-    s_prevMode = g.mode;
+// P3c：下面这些函数是从 1263 行的 screen_outline_handle 里**原样搬出来**的各个
+// `if (g.mode == …) { … }` 块。与计划模式不同，这里的块**不是互斥的**（M_ITEM_MENU /
+// M_BROWSE 各有两块，且前面的块可能落空往下走），所以没做成 else-if 分发表，而是每个
+// 函数：命中并处理了 → 返回 true 并把目标 AppState 写进 out；没命中 → false，由调用方
+// 接着试下一块。`key` 按引用传：块里（以及调用方前面）会把点按翻译成键码，后面的块
+// 要看到同一个 key。逻辑一行未改，只把 `return APP_X;` 换成 `out = APP_X; return true;`。
 
-    // 虚拟键盘（编辑态，与写作/计划模式同一套）：先认状态栏上的键盘开关图标，再认
-    // 键盘面板。命中就把点按翻译成普通键码，交给下面既有的输入逻辑——不重复实现
-    // 任何输入。key 置 0 时各编辑块照旧重绘，正好把按下反馈刷出去。
-    if (olVkEditing()) editorVkSyncBtState();   // 蓝牙键盘连上就自动收起
-    if (olVkEditing() && (key == 0x0A || key == 0x0D)) {
-        int vx = 0, vy = 0;
-        if (input_tap_xy(&vx, &vy)) {
-            if (editorVkIconHit(vx, vy)) {
-                editorVkSetVisible(!editorVkVisible());
-                key = 0;
-            } else if (editorVkVisible() && vy >= editorVkTop()) {
-                EditorVkHit hit;
-                int vk = editorVkHitTest(vx, vy, &hit);
-                key = 0;
-                if (vk != EVK_NONE) editorVkMarkPressed(hit);
-                // EVK_PAGE：换面板已在命中测试里完成，key 保持 0 → 下面照样重绘
-                if (vk == EVK_LANG) {
-                    // 未开输入法 → 开中文；已开 → 拼音/英文互切（与物理 Ctrl+Space 等价）
-                    if (!g.imeActive) { g.imeActive = true; g_ime.setActive(true); }
-                    else g_ime.toggleEnglish();
-                } else if (vk > 0) {
-                    key = vk;   // 普通键：走下面既有的输入逻辑
-                }
-                // EVK_CTRL/EVK_SHIFT：待发状态已在命中测试内翻转，重绘即反馈
-                // EVK_NONE：点在键盘空白处，吞掉本次点按
-            }
-        }
-    }
-
-    // 触摸点按：命中悬浮「+」就把它翻译成对应的普通键码（项目列表 → 'n' 新建项目，
-    // 树里 → 'a' 新建标题），下面既有的键盘逻辑照旧执行，不另写一套新建逻辑。
-    // input_tap_xy() 读后即清，改写 key 后不会再次进这里，不会递归。
-    if ((g.mode == M_PROJECTS || g.mode == M_BROWSE) && (key == 0x0A || key == 0x0D)) {
-        int tx = 0, ty = 0;
-        if (input_tap_xy(&tx, &ty)) {
-            // 判定顺序与计划模式一致：子标题键 → 「+」→ 方向键。
-            if (outlineSubFabHit(tx, ty))       key = 'i';
-            else if (outlineFabHit(tx, ty))     key = (g.mode == M_PROJECTS) ? 'n' : 'a';
-            else {
-                int di = outlineDirPadHit(tx, ty);
-                if (di >= 0) key = kOutlinePadKey[di];
-            }
-        }
-    }
-
-    // 长按标题行 → 弹编辑菜单（重命名/添加子标题/提升层级/降低层级/删除）。
-    // 长按的点落在哪一行就选中哪一行，与键盘"先选中再按 r/i/h/l/d"完全等价：
-    // 菜单选中项回车后只是把键码换回来，走下面同一条分支。
+static bool olHandleBrowseLongPress(int &key, AppState &out) {
     if (g.mode == M_BROWSE && key == KEY_TOUCH_LONG && g.filterText.empty()) {
         int lx = 0, ly = 0;
         if (input_tap_xy(&lx, &ly)) {
@@ -1263,12 +1239,14 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 g.mode = M_ITEM_MENU;
                 ui_render_begin_overlay();   // 叠在上一帧上（见 ui_render.h）
                 drawOutlineItemMenu();
-                return APP_OUTLINE;
+                out = APP_OUTLINE; return true;
             }
         }
     }
+    return false;
+}
 
-    // 编辑菜单里的点按：命中哪一项就选中它再走回车；点浮层外就关掉菜单。
+static bool olHandleItemMenuTap(int &key, AppState &out) {
     if (g.mode == M_ITEM_MENU && (key == 0x0A || key == 0x0D)) {
         int tx = 0, ty = 0;
         if (input_tap_xy(&tx, &ty)) {
@@ -1277,7 +1255,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             if (tx < bx || tx >= bx + bw || ty < by || ty >= by + bh) {
                 g.mode = M_BROWSE;          // 点浮层外 = 关掉
                 drawOutline(); ui_commit();
-                return APP_OUTLINE;
+                out = APP_OUTLINE; return true;
             }
             int top0 = outlineItemMenuRowY(by, 0) - g_font.ascent();
             int r = (ty >= top0) ? (ty - top0) / LINE_SPACING : -1;
@@ -1285,22 +1263,23 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             else g.itemMenuSel = r;
         }
     }
+    return false;
+}
 
-    // ── M_ADD_PROJECT ────────────────────────────────────────────────
+static bool olHandleAddProject(int &key, AppState &out) {
     if (g.mode == M_ADD_PROJECT) {
         if (g.imeActive && key != 0) {
             std::string imeOut;
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, /*multiline=*/false, imeOut)) {
                 if (!imeOut.empty()) {
-                    g.editBuf.insert(g.editCur, imeOut);
-                    g.editCur += (int)imeOut.length();
+                    imeFieldInsert(olEditField(), imeOut);
                 }
-                drawInputOverlay("新建项目"); return APP_OUTLINE;
+                drawInputOverlay("新建项目"); out = APP_OUTLINE; return true;
             }
         }
         if (key == KEY_IME_TOGGLE) {
             g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive);
-            drawInputOverlay("新建项目"); return APP_OUTLINE;
+            drawInputOverlay("新建项目"); out = APP_OUTLINE; return true;
         }
         if (key == 0x1B) {
             g.mode = (g.curProject >= 0) ? M_BROWSE : M_PROJECTS;
@@ -1322,70 +1301,63 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             loadOutline();
             rebuildFilter();
         } else if (key == 0x7F || key == 0x08) {
-            if (g.editCur > 0) {
-                int prev = g.editCur - 1;
-                while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--;
-                g.editBuf.erase(prev, g.editCur - prev); g.editCur = prev;
-            }
+            imeFieldBackspace(olEditField());
         } else if (key == KEY_LEFT) {
-            if (g.editCur > 0) { g.editCur--;
-                while (g.editCur > 0 && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur--; }
+            imeFieldMoveLeft(olEditField());
         } else if (key == KEY_RIGHT) {
-            if (g.editCur < (int)g.editBuf.length()) { g.editCur++;
-                while (g.editCur < (int)g.editBuf.length() && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur++; }
+            imeFieldMoveRight(olEditField());
         } else if (key >= 0x20 && key <= 0x7E) {
-            g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++;
+            imeFieldInsert(olEditField(), std::string(1, (char)key));
         }
         drawInputOverlay("新建项目");
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_FILTER ─────────────────────────────────────────────────────
+static bool olHandleFilter(int &key, AppState &out) {
     if (g.mode == M_FILTER) {
         // Esc always exits filter mode, even when IME is active
         if (key == 0x1B) {
             g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
             g.filterText.clear(); rebuildFilter();
-            drawOutline(); ui_commit(); return APP_OUTLINE;
+            drawOutline(); ui_commit(); out = APP_OUTLINE; return true;
         }
         // Backspace: if IME is composing, let it handle; otherwise delete from filterText
         if ((key == 0x7F || key == 0x08) && g.imeActive && g_ime.composing()) {
             std::string imeOut;
             g_ime.handleKey(key, imeOut);
-            drawOutline(); ui_commit(); return APP_OUTLINE;
+            drawOutline(); ui_commit(); out = APP_OUTLINE; return true;
         }
         if ((key == 0x7F || key == 0x08) && (!g.imeActive || !g_ime.composing())) {
-            if (!g.filterText.empty()) {
-                int len = (int)g.filterText.size();
-                while (len > 1 && ((unsigned char)g.filterText[len - 1] & 0xC0) == 0x80) len--;
-                g.filterText.erase(len - 1);
-                rebuildFilter();
-            }
-            drawOutline(); ui_commit(); return APP_OUTLINE;
+            if (imeFieldBackspace(olFilterField())) rebuildFilter();
+            drawOutline(); ui_commit(); out = APP_OUTLINE; return true;
         }
         if (g.imeActive && key != 0) {
             std::string imeOut;
-            if (g_ime.handleKey(key, imeOut)) {
-                if (!imeOut.empty()) { g.filterText += imeOut; rebuildFilter(); }
-                drawOutline(); ui_commit(); return APP_OUTLINE;
+            if (imeFieldKeyText(g_ime, key, /*multiline=*/false, imeOut)) {
+                if (!imeOut.empty()) { imeFieldInsert(olFilterField(), imeOut); rebuildFilter(); }
+                drawOutline(); ui_commit(); out = APP_OUTLINE; return true;
             }
             // IME consumed the key (still composing) — don't add to filterText
-            drawOutline(); ui_commit(); return APP_OUTLINE;
+            drawOutline(); ui_commit(); out = APP_OUTLINE; return true;
         }
         if (key == KEY_IME_TOGGLE) {
             g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive);
-            drawOutline(); ui_commit(); return APP_OUTLINE;
+            drawOutline(); ui_commit(); out = APP_OUTLINE; return true;
         }
         if (key == 0x0A || key == 0x0D) {
             g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
         } else if (key >= 0x20 && key <= 0x7E) {
-            g.filterText += (char)key; rebuildFilter();
+            imeFieldInsert(olFilterField(), std::string(1, (char)key)); rebuildFilter();
         }
         drawOutline(); ui_commit();
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_DETAIL ──────────────────────────────────────────────────
+static bool olHandleDetail(int &key, AppState &out, ScreenContext &ctx) {
     if (g.mode == M_DETAIL) {
         if (key == 0x1B || key == 'q' || key == 'Q') {
             g.mode = M_BROWSE;
@@ -1460,7 +1432,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g.pendingOutlineTarget = fullPath;
             ctx.prevState = APP_OUTLINE;
             ctx.nextState = APP_EDITOR;
-            return APP_EDITOR;
+            out = APP_EDITOR; return true;
         }
         if (key == '?') {
             g.helpScroll = 0;
@@ -1469,28 +1441,29 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             ui_render_begin_overlay();   // 叠在上一帧上（见 ui_render.h）
             drawHelp();
             ui_commit();
-            return APP_OUTLINE;
+            out = APP_OUTLINE; return true;
         }
 
         drawOutlineDetail();
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_EDIT_NOTE ──────────────────────────────────────────────────
+static bool olHandleEditNote(int &key, AppState &out) {
     if (g.mode == M_EDIT_NOTE) {
         if (g.imeActive && key != 0) {
             std::string imeOut;
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, /*multiline=*/false, imeOut)) {
                 if (!imeOut.empty()) {
-                    g.editBuf.insert(g.editCur, imeOut);
-                    g.editCur += (int)imeOut.length();
+                    imeFieldInsert(olEditField(), imeOut);
                 }
-                drawInputOverlay(g.editingTitle ? "编辑标题" : (g.editingKeyword ? "编辑关键词" : "编辑备注")); return APP_OUTLINE;
+                drawInputOverlay(g.editingTitle ? "编辑标题" : (g.editingKeyword ? "编辑关键词" : "编辑备注")); out = APP_OUTLINE; return true;
             }
         }
         if (key == KEY_IME_TOGGLE) {
             g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive);
-            drawInputOverlay(g.editingTitle ? "编辑标题" : (g.editingKeyword ? "编辑关键词" : "编辑备注")); return APP_OUTLINE;
+            drawInputOverlay(g.editingTitle ? "编辑标题" : (g.editingKeyword ? "编辑关键词" : "编辑备注")); out = APP_OUTLINE; return true;
         }
         if (key == 0x1B) {
             g.mode = M_DETAIL; g.imeActive = false; g_ime.setActive(false);
@@ -1506,26 +1479,32 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             }
             g.mode = M_DETAIL; g.imeActive = false; g_ime.setActive(false);
         } else if (key == 0x7F || key == 0x08) {
-            if (g.editCur > 0) {
-                int prev = g.editCur - 1;
-                while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--;
-                g.editBuf.erase(prev, g.editCur - prev); g.editCur = prev;
-            }
+            imeFieldBackspace(olEditField());
         } else if (key == KEY_LEFT) {
-            if (g.editCur > 0) { g.editCur--;
-                while (g.editCur > 0 && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur--; }
+            imeFieldMoveLeft(olEditField());
         } else if (key == KEY_RIGHT) {
-            if (g.editCur < (int)g.editBuf.length()) { g.editCur++;
-                while (g.editCur < (int)g.editBuf.length() && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur++; }
+            imeFieldMoveRight(olEditField());
         } else if (key >= 0x20 && key <= 0x7E) {
-            g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++;
+            imeFieldInsert(olEditField(), std::string(1, (char)key));
         }
         drawInputOverlay(g.editingTitle ? "编辑标题" : (g.editingKeyword ? "编辑关键词" : "编辑备注"));
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_PICKER ─────────────────────────────────────────────────────
+static bool olHandlePicker(int &key, AppState &out) {
     if (g.mode == M_PICKER) {
+        // 标签选择器在一条标签都没有时是空的（见 openOutlinePicker 的 fieldIdx==4）。
+        // 空 vector 上按回车/空格会往 pickerToggled 里塞下标 0，随后按 y
+        // 就是 pickerOpts[0] 越界读 → 崩。空选择器直接退回详情页。
+        if (g.pickerOpts.empty()) {
+            g.mode = M_DETAIL;
+            drawOutlineDetailInner();
+            ui_commit();
+            out = APP_OUTLINE;
+            return true;
+        }
         if (key == 0x1B || key == 'q' || key == 'Q') {
             g.mode = M_DETAIL;
         } else if (key == KEY_UP) {
@@ -1560,7 +1539,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
         {
             drawOutlineDetailInner();
             int n = (int)g.pickerOpts.size();
-            if (n == 0) { ui_commit(); return APP_OUTLINE; }
+            if (n == 0) { ui_commit(); out = APP_OUTLINE; return true; }
             int maxVis = 6;
             int boxW = 250;
             int boxH = maxVis * LINE_SPACING + 24 + 15;
@@ -1594,7 +1573,8 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                     u8g2_SetDrawColor(g_u8g2, 0);
                     u8g2_DrawBox(g_u8g2, boxX + 4, iy - g_font.ascent(), boxW - 8, FONT_H);
                     u8g2_SetDrawColor(g_u8g2, 1);
-                    g_font.drawText(boxX + 8, iy, display.c_str(), false);
+                    // 同 GTD 选择器：TTF 渲染器不吃 u8g2 的 draw color，反色要显式传 invert。
+                    g_font.drawText(boxX + 8, iy, display.c_str(), true);
                     u8g2_SetDrawColor(g_u8g2, 0);
                 } else {
                     g_font.drawText(boxX + 8, iy, display.c_str(), false);
@@ -1602,10 +1582,12 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             }
             ui_commit();
         }
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_TAG_MGR ────────────────────────────────────────────────────
+static bool olHandleTagMgr(int &key, AppState &out) {
     if (g.mode == M_TAG_MGR) {
         if (key == 0x1B || key == 'q' || key == 'Q') {
             g.mode = M_BROWSE;
@@ -1678,21 +1660,23 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             ui_draw_status("a:添加 d:删除 r:重命名 Enter:筛选 Esc:返回", "");
             ui_commit();
         }
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_ADD_TAG / M_RENAME_TAG ─────────────────────────────────────
+static bool olHandleAddTag(int &key, AppState &out) {
     if (g.mode == M_ADD_TAG || g.mode == M_RENAME_TAG) {
         if (g.imeActive && key != 0) {
             std::string imeOut;
-            if (g_ime.handleKey(key, imeOut)) {
-                if (!imeOut.empty()) { g.editBuf.insert(g.editCur, imeOut); g.editCur += (int)imeOut.length(); }
-                drawInputOverlay(g.mode == M_ADD_TAG ? "添加标签" : "重命名标签"); return APP_OUTLINE;
+            if (imeFieldKeyText(g_ime, key, /*multiline=*/false, imeOut)) {
+                if (!imeOut.empty()) { imeFieldInsert(olEditField(), imeOut); }
+                drawInputOverlay(g.mode == M_ADD_TAG ? "添加标签" : "重命名标签"); out = APP_OUTLINE; return true;
             }
         }
         if (key == KEY_IME_TOGGLE) {
             g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive);
-            drawInputOverlay(g.mode == M_ADD_TAG ? "添加标签" : "重命名标签"); return APP_OUTLINE;
+            drawInputOverlay(g.mode == M_ADD_TAG ? "添加标签" : "重命名标签"); out = APP_OUTLINE; return true;
         }
         if (key == 0x1B) {
             g.mode = M_TAG_MGR; g.imeActive = false; g_ime.setActive(false);
@@ -1728,31 +1712,34 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             }
             g.mode = M_TAG_MGR; g.imeActive = false; g_ime.setActive(false);
         } else if (key == 0x7F || key == 0x08) {
-            if (g.editCur > 0) { int prev = g.editCur - 1; while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--; g.editBuf.erase(prev, g.editCur - prev); g.editCur = prev; }
-        } else if (key >= 0x20 && key <= 0x7E) { g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++; }
+            imeFieldBackspace(olEditField());
+        } else if (key >= 0x20 && key <= 0x7E) { imeFieldInsert(olEditField(), std::string(1, (char)key)); }
         drawInputOverlay(g.mode == M_ADD_TAG ? "添加标签" : "重命名标签");
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-
-    // ── M_SUMMARY ──────────────────────────────────────────────────
+static bool olHandleSummary(int &key, AppState &out) {
     if (g.mode == M_SUMMARY) {
         if (key == 0x1B || key == 'q' || key == 'Q') {
             g.mode = M_BROWSE;
         } else if (key == KEY_UP) {
             if (g.summaryScroll > 0) g.summaryScroll--;
             drawOutline(); drawSummary();
-            return APP_OUTLINE;
+            out = APP_OUTLINE; return true;
         } else if (key == KEY_DOWN) {
             g.summaryScroll++;
             drawOutline(); drawSummary();
-            return APP_OUTLINE;
+            out = APP_OUTLINE; return true;
         }
         drawOutline(); drawSummary();
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_HELP ─────────────────────────────────────────────────────
+static bool olHandleHelp(int &key, AppState &out) {
     if (g.mode == M_HELP) {
         if (key == 0x1B || key == 'q' || key == 'Q' || key == 0x0A || key == 0x0D) {
             g.mode = g.helpPrevMode;
@@ -1767,10 +1754,12 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
         }
         ui_render_begin_overlay();   // 叠在上一帧上（见 ui_render.h）
         drawHelp();
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_BOOKMARK_MGR ──────────────────────────────────────────────
+static bool olHandleBookmarkMgr(int &key, AppState &out) {
     if (g.mode == M_BOOKMARK_MGR) {
         auto &bmArr = g.outlineData["bookmarks"];
         int bmCount = bmArr.isArray() ? (int)bmArr.size() : 0;
@@ -1805,17 +1794,18 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             saveOutline();
         }
         drawBookmarkMgr();
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_EDIT_NOTE_ML: multi-line note editor ───────────────────────
+static bool olHandleEditNoteMl(int &key, AppState &out) {
     if (g.mode == M_EDIT_NOTE_ML) {
         if (g.imeActive && key != 0) {
             std::string imeOut;
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, /*multiline=*/false, imeOut)) {
                 if (!imeOut.empty()) {
-                    g.noteLines[g.noteRow].insert(g.noteCol, imeOut);
-                    g.noteCol += (int)imeOut.length();
+                    imeFieldInsert(olNoteField(), imeOut);
                     g.noteVrowsDirty = true;
                 }
                 goto drawNoteEditor;
@@ -1837,7 +1827,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 saveOutline();
             }
             g.mode = M_DETAIL; g.imeActive = false; g_ime.setActive(false);
-            drawOutlineDetail(); return APP_OUTLINE;
+            drawOutlineDetail(); out = APP_OUTLINE; return true;
         }
         if (key == 0x0A || key == 0x0D) {
             // New line
@@ -1849,10 +1839,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g.noteVrowsDirty = true;
         } else if (key == 0x7F || key == 0x08) {
             if (g.noteCol > 0) {
-                int prev = g.noteCol - 1;
-                while (prev > 0 && ((unsigned char)g.noteLines[g.noteRow][prev] & 0xC0) == 0x80) prev--;
-                g.noteLines[g.noteRow].erase(prev, g.noteCol - prev);
-                g.noteCol = prev;
+                imeFieldBackspace(olNoteField());
                 g.noteVrowsDirty = true;
             } else if (g.noteRow > 0) {
                 // Join with previous line
@@ -1868,9 +1855,9 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
         } else if (key == KEY_DOWN) {
             if (g.noteRow < (int)g.noteLines.size() - 1) { g.noteRow++; g.noteCol = std::min(g.noteCol, (int)g.noteLines[g.noteRow].length()); }
         } else if (key == KEY_LEFT) {
-            if (g.noteCol > 0) { g.noteCol--; while (g.noteCol > 0 && ((unsigned char)g.noteLines[g.noteRow][g.noteCol] & 0xC0) == 0x80) g.noteCol--; }
+            if (g.noteCol > 0) imeFieldMoveLeft(olNoteField());
         } else if (key == KEY_RIGHT) {
-            if (g.noteCol < (int)g.noteLines[g.noteRow].length()) { g.noteCol++; while (g.noteCol < (int)g.noteLines[g.noteRow].length() && ((unsigned char)g.noteLines[g.noteRow][g.noteCol] & 0xC0) == 0x80) g.noteCol++; }
+            if (g.noteCol < (int)g.noteLines[g.noteRow].length()) imeFieldMoveRight(olNoteField());
         } else if (key == '\t' || (key == KEY_CTRL_ENTER)) {
             // Tab or Ctrl+Enter = save
             if (g.editNoteIdx >= 0 && g.nodes && (size_t)g.editNoteIdx < g.nodeCount) {
@@ -1883,10 +1870,9 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 saveOutline();
             }
             g.mode = M_DETAIL; g.imeActive = false; g_ime.setActive(false);
-            drawOutlineDetail(); return APP_OUTLINE;
+            drawOutlineDetail(); out = APP_OUTLINE; return true;
         } else if (key >= 0x20 && key <= 0x7E) {
-            g.noteLines[g.noteRow].insert(g.noteCol, 1, (char)key);
-            g.noteCol++;
+            imeFieldInsert(olNoteField(), std::string(1, (char)key));
             g.noteVrowsDirty = true;
         }
         drawNoteEditor:
@@ -1954,10 +1940,12 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             if (vkNote) editorVkDrawIcon();   // 必须在状态栏之后，否则被白底盖掉
             ui_commit();
         }
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_CONFIRM: confirmation dialog ────────────────────────────────
+static bool olHandleConfirm(int &key, AppState &out, ScreenContext &ctx) {
     if (g.mode == M_CONFIRM) {
         ui_clear();
         ui_draw_text_centered(SCREEN_H / 2, g.confirmMsg.c_str(), false, true);
@@ -2015,14 +2003,16 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             // Cancelled
             g.mode = (g.confirmAction == 2) ? M_PROJECTS : M_BROWSE;
         }
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_PROJECTS: project list ─────────────────────────────────────
+static bool olHandleProjects(int &key, AppState &out, ScreenContext &ctx) {
     if (g.mode == M_PROJECTS) {
         if (key == 'q' || key == 'Q' || key == 0x1B) {
             g_ime.setActive(false);
-            ctx.nextState = APP_MAIN; return APP_MAIN;
+            ctx.nextState = APP_MAIN; out = APP_MAIN; return true;
         }
         if (key == 'j' || key == KEY_DOWN) {
             if (g.sel < (int)g.projects.size() - 1) g.sel++;
@@ -2060,17 +2050,16 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             ui_render_begin_overlay();   // 叠在上一帧上（见 ui_render.h）
             drawHelp();
             ui_commit();
-            return APP_OUTLINE;
+            out = APP_OUTLINE; return true;
         }
 
         drawProjectList(); ui_commit();
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_ITEM_MENU: 长按标题弹出的编辑菜单 ──────────────────────────
-    // 浮层：↑↓/j k 移动选中项，回车执行，Esc 关掉。动作**把 key 换成对应的普通键码
-    // 继续往下走**（重命名='r'、添加子标题='i'、提升层级='h'、降低层级='l'、删除='d'），
-    // 与键盘那几个键是同一条实现。
+static bool olHandleItemMenu(int &key, AppState &out) {
     if (g.mode == M_ITEM_MENU) {
         bool handOff = false;   // 退出浮层并把动作交给下面的键盘逻辑
         if (key == KEY_UP || key == 'k') {
@@ -2083,7 +2072,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g.mode = M_BROWSE;
             if (a == OMA_CANCEL) {
                 drawOutline(); ui_commit();
-                return APP_OUTLINE;
+                out = APP_OUTLINE; return true;
             }
             key = (a == OMA_RENAME)  ? 'r'
                 : (a == OMA_SUBTASK) ? 'i'
@@ -2096,12 +2085,14 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
         if (!handOff) {
             ui_render_begin_overlay();   // 叠在上一帧上（见 ui_render.h）
             drawOutlineItemMenu();
-            return APP_OUTLINE;
+            out = APP_OUTLINE; return true;
         }
         // handOff：浮层已关，key 已换成 'r'/'i'/'h'/'l'/'d'，往下走同一条键盘逻辑
     }
+    return false;
+}
 
-    // ── M_BROWSE: outline tree ───────────────────────────────────────
+static bool olHandleBrowse(int &key, AppState &out, ScreenContext &ctx) {
     if (g.mode == M_BROWSE) {
         if (key == 'q' || key == 'Q' || key == 0x1B) {
             if (!g.filterTags.empty()) {
@@ -2114,7 +2105,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 g.nodes = nullptr; g.nodeCount = 0;
                 g_filteredIdx.clear();
                 drawProjectList(); ui_commit();
-                return APP_OUTLINE;
+                out = APP_OUTLINE; return true;
             }
         }
 
@@ -2231,7 +2222,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 g.mode = M_EDIT_NOTE;
                 drawInputOverlay("编辑标题");
                 ui_commit();
-                return APP_OUTLINE;
+                out = APP_OUTLINE; return true;
             }
         }
 
@@ -2245,7 +2236,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 g.summaryScroll = 0;
                 g.mode = M_SUMMARY;
                 drawOutline(); drawSummary();
-                return APP_OUTLINE;
+                out = APP_OUTLINE; return true;
             }
         }
 
@@ -2324,7 +2315,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 g.pendingOutlineTarget = fullPath;
                 ctx.prevState = APP_OUTLINE;
                 ctx.nextState = APP_EDITOR;
-                return APP_EDITOR;
+                out = APP_EDITOR; return true;
             }
         }
 
@@ -2335,7 +2326,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             ui_render_begin_overlay();   // 叠在上一帧上（见 ui_render.h）
             drawHelp();
             ui_commit();
-            return APP_OUTLINE;
+            out = APP_OUTLINE; return true;
         }
 
         // z: toggle fold, Z: fold/unfold all
@@ -2393,7 +2384,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g.scroll = 0;
             g.mode = M_TAG_MGR;
             ui_clear(); ui_commit();
-            return APP_OUTLINE;
+            out = APP_OUTLINE; return true;
         }
 
         // b: bookmark manager
@@ -2402,29 +2393,30 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g.scroll = 0;
             g.mode = M_BOOKMARK_MGR;
             drawBookmarkMgr();
-            return APP_OUTLINE;
+            out = APP_OUTLINE; return true;
         }
 
         drawOutline(); ui_commit();
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
     }
+    return false;
+}
 
-    // ── M_ADD_HEADING / M_ADD_SUB ────────────────────────────────────
+static bool olHandleAddHeading(int &key, AppState &out) {
     if (g.mode == M_ADD_HEADING || g.mode == M_ADD_SUB) {
         const char *addTitle = (g.mode == M_ADD_SUB) ? "添加子标题" : "添加标题";
         if (g.imeActive && key != 0) {
             std::string imeOut;
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, /*multiline=*/false, imeOut)) {
                 if (!imeOut.empty()) {
-                    g.editBuf.insert(g.editCur, imeOut);
-                    g.editCur += (int)imeOut.length();
+                    imeFieldInsert(olEditField(), imeOut);
                 }
-                drawInputOverlay(addTitle); return APP_OUTLINE;
+                drawInputOverlay(addTitle); out = APP_OUTLINE; return true;
             }
         }
         if (key == KEY_IME_TOGGLE) {
             g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive);
-            drawInputOverlay(addTitle); return APP_OUTLINE;
+            drawInputOverlay(addTitle); out = APP_OUTLINE; return true;
         }
         if (key == 0x1B) {
             g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
@@ -2469,22 +2461,186 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g.insertAfter = -1;
             g.insertAfter = -1;
         } else if (key == 0x7F || key == 0x08) {
-            if (g.editCur > 0) {
-                int prev = g.editCur - 1;
-                while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--;
-                g.editBuf.erase(prev, g.editCur - prev); g.editCur = prev;
-            }
+            imeFieldBackspace(olEditField());
         } else if (key == KEY_LEFT) {
-            if (g.editCur > 0) { g.editCur--;
-                while (g.editCur > 0 && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur--; }
+            imeFieldMoveLeft(olEditField());
         } else if (key == KEY_RIGHT) {
-            if (g.editCur < (int)g.editBuf.length()) { g.editCur++;
-                while (g.editCur < (int)g.editBuf.length() && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur++; }
+            imeFieldMoveRight(olEditField());
         } else if (key >= 0x20 && key <= 0x7E) {
-            g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++;
+            imeFieldInsert(olEditField(), std::string(1, (char)key));
         }
         drawInputOverlay(addTitle);
-        return APP_OUTLINE;
+        out = APP_OUTLINE; return true;
+    }
+    return false;
+}
+
+
+AppState screen_outline_handle(int key, ScreenContext &ctx) {
+    // 切进"要打字"的模式（新建/重命名/编辑备注/筛选）时，自动把虚拟键盘弹出来
+    // （没连蓝牙键盘的话）。只在**模式切换**的那一刻自动展示：用户在本模式里手动
+    // 点状态栏图标收起后，不会被下一帧又弹回来。与计划模式同款。
+    static int s_prevMode = M_PROJECTS;
+    if (g.mode != s_prevMode && olVkEditing()) editorVkAutoShow();
+    s_prevMode = g.mode;
+
+    // 虚拟键盘（编辑态，与写作/计划模式同一套）：先认状态栏上的键盘开关图标，再认
+    // 键盘面板。命中就把点按翻译成普通键码，交给下面既有的输入逻辑——不重复实现
+    // 任何输入。key 置 0 时各编辑块照旧重绘，正好把按下反馈刷出去。
+    if (olVkEditing()) editorVkSyncBtState();   // 蓝牙键盘连上就自动收起
+    if (olVkEditing() && (key == 0x0A || key == 0x0D)) {
+        int vx = 0, vy = 0;
+        if (input_tap_xy(&vx, &vy)) {
+            if (editorVkIconHit(vx, vy)) {
+                editorVkSetVisible(!editorVkVisible());
+                key = 0;
+            } else if (editorVkVisible() && vy >= editorVkTop()) {
+                EditorVkHit hit;
+                int vk = editorVkHitTest(vx, vy, &hit);
+                key = 0;
+                if (vk != EVK_NONE) editorVkMarkPressed(hit);
+                // EVK_PAGE：换面板已在命中测试里完成，key 保持 0 → 下面照样重绘
+                if (vk == EVK_LANG) {
+                    // 未开输入法 → 开中文；已开 → 拼音/英文互切（与物理 Ctrl+Space 等价）
+                    if (!g.imeActive) { g.imeActive = true; g_ime.setActive(true); }
+                    else g_ime.toggleEnglish();
+                } else if (vk > 0) {
+                    key = vk;   // 普通键：走下面既有的输入逻辑
+                }
+                // EVK_CTRL/EVK_SHIFT：待发状态已在命中测试内翻转，重绘即反馈
+                // EVK_NONE：点在键盘空白处，吞掉本次点按
+            }
+        }
+    }
+
+    // 触摸点按：命中悬浮「+」就把它翻译成对应的普通键码（项目列表 → 'n' 新建项目，
+    // 树里 → 'a' 新建标题），下面既有的键盘逻辑照旧执行，不另写一套新建逻辑。
+    // input_tap_xy() 读后即清，改写 key 后不会再次进这里，不会递归。
+    if ((g.mode == M_PROJECTS || g.mode == M_BROWSE) && (key == 0x0A || key == 0x0D)) {
+        int tx = 0, ty = 0;
+        if (input_tap_xy(&tx, &ty)) {
+            // 判定顺序与计划模式一致：子标题键 → 「+」→ 方向键。
+            if (outlineSubFabHit(tx, ty))       key = 'i';
+            else if (outlineFabHit(tx, ty))     key = (g.mode == M_PROJECTS) ? 'n' : 'a';
+            else {
+                int di = outlineDirPadHit(tx, ty);
+                if (di >= 0) key = kOutlinePadKey[di];
+            }
+        }
+    }
+
+    // 长按标题行 → 弹编辑菜单（重命名/添加子标题/提升层级/降低层级/删除）。
+    // 长按的点落在哪一行就选中哪一行，与键盘"先选中再按 r/i/h/l/d"完全等价：
+    // 菜单选中项回车后只是把键码换回来，走下面同一条分支。
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleBrowseLongPress(key, out)) return out;
+    }
+
+    // 编辑菜单里的点按：命中哪一项就选中它再走回车；点浮层外就关掉菜单。
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleItemMenuTap(key, out)) return out;
+    }
+
+    // ── M_ADD_PROJECT ────────────────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleAddProject(key, out)) return out;
+    }
+
+    // ── M_FILTER ─────────────────────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleFilter(key, out)) return out;
+    }
+
+    // ── M_DETAIL ──────────────────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleDetail(key, out, ctx)) return out;
+    }
+
+    // ── M_EDIT_NOTE ──────────────────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleEditNote(key, out)) return out;
+    }
+
+    // ── M_PICKER ─────────────────────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandlePicker(key, out)) return out;
+    }
+
+    // ── M_TAG_MGR ────────────────────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleTagMgr(key, out)) return out;
+    }
+
+    // ── M_ADD_TAG / M_RENAME_TAG ─────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleAddTag(key, out)) return out;
+    }
+
+
+    // ── M_SUMMARY ──────────────────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleSummary(key, out)) return out;
+    }
+
+    // ── M_HELP ─────────────────────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleHelp(key, out)) return out;
+    }
+
+    // ── M_BOOKMARK_MGR ──────────────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleBookmarkMgr(key, out)) return out;
+    }
+
+    // ── M_EDIT_NOTE_ML: multi-line note editor ───────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleEditNoteMl(key, out)) return out;
+    }
+
+    // ── M_CONFIRM: confirmation dialog ────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleConfirm(key, out, ctx)) return out;
+    }
+
+    // ── M_PROJECTS: project list ─────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleProjects(key, out, ctx)) return out;
+    }
+
+    // ── M_ITEM_MENU: 长按标题弹出的编辑菜单 ──────────────────────────
+    // 浮层：↑↓/j k 移动选中项，回车执行，Esc 关掉。动作**把 key 换成对应的普通键码
+    // 继续往下走**（重命名='r'、添加子标题='i'、提升层级='h'、降低层级='l'、删除='d'），
+    // 与键盘那几个键是同一条实现。
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleItemMenu(key, out)) return out;
+    }
+
+    // ── M_BROWSE: outline tree ───────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleBrowse(key, out, ctx)) return out;
+    }
+
+    // ── M_ADD_HEADING / M_ADD_SUB ────────────────────────────────────
+    {
+        AppState out = APP_OUTLINE;
+        if (olHandleAddHeading(key, out)) return out;
     }
 
     // Fallback

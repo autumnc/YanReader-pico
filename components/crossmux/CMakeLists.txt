@@ -1,6 +1,11 @@
 # crossmux 阅读器组件：FreeInkUI 逻辑库（原样）+ 针对 read_pico（epdiy 4bpp + ttf_font）的 shim。
 # 只保留阅读器/微信读书所需的最小面；JPEG/PNG 封面解码首版 stub。
 
+# 注意：GLOB 的结果在**配置期**定死，所以新增/删除 .c/.cpp/.h 之后必须重新配置一次
+# （`idf.py reconfigure`，或 touch 本文件再 build）—— 否则新文件被静默漏掉，直到链接期才
+# 以 "undefined reference" 现身。**不要**加 CONFIGURE_DEPENDS 图省事：IDF 会把本文件以
+# script 模式 include 一遍来提取依赖（component_get_requirements.cmake），那个模式下
+# CONFIGURE_DEPENDS 直接报错，整个工程配置不起来。
 file(GLOB_RECURSE SOURCES
   "lib/*.c"
   "lib/*.cpp"

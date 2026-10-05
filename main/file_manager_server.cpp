@@ -1,6 +1,7 @@
 #include "file_manager_server.h"
 #include "journal_storage.h"
 #include "settings_manager.h"
+#include "screen_reader.h"  // readerRequestStandbyImage（/api/set_standby 投递给主任务解图）
 #include <esp_log.h>
 #include <esp_http_server.h>
 #include <dirent.h>
@@ -50,12 +51,6 @@ static void xferAdd(uint32_t n) { s_xfer.done += n; }
 // 决定要不要显示完成提示。
 static void xferEnd() { s_xfer.active = 0; }
 
-// 取路径的 basename 用于显示。
-static std::string baseName(const std::string &path) {
-    auto slash = path.rfind('/');
-    return slash == std::string::npos ? path : path.substr(slash + 1);
-}
-
 // 传输结束时无条件清 active（handler 里有好几条提前 return 的失败路径，靠析构兜住，
 // 免得界面上留一条永远"传输中"的进度）。
 struct XferGuard {
@@ -88,6 +83,33 @@ static bool isSafePath(const std::string &path) {
     if (path.compare(0, 7, "/sdcard") != 0) return false;
     if (path.size() > 7 && path[7] != '/') return false;
     return true;
+}
+
+// 图片后缀 → MIME。返回 nullptr = 不是我们认的图片（照旧按 attachment 下载）。
+// 只认这几种：浏览器能直接显示的常见格式；BMP 也认（有些导出工具就存它）。
+// 与设备端"设为待机画面"认的后缀**故意不一致**：那边解码器只吃 JPG/PNG，
+// 但网页端能否预览是浏览器的事，多认一个 BMP 不吃亏。
+static const char *imageMimeFor(const std::string &path) {
+    struct { const char *ext; const char *mime; } kMap[] = {
+        {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"}, {".png", "image/png"},
+        {".bmp", "image/bmp"},  {".gif", "image/gif"},   {".webp", "image/webp"},
+    };
+    const size_t dot = path.rfind('.');
+    if (dot == std::string::npos) return nullptr;
+    std::string ext = path.substr(dot);
+    for (char &c : ext) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    for (auto &m : kMap) if (ext == m.ext) return m.mime;
+    return nullptr;
+}
+
+// 设备端「设为待机画面」认的后缀（只有 JPG/PNG 有解码器）。网页上给按钮的条件用它，
+// 免得点了才报"只支持 JPG/PNG"。
+static bool isStandbyImagePath(const std::string &path) {
+    const size_t dot = path.rfind('.');
+    if (dot == std::string::npos) return false;
+    std::string ext = path.substr(dot);
+    for (char &c : ext) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".png";
 }
 
 static std::string formatSize(off_t size) {
@@ -274,7 +296,15 @@ function loadDir(p){
     d.entries.forEach(e=>{
       var fp=esc((d.path==='/'?'':d.path)+'/'+e.name);
       if(e.type==='dir') h+='<tr><td class="dir" onclick="loadDir(\''+fp+'\')">'+esc(e.name)+'/</td><td></td><td class="act"><button onclick="dlDir(\''+fp+'\')">下载</button><button onclick="del(\''+fp+'\',true)">删除</button></td></tr>';
-      else h+='<tr><td>'+esc(e.name)+'</td><td>'+e.size+'</td><td class="act"><button onclick="dl(\''+fp+'\')">下载</button><button onclick="del(\''+fp+'\',false)">删除</button></td></tr>';
+      else{
+        // 图片多两个动作：「查看」新开一页内联显示（以前一律按 attachment 下载，
+        // 网页上根本看不了图）；「设为待机」只在解码器认的后缀（JPG/PNG）上给。
+        var a='<button onclick="dl(\''+fp+'\')">下载</button>';
+        if(e.image) a+='<button onclick="view(\''+fp+'\')">查看</button>';
+        if(e.standby) a+='<button onclick="setSb(\''+fp+'\')">设为待机</button>';
+        a+='<button onclick="del(\''+fp+'\',false)">删除</button>';
+        h+='<tr><td>'+esc(e.name)+'</td><td>'+e.size+'</td><td class="act">'+a+'</td></tr>';
+      }
     });
     document.getElementById('list').innerHTML=h;
   }).catch(e=>showMsg('加载失败',false));
@@ -322,6 +352,13 @@ function fmtB(n){
 }
 function dl(p){window.open('/api/download?path='+encodeURIComponent(p)+'&token='+encodeURIComponent(token))}
 function dlDir(p){window.open('/api/download_dir?path='+encodeURIComponent(p)+'&token='+encodeURIComponent(token))}
+function view(p){window.open('/api/download?view=1&path='+encodeURIComponent(p)+'&token='+encodeURIComponent(token))}
+function setSb(p){
+  if(!confirm('把这台设备的待机画面设成这张图？\n'+p))return;
+  fetch('/api/set_standby?path='+encodeURIComponent(p),{method:'POST',headers:hd()})
+  .then(r=>r.json()).then(d=>showMsg(d.ok?'已设为待机画面（设备空闲几秒后生效）':'设置失败: '+d.error,d.ok))
+  .catch(e=>showMsg('设置失败',false));
+}
 function del(p,isDir){
   if(!confirm('确认删除?'))return;
   fetch('/api/delete?path='+encodeURIComponent(p)+'&dir='+isDir,{method:'POST',headers:hd()})
@@ -400,7 +437,14 @@ static esp_err_t __attribute__((unused)) handler_list(httpd_req_t *req) {
         json += isDir ? "dir" : "file";
         json += "\",\"size\":\"";
         json += formatSize(fsize);
-        json += "\"}";
+        json += "\"";
+        // 图片条目：前端据此多给「查看」按钮。standby 再细分一层 —— 只有解码器认的
+        // JPG/PNG 才给「设为待机」，别的（bmp/gif/webp）能看不能设。
+        if (!isDir && imageMimeFor(full)) {
+            json += ",\"image\":true";
+            if (isStandbyImagePath(full)) json += ",\"standby\":true";
+        }
+        json += "}";
     }
     closedir(dir);
     if (mtx) xSemaphoreGiveRecursive(mtx);
@@ -441,9 +485,14 @@ static esp_err_t __attribute__((unused)) handler_download(httpd_req_t *req) {
     auto slash = filename.rfind('/');
     if (slash != std::string::npos) filename = filename.substr(slash + 1);
 
-    httpd_resp_set_type(req, "application/octet-stream");
+    // 图片预览：网页上的「查看」走 &view=1。此前无论什么文件都按 attachment 下载，
+    // 浏览器只会弹存盘、不显示 —— 图片在网页端就等于"看不了"。这里按要求放行 inline：
+    // 认得出的图片给真 MIME，浏览器自己渲染（大图会自适应窗口）；不是图片或没带
+    // view=1 就照旧下载。下载按钮不受影响。
+    const char *mime = (getQueryParam(req, "view") == "1") ? imageMimeFor(path) : nullptr;
+    httpd_resp_set_type(req, mime ? mime : "application/octet-stream");
     char hdr[128];
-    snprintf(hdr, sizeof(hdr), "attachment; filename=\"%s\"", filename.c_str());
+    snprintf(hdr, sizeof(hdr), "%s; filename=\"%s\"", mime ? "inline" : "attachment", filename.c_str());
     httpd_resp_set_hdr(req, "Content-Disposition", hdr);
 
     XferGuard xferGuard;
@@ -536,7 +585,14 @@ static esp_err_t __attribute__((unused)) handler_download_dir(httpd_req_t *req) 
         memcpy(lfh.data() + 30, e.relPath.c_str(), nameLen);
 
         // Read file, compute CRC32 incrementally
-        std::string fullPath = path + "/" + e.relPath.substr(dirName.length() + 1);
+        // dirName 是 path 最后一个 '/' 之后的部分。请求路径带尾斜杠时（如 /sdcard/）
+        // 它是空串，而 collectFiles 此刻的 relPath 本就不含 "dirName/" 前缀 —— 这时再
+        // substr(1) 会把文件名首字符也砍掉，fopen 失败、CRC/size 全 0：ZIP 里每个条目
+        // 都是 0 字节，静默数据损坏。空 dirName 直接用 relPath，并压掉重复的斜杠。
+        std::string fullPath = path;
+        if (!fullPath.empty() && fullPath.back() == '/') fullPath.pop_back();
+        fullPath += "/";
+        fullPath += dirName.empty() ? e.relPath : e.relPath.substr(dirName.length() + 1);
         if (mtx) xSemaphoreTakeRecursive(mtx, portMAX_DELAY);
         FILE *f = fopen(fullPath.c_str(), "rb");
         uint32_t crc = 0xFFFFFFFF;
@@ -847,6 +903,34 @@ static esp_err_t __attribute__((unused)) handler_mkdir(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// 「设为待机画面」（网页端）。这里**只投递不落地**：把设置键改掉、把"解这张图"记成
+// 一张待办就返回。真正解图在主任务上做（readerStandbyPump）——httpd 任务只有 8KB 栈，
+// 解几百万像素的 JPEG 会直接爆栈，见 screen_reader.h 的注释。
+// 返回后设备那边还没生成缓存，待机表盘会先画一帧"正在生成"的占位，几秒后就好了。
+static esp_err_t __attribute__((unused)) handler_set_standby(httpd_req_t *req) {
+    if (!authOk(req)) return sendAuthError(req);
+    std::string path = getQueryParam(req, "path");
+    if (!isSafePath(path)) {
+        sendJsonError(req, "invalid path");
+        return ESP_OK;
+    }
+    // 只有 JPG/PNG 有解码器。前端按 standby 标记给不给按钮，这里再挡一道。
+    if (!isStandbyImagePath(path)) {
+        sendJsonError(req, "只支持 JPG / PNG");
+        return ESP_OK;
+    }
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+        sendJsonError(req, "不是文件");
+        return ESP_OK;
+    }
+
+    readerRequestStandbyImage(path);
+    ESP_LOGI(TAG, "Web set standby image: %s", path.c_str());
+    sendJsonOK(req);
+    return ESP_OK;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 bool file_manager_server_start(uint16_t port) {
@@ -854,7 +938,7 @@ bool file_manager_server_start(uint16_t port) {
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 10;
     config.stack_size = 8192;
     config.lru_purge_enable = true;
 
@@ -872,6 +956,7 @@ bool file_manager_server_start(uint16_t port) {
         {"/api/upload",      HTTP_POST, handler_upload,       nullptr},
         {"/api/delete",      HTTP_POST, handler_delete,       nullptr},
         {"/api/mkdir",       HTTP_POST, handler_mkdir,        nullptr},
+        {"/api/set_standby", HTTP_POST, handler_set_standby,  nullptr},
     };
     for (auto &u : uris) {
         httpd_register_uri_handler(s_server, &u);

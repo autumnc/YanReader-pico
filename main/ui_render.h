@@ -22,6 +22,14 @@
 extern "C" {
 #endif
 
+// 输入法条（编码行 + 候选行）画在屏幕上的矩形，由绘制方（ui_helpers 的 drawIMEUI）
+// 在画的时候报上来。上屏后要用全像素刷把这两行的残影清一遍，而**那一刻组合已经结束、
+// 面板这一帧根本没画**（g_ime.composing() 已是 false，从 IME 状态反推不出来），
+// 所以只能靠"上一次画在哪儿"。逻辑坐标，y 是面板上沿（编码行顶），不是基线。
+// 清的那一下**推迟到打字停顿**（距离最后一次输入法动作 IME_CLEAN_PAUSE_US），
+// 不是上屏当场做 —— 清一遍是整屏 30 相全像素，每词一次会卡。见 ui_render.cpp。
+void ui_render_note_ime_panel(int x, int y, int w, int h);
+
 // 建渲染任务（core1, prio 6, 12KB 栈走 PSRAM）、双工作缓冲、作业队列。
 // 必须在 board_init() 之后、任何 ui_clear() 之前调用一次。
 void ui_render_init(void);
@@ -62,6 +70,13 @@ void ui_render_restore_kept(void);
 
 void ui_render_set_fast_partial(bool enable);
 void ui_render_set_local_only(bool enable);
+
+// 阅读模式**虚拟键盘打字帧**的区域推屏。注册进 crossmux 的 vk_present 钩子（见 main.cpp
+// 与 crossmux_platform.h），由 HalDisplay::displayBufferVk 调用。panel_top = 键盘面板顶边
+// （= 编码/候选两行上沿），cand_h = 那两行的总高，都是逻辑像素。
+// 阅读器整条绘制路径绕过渲染任务（直画 front_fb、自己同步推屏），所以这条不能复用
+// render_present 的作业队列，只能把同一套差分/波形判据重走一遍——实现在 ui_render.cpp。
+void reader_vk_present(int panel_top, int cand_h);
 
 #ifdef __cplusplus
 }

@@ -103,8 +103,11 @@ InflateStream::Status InflateStream::readAtMost(uint8_t* dest, const size_t maxL
     }
     if (finished) return Status::Done;
 
-    if (inAvail == 0 && !inputExhausted && fill) {
-      inAvail = fill(fillCtx, &inPtr);
+    if (inAvail == 0 && !inputExhausted) {
+      // fill 为空也要在这里把 inputExhausted 置真：否则 tinfl 恒返回
+      // NEEDS_MORE_INPUT，而下面那句兜底判定要求 inputExhausted 为真、永远进不去，
+      // 这个 for(;;) 就成了纯自旋（100% 占核，调用者还等不到返回）。
+      inAvail = fill ? fill(fillCtx, &inPtr) : 0;
       if (inAvail == 0) inputExhausted = true;
     }
 

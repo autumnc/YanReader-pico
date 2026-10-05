@@ -1,10 +1,11 @@
-#include "pjournal_app.h"
+#include "screen_inspiration.h"  // 本屏入口（头里再拉 pjournal_app.h）
 #include "screen_editor.h"
 #include "font_renderer.h"
 #include "json_parser.h"
 #include "journal_storage.h"
 #include "ui_helpers.h"
 #include "ime/IME.h"
+#include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划/阅读共用一份）
 #include "clipboard.h"
 #include "editor_vk.h"   // 虚拟键盘：关键词编辑/检索没连蓝牙键盘时的唯一输入途径
 #include "text_sel.h"    // 单行输入框的触摸选字 / 粘贴板（三模式共享底层件）
@@ -53,6 +54,9 @@ static struct {
     std::string pendingInspirationId;
     bool preservePos = false;  // 发送到Flomo返回后保留列表位置
 } g;
+
+static ImeField inspKeywordField() { return ImeField{&g.editBuf, &g.editCur}; }
+static ImeField inspSearchField()  { return ImeField{&g.searchBuf, &g.searchCur}; }
 
 static void loadData() {
     g.data = JsonValue::loadFromFile(INSPIRATION_FILE);
@@ -144,6 +148,9 @@ static void drawList() {
             if (c < 0x80) end++;
             else if ((c & 0xE0) == 0xC0) end += 2;
             else if ((c & 0xF0) == 0xE0) end += 3;
+            // 4 字节序列（emoji / 生僻字）：漏了这条会只前进 1 字节，
+            // substr(0, end) 就切在多字节字中间，预览里是半个乱码字。
+            else if ((c & 0xF8) == 0xF0) end += 4;
             else end += 1;
             chars++;
         }
@@ -263,6 +270,9 @@ static void drawSearch() {
             if (c < 0x80) end++;
             else if ((c & 0xE0) == 0xC0) end += 2;
             else if ((c & 0xF0) == 0xE0) end += 3;
+            // 4 字节序列（emoji / 生僻字）：漏了这条会只前进 1 字节，
+            // substr(0, end) 就切在多字节字中间，预览里是半个乱码字。
+            else if ((c & 0xF8) == 0xF0) end += 4;
             else end += 1;
             chars++;
         }
@@ -436,8 +446,8 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
         }
         if (g.imeActive && key != 0) {
             std::string imeOut;
-            if (g_ime.handleKey(key, imeOut)) {
-                if (!imeOut.empty()) { g.editBuf.insert(g.editCur, imeOut); g.editCur += (int)imeOut.length(); }
+            if (imeFieldKeyText(g_ime, key, false, imeOut)) {
+                if (!imeOut.empty()) imeFieldInsert(inspKeywordField(), imeOut);
                 drawKeywordEdit(); return APP_INSPIRATION;
             }
         }
@@ -456,13 +466,9 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
             g.mode = IM_LIST; g.imeActive = false; g_ime.setActive(false);
             editorVkAutoHide();
         } else if (key == 0x7F || key == 0x08) {
-            if (g.editCur > 0) {
-                int prev = g.editCur - 1;
-                while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--;
-                g.editBuf.erase(prev, g.editCur - prev); g.editCur = prev;
-            }
+            imeFieldBackspace(inspKeywordField());
         } else if (key >= 0x20 && key <= 0x7E) {
-            g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++;
+            imeFieldInsert(inspKeywordField(), std::string(1, (char)key));
         }
         drawKeywordEdit();
         return APP_INSPIRATION;
@@ -506,10 +512,9 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
         }
         if (g.searchImeActive && key != 0) {
             std::string imeOut;
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, false, imeOut)) {
                 if (!imeOut.empty()) {
-                    g.searchBuf.insert(g.searchCur, imeOut);
-                    g.searchCur += (int)imeOut.length();
+                    imeFieldInsert(inspSearchField(), imeOut);
                     doSearch();
                     g.sel = 0; g.scroll = 0;
                 }
@@ -554,15 +559,13 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
         } else if (key == KEY_DOWN) {
             if (g.sel < (int)g.searchResults.size() - 1) g.sel++;
         } else if (key == 0x7F || key == 0x08) {
-            if (g.searchCur > 0) {
-                int prev = g.searchCur - 1;
-                while (prev > 0 && ((unsigned char)g.searchBuf[prev] & 0xC0) == 0x80) prev--;
-                g.searchBuf.erase(prev, g.searchCur - prev); g.searchCur = prev;
+            // 只在真的删掉一个码点后重算结果/复位选中：和原来 `if (searchCur > 0)` 等价
+            if (imeFieldBackspace(inspSearchField())) {
                 doSearch();
                 g.sel = 0; g.scroll = 0;
             }
         } else if (key >= 0x20 && key <= 0x7E) {
-            g.searchBuf.insert(g.searchCur, 1, (char)key); g.searchCur++;
+            imeFieldInsert(inspSearchField(), std::string(1, (char)key));
             doSearch();
             g.sel = 0; g.scroll = 0;
         }

@@ -2,6 +2,8 @@
 #include "ui_render.h"   // 绘制/推屏决策都在 core1 的渲染任务里
 #include "font_renderer.h"
 #include "markdown_render.h"
+#include "ttf_font.h"     // 候选行的直绘/测宽（屏幕像素高由「候选字大小」定，不走格子模型）
+#include "icon_font.h"    // 未装外置字体时拉丁字母的半格字形
 #include "wifi_manager.h"
 #include "settings_manager.h"
 #include "ime/IME.h"
@@ -24,6 +26,25 @@
 // ── 运行时屏幕几何（由 epd 旋转决定）───────────────────────────────────
 int ui_screen_w() { return epd_rotated_display_width(); }
 int ui_screen_h() { return epd_rotated_display_height(); }
+
+// ── 界面框架字号哨兵（见 ui_helpers.h）──────────────────────────────────
+void uiFontGuard(const char *who) {
+    const int cur = g_font.pxHeight();
+    const int ui = FontRenderer::uiPxHeight();
+    if (cur == ui) return;   // 正常路径：一次比较，到此为止
+    // 对不上才走这里。who 是各入口的 __func__，静态存储期，存指针不会悬空；
+    // 但字符串字面量可能被链接器合并，所以按内容比而不是按指针比。
+    // 记满这几位就不再记新的：真有多个入口同时错，头几条足够定位。
+    static const char *reported[8] = {};
+    static int nReported = 0;
+    for (int i = 0; i < nReported; i++)
+        if (std::strcmp(reported[i], who) == 0) return;
+    if (nReported < 8) reported[nReported++] = who;
+    ESP_LOGE("UIFont",
+             "%s: 画界面框架时格子是 %dpx，界面档是 %dpx —— 少了 "
+             "FontScope(FontRenderer::uiPxHeight())，或把它写成了别的档 / 位置不对",
+             who, cur, ui);
+}
 
 // ── Battery（PMU soc_permille，‰ → %）────────────────────────────────────
 void battery_init() {
@@ -280,19 +301,127 @@ std::vector<VRow> buildVrows(const std::vector<std::string> &lines,
 // ── IME singleton ─────────────────────────────────────────────────────────
 IME &g_ime = IME::getInstance();
 
-// ── IME drawing helper ────────────────────────────────────────────────────
-// 与 drawIMEUI(anchorBottom=true) 的行位一致：候选行贴底、编码行依次向上。
-// 原版固定 STATUS_Y-67 是为 22px 位图字号标定的；这里按 FONT_H 反推，随字号缩放。
-int imeStatusPanelTopY() {
-    int bottom = STATUS_BAR_Y;
-    int sepY = bottom - (2 * FONT_H - g_font.ascent()) - 4;
-    int codeBase = sepY - 7;
-    return codeBase - g_font.ascent() - 6;
+// ── 编辑区正文字号（"显示与版式 → 正文字号"）──────────────────────────────
+// 见 ui_helpers.h。45 = 与界面 20pt(line_height) 同高的标准档，也就是"没改过"时的
+// 逐像素原样。编辑器正文整块的排版都按这个字号算（实现见 font_renderer.h 的 FontScope）。
+int editorBodyFontPx() {
+    int px = atoi(g_settings.getString("editor_font_size", "45").c_str());
+    if (px < 28) px = 45;      // 没设过/写坏 → 回标准档
+    if (px > 96) px = 96;      // 上限：与候选字号同一量程
+    return px;
 }
 
-int imeFullscreenPanelTopY() {
-    return SCREEN_H - (2 * FONT_H + 8);
+// ── 输入法候选行：字号 / 度量 / 测宽 / 直绘（唯一权威实现）────────────────
+// 见 ui_helpers.h。这一套原来只存在于 editor_vk.cpp（static），于是实体键盘的输入法条
+// 只能按**界面字号**画、按界面字号量：「候选字大小」改了它纹丝不动，而输入法分页早已
+// 按候选字号算宽度，两种口径一混，"一行放几个"就对不上（大字号时最后一两个候选被挤出
+// 屏幕右边，看不见也点不到）。搬到这一份之后，虚拟键盘的候选条与 drawIMEUI 共用同一个
+// 字号、同一份量法、同一支直绘。
+int imeCandFontPx() {
+    int px = atoi(g_settings.getString("ime_cand_size", "45").c_str());
+    if (px < 28) px = 45;      // 没设过/写坏 → 回标准档
+    if (px > 96) px = 96;      // 上限：再大面板就吃光正文了
+    return px;
 }
+
+// 候选字的 ascent。照 FontRenderer::setSize 的口径：字体没就绪时用 0.78em 近似。
+int imeCandAscent() {
+    const int px = imeCandFontPx();
+    int a = ttf_ascender_px(px);
+    if (a <= 0 || a >= px) a = px * 78 / 100;
+    return a;
+}
+
+// 候选串在候选字号下的像素宽：ASCII = 半格（0.5em），其余取该字号下的字形宽。
+// 与 FontRenderer 的等宽 cell 模型同口径，只是把 line_height_ 换成候选字号。
+int imeCandStrW(const char *s) {
+    if (!s) return 0;
+    const int px = imeCandFontPx();
+    int w = 0;
+    while (*s) {
+        const unsigned char c = static_cast<unsigned char>(*s);
+        if (c < 0x80) {
+            w += px / 2;
+            s += 1;
+            continue;
+        }
+        const int m = (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        char ch[5];
+        memcpy(ch, s, m);
+        ch[m] = '\0';
+        w += ttf_text_width_px(px, ch);
+        s += m;
+    }
+    return w;
+}
+
+// 按候选字号画一段候选串：ASCII 走 NF-Propo 等宽（同 FontRenderer 的路由），CJK 走
+// TTF 直绘。invert = 反白（外部已填黑底，这里把字画白）。
+void imeCandDrawText(int x, int baseline, const char *s, bool invert) {
+    const int px = imeCandFontPx();
+    uint8_t *fb = u8g2_GetBufferPtr(g_u8g2);
+    const uint8_t fg = invert ? 15 : 0;
+    const uint8_t bg = invert ? 0 : 15;
+    // 候选串是**输入法正文**，走内容面（= 用户选的字体），与编辑器正文同一路。
+    // 必须显式选面：虚拟键盘的键帽是 g_vk_font 画的，s_cur 大概率正停在内置面上，
+    // 不选就会让候选字顶着内置字体渲染。画完还原调用方的面。
+    const int prev_role = ttf_get_role();
+    ttf_set_role(TTF_ROLE_CONTENT);
+    // 拉丁字母按 FontRenderer 同一口径：装了外置字体就用用户字体的字形，仍旧半格
+    // 宽、格内居中（imeCandStrW 量的正是这半格，两边不会打架）。
+    const bool user_latin = !ttf_font_is_builtin();
+    while (*s) {
+        const unsigned char c = static_cast<unsigned char>(*s);
+        if (c < 0x80) {
+            if (user_latin) {
+                char ch[2] = {static_cast<char>(c), '\0'};
+                const int gw = ttf_text_width_px(px, ch);
+                ttf_draw_text_px(fb, x + (px / 2 - gw) / 2, baseline, px, ch,
+                                 TTF_ALIGN_LEFT, fg, bg);
+            } else {
+                icon_font_draw_baseline(fb, x, baseline, px / 2, px, c, invert);
+            }
+            x += px / 2;
+            s += 1;
+            continue;
+        }
+        const int m = (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        char ch[5];
+        memcpy(ch, s, m);
+        ch[m] = '\0';
+        const int gw = ttf_text_width_px(px, ch);
+        ttf_draw_text_px(fb, x + (px - gw) / 2, baseline, px, ch, TTF_ALIGN_LEFT, fg, bg);
+        x += px;   // CJK advance = 一个字号宽，与原 line_height_ 口径一致
+        s += m;
+    }
+    ttf_set_role(prev_role);   // 还原调用方的面（见函数头）
+}
+
+// ── 输入法条（编码行 + 候选行）的两行高 ──────────────────────────────────
+// 行高**刻意与虚拟键盘不同**：键盘面板的键要指尖点得着，候选行给到 px+20；这条是贴在
+// 正文下面的窄条，px+8 就够，别白吃正文行数。45(标准) 下两行共 106，与改造前那条
+// (107) 基本一致，所以默认档看不出变化；「候选字大小」调大/调小这条跟着长/缩。
+// 编码行仍按**界面字号**画（与旧行为一致），所以它至少要有 FONT_H 高。
+static int imeBarRowH(int row) {
+    const int px = imeCandFontPx();
+    const int textH = (row == 0 && px < FONT_H) ? FONT_H : px;
+    return textH + 8;
+}
+
+// 面板总高（编码行 + 候选行）。面板贴 bottomY 往上排，所以顶边 = bottomY - 本值。
+// 非 static：阅读模式（screen_reader.cpp）要在**没弹虚拟键盘**时给这条留出正文底边，
+// 两处必须同一个式子，不然候选条一出现正文就会被压掉一行。
+int imeBarPanelH() { return imeBarRowH(0) + imeBarRowH(1); }
+
+// ── IME drawing helper ────────────────────────────────────────────────────
+// 编码行 + 候选行的总高推出来的顶边。随界面字号缩放，也随「候选字大小」缩放。
+int imeStatusPanelTopY() {
+    // 界面框架的几何：本函数会在编辑器正文作用域里被调到（算正文底边），钉回界面字号。
+    FontScope ui(FontRenderer::uiPxHeight());
+    return STATUS_BAR_Y - imeBarPanelH();
+}
+
+int imeFullscreenPanelTopY() { return SCREEN_H - imeBarPanelH(); }
 
 int imeCandidateLineWidth() {
     return SCREEN_W - 12;
@@ -318,13 +447,19 @@ static void popUtf8Char(std::string &s) {
     s.erase(pos);
 }
 
-static std::string fitTextWidth(const std::string &text, int maxW) {
+// 量宽可换：编码行与别的界面短串按**界面字号**量（默认 g_font），候选行按**候选字号**
+// 量（imeCandStrW）。量法与画法必须是同一份，否则截出来的 "..." 会与实际画出来的宽度打架。
+static std::string fitTextWidth(const std::string &text, int maxW,
+                                int (*measure)(const char *) = nullptr) {
+    auto tw = [&](const std::string &s) {
+        return measure ? measure(s.c_str()) : g_font.textWidth(s.c_str());
+    };
     if (maxW <= 0) return "";
-    if (g_font.textWidth(text.c_str()) <= maxW) return text;
+    if (tw(text) <= maxW) return text;
     const std::string ell = "...";
-    if (g_font.textWidth(ell.c_str()) > maxW) return "";
+    if (tw(ell) > maxW) return "";
     std::string out = text;
-    while (!out.empty() && g_font.textWidth((out + ell).c_str()) > maxW)
+    while (!out.empty() && tw(out + ell) > maxW)
         popUtf8Char(out);
     return out.empty() ? ell : out + ell;
 }
@@ -337,15 +472,19 @@ static std::string shiftUtf8Char(std::string &s) {
     return ch;
 }
 
-static std::string fitTextWidthMiddle(const std::string &text, int maxW) {
+static std::string fitTextWidthMiddle(const std::string &text, int maxW,
+                                      int (*measure)(const char *) = nullptr) {
+    auto tw = [&](const std::string &s) {
+        return measure ? measure(s.c_str()) : g_font.textWidth(s.c_str());
+    };
     if (maxW <= 0) return "";
-    if (g_font.textWidth(text.c_str()) <= maxW) return text;
+    if (tw(text) <= maxW) return text;
     const std::string ell = "...";
-    if (g_font.textWidth(ell.c_str()) > maxW) return "";
+    if (tw(ell) > maxW) return "";
     std::string head = text;
     std::string tail;
     bool trimHead = false;
-    while (!head.empty() && g_font.textWidth((head + ell + tail).c_str()) > maxW) {
+    while (!head.empty() && tw(head + ell + tail) > maxW) {
         if (trimHead) {
             tail = shiftUtf8Char(head) + tail;
         } else {
@@ -353,10 +492,24 @@ static std::string fitTextWidthMiddle(const std::string &text, int maxW) {
         }
         trimHead = !trimHead;
     }
-    return head.empty() ? fitTextWidth(text, maxW) : head + ell + tail;
+    return head.empty() ? fitTextWidth(text, maxW, measure) : head + ell + tail;
 }
 
-void drawIMEUI(int baseY, bool anchorBottom) {
+// 输入法条：编码行 + 候选行，两行贴着 bottomY 往上排（bottomY = 面板底边）。三个落点
+// 由下面三个包装给：状态栏分割线 / 屏底 / 状态栏上方 3px。
+//
+// 两行的字号是**分开**的：编码行是界面字号（g_content_font，与旧行为一致），候选行跟
+// 「候选字大小」设置——与虚拟键盘的候选行共用同一份实现（imeCandFontPx/imeCandStrW/
+// imeCandDrawText）。以前两行都按界面字号画，设置改了实体键盘这边纹丝不动。
+//
+// 旧接口是 drawIMEUI(baseY, anchorBottom)：面板顶由调用方算、行位再按 anchorBottom 分叉
+// 算第二遍——同一套几何两处维护。现在面板高由两行高推出来，调用方只报一个底边。
+void drawIMEUI(int bottomY) {
+    // 输入法条是**界面框架**：编码行的行高按界面字号算（候选行另有「候选字大小」）。
+    // 本函数会在编辑器正文作用域里被调到（实体键盘打字），所以必须自己钉回界面字号，
+    // 否则编码行会随正文字号一起长高。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     if (!g_ime.composing()) return;
 
     std::string code = g_ime.displayCode();
@@ -371,49 +524,53 @@ void drawIMEUI(int baseY, bool anchorBottom) {
     char pageInfo[32];
     snprintf(pageInfo, sizeof(pageInfo), "%d/%d", curPage, totalPages);
 
-    u8g2_SetDrawColor(g_u8g2, 1);
+    const int row0H = imeBarRowH(0);
+    const int row1H = imeBarRowH(1);
+    const int top = bottomY - row0H - row1H;
+    const int candRowY = top + row0H;      // 两行的交界 = 那条分隔线
+    // 行内居中。编码行按界面字号的 ascent/descent；候选行按候选字号（块高 = 候选字号）。
+    const int codeBase = top + (row0H + g_font.ascent() - g_font.descent()) / 2;
+    const int candBase = candRowY + (row1H - imeCandFontPx()) / 2 + imeCandAscent();
+    const int hlH = imeCandFontPx();
+    const int hlY = candRowY + (row1H - hlH) / 2;
 
-    // anchorBottom: 行位与编辑器 compose 条一致(候选行贴面板底边,
-    // 基线离底 descent+3,分割线、编码行依次向上),词库管理等面板型调用用。
-    // 底边锚定状态栏分割线 STATUS_BAR_Y 而非 baseY+67(=STATUS_Y,随字号浮动)。
-    int codeBase, sepY, candBase;
-    if (anchorBottom) {
-        int bottom = STATUS_BAR_Y;
-        candBase = bottom - g_font.descent() - 3;
-        sepY = bottom - (2 * FONT_H - g_font.ascent()) - 4;
-        codeBase = sepY - 7;
-    } else {
-        codeBase = baseY + 4 + g_font.ascent();
-        sepY = baseY + FONT_H + 4;
-        candBase = baseY + FONT_H + 8 + g_font.ascent();
-    }
-
-    // 白底清出候选条区域;anchorBottom 清到分割线为止,不抹掉状态栏
+    // 白底清出整块面板（编码行 + 候选行），清到 bottomY 为止，不抹状态栏。
     u8g2_SetDrawColor(g_u8g2, 1);
-    int panelBottom = anchorBottom ? STATUS_BAR_Y : SCREEN_H;
-    u8g2_DrawBox(g_u8g2, 0, baseY, SCREEN_W,
-                 panelBottom - baseY);
-    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawBox(g_u8g2, 0, top, SCREEN_W, bottomY - top);
+    // 记下这块矩形：上屏之后要用全像素刷把这两行的残影清一遍（推迟到打字停顿，
+    // 见 ui_render.cpp 的 IME_CLEAN_PAUSE_US），而上屏那一刻组合已经结束、面板这一帧
+    // 根本没画（g_ime.composing() 已是 false，从状态反推不出来），只能由绘制方在这里
+    // 报上去。见 ui_render.h 的 ui_render_note_ime_panel。
+    ui_render_note_ime_panel(0, top, SCREEN_W, bottomY - top);
 
-    int tw = g_font.textWidth(pageInfo);
-    int pw = tw + 8;
-    int px = SCREEN_W - pw - 4;
-    code = fitTextWidth(code, px - 12);
-    int cw = g_font.textWidth(code.c_str()) + 8;
-    u8g2_DrawBox(g_u8g2, 4, codeBase - g_font.ascent(), cw, FONT_H);
+    // ── 编码行：编码串 + 右端页码（都是界面字号，白底黑字）──
+    //
+    // **画用 g_font，不是 g_content_font** —— 编码行是给人逐个字母读的**码**，不是
+    // 正文散文，拉丁必须走内置等宽路（g_font 的第二个模板参数 latinBuiltin=true）。
+    // 量宽本来就用 g_font（下面几行），画却用 g_content_font 的那一版会让"量"和"画"
+    // 分家：格宽恒为半格（charWidth() 对 ASCII 一律 halfAdvance()），而 g_content_font
+    // 在用户选了非内置字体时把**比例**拉丁居中塞进这半格 —— 'i' 空一片、'm' 顶到邻格，
+    // 看着就是"有的稀疏有的挤在一起"。两者共用同一份静态格子（px_/ascent_ 都是 static），
+    // 所以只换字形来源，行高、基线、量宽一个像素都不变。CJK（码串里的模式标签）两边
+    // 同一张内容面，也不受影响。
+    int pageW = g_font.textWidth(pageInfo) + 8;
+    int pageX = SCREEN_W - pageW - 4;
+    code = fitTextWidth(code, pageX - 12);
+    int codeW = g_font.textWidth(code.c_str()) + 8;
+    u8g2_DrawBox(g_u8g2, 4, codeBase - g_font.ascent(), codeW, FONT_H);
     u8g2_SetDrawColor(g_u8g2, 0);
-    g_content_font.drawText(4, codeBase, code.c_str(), false);
+    g_font.drawText(4, codeBase, code.c_str(), false);
     u8g2_SetDrawColor(g_u8g2, 1);
-
-    u8g2_DrawBox(g_u8g2, px, codeBase - g_font.ascent(), pw, FONT_H);
+    u8g2_DrawBox(g_u8g2, pageX, codeBase - g_font.ascent(), pageW, FONT_H);
     u8g2_SetDrawColor(g_u8g2, 0);
-    g_content_font.drawText(px + 4, codeBase, pageInfo, false);
+    g_font.drawText(pageX + 4, codeBase, pageInfo, false);
     u8g2_SetDrawColor(g_u8g2, 1);
 
     u8g2_SetDrawColor(g_u8g2, 0);
-    u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
+    u8g2_DrawHLine(g_u8g2, 0, candRowY, SCREEN_W);
     u8g2_SetDrawColor(g_u8g2, 1);
 
+    // ── 候选行：按候选字号量宽/直绘（imeCandStrW 量的正是 imeCandDrawText 画的）──
     int hl = g_ime.highlightIdx();
     int x = 4;
     for (int i = 0; i < (int)cands.size(); i++) {
@@ -421,27 +578,23 @@ void drawIMEUI(int baseY, bool anchorBottom) {
         snprintf(idx, sizeof(idx), "%d.", (i % pageSize) + 1);
         std::string prefix = std::string(" ") + idx;
         std::string part = prefix + cands[i];
-        int partW = g_font.textWidth(part.c_str());
+        int partW = imeCandStrW(part.c_str());
         int availW = SCREEN_W - x - 8;
         bool truncated = false;
         if (partW > availW) {
-            std::string word = fitTextWidthMiddle(cands[i], availW - g_font.textWidth(prefix.c_str()));
+            std::string word = fitTextWidthMiddle(cands[i], availW - imeCandStrW(prefix.c_str()),
+                                                  imeCandStrW);
             part = prefix + word;
-            partW = g_font.textWidth(part.c_str());
+            partW = imeCandStrW(part.c_str());
             truncated = true;
         }
         if (partW <= 0 || x + partW + 8 > SCREEN_W) break;
-        // 白底清出该段区域,高亮候选反白(黑底白字)
-        u8g2_SetDrawColor(g_u8g2, 1);
-        u8g2_DrawBox(g_u8g2, x, candBase - g_font.ascent(), partW, FONT_H);
+        // 高亮候选反白（黑底白字）。面板白底已整块清过，不必再逐段清。
         if (i == hl) {
             u8g2_SetDrawColor(g_u8g2, 0);
-            u8g2_DrawBox(g_u8g2, x, candBase - g_font.ascent(), partW, FONT_H);
-            g_content_font.drawText(x, candBase, part.c_str(), true);   // 白字
-        } else {
-            u8g2_SetDrawColor(g_u8g2, 0);
-            g_content_font.drawText(x, candBase, part.c_str(), false);  // 黑字
+            u8g2_DrawBox(g_u8g2, x, hlY, partW, hlH);
         }
+        imeCandDrawText(x, candBase, part.c_str(), i == hl);
         x += partW;
         if (truncated) break;
     }
@@ -449,18 +602,20 @@ void drawIMEUI(int baseY, bool anchorBottom) {
 }
 
 void drawIMEUIWithStatusBar() {
-    drawIMEUI(imeStatusPanelTopY(), true);
+    FontScope ui(FontRenderer::uiPxHeight());   // 底边是界面字号下的量
+    UI_FONT_GUARD();
+    drawIMEUI(STATUS_BAR_Y);
 }
 
 void drawIMEUIFullscreen() {
-    drawIMEUI(imeFullscreenPanelTopY(), false);
+    drawIMEUI(SCREEN_H);
 }
 
-// 见头文件。非锚定布局的内容高固定是 2*FONT_H + 8（编码行 + 分割线 + 候选行），
-// 想让候选行的下沿落在 bottom 上，面板顶就得从 bottom 往上退这么多。
-// 落点与 drawIMEUIWithStatusBar() 那套一致（状态栏上沿之上 3px）。
+// 见头文件：面板与状态栏**同时**要画时用它——整块面板上移到状态栏上沿之上 3px。
 void drawIMEUIFullscreenAboveStatusBar() {
-    drawIMEUI(STATUS_BAR_Y - 3 - (2 * FONT_H + 8), false);
+    FontScope ui(FontRenderer::uiPxHeight());   // 底边是界面字号下的量
+    UI_FONT_GUARD();
+    drawIMEUI(STATUS_BAR_Y - 3);
 }
 
 // ── UI Helpers ────────────────────────────────────────────────────────────
@@ -501,6 +656,10 @@ bool ui_toast_active() {
 // 画在**本帧内容之上**（所以是"盖在当前画面上"而不是清屏重画）。白底 + 黑框 +
 // 黑字：三样都不透光，底下的正文一个字都透不出来。
 static void ui_toast_draw() {
+    // 轻提示是界面框架：由 ui_commit() 在**当前**绘制作用域里调用，而编辑器正文那一片
+    // 是正文字号 —— 这里钉回界面字号，提示框不跟着正文一起放大。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     if (!ui_toast_active()) { s_toastUntilUs = 0; return; }
     const int tw = g_font.textWidth(s_toastMsg);
     const int bw = tw + 24;
@@ -525,9 +684,6 @@ void ui_commit() { ui_toast_draw(); ui_render_submit(false); }
 // 换 GC16 波形把它重画一遍，用来清掉局刷/DU 积累的残影。各模式通用（main.cpp）。
 void ui_full_refresh_now() { ui_render_full_refresh(); }
 
-// 只发送缓冲不更新参考帧（休眠提示用：唤醒后需恢复提示前的画面）。
-void ui_send_buffer() { ui_render_full_refresh(); }
-
 // 恢复待机前的画面：standbyClockDraw 之前 ui_render_keep_frame() 留过一份副本，
 // 这里把它按 from-white 推回去（面板唤醒时刚被物理清成白底）。
 void ui_restore_snapshot() { ui_render_restore_kept(); }
@@ -536,9 +692,9 @@ void ui_restore_snapshot() { ui_render_restore_kept(); }
 // 用于 light sleep 唤醒后面板被复位、需要强制重绘的场景。
 void ui_invalidate_snapshot() { ui_render_invalidate(); }
 
-// IME 候选/编码条局刷的合并窗口现在由渲染任务自己在队列超时里做（见 ui_render.cpp
-// 的 flush_deferred），core0 不用再每轮冲刷。保留空函数以免改各界面调用点。
-void ui_flush_ime_deferred() {}
+// 注：IME 候选/编码条局刷的合并窗口由渲染任务自己在队列超时里做（见 ui_render.cpp
+// 的 flush_deferred），core0 不必每轮冲刷 —— 原先那个空壳 ui_flush_ime_deferred()
+// 和它在主循环里的调用点已删。
 
 void ui_set_fast_partial(bool enable) { ui_render_set_fast_partial(enable); }
 void ui_set_local_only(bool enable) { ui_render_set_local_only(enable); }
@@ -599,7 +755,11 @@ void ui_draw_text_content_centered(int y, const char *text, bool invert) {
 }
 
 void ui_draw_status(const char *left, const char *right, int rightReserve) {
-    // 状态栏使用当前字号;编辑器的字号设置应同时影响正文和状态栏。
+    // 状态栏是**界面框架**：底边、条高、字号全按界面字号。编辑器正文有自己的字号
+    // （「显示与版式 → 正文字号」），那一个**只管正文**，不带着状态栏一起长——
+    // 所以这里必须钉回界面字号，免得在正文作用域里被调到时整条状态栏变高。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     int y = STATUS_BAR_Y;
     u8g2_SetDrawColor(g_u8g2, 0);
     u8g2_DrawHLine(g_u8g2, 0, y, SCREEN_W);
@@ -619,6 +779,9 @@ void ui_draw_status(const char *left, const char *right, int rightReserve) {
 }
 
 void ui_show_message_centered(const char *msg) {
+    // 对话框是界面框架（编辑器正文作用域里也会调到，如"AI生成提示中..."），钉回界面字号。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     // 全屏消息优先：顺手收掉还没到点的就地提示，免得小框盖在对话框上。
     ui_toast_clear();
     // 先清屏,确保消息框是不透明对话框而不是盖在旧画面上
@@ -634,6 +797,9 @@ void ui_show_message_centered(const char *msg) {
 }
 
 void ui_draw_confirm_dialog(const char *l1, const char *l2, const char *l3) {
+    // 确认框是界面框架（编辑器正文作用域里也会调到：保存/恢复草稿），钉回界面字号。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
     // 行距 = FONT_H（原固定 30px 比 UI 行高还小，文字会互相挤压），
     // 框宽取最长一行的宽度，框高按 3 行 + 上下留白。
     int padX = 40, padTop = 24, padBottom = 22;

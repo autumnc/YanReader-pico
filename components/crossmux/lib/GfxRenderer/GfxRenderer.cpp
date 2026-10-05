@@ -17,12 +17,13 @@ typedef struct {
   int width;
   int height;
 } EpdRect;
-// epdiy.h 的字体对齐标志（与 MAIN 组件 ttf_font.h 引用的 enum 同名同值，ABI 一致）。
-enum EpdFontFlags {
-  EPD_DRAW_BACKGROUND = 0x1,
-  EPD_DRAW_ALIGN_LEFT = 0x2,
-  EPD_DRAW_ALIGN_RIGHT = 0x4,
-  EPD_DRAW_ALIGN_CENTER = 0x8,
+// MAIN 组件 ttf_font.h 的 TtfDrawAlign 镜像（同名同值）。不能 include 那个头：
+// main 依赖 crossmux，反向 includes 会成环。P1.3 之后 ttf_font.h 不再带 epdiy，
+// 对齐标志也成了它自己的 TTF_ALIGN_*，这里镜像同一份；数值 = epdiy 的 EPD_DRAW_ALIGN_*。
+enum TtfDrawAlign {
+  TTF_ALIGN_LEFT = 0x2,
+  TTF_ALIGN_RIGHT = 0x4,
+  TTF_ALIGN_CENTER = 0x8,
 };
 void epd_draw_pixel(int x, int y, uint8_t color, uint8_t* framebuffer);
 void epd_draw_line(int x0, int y0, int x1, int y1, uint8_t color, uint8_t* framebuffer);
@@ -34,8 +35,11 @@ void epd_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint8_t c
 
 // ttf_font 位于 MAIN 组件（官方固件字体层），跨组件在最终链接时解析。
 extern "C" {
+// align 是 int：MAIN 组件的 ttf_font.h 刻意不带 epdiy（改成 int 就是为此，见那头的
+// P1.3 说明），本组件又不能 include MAIN 的头（main 依赖 crossmux，反向会成环），
+// 所以这里手工镜像同一份 ABI。传值仍是上面那几个 EPD_DRAW_ALIGN_* 标志位。
 void ttf_draw_text_px(uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
-                      enum EpdFontFlags align, uint8_t fg, uint8_t bg);
+                      int align, uint8_t fg, uint8_t bg);
 int ttf_text_width_px(int pixel_height, const char* text);
 int ttf_ascender_px(int pixel_height);
 // 选定后续 ttf_* 绘制/度量作用于哪个字面（同 MAIN 组件 ttf_font.h）。UI_FONT_ID=0
@@ -227,6 +231,36 @@ void GfxRenderer::drawLine(int x1, int y1, int x2, int y2, int lineWidth, bool s
   }
   for (int i = 0; i < lineWidth; ++i) drawLine(x1, y1 + i, x2, y2 + i, state);
 }
+void GfxRenderer::drawWavyLine(int x1, int y1, int x2, int y2, int lineWidth, bool state) const {
+  if (!frameBuffer) return;
+  // Normalize so the phase starts at the left end regardless of call order.
+  if (x2 < x1) {
+    const int tx = x1;
+    x1 = x2;
+    x2 = tx;
+    const int ty = y1;
+    y1 = y2;
+    y2 = ty;
+  }
+  // 12 px 一周期、幅度 ±2 px 的折线波。取折线而非正弦：整数相位表零计算量（每条线就是
+  // 几百次查表 + epd_draw_pixel），而且在 1bpp 抖动下不会出现正弦采样丢失波峰的问题。
+  // 幅度/周期取头文件里的常量 —— TextBlock 用 kWavyAmplitudePx 给中线让位。
+  static_assert(kWavyPeriodPx == 12, "kWave 表的长度必须等于 kWavyPeriodPx");
+  static constexpr int8_t kWave[kWavyPeriodPx] = {0, -1, -2, -2, -1, 0, 0, 1, 2, 2, 1, 0};
+  const uint8_t ink = toInk(state);
+  const int span = (x2 > x1) ? (x2 - x1) : 1;
+  const int dy = y2 - y1;
+  for (int x = x1; x <= x2; ++x) {
+    if (clipActive && (x < clipX0 || x >= clipX1)) continue;
+    const int off = x - x1;
+    const int yBase = y1 + dy * off / span + kWave[off % kWavyPeriodPx];
+    for (int i = 0; i < lineWidth; ++i) {
+      const int py = yBase + i;
+      if (clipActive && (py < clipY0 || py >= clipY1)) continue;
+      epd_draw_pixel(x, py, ink, frameBuffer);
+    }
+  }
+}
 void GfxRenderer::drawArc(int maxRadius, int cx, int cy, int xDir, int yDir, int lineWidth, bool state) const {
   (void)xDir; (void)yDir; (void)lineWidth;
   if (!frameBuffer) return;
@@ -367,10 +401,10 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
   uint8_t fg = black ? 0x00 : 0x0F;
   uint8_t bg = black ? 0x0F : 0x00;
   bool bold = (style & EpdFontFamily::BOLD) || syntheticBoldPixels > 0;
-  ttf_draw_text_px(frameBuffer, x, y, px, text, EPD_DRAW_ALIGN_LEFT, fg, bg);
+  ttf_draw_text_px(frameBuffer, x, y, px, text, TTF_ALIGN_LEFT, fg, bg);
   if (bold) {
-    ttf_draw_text_px(frameBuffer, x + 1, y, px, text, EPD_DRAW_ALIGN_LEFT, fg, bg);
-    ttf_draw_text_px(frameBuffer, x, y + 1, px, text, EPD_DRAW_ALIGN_LEFT, fg, bg);
+    ttf_draw_text_px(frameBuffer, x + 1, y, px, text, TTF_ALIGN_LEFT, fg, bg);
+    ttf_draw_text_px(frameBuffer, x, y + 1, px, text, TTF_ALIGN_LEFT, fg, bg);
   }
 }
 int GfxRenderer::getSpaceWidth(const int fontId, const EpdFontFamily::Style style) const {
@@ -450,7 +484,21 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* 
   std::string line;
   size_t i = 0;
   while (i < s.size() && static_cast<int>(lines.size()) < maxLines) {
-    int len = utf8CharLen(static_cast<unsigned char>(s[i]));
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    // 硬换行。词典释义、笔记正文、脚注原文里的 '\n' 是"这里断行"，不是可折行的普通
+    // 字符 —— 原来只按宽度折行，'\n' 既不断行又不显字形，整条释义就糊成一坨。
+    // 空行照样入列（段落间距要留住）；"\r\n" 里的 '\r' 直接丢掉，免得多个空字形。
+    if (c == '\n') {
+      lines.push_back(line);
+      line.clear();
+      i++;
+      continue;
+    }
+    if (c == '\r') {
+      i++;
+      continue;
+    }
+    int len = utf8CharLen(c);
     if (i + static_cast<size_t>(len) > s.size()) break;
     std::string ch = s.substr(i, len);
     std::string cand = line + ch;

@@ -15,6 +15,7 @@ crossmux_full_refresh_fn s_full_refresh = nullptr;
 crossmux_full_refresh_fn s_gray8_refresh = nullptr;
 crossmux_full_refresh_fn s_gray8_text_refresh = nullptr;
 crossmux_mode_refresh_fn s_mode_refresh = nullptr;
+crossmux_vk_present_fn s_vk_present = nullptr;
 
 enum EpdDrawMode toEpdMode(HalDisplay::RefreshMode mode) {
   switch (mode) {
@@ -41,6 +42,9 @@ extern "C" void crossmux_platform_set_gray8_text_refresh(crossmux_full_refresh_f
 extern "C" void crossmux_platform_set_mode_refresh(crossmux_mode_refresh_fn fn) {
   s_mode_refresh = fn;
 }
+extern "C" void crossmux_platform_set_vk_present(crossmux_vk_present_fn fn) {
+  s_vk_present = fn;
+}
 
 HalDisplay::HalDisplay() {}
 HalDisplay::~HalDisplay() {}
@@ -63,10 +67,14 @@ void HalDisplay::drawImage(const uint8_t* imageData, uint16_t x, uint16_t y, uin
   (void)fromProgmem;
   uint8_t* fb = getFrameBuffer();
   if (!fb || !imageData) return;
+  // 位序号按 size_t 算：yy*w+xx 在 int 下会溢出（w、h 都是 uint16，65535² > INT_MAX），
+  // 溢出即 UB，可能算出负下标。另注：本函数没有位图长度参数，调用前请自备
+  // ceil(w*h/8) 字节的缓冲（当前树内无调用者）。
   for (uint16_t yy = 0; yy < h; ++yy) {
     for (uint16_t xx = 0; xx < w; ++xx) {
-      uint8_t byte = imageData[(yy * w + xx) / 8];
-      uint8_t bit = byte & (0x80 >> ((yy * w + xx) % 8));
+      const size_t bitIdx = static_cast<size_t>(yy) * w + xx;
+      const uint8_t byte = imageData[bitIdx >> 3];
+      const uint8_t bit = byte & (0x80 >> (bitIdx & 7));
       epd_draw_pixel(x + xx, y + yy, bit ? 0x00 : 0xF0, fb);
     }
   }
@@ -82,20 +90,12 @@ void HalDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen, DisplayRefr
   (void)turnOffScreen;
   (void)context;
   if (!s_hl) return;
-  // ── 全局夜间反色 ──────────────────────────────────────────────────────
-  // 本函数是**所有**推屏的唯一出口：main 的 update_display_reader() 挂在 s_mode_refresh
-  // 上且无条件 return（下面第一支），五档全从那里进 display.c；而 display.c 自己的
-  // update_display_gray8_text / from_white 又各自直呼 epd_hl_update_screen*，绕开
-  // display.c 里那个看似公共的 hl_update()。所以只有这里能一次性罩住全部界面
-  // （书架/菜单/设置/阅读/写作/GTD/待机）。
-  // 做法：推之前把整块 4bpp fb 逐字节取反、推完再取反回来（~ 把 16 级灰度逐像素反相，
-  // 0xF0 白 ↔ 0x00 黑）。代价每帧两趟 ~416KB 字节遍历，~8ms，可忽略。
-  // 差分刷基线天然一致：epdiy 存下的"上一帧"也是取反过的，两次比较同向，不会误判变化。
-  uint8_t* invFb = s_inverted ? epd_hl_get_framebuffer(s_hl) : nullptr;
-  if (invFb) {
-    const uint32_t n = getBufferSize();
-    for (uint32_t i = 0; i < n; i++) invFb[i] = static_cast<uint8_t>(~invFb[i]);
-  }
+  // ── 夜间反色不在这里 ──────────────────────────────────────────────────
+  // 这里曾经是"所有推屏的唯一出口"，但那是错的：core1 的渲染任务（书架/菜单/设置/
+  // 写作/GTD/待机）直呼 main 的 display.c，根本不经过本类 —— 反色挂在这里只会覆盖
+  // 阅读器一族，用户侧就是"夜间模式只对阅读模式生效"。
+  // 现在唯一实施点在 display.c 的推屏处（front/back 成对取反 + 推完翻回来），本类
+  // 只保留 s_inverted 标志（isInverted() 的语义不变）。
   auto push = [&]() {
     // 统一出口优先：main 的 update_display_reader() 把五个档位全收口到 display.c，
     // 那里才有 GL16 全像素与"软刷攒够升 GC16"的计数。见 crossmux_platform.h 的说明。
@@ -125,10 +125,17 @@ void HalDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen, DisplayRefr
     epd_hl_update_screen(s_hl, toEpdMode(mode), 25);
   };
   push();
-  if (invFb) {
-    const uint32_t n = getBufferSize();
-    for (uint32_t i = 0; i < n; i++) invFb[i] = static_cast<uint8_t>(~invFb[i]);
+}
+
+// 阅读模式虚拟键盘的打字帧。夜间反色同样不在本类做（钩子最终落到 display.c 的推屏处）。
+void HalDisplay::displayBufferVk(int panel_top, int cand_h) {
+  if (!s_hl) return;
+  if (!s_vk_present) {
+    // 没注册钩子（理论上只有单测/裁剪构建会这样）：退回老行为 —— 整屏局刷。
+    displayBuffer(HALF_REFRESH);
+    return;
   }
+  s_vk_present(panel_top, cand_h);
 }
 void HalDisplay::displayBufferAsync(RefreshMode mode, DisplayRefreshContext context) {
   displayBuffer(mode, false, context);

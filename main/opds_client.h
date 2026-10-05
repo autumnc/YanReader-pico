@@ -6,8 +6,9 @@
 #include <string>
 #include <vector>
 
-// OPDS(Atom) 目录拉取与电子书下载。HTTP 走 esp_http_client，解析复用 crossmux 的
-// OpdsParser（expat）。仅在已连 WiFi 时调用；两个函数都是阻塞式的（超时 20~30s）。
+// OPDS(Atom) 目录拉取与电子书下载。HTTP 走 net/http（perform 路，必须跟随 302 到
+// 镜像站），解析复用 crossmux 的 OpdsParser（expat）。仅在已连 WiFi 时调用；
+// 两个函数都是阻塞式的，各自带墙钟上限（feed 60s / 下载 15min），到点即中止。
 
 // 拉取一个 OPDS feed。成功时 entries 为解析出的条目，其中每个 href 都已解析成
 // 相对该 feed URL 的绝对地址；nextPageUrl 回填 feed 里的 rel="next"（同样绝对化，

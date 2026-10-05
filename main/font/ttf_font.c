@@ -13,6 +13,8 @@
 #include "ttf_font.h"
 
 #include "fb_fast.h"   // 字形逐像素直写：绕开 epd_draw_pixel 的逐像素旋转/边界开销
+// 注：下面几个定义的 align 形参写 int 而不是 `enum EpdFontFlags` —— 声明和定义必须一致，
+// 而 ttf_font.h 刻意不带 epdiy（见那边的 P1.3 说明），对齐标志用它自己的 TTF_ALIGN_*。
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -25,7 +27,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "settings.h"
+#include "font_store.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -1718,7 +1720,10 @@ static bool pack_glyph_tree(int root_gid) {
     for (int i = 0; i < tree_n; i++) {
         int gid = tree[i];
         uint32_t len = file_glyph_len(gid);
-        if (packed + len > TTF_GLYF_ARENA) {
+        // 64 位比较：len 是两张 loca 偏移之差，畸形 loca 能给到接近 2^32，`packed + len`
+        // 在 32 位下会回绕（packed=4、len=0xFFFFFFFC 得 0）从而骗过检查，随后
+        // file_read_at 把数据写进这个 128KB 窗口之外。
+        if ((uint64_t)packed + len > TTF_GLYF_ARENA) {
             ESP_LOGE(TAG, "glyf arena overflow gid=%d len=%u", gid, (unsigned)len);
             return false;
         }
@@ -1750,10 +1755,6 @@ static bool pack_glyph_tree(int root_gid) {
     return true;
 }
 
-static uint32_t align4(uint32_t v) {
-    return (v + 3u) & ~3u;
-}
-
 static bool copy_table(
     uint8_t* dst, uint32_t dst_off, uint32_t file_off, uint32_t length
 ) {
@@ -1783,13 +1784,30 @@ static uint8_t* build_working_font(const uint8_t* header, size_t header_len) {
         }
     }
 
-    uint32_t cursor = 12 + 7 * 16;
-    uint32_t dst_off[7];
-    uint32_t total = cursor;
+    // 表长/表偏移是文件**自报**的（find_sfnt_table 原样采信）。畸形 .ttf 里一个接近
+    // 2^32 的 length 会让下面的 4 字节对齐累加回绕、total 反而变小：data 按
+    // 小 total 分配，copy_table 却往里写 length 字节 → 堆越界写。先逐表卡上限，再用
+    // 64 位累加核对总量。
+    const uint32_t kTableMaxBytes = 16u * 1024 * 1024;
     for (int i = 0; i < 7; i++) {
-        dst_off[i] = total;
-        total = align4(total + src[i].length);
+        if (src[i].length > kTableMaxBytes) {
+            ESP_LOGE(TAG, "table %.4s 长度异常 (%u)", src[i].tag, (unsigned)src[i].length);
+            return NULL;
+        }
     }
+
+    const uint32_t cursor = 12 + 7 * 16;
+    uint32_t dst_off[7];
+    uint64_t total64 = cursor;
+    for (int i = 0; i < 7; i++) {
+        dst_off[i] = (uint32_t)total64;
+        total64 = ((total64 + src[i].length) + 3u) & ~(uint64_t)3u;
+        if (total64 > 64u * 1024 * 1024) {
+            ESP_LOGE(TAG, "工作字体过大 (%llu)", (unsigned long long)total64);
+            return NULL;
+        }
+    }
+    const uint32_t total = (uint32_t)total64;
 
     uint8_t* data = heap_caps_calloc(1, total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (data == NULL) return NULL;
@@ -1822,10 +1840,31 @@ static uint8_t* build_working_font(const uint8_t* header, size_t header_len) {
     }
     memcpy(file_loca, data + work_loca_off, file_loca_len);
 
+    // head/maxp 是目录里靠后的表，声明长度可能短于我们要读的字段（head 读偏移 50、
+    // maxp 读偏移 4）——那读的就是 data 缓冲区**之外**。先卡这两张表的最小长度。
+    if (src[2].length < 54 || src[6].length < 6) {
+        ESP_LOGE(TAG, "head/maxp 表过短 (%u/%u)", (unsigned)src[2].length, (unsigned)src[6].length);
+        heap_caps_free(file_loca);
+        file_loca = NULL;
+        heap_caps_free(data);
+        return NULL;
+    }
     uint8_t* head = data + dst_off[2];
     loca_long = be16(head + 50) != 0;
     uint8_t* maxp = data + dst_off[6];
     num_glyphs = be16(maxp + 4);
+
+    // loca 表长度必须装得下 (num_glyphs+1) 个偏移：file_glyph_off(gid) 允许
+    // gid == num_glyphs（末项），而数组是按 loca 表**自报**的长度分配的 —— 表被声明得
+    // 很短、maxp 里 numGlyphs 却很大时，就是越界读 loca。
+    const size_t loca_need = ((size_t)num_glyphs + 1) * (loca_long ? 4u : 2u);
+    if (loca_need > file_loca_len) {
+        ESP_LOGE(TAG, "loca 表过短: 需要 %u, 实际 %u", (unsigned)loca_need, (unsigned)file_loca_len);
+        heap_caps_free(file_loca);
+        file_loca = NULL;
+        heap_caps_free(data);
+        return NULL;
+    }
     return data;
 }
 
@@ -2512,7 +2551,7 @@ esp_err_t ttf_font_init(void) {
     esp_err_t err = ESP_OK;
     if (!s_faces[TTF_ROLE_CONTENT].f_font_ready) {
         ttf_face_t* prev = face_enter(TTF_ROLE_CONTENT);
-        const char* path = app_settings_font_path();
+        const char* path = font_store_get_path();
         err = ttf_font_path_is_builtin(path) ? face_open_builtin() : face_open(path);
         if (err != ESP_OK && font_ready) err = ESP_OK;   // 与今日同样的容忍度
         face_leave(prev);
@@ -2588,14 +2627,14 @@ static uint8_t mix_ink(uint8_t alpha, uint8_t fg, uint8_t bg) {
 
 void ttf_draw_text(
     uint8_t* framebuffer, int x, int y, int size, const char* text,
-    enum EpdFontFlags align, uint8_t fg, uint8_t bg
+    int align, uint8_t fg, uint8_t bg
 ) {
     ttf_draw_text_px(framebuffer, x, y, size_to_px(size), text, align, fg, bg);
 }
 
 void ttf_draw_text_px(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
-    enum EpdFontFlags align, uint8_t fg, uint8_t bg
+    int align, uint8_t fg, uint8_t bg
 ) {
     if (!font_ready || framebuffer == NULL || text == NULL) return;
     ttf_cover_lut_init();
@@ -2604,9 +2643,9 @@ void ttf_draw_text_px(
     fb_fast_sync();   // 本次绘制内旋转/尺寸只查一次
 
     int cursor_x = x;
-    if (align & EPD_DRAW_ALIGN_CENTER) {
+    if (align & TTF_ALIGN_CENTER) {
         cursor_x = x - measure_width(pixel_height, text) / 2;
-    } else if (align & EPD_DRAW_ALIGN_RIGHT) {
+    } else if (align & TTF_ALIGN_RIGHT) {
         cursor_x = x - measure_width(pixel_height, text);
     }
 
@@ -2635,7 +2674,7 @@ void ttf_draw_text_px(
 
 void ttf_draw_text_px_bw(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
-    enum EpdFontFlags align, uint8_t fg, uint8_t bg
+    int align, uint8_t fg, uint8_t bg
 ) {
     if (!font_ready || framebuffer == NULL || text == NULL) return;
     pixel_height = clamp_px(pixel_height);
@@ -2643,9 +2682,9 @@ void ttf_draw_text_px_bw(
     fb_fast_sync();   // 本次绘制内旋转/尺寸只查一次
 
     int cursor_x = x;
-    if (align & EPD_DRAW_ALIGN_CENTER) {
+    if (align & TTF_ALIGN_CENTER) {
         cursor_x = x - measure_width(pixel_height, text) / 2;
-    } else if (align & EPD_DRAW_ALIGN_RIGHT) {
+    } else if (align & TTF_ALIGN_RIGHT) {
         cursor_x = x - measure_width(pixel_height, text);
     }
 

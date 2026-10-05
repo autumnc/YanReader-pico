@@ -11,8 +11,9 @@
 #include "../../../../src/fontIds.h"
 
 size_t TextBlock::arenaSize(const uint16_t wordCount, const bool hasFocus, const uint16_t textBytes) {
-  // Layout documented in TextBlock.h: 16-bit arrays first, then 8-bit arrays, then text.
-  size_t size = static_cast<size_t>(wordCount) * (sizeof(uint16_t) + sizeof(int16_t) + sizeof(uint8_t));
+  // Layout documented in TextBlock.h: 16-bit arrays first (textOff/xpos/focusSuffixX/styles),
+  // then the 8-bit focusBoundary, then text. styles is 16-bit since WAVY_UNDERLINE.
+  size_t size = static_cast<size_t>(wordCount) * (sizeof(uint16_t) + sizeof(int16_t) + sizeof(uint16_t));
   if (hasFocus) {
     size += static_cast<size_t>(wordCount) * (sizeof(uint16_t) + sizeof(uint8_t));
   }
@@ -29,8 +30,9 @@ void TextBlock::bindArenaPointers() {
     focusSuffixXArr = reinterpret_cast<const uint16_t*>(base + off);
     off += wc * 2;
   }
-  stylesArr = base + off;
-  off += wc;
+  // 16 位组必须整体在前（RISC-V 不对齐访问会 fault）：styles 加宽后归到这里。
+  stylesArr = reinterpret_cast<const uint16_t*>(base + off);
+  off += wc * 2;
   if (focusPresent) {
     focusBoundaryArr = base + off;
     off += wc;
@@ -98,13 +100,13 @@ TextBlock::TextBlock(const std::vector<std::string>& words, const std::vector<in
   // Pass 2: fill. Mutable aliases of the const views bound above.
   auto* textOff = const_cast<uint16_t*>(textOffArr);
   auto* xpos = const_cast<int16_t*>(xposArr);
-  auto* styles = const_cast<uint8_t*>(stylesArr);
+  auto* styles = const_cast<uint16_t*>(stylesArr);
   auto* text = const_cast<char*>(textArr);
   uint16_t off = 0;
   for (uint16_t i = 0; i < numWords; i++) {
     textOff[i] = off;
     xpos[i] = wordXpos[i];
-    styles[i] = static_cast<uint8_t>(wordStyles[i]);
+    styles[i] = static_cast<uint16_t>(wordStyles[i]);
     memcpy(text + off, words[i].data(), words[i].size());
     off += static_cast<uint16_t>(words[i].size());
     text[off++] = '\0';
@@ -173,6 +175,10 @@ void TextBlock::render(const GfxRenderer& renderer, const int fallbackFontId, co
 
   struct DecorationLineTracker {
     EpdFontFamily::Style style;
+    // 这一位也置位时本 tracker 退场。实线下划线遇到 WAVY_UNDERLINE 就让位，于是
+    // "UNDERLINE|WAVY_UNDERLINE 都置位"最终只落一条波浪线（见 EpdFontFamily.h）。
+    uint16_t suppressIf = 0;
+    bool wavy = false;
     int startX = -1;
     int endX = -1;
     int yPos = 0;
@@ -186,8 +192,9 @@ void TextBlock::render(const GfxRenderer& renderer, const int fallbackFontId, co
   };
 
   DecorationLineTracker decorationLines[] = {
-      {EpdFontFamily::UNDERLINE},
-      {EpdFontFamily::STRIKETHROUGH},
+      {EpdFontFamily::UNDERLINE, static_cast<uint16_t>(EpdFontFamily::WAVY_UNDERLINE), false},
+      {EpdFontFamily::STRIKETHROUGH, 0, false},
+      {EpdFontFamily::WAVY_UNDERLINE, 0, true},
   };
 
   // 装饰线相对**实际画出来的基线**定位。上游那两条偏移（ascender+2 / ascender*4/5）是给
@@ -195,17 +202,33 @@ void TextBlock::render(const GfxRenderer& renderer, const int fallbackFontId, co
   // ttf 渲染器把传进去的 y 直接当基线用（`yy = y - glyph->top`），所以照搬上游的偏移，
   // 整条线会掉到基线下方一整个 ascender 处 —— 正好压在下一行的字上。上标注号最明显：
   // 它自己还被抬高 0.4*ascender，下划线看着就是"飘在序号下面老远"。
-  // 基线下方 2px / 基线上方 ascender/5（与上游两条线的相对关系一致），上标下标按半号缩。
-  constexpr int kUnderlineDropPx = 2;
+  // 基线上方 ascender/5（与上游那条线的相对关系一致），上标下标按半号缩。
+  //
+  // 下划线离基线的间隙**随字号走**而不是写死：汉字底部本来就压在基线上，原来固定 2px 看着
+  // 就是"贴着字画"。但也不能一路用正文的数值 —— 脚注那种半号字吃同样的 4px 会飘起来。
+  // 正文 ascender≈40 → 4px；半号字自动收到 2px。
+  const int underlineDropPx = ascender / 10 < 2 ? 2 : ascender / 10;
   const auto decorationY = [&](EpdFontFamily::Style deco, EpdFontFamily::Style wordStyle, int wordY) {
     const bool decoHalf = (wordStyle & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0;
     const int decoAsc = decoHalf ? ascender / 2 : ascender;
-    return wordY + (deco == EpdFontFamily::UNDERLINE ? kUnderlineDropPx : -(decoAsc / 5));
+    const uint16_t decoBits = static_cast<uint16_t>(deco);
+    // 只有删除线在基线上方（波浪线/实线下划线都在字下，书名线/专名线同一个位置）。
+    if ((decoBits & (EpdFontFamily::UNDERLINE | EpdFontFamily::WAVY_UNDERLINE)) == 0) {
+      return wordY - decoAsc / 5;
+    }
+    // 波浪线以**中线**定位：波峰压到与实线下划线同高（都在 underlineDropPx），多出来的
+    // 幅度全部往**下**扩。不这么做的话，抬高幅度会让波峰重新贴回字上 —— 波峰 = 中线 − 幅度。
+    const bool wavy = (decoBits & EpdFontFamily::WAVY_UNDERLINE) != 0;
+    return wordY + underlineDropPx + (wavy ? GfxRenderer::kWavyAmplitudePx : 0);
   };
 
   const auto flushDecoration = [&](DecorationLineTracker& line) {
     if (line.active()) {
-      renderer.drawLine(line.startX, line.yPos, line.endX, line.yPos, 2, true);
+      if (line.wavy) {
+        renderer.drawWavyLine(line.startX, line.yPos, line.endX, line.yPos, 2, true);
+      } else {
+        renderer.drawLine(line.startX, line.yPos, line.endX, line.yPos, 2, true);
+      }
       line.reset();
     }
   };
@@ -285,7 +308,8 @@ void TextBlock::render(const GfxRenderer& renderer, const int fallbackFontId, co
       }
 
       for (auto& line : decorationLines) {
-        if ((currentStyle & line.style) == 0) {
+        const bool suppressed = line.suppressIf != 0 && (static_cast<uint16_t>(currentStyle) & line.suppressIf) != 0;
+        if ((static_cast<uint16_t>(currentStyle) & line.style) == 0 || suppressed) {
           flushDecoration(line);
           continue;
         }

@@ -52,6 +52,23 @@ void crossmux_platform_set_gray8_text_refresh(crossmux_full_refresh_fn fn);
 typedef enum EpdDrawError (*crossmux_mode_refresh_fn)(EpdiyHighlevelState* hl, int kind);
 void crossmux_platform_set_mode_refresh(crossmux_mode_refresh_fn fn);
 
+// 阅读模式**虚拟键盘打字帧**的区域推屏落地点（可选，main 提供）。参数是**逻辑像素**：
+// panel_top 是键盘面板顶边（= 编码/候选两行上沿），cand_h 是那两行的总高。实现自己
+// 取 epdiy 句柄（board_hl()），所以这里不带 hl —— 这个类型要放进阅读器也能 include
+// 的头里，而阅读器碰不得 epdiy.h（EpdFont 名字冲突，见 screen_reader.cpp 开头）。
+// **为什么需要它**：阅读器给虚拟键盘打字帧走的是 HALF(局刷)，而 display.c 的
+// hl_update() 有一条"GL16 恒全像素"的规矩 —— 于是每按一个键整屏全像素驱动一遍
+// （≈410ms + 整屏闪一下）。区域刷只驱动与上一帧有差异的那块矩形，判据与波形挑选
+// 在 ui_render.cpp 的 reader_vk_present 里，和写作模式的虚拟键盘是同一套。
+// 未注册时 HalDisplay 退回 displayBuffer(HALF_REFRESH)（老行为）。
+// / Landing point for the reader's virtual-keyboard typing frame (optional).
+// All-in-area present: only the rect that differs from the previous frame is driven.
+// panel_top/cand_h are logical pixels; the implementation grabs the epdiy handle itself
+// because this type must live in a header the reader may include (it cannot touch
+// epdiy.h). Without the hook HalDisplay falls back to a full-screen HALF refresh.
+typedef void (*crossmux_vk_present_fn)(int panel_top, int cand_h);
+void crossmux_platform_set_vk_present(crossmux_vk_present_fn fn);
+
 #ifdef __cplusplus
 }
 #endif

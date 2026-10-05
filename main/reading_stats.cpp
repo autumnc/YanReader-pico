@@ -36,7 +36,10 @@ constexpr size_t MAX_BOOKS = 200;  // 体积红线：见 reading_stats.h 的说�
 // 2024-01-01（UTC+14 的最早那一刻）之前一律当成时钟没同步。
 constexpr uint32_t VALID_CLOCK_THRESHOLD = 1704016800UL;
 
-constexpr int kFormatVersion = 8;  // 与 crossmux v6 同名字段，去掉 legacyReadingDays/knownPaths
+// v9：日桶和书各多了 pages/totalPages（"每日页数"）。老文件缺这两个字段一律读成 0，
+// 所以降级回旧固件也不会读坏，只是页数归零。
+// v9 adds pages/totalPages; missing fields load as 0 so an older firmware can still read the file.
+constexpr int kFormatVersion = 9;  // 与 crossmux v6 同名字段，去掉 legacyReadingDays/knownPaths
 
 int64_t nowMs() { return esp_timer_get_time() / 1000; }
 
@@ -96,6 +99,8 @@ struct SummaryCache {
     uint32_t booksFinishedCount = 0;
     uint64_t totalReadingMs = 0;
     uint64_t todayReadingMs = 0;
+    uint64_t totalPagesRead = 0;
+    uint32_t todayPages = 0;
     uint64_t recent7ReadingMs = 0;
     uint64_t recent30ReadingMs = 0;
     uint32_t currentStreakDays = 0;
@@ -120,6 +125,7 @@ void normalizeReadingDays(std::vector<ReadingDayStats> &days) {
     for (const auto &day : days) {
         if (!merged.empty() && merged.back().dayOrdinal == day.dayOrdinal) {
             merged.back().readingMs += day.readingMs;
+            merged.back().pages += day.pages;
         } else {
             merged.push_back(day);
         }
@@ -147,12 +153,18 @@ ReadingDayStats &getOrCreateDay(std::vector<ReadingDayStats> &days, uint32_t day
     return *it;
 }
 
+void addPagesToDays(std::vector<ReadingDayStats> &days, uint32_t dayOrdinal, uint32_t pages) {
+    if (dayOrdinal == 0 || pages == 0) return;
+    getOrCreateDay(days, dayOrdinal).pages += pages;
+}
+
 // 聚合日表 = 所有书那天的时长之和（crossmux 是"每本书的日桶 + 老档期日桶"，这里没有老档期）。
 void rebuildAggregatedDays() {
     s_readingDays.clear();
     for (const auto &book : s_books) {
         for (const auto &day : book.readingDays) {
             addReadingToDays(s_readingDays, day.dayOrdinal, day.readingMs);
+            addPagesToDays(s_readingDays, day.dayOrdinal, day.pages);
         }
     }
 }
@@ -295,6 +307,15 @@ void recordReadingTime(ReadingBookStats &book, uint32_t epochSeconds, uint64_t r
     getOrCreateDay(s_readingDays, ordinal).readingMs += readingMs;
 }
 
+// 页数只走同一个日桶口径：书里一份、聚合表里一份（聚合表 load() 后一律重算）。
+void recordPages(ReadingBookStats &book, uint32_t epochSeconds, uint32_t pages) {
+    if (!RdTime::clockValid(epochSeconds) || pages == 0) return;
+    const uint32_t ordinal = RdTime::dayOrdinal(epochSeconds);
+    if (ordinal == 0) return;
+    getOrCreateDay(book.readingDays, ordinal).pages += pages;
+    getOrCreateDay(s_readingDays, ordinal).pages += pages;
+}
+
 void appendSessionLogEntry(uint32_t dayOrdinal, uint32_t sessionMs) {
     if (dayOrdinal == 0 || sessionMs == 0) return;
     s_sessionLog.push_back(ReadingSessionLogEntry{dayOrdinal, sessionMs});
@@ -321,6 +342,7 @@ void rebuildSummaryCache() {
 
     for (const auto &book : s_books) {
         cache.totalReadingMs += book.totalReadingMs;
+        cache.totalPagesRead += book.totalPages;
         if (book.completed) cache.booksFinishedCount++;
     }
 
@@ -332,7 +354,10 @@ void rebuildSummaryCache() {
         eligibleDays.reserve(s_readingDays.size());
 
         for (const auto &day : s_readingDays) {
-            if (day.dayOrdinal == cache.referenceDayOrdinal) cache.todayReadingMs = day.readingMs;
+            if (day.dayOrdinal == cache.referenceDayOrdinal) {
+                cache.todayReadingMs = day.readingMs;
+                cache.todayPages = day.pages;
+            }
             if (day.dayOrdinal >= start7 && day.dayOrdinal <= cache.referenceDayOrdinal) {
                 cache.recent7ReadingMs += day.readingMs;
             }
@@ -392,6 +417,7 @@ JsonValue dayToJson(const ReadingDayStats &day) {
     JsonValue o = JsonValue::object();
     o.set("dayOrdinal", JsonValue(static_cast<double>(day.dayOrdinal)));
     o.set("readingMs", JsonValue(static_cast<double>(day.readingMs)));
+    if (day.pages != 0) o.set("pages", JsonValue(static_cast<double>(day.pages)));
     return o;
 }
 
@@ -402,6 +428,7 @@ JsonValue bookToJson(const ReadingBookStats &book) {
     o.set("author", JsonValue(book.author));
     o.set("chapterTitle", JsonValue(book.chapterTitle));
     o.set("totalReadingMs", JsonValue(static_cast<double>(book.totalReadingMs)));
+    o.set("totalPages", JsonValue(static_cast<double>(book.totalPages)));
     o.set("sessions", JsonValue(static_cast<double>(book.sessions)));
     o.set("lastSessionMs", JsonValue(static_cast<double>(book.lastSessionMs)));
     o.set("firstReadAt", JsonValue(static_cast<double>(book.firstReadAt)));
@@ -424,7 +451,9 @@ std::vector<ReadingDayStats> daysFromJson(const JsonValue &arr) {
         ReadingDayStats day;
         day.dayOrdinal = static_cast<uint32_t>(e["dayOrdinal"].asNumber(0));
         day.readingMs = static_cast<uint64_t>(e["readingMs"].asNumber(0));
-        if (day.dayOrdinal != 0 && day.readingMs != 0) days.push_back(day);
+        day.pages = static_cast<uint32_t>(e["pages"].asNumber(0));
+        // 时长和页数至少有一个才留：只有页数的那天（秒翻过去、时长被截到 0）也是记录。
+        if (day.dayOrdinal != 0 && (day.readingMs != 0 || day.pages != 0)) days.push_back(day);
     }
     return days;
 }
@@ -466,6 +495,7 @@ void load() {
             book.author = b["author"].asString();
             book.chapterTitle = b["chapterTitle"].asString();
             book.totalReadingMs = static_cast<uint64_t>(b["totalReadingMs"].asNumber(0));
+            book.totalPages = static_cast<uint64_t>(b["totalPages"].asNumber(0));
             book.sessions = static_cast<uint32_t>(b["sessions"].asNumber(0));
             book.lastSessionMs = static_cast<uint32_t>(b["lastSessionMs"].asNumber(0));
             book.firstReadAt = static_cast<uint32_t>(b["firstReadAt"].asNumber(0));
@@ -584,6 +614,19 @@ void noteActivity() {
     }
 
     s_session.lastInteractionMs = now;
+}
+
+// 往后翻了一页。**只数往后翻**：往前翻是回看，来回翻两下就能把"页数"刷成假的，
+// 那是时长已经覆盖得住的指标；往后翻才对应"读过去了"。和时长一样只在会话进行中计。
+// 日期口径与 noteActivity 逐字一致（当前墙钟优先，时钟不可信时退回这本书最后见过
+// 的时间），页数落地在书自己的日桶和聚合日桶各一份。
+void notePageTurn() {
+    if (!s_session.active || s_books.empty()) return;
+    auto &book = s_books[0];  // beginSession 里 touchBook 把当前书挪到了 0
+    const uint32_t ref = referenceTimestamp(RdTime::nowEpoch(), book.lastReadAt);
+    recordPages(book, ref, 1);  // 时钟不可信时它自己跳过（页数没有日期可落）
+    book.totalPages++;          // 总数不依赖日期，和 totalReadingMs 一个待遇：照记
+    markDirty();
 }
 
 void tickActiveSession() {
@@ -713,6 +756,23 @@ uint32_t currentStreakDays() {
 uint32_t maxStreakDays() {
     ensureSummary();
     return s_summary.maxStreakDays;
+}
+
+uint64_t totalPagesRead() {
+    ensureSummary();
+    return s_summary.totalPagesRead;
+}
+
+uint32_t todayPages() {
+    ensureSummary();
+    return s_summary.todayPages;
+}
+
+uint32_t pagesOnDay(uint32_t dayOrdinal) {
+    if (dayOrdinal == 0) return 0;
+    const auto it = std::lower_bound(s_readingDays.begin(), s_readingDays.end(), dayOrdinal,
+                                     [](const ReadingDayStats &day, uint32_t ord) { return day.dayOrdinal < ord; });
+    return (it == s_readingDays.end() || it->dayOrdinal != dayOrdinal) ? 0 : it->pages;
 }
 
 uint32_t readDaysCount() {

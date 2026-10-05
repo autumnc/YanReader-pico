@@ -59,6 +59,9 @@ class HalFile::Impl {
   DIR* dp = nullptr;   // 非空 = 这是个可枚举的目录（此时 fp 恒为空，不占 VFS 槽位）
   std::string path;
   bool isDir = false;
+  // openNextFile() 造出来的"目录项"（只有路径，没有打开句柄）。isOpen() 认它，
+  // 否则枚举循环会在第一个普通文件处收摊（见 isOpen 的注释）。
+  bool isEntry = false;
 };
 
 HalStorage HalStorage::instance;
@@ -352,13 +355,20 @@ HalFile HalFile::openNextFile() {
     std::string child = impl->path + "/" + nm;
     std::unique_ptr<Impl> ci(new (std::nothrow) Impl(static_cast<FILE*>(nullptr), child));
     if (!ci) return {};
+    ci->isEntry = true;   // 目录项本身是"有效"的，见 isOpen()
     struct stat st;
     if (::stat(child.c_str(), &st) == 0) ci->isDir = S_ISDIR(st.st_mode) != 0;
     return HalFile(std::move(ci));
   }
 }
 
-// "这个 HalFile 指向的东西有效吗"。目录也算有效——否则
-// `for (auto e = dir.openNextFile(); e; ...)` 遇到子目录就会提前收摊。
-bool HalFile::isOpen() const { return impl && (impl->fp != nullptr || impl->isDir); }
+// "这个 HalFile 指向的东西有效吗"。目录项也算有效——否则
+// `for (auto e = dir.openNextFile(); e; ...)` 遇到它就会提前收摊。
+//
+// **文件项也必须算有效**：openNextFile() 返回的文件项只有路径、没有打开句柄（fp 恒空），
+// 早先的判据是 `fp || isDir`，于是"枚举到第一个普通文件就收摊"——调用方的循环体一次都
+// 不执行。症状不是报错而是一片空白：DictionaryRegistry::findStem 永远看不到 *.idx
+// （entries=[]），resolveBasePath 永远失败，词典功能整体不可用（"未找到词典"），
+// 而用户把三件套摆得再对也没用。见 [[crossmux-dict-assets]]。
+bool HalFile::isOpen() const { return impl && (impl->fp != nullptr || impl->dp != nullptr || impl->isEntry); }
 HalFile::operator bool() const { return isOpen(); }

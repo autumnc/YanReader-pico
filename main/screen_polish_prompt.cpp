@@ -2,6 +2,7 @@
 #include "font_renderer.h"
 #include "settings_manager.h"
 #include "ime/IME.h"
+#include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划/阅读共用一份）
 #include "ui_helpers.h"
 #include "editor_vk.h"   // 虚拟键盘：没连蓝牙键盘时的唯一输入途径（自己解析点按）
 #include "text_sel.h"    // 输入框的触摸选区（三模式共享件）
@@ -20,6 +21,8 @@ static struct {
     int scroll = 0;    // 首个可见 vrow 索引
     bool imeActive = false;
 } g;
+
+static ImeField ppPromptField() { return ImeField{&g.buf, &g.cur}; }
 
 // 按 '\n' 切逻辑行,返回每行的起始字节偏移。
 static void splitLines(const std::string &s, std::vector<std::string> &lines, std::vector<int> &starts) {
@@ -53,20 +56,6 @@ static void locate(const std::string &s, int cur, int &lineIdx, int &lineStart, 
         lineIdx = i; lineStart = starts[i];
         xCells = byteToCells(lines[i], cur - lineStart);
     }
-}
-
-static int prevChar(int cur, const std::string &s) {
-    if (cur <= 0) return 0;
-    int p = cur - 1;
-    while (p > 0 && ((unsigned char)s[p] & 0xC0) == 0x80) p--;
-    return p;
-}
-
-static int nextChar(int cur, const std::string &s) {
-    if (cur >= (int)s.length()) return (int)s.length();
-    int n = cur + 1;
-    while (n < (int)s.length() && ((unsigned char)s[n] & 0xC0) == 0x80) n++;
-    return n;
 }
 
 // ── 版式：绘制与触摸命中共用 ──────────────────────────────────────────────
@@ -219,10 +208,10 @@ AppState screen_polish_prompt_handle(int key, ScreenContext &ctx) {
 
     if (g.imeActive && key != 0) {
         std::string imeOut;
-        if (g_ime.handleKey(key, imeOut)) {
+        // 多行字段：Enter 本来就落 '\n'（见下面那一支），输入法上屏带出的 '\n' 也别吞。
+        if (imeFieldKeyText(g_ime, key, /*multiline=*/true, imeOut)) {
             if (!imeOut.empty()) {
-                g.buf.insert(g.cur, imeOut);
-                g.cur += (int)imeOut.length();
+                imeFieldInsert(ppPromptField(), imeOut);
             }
             drawPromptEditor();
             return APP_POLISH_PROMPT;
@@ -254,18 +243,13 @@ AppState screen_polish_prompt_handle(int key, ScreenContext &ctx) {
     }
 
     if (key == 0x0A || key == 0x0D) {  // Enter 换行
-        g.buf.insert(g.cur, 1, '\n');
-        g.cur++;
+        imeFieldInsert(ppPromptField(), "\n");
     } else if (key == 0x7F || key == 0x08) {  // Backspace
-        if (g.cur > 0) {
-            int p = prevChar(g.cur, g.buf);
-            g.buf.erase(p, g.cur - p);
-            g.cur = p;
-        }
+        imeFieldBackspace(ppPromptField());
     } else if (key == KEY_LEFT) {
-        g.cur = prevChar(g.cur, g.buf);
+        imeFieldMoveLeft(ppPromptField());
     } else if (key == KEY_RIGHT) {
-        g.cur = nextChar(g.cur, g.buf);
+        imeFieldMoveRight(ppPromptField());
     } else if (key == KEY_UP) {
         int lineIdx, lineStart, xCells;
         locate(g.buf, g.cur, lineIdx, lineStart, xCells);
@@ -287,8 +271,7 @@ AppState screen_polish_prompt_handle(int key, ScreenContext &ctx) {
                 cellsToByte(target, 0, (int)target.length(), xCells);
         }
     } else if (key >= 0x20 && key <= 0x7E) {
-        g.buf.insert(g.cur, 1, (char)key);
-        g.cur++;
+        imeFieldInsert(ppPromptField(), std::string(1, (char)key));
     }
 
     drawPromptEditor();

@@ -8,9 +8,9 @@
 #include <sys/stat.h>
 #include <utime.h>
 #include <esp_log.h>
-#include <esp_http_client.h>
-#include <esp_crt_bundle.h>
 #include <mbedtls/base64.h>
+
+#include "net/http.h"
 
 static const char *TAG = "WebDAV";
 WebDavClient g_webdav;
@@ -34,11 +34,15 @@ static std::vector<PropfindEntry> parsePropfindResponse(const std::string &xml) 
             if (!respStart) break;
         }
         const char *respEnd = strstr(respStart, "</d:response>");
+        size_t endTagLen = 13;   // strlen("</d:response>")
         if (!respEnd) {
             respEnd = strstr(respStart, "</response>");
+            endTagLen = 11;      // strlen("</response>")
             if (!respEnd) break;
         }
-        std::string block(respStart, respEnd - respStart + 14);
+        // 长度必须按实际结束标签算：写死 +14 时 `</response>`（11 字节）会多读 3 字节，
+        // 结束标签正好贴住缓冲末尾的那个 `</d:response>`(+14) 也会越过 NUL 多读 1 字节。
+        std::string block(respStart, static_cast<size_t>(respEnd - respStart) + endTagLen);
 
         PropfindEntry entry;
 
@@ -128,70 +132,38 @@ static std::string httpRequest(const std::string &url, const std::string &method
                                 const std::string &contentType = "",
                                 const std::string &extraHeader = "",
                                 int *outStatusCode = nullptr) {
-    esp_http_client_config_t cfg = {};
-    cfg.url = url.c_str();
-    cfg.method = method == "GET" ? HTTP_METHOD_GET :
-                 method == "PUT" ? HTTP_METHOD_PUT :
-                 method == "DELETE" ? HTTP_METHOD_DELETE :
-                 method == "MKCOL" ? HTTP_METHOD_MKCOL :
-                 method == "HEAD" ? HTTP_METHOD_HEAD :
-                 HTTP_METHOD_PROPFIND;
-    cfg.timeout_ms = 30000;
-    cfg.skip_cert_common_name_check = true;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    net::Request req;
+    req.url = url;
+    req.method = method == "GET" ? net::Method::Get :
+                 method == "PUT" ? net::Method::Put :
+                 method == "DELETE" ? net::Method::Delete :
+                 method == "MKCOL" ? net::Method::Mkcol :
+                 method == "HEAD" ? net::Method::Head :
+                 net::Method::Propfind;
+    req.timeout_ms = 30000;
+    req.cap = 2 * 1024 * 1024;  // 软上限，防止响应体把内存撑爆
+    // 墙钟上限：挂住的对端会让同步任务永远停在读循环里（界面一直"同步中"）。
+    // PROPFIND 响应可能较大，给 60s 宽裕些；PUT/DELETE 的响应本身很小，不受影响。
+    req.deadline_ms = 60000;
+    req.headers.push_back({"User-Agent", "pjournal-esp32/1.0"});
+    if (!auth.empty()) req.headers.push_back({"Authorization", auth});
+    if (!contentType.empty()) req.headers.push_back({"Content-Type", contentType});
+    if (!extraHeader.empty()) req.headers.push_back({"Depth", extraHeader});
+    req.body = body;
 
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return "";
-
-    esp_http_client_set_header(client, "User-Agent", "pjournal-esp32/1.0");
-    if (!auth.empty()) esp_http_client_set_header(client, "Authorization", auth.c_str());
-    if (!contentType.empty()) esp_http_client_set_header(client, "Content-Type", contentType.c_str());
-    if (!extraHeader.empty()) esp_http_client_set_header(client, "Depth", extraHeader.c_str());
-
-    std::string response;
-    int status = 0;
-    int bodyLen = (!body.empty() && method != "GET" && method != "HEAD") ? (int)body.size() : 0;
-    esp_err_t err = esp_http_client_open(client, bodyLen);
-    if (err == ESP_OK) {
-        // Write request body for PUT/POST/etc
-        if (bodyLen > 0) {
-            int written = esp_http_client_write(client, body.c_str(), bodyLen);
-            ESP_LOGI(TAG, "Written %d/%d bytes to request body", written, bodyLen);
-        }
-
-        int content_length = esp_http_client_fetch_headers(client);
-        status = esp_http_client_get_status_code(client);
-        ESP_LOGI(TAG, "HTTP %s %s status=%d content_length=%d",
-                 method.c_str(), url.c_str(), status, content_length);
-
-        // 读取响应体 (上限 2MB 防止内存耗尽)
-        const size_t MAX_RESPONSE_SIZE = 2 * 1024 * 1024;
-        if (status == 200 || status == 207 || content_length > 0) {  // PROPFIND 返回 207
-            char buf[512];
-            int len;
-            int total_read = 0;
-            while ((len = esp_http_client_read(client, buf, sizeof(buf) - 1)) > 0) {
-                if (response.size() + len > MAX_RESPONSE_SIZE) {
-                    ESP_LOGW(TAG, "Response body exceeds 2MB limit, truncating");
-                    break;
-                }
-                buf[len] = 0;
-                response += buf;
-                total_read += len;
-                // 如果 content_length 为 -1（chunked），继续读取
-                // 如果有明确长度，检查是否读完
-                if (content_length > 0 && total_read >= content_length) break;
-            }
-            ESP_LOGI(TAG, "Total bytes read: %d", total_read);
-        }
+    net::Response resp = net::request(req);
+    int status = resp.status;
+    if (resp.err != ESP_OK) {
+        ESP_LOGW(TAG, "HTTP %s %s 失败: %s", method.c_str(), url.c_str(),
+                 esp_err_to_name(resp.err));
+        status = -static_cast<int>(resp.err);  // 用负的错误码表示网络错误
     } else {
-        ESP_LOGW(TAG, "HTTP %s %s open failed: %d", method.c_str(), url.c_str(), err);
-        status = -err;  // 使用负的错误码表示网络错误
+        ESP_LOGI(TAG, "HTTP %s %s status=%d bytes=%u", method.c_str(), url.c_str(), status,
+                 static_cast<unsigned>(resp.got));
+        if (resp.truncated) ESP_LOGW(TAG, "Response body exceeds 2MB limit, truncating");
     }
-
-    esp_http_client_cleanup(client);
     if (outStatusCode) *outStatusCode = status;
-    return response;
+    return resp.body;
 }
 
 bool WebDavClient::ensureDirectory(const std::string &path) {

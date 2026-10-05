@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Build + run the host-side pinyin IME harness. See README.md.
+#
+#   tests/host/ime/run.sh                    # build, run diagnostics + the regression test
+#   tests/host/ime/run.sh --regress-only     # build, run only the regression test (quiet)
+#   tests/host/ime/run.sh --verify-fix       # prove the regression fails on the pre-fix IME.cpp
+#   tests/host/ime/run.sh zhege 1            # build, then one ad-hoc diagnostic scenario
+#   tests/host/ime/run.sh --regress jiushi 就是
+#
+# Plain g++ -std=c++17; no ESP-IDF, no CMake, no device.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+BUILD="$SCRIPT_DIR/build"
+BIN="$BUILD/ime_driver"
+
+mkdir -p "$BUILD"
+
+# The .incbin paths in stubs.cpp are relative to the repo root, so build from there.
+cd "$REPO"
+
+CXX="${CXX:-g++}"
+# -Wno-sign-compare: the warnings come from the firmware sources (main/ime/IME.cpp), which
+# are compiled verbatim; the ESP-IDF build does not enable -Wall, and we do not patch them.
+CXXFLAGS=(-std=c++17 -O1 -g -Wall -Wno-unused-variable -Wno-unused-function -Wno-sign-compare)
+
+# $1 = output binary, $2 = path to the IME.cpp to compile (repo one by default)
+build() {
+    local out="$1" ime_src="$2"
+    echo ">> compiling $out"
+    "$CXX" "${CXXFLAGS[@]}" \
+        -I "$SCRIPT_DIR" \
+        -I "$REPO/main" \
+        -I "$REPO/main/ime" \
+        "$SCRIPT_DIR/ime_driver.cpp" \
+        "$SCRIPT_DIR/stubs.cpp" \
+        "$ime_src" \
+        "$REPO/main/ime/yong_dict.cpp" \
+        "$REPO/main/ime/yong_pinyin.cpp" \
+        -o "$out"
+}
+
+build "$BIN" "$REPO/main/ime/IME.cpp"
+
+# The two sequences from the bug report. The intermediate keystroke matters, so the
+# driver feeds them one at a time (see ime_driver.cpp).
+REGRESS_CASES=("zhege 这个" "jiushi 就是")
+
+run_regress() {
+    local bin="$1" expect="$2" failed=0
+    for case in "${REGRESS_CASES[@]}"; do
+        for paging in "" "--fixed"; do
+            if "$bin" --regress $case $paging > "$BUILD/regress.out" 2>&1; then
+                echo "  pass [$expect] regress $case ${paging:-width-paging}"
+            else
+                echo "  FAIL [$expect] regress $case ${paging:-width-paging}"
+                sed -n '/=== regression/,$p' "$BUILD/regress.out"
+                failed=1
+            fi
+        done
+    done
+    return $failed
+}
+
+case "${1:-}" in
+    --regress-only)
+        echo ">> regression test (current main/ime/IME.cpp)"
+        run_regress "$BIN" "current"
+        echo ">> regression passed"
+        exit 0
+        ;;
+    --verify-fix)
+        # Build a second binary against the PRE-FIX IME.cpp taken from git HEAD (the
+        # working copy has the fix). Expectation: passes now, fails before the fix.
+        if ! git -C "$REPO" show HEAD:main/ime/IME.cpp > "$BUILD/IME_prefix.cpp" 2>/dev/null; then
+            echo ">> cannot read HEAD:main/ime/IME.cpp (not a git repo?) - skipping pre-fix check"
+            exit 0
+        fi
+        if cmp -s "$BUILD/IME_prefix.cpp" "$REPO/main/ime/IME.cpp"; then
+            echo ">> WARNING: HEAD:main/ime/IME.cpp is identical to the working copy;"
+            echo ">>          the pre-fix check is vacuous (is the fix committed?)"
+        fi
+        build "$BUILD/ime_driver_prefix" "$BUILD/IME_prefix.cpp" >/dev/null
+
+        echo ">> regression against the PRE-FIX build (expect FAIL):"
+        if run_regress "$BUILD/ime_driver_prefix" "pre-fix"; then
+            echo ">> UNEXPECTED: pre-fix build passed the regression"
+            exit 1
+        fi
+        echo ">> regression against the CURRENT build (expect PASS):"
+        run_regress "$BIN" "current"
+        echo ">> verified: fails before the fix, passes after"
+        exit 0
+        ;;
+esac
+
+if [ "$#" -ge 1 ]; then
+    exec "$BIN" "$@"
+fi
+
+echo ">> running diagnostic scenarios"
+for letters in zhege jiushi; do
+    for idx in 0 1 2; do
+        echo
+        echo "############################################################"
+        echo "# $letters  commit index $idx  (width paging)"
+        echo "############################################################"
+        "$BIN" "$letters" "$idx"
+    done
+    echo
+    echo "############################################################"
+    echo "# $letters  commit index 0  (fixed page-size paging)"
+    echo "############################################################"
+    "$BIN" "$letters" 0 --fixed
+done
+
+echo
+echo "############################################################"
+echo "# regression test (zhege/jiushi, both paging modes)"
+echo "############################################################"
+run_regress "$BIN" "current"
+echo ">> all regression cases passed"

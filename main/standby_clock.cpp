@@ -1,5 +1,7 @@
 #include "standby_clock.h"
 
+#include <HalStorage.h>   // 图片表盘：判缓存 BMP 在不在
+
 #include "chinese_almanac.h"
 #include "fb_fast.h"        // 封面灰阶落屏：4bpp 直写（u8g2 shim 只有 1 位）
 #include "font_renderer.h"
@@ -28,6 +30,7 @@ StandbyFace standbyFaceFromKey(const char *key) {
     if (strcmp(key, "clock") == 0) return StandbyFace::Clock;
     if (strcmp(key, "almanac") == 0) return StandbyFace::Almanac;
     if (strcmp(key, "cover") == 0) return StandbyFace::Cover;
+    if (strcmp(key, "image") == 0) return StandbyFace::Image;
     return StandbyFace::Off;
 }
 
@@ -36,6 +39,7 @@ const char *standbyFaceKey(StandbyFace f) {
         case StandbyFace::Clock: return "clock";
         case StandbyFace::Almanac: return "almanac";
         case StandbyFace::Cover: return "cover";
+        case StandbyFace::Image: return "image";
         default: return "off";
     }
 }
@@ -45,6 +49,7 @@ const char *standbyFaceLabel(StandbyFace f) {
         case StandbyFace::Clock: return "简约时钟";
         case StandbyFace::Almanac: return "老黄历";
         case StandbyFace::Cover: return "书籍封面";
+        case StandbyFace::Image: return "图片";
         default: return "关闭";
     }
 }
@@ -377,30 +382,42 @@ static void drawAlmanacFace(bool valid) {
 }
 
 // ── 书籍封面表盘 ──────────────────────────────────────────────────────────
-// 整屏只放封面：**不画时刻 / 日期 / 书名 / 进度**（用户要求：待机时把空间全留给封面，
-// 封面以最清晰的形式显示）。原来那套"封面 + 一列信息"的版式（横屏封面在左、信息在右，
-// 竖屏封面上 3/5、信息在下）连同它的书名折行工具 wrapToWidth / utf8Step 一起撤掉了；
-// 要恢复的话照 drawClockFace 的排版口径重写一列即可，书名那一列是"分隔线 + 垂直居中
-// 折行 + 进度钉底"三段，源文在 // 已废弃 那段记录里。
+// 版式：**上边封面，下来时刻，再下来日期，最底一行书名 + 进度条**（用户要求恢复"改成
+// 整屏单图之前"的那一版）。封面缩到屏宽 2/3、高 55%（框见 readerStandbyCoverBox），
+// 下面那几行才有地方站。
 //
 // 清晰度靠两件事，都不在绘制这一层：
-//   1) 框几乎占满整屏（原来竖屏只有 60% 的高度给封面）：同一张图下采样比更小，
-//      丢的细节更少；
+//   1) 封面框贴合常见封面的 2:3（456:668@竖屏）：同一张图下采样比更小，丢的细节更
+//      少；待机封面缓存就是按这个框解出来的（standby_v2.bmp），绘制端与它 1:1；
 //   2) readerCoverScale 里改成**只缩不放**（scale ≤ 1）：源图比框小就按原尺寸画。
 //      放大要么复制像素、要么插值，画出来的细节都是编的，只会更糊。
 // 封面像素用 fb_fast 直写（0..15 灰阶），不走 g_rd.drawGrayscale16Pixel：g_rd 绑的是
 // front_fb，而待机表盘画在 ui_render 的工作缓冲上（见 ui_render.cpp 那条不变式）。
 
-static void drawCoverFace() {
-    // 页边距只留短边的 2.5%（原来是 4.5%，那个值是给信息列让出来的）：面板四周本来
-    // 就有 3~4px 盖边，留一点点就够，剩下的全给封面。框就是整屏减这一圈。
+// 把一行文字截到 maxW 宽（超出接省略号）。按 UTF-8 整字步进，不劈字。
+static std::string ellipsizeToWidth(const std::string &s, int maxW) {
+    if (g_font.textWidth(s.c_str()) <= maxW) return s;
+    const char *kEll = "…";
+    std::string out;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        const int len = (c < 0x80) ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        if (i + static_cast<size_t>(len) > s.size()) break;
+        std::string cand = out + s.substr(i, static_cast<size_t>(len));
+        if (g_font.textWidth((cand + kEll).c_str()) > maxW) break;
+        out.swap(cand);
+        i += static_cast<size_t>(len);
+    }
+    return out + kEll;
+}
+
+static void drawCoverFace(const struct tm &tm, bool valid) {
+    const int W = SCREEN_W, H = SCREEN_H;
     // 框的定义挪到 screen_reader 的 readerStandbyCoverBox：待机封面的缓存文件是按
     // 这个尺寸解的，两边算出来必须一样，那条 1:1 直拷快路径才命中得了。
     int boxX = 0, boxY = 0, boxW = 0, boxH = 0;
     readerStandbyCoverBox(boxX, boxY, boxW, boxH);
 
-    // 书名与进度不再显示，但 readerLastBookCover 是"最后一本书 + 它的封面缓存路径"
-    // 的唯一出口，两个出参照样接着 —— title 还能区分"没读过书"和"这本书没封面"两种情况。
     std::string bmp, title;
     int percent = 0;
     const bool hasBook = readerLastBookCover(bmp, title, percent);
@@ -408,7 +425,7 @@ static void drawCoverFace() {
     bool drew = false;
     if (hasBook) {
         const size_t cap = static_cast<size_t>(boxW) * static_cast<size_t>(boxH);
-        // 一张整屏封面约 300KB：**必须 PSRAM**（内部 RAM 挤不出这么大一块，见
+        // 一张封面约 200KB：**必须 PSRAM**（内部 RAM 挤不出这么大一块，见
         // internal-ram-squeeze）。拿不到就退占位框 —— 表盘本身还是要出来的。
         uint8_t *buf = static_cast<uint8_t *>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (buf) {
@@ -429,11 +446,119 @@ static void drawCoverFace() {
     u8g2_SetDrawColor(g_u8g2, 0);
     if (!drew) {
         // 没有封面可画（没读过书 / 这本书还没生成封面缓存 / PSRAM 要不到）：
-        // 细框 + 一行说明，别让整屏白得看不出"这是待机画面"。
+        // 细框 + 一行说明，别让整屏白得看不出"这是待机画面"。下面三行照样画。
         u8g2_DrawFrame(g_u8g2, boxX, boxY, boxW, boxH);
         drawCenteredIn(boxX, boxW, boxY + boxH / 2 + g_font.ascent() / 2,
                        hasBook ? "暂无封面" : "还没读过书");
     }
+
+    // ── 封面下：时刻 / 日期 / 书名 + 进度 ──────────────────────────────────
+    // 下面三行从**底**往上钉（进度条压底、日期/书名依次向上），时刻块吃掉剩下的高度
+    // 再垂直居中。反过来（从上往下累加）在横屏会溢出屏底 —— 那里封面上方的空间只有
+    // 一百多像素。
+    const int lineGap = FONT_H * 6 / 5;      // 与 drawClockFace 同一口径的行距
+    const int bottom = H - boxY;             // 与上边距对称，不另算一套
+    const int barH = 18;
+    const int barY = std::max(boxY + boxH + 24, bottom - barH);
+    const int titleBase = barY - FONT_H * 2 / 5;
+    const int dateBase = titleBase - lineGap;
+    const int infoTop = boxY + boxH + 24;
+    int timeAvail = dateBase - FONT_H - infoTop;
+    if (timeAvail < 40) timeAvail = 40;      // 兜底：宁可挤一点也不叠字
+
+    // 时刻块：数字高 = 可用高度，再按宽度收（4 个数字 + 冒号 + 5 个间隙）。
+    const int colGap = 12;
+    const int maxW = W - 2 * boxX;
+    int dh = timeAvail;
+    int dw = static_cast<int>(dh * 0.55f);
+    if (4 * dw + dw * 35 / 100 + 5 * colGap > maxW) {
+        dw = static_cast<int>(static_cast<float>(maxW - 5 * colGap) / 4.35f);
+        dh = static_cast<int>(dw / 0.55f);
+    }
+    if (dw < 20) { dw = 20; dh = static_cast<int>(dw / 0.55f); }
+    const int colonW = dw * 35 / 100;
+    const int totalW = 4 * dw + colonW + 5 * colGap;
+    int tx = (W - totalW) / 2;
+    if (tx < 0) tx = 0;
+    // 按宽度收过之后，把时刻块在"信息区上沿 ~ 日期的上沿"之间重新居中。
+    int timeTop = infoTop + (dateBase - FONT_H - infoTop - dh) / 2;
+    if (timeTop < infoTop) timeTop = infoTop;
+    drawTimeSevenSeg(tx, timeTop, dw, dh, colonW, colGap, valid, tm);
+
+    char dateBuf[64];
+    if (valid) {
+        snprintf(dateBuf, sizeof(dateBuf), "%d 年 %d 月 %d 日  星期%s",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, kWdayCn[tm.tm_wday % 7]);
+    } else {
+        snprintf(dateBuf, sizeof(dateBuf), "尚未对时");
+    }
+    drawCentered(dateBase, dateBuf);
+
+    if (!hasBook) {
+        drawCentered(titleBase, "还没读过书");
+        return;
+    }
+    // 书名一行，放不下就省略号截断（折行会把下面的进度条挤出屏）。
+    const std::string shown = ellipsizeToWidth(title, maxW);
+    drawCentered(titleBase, shown.c_str());
+
+    // 进度：横条 + 百分比，整体居中。条画在书名下方那一行，百分比跟在条后面。
+    char pct[16];
+    snprintf(pct, sizeof(pct), "%d%%", percent);
+    const int pctW = g_font.textWidth(pct);
+    const int barW = W * 55 / 100;
+    const int groupW = barW + 16 + pctW;
+    const int gx = (W - groupW) / 2;
+    u8g2_DrawFrame(g_u8g2, gx, barY, barW, barH);
+    int filled = (barW - 4) * (percent < 0 ? 0 : (percent > 100 ? 100 : percent)) / 100;
+    if (filled > 0) u8g2_DrawBox(g_u8g2, gx + 2, barY + 2, filled, barH - 4);
+    g_font.drawText(gx + barW + 16, barY + barH / 2 + g_font.ascent() / 2, pct, false);
+}
+
+// ── 图片表盘 ──────────────────────────────────────────────────────────────
+// 用户自己选的一张图铺满整屏（文件管理里长按图片 → 「设为待机画面」）。**只有图**：
+// 不叠时刻、不叠状态栏 —— 选它的人要的就是"待机时看到这张画"。想同时看时间就选
+// 「书籍封面」或「简约时钟」。
+//
+// 像素来自 screen_reader 侧预先解好的 Gray8 BMP 缓存（原图在选中那一刻就解好了，
+// 见 screen_reader.h 的 readerStandbyImage）——待机是休眠前的最后一屏，这里**绝不能**
+// 现解一张几百万像素的 JPEG。缓存按屏尺寸命名，转了屏就换一张；这一张还没做出来时
+// （转屏后第一次、或从网页设的图本机还没空闲补做）画提示，不阻塞休眠。
+static void drawImageFace() {
+    const int W = SCREEN_W, H = SCREEN_H;
+    std::string bmp, src;
+    const bool hasChoice = readerStandbyImage(bmp, src);
+    const bool hasCache = hasChoice && Storage.exists(bmp.c_str());
+
+    bool drew = false;
+    if (hasCache) {
+        const size_t cap = static_cast<size_t>(W) * static_cast<size_t>(H);
+        // 整屏 ~800KB：**必须 PSRAM**（内部 RAM 挤不出这么大一块，见 internal-ram-squeeze）。
+        uint8_t *buf = static_cast<uint8_t *>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (buf) {
+            int dw = 0, dh = 0, ox = 0, oy = 0;
+            // **只缩不放**（readerCoverScale 的口径）：缓存本来就是按这个屏尺寸 fit 出来
+            // 的，所以正常情况下是 1:1 直拷；比屏小的那张也不放大，居中留白。
+            if (readerCoverScale(bmp, W, H, buf, cap, dw, dh, ox, oy)) {
+                fb_fast_sync();  // 每帧入口同步一次旋转/尺寸（见 fb_fast.h）
+                uint8_t *fb = u8g2_GetBufferPtr(g_u8g2);
+                for (int y = 0; y < dh; y++) {
+                    const uint8_t *row = buf + static_cast<size_t>(y) * static_cast<size_t>(dw);
+                    for (int x = 0; x < dw; x++) fb_fast_set_gray(fb, ox + x, oy + y, row[x]);
+                }
+                drew = true;
+            }
+            heap_caps_free(buf);
+        }
+    }
+
+    if (drew) return;
+    // 画不出来：细框 + 一行说明。两种原因分开说，因为它们要做的事不一样。
+    u8g2_SetDrawColor(g_u8g2, 0);
+    const int m = (W < H ? W : H) / 20;
+    u8g2_DrawFrame(g_u8g2, m, m, W - 2 * m, H - 2 * m);
+    drawCentered(H / 2 - FONT_H, hasChoice ? "待机图片还没准备好" : "还没选待机图片");
+    drawCentered(H / 2 + FONT_H, hasChoice ? "（正在生成，稍后再试）" : "文件管理里长按图片可设置");
 }
 
 // ── 「关闭」表盘的提示页 ──────────────────────────────────────────────────
@@ -465,7 +590,7 @@ static void drawCenteredPx(int baseline, int px, const char *s, uint8_t fg, uint
         char ch[5];
         memcpy(ch, p, (size_t)m);
         ch[m] = '\0';
-        ttf_draw_text_px(fb, x, baseline, px, ch, EPD_DRAW_ALIGN_LEFT, fg, bg);
+        ttf_draw_text_px(fb, x, baseline, px, ch, TTF_ALIGN_LEFT, fg, bg);
         x += (m == 1) ? ttf_text_width_px(px, ch) : px;
         p += m;
     }
@@ -499,7 +624,7 @@ void standbyClockDraw(StandbyFace face) {
         ttf_set_role(TTF_ROLE_CONTENT);   // 本页走内容面（正文那一路的字体）
         drawOffNotice();
         ttf_set_role(prev_role);
-        ui_send_buffer();
+        ui_full_refresh_now();
         return;
     }
 
@@ -509,11 +634,13 @@ void standbyClockDraw(StandbyFace face) {
     if (face == StandbyFace::Almanac)
         drawAlmanacFace(valid);
     else if (face == StandbyFace::Cover)
-        drawCoverFace();   // 封面表盘不显示时刻/日期，用不上 lt/valid
+        drawCoverFace(lt, valid);   // 封面表盘恢复成"封面 + 时刻/日期/书名/进度"
+    else if (face == StandbyFace::Image)
+        drawImageFace();            // 整屏只有用户选的那张图
     else
         drawClockFace(lt, valid);
 
-    ui_send_buffer();  // 整屏 GC16；不更新快照，唤醒后据此恢复
+    ui_full_refresh_now();  // 整屏 GC16；不更新快照，唤醒后据此恢复
 }
 
 // ── 关机页 ────────────────────────────────────────────────────────────────
@@ -534,7 +661,7 @@ void standbyShutdownDraw() {
     drawCenteredPx(top + ttf_ascender_px(pxTitle), pxTitle, "已关机", 0, 15);
     drawCenteredPx(top + pxTitle + gap + ttf_ascender_px(pxSub), pxSub, "长按电源键约 1 秒开机", 0, 15);
     ttf_set_role(prev_role);
-    ui_send_buffer();   // 整屏 GC16，推完才返回（ui_render_full_refresh 是同步的）
+    ui_full_refresh_now();   // 整屏 GC16，推完才返回（ui_render_full_refresh 是同步的）
 }
 
 void standbyClockPreview(StandbyFace face, int ms) {

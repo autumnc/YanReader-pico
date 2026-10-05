@@ -54,9 +54,11 @@ void ui_commit();
 // 对当前帧缓冲做一次整屏 GC16 全刷（清掉局刷/DU 攒下的残影）。不重绘、不重排：
 // 帧缓冲里就是当前画面，全刷只是换 GC16 波形把它重画一遍。长按中间确认键调用，
 // 各模式通用（见 main.cpp 的全局键处理）。
+//
+// 待机提示页也用它（standby_clock.cpp）——那里要的是"推上去但**别动**保留帧"，而本
+// 函数本来就不碰保留帧（快照只由 ui_invalidate_snapshot / ui_restore_snapshot 管），
+// 所以曾经另起的名字 ui_send_buffer() 是同一件事的第二个说法，已删。
 void ui_full_refresh_now();
-// 只发送缓冲不更新快照(休眠提示用:唤醒后需按快照恢复,快照须保持提示前画面)
-void ui_send_buffer();
 // 用快照恢复缓冲并整屏发送(休眠唤醒后清除"休眠中"提示)
 void ui_restore_snapshot();
 void ui_invalidate_snapshot();
@@ -75,9 +77,6 @@ void ui_set_fast_partial(bool enable);
 // 周期 GC16 兜底同样挂起(见 ui_set_fast_partial)：局刷每 8 次本会升级一次整屏
 // GC16，落在输入法上就是"敲几个字闪一屏"，这正是要避免的。
 void ui_set_local_only(bool enable);
-// 冲刷合并窗口已到期的 IME 候选/编码条局刷。主循环每轮调用，把 IME_DEFER_US
-// 内的连续输入合并成一次跟随 DU 刷新（仅 IME 条，不影响编辑区/整屏路径）。
-void ui_flush_ime_deferred();
 int  ui_text_width(const char *text);
 void ui_draw_text(int x, int y, const char *text, bool invert = false, bool bold = false);
 void ui_draw_text_centered(int y, const char *text, bool invert = false, bool bold = false);
@@ -123,15 +122,59 @@ std::vector<VRow> buildVrows(const std::vector<std::string> &lines,
                              const std::vector<MdLineInfo> *mdInfoIn = nullptr,
                              const std::set<int> *foldedHeadings = nullptr);
 
+// ── 编辑区正文字号（"显示与版式 → 正文字号"）──────────────────────────────
+// 设置项 editor_font_size（像素高，档位 34/45/56/68，45 = 与界面 20pt 同高的标准档）。
+// 编辑器**正文整块**（布局、换行、光标、选区、触摸命中、竖排）都按这个字号算，界面框架
+// （状态栏、输入法条、查找/帮助/快捷菜单浮层）仍是界面字号。
+//
+// 实现方式：进正文作用域时把 FontRenderer 的**共享格子**整块换成这个字号
+// （font_renderer.h 的 FontScope），出来自动还原。这样正文那几十处派生式
+// （FONT_H / LINE_SPACING / ascent() / halfAdvance()）连带 buildVrows、markdown_render
+// 全都跟着走，不用逐个调用点改；代价是作用域里画界面框架的地方必须显式钉回
+// `FontRenderer::uiPxHeight()`（见 drawIMEUI 等）。
+int editorBodyFontPx();
+
+// ── 界面框架字号哨兵 ─────────────────────────────────────────────────────
+// 上面那套"正文整块换格子"有一个已知代价：**界面框架必须自己钉回界面字号**。漏钉的
+// 症状只在用户把正文字号调离默认档之后才出现（默认档正文与界面同高，漏了也看不出来），
+// 而且表现为"状态栏高了半格""候选条挤了"这种一眼看不出对错的错版——最难查的一类。
+//
+// 所以每个界面框架绘制入口在**钉回之后**对一次账：格子是不是真回到了界面档？不是就
+// 记一条日志（**每个入口只报一次**，免得每帧刷屏）。正常路径的代价是一次整数比较；
+// 买到的是"将来某次把 FontScope 那行删了/写错档"在日志里立刻有一句话，而不是靠肉眼
+// 去比对一个只有在非默认设置下才显形的版式。
+//
+// 用法：在 `FontScope ui(FontRenderer::uiPxHeight());` 的下一行写 `UI_FONT_GUARD();`。
+void uiFontGuard(const char *who);
+#define UI_FONT_GUARD() uiFontGuard(__func__)
+
+// ── 输入法候选行：字号 / 度量 / 测宽 / 直绘 ────────────────────────────────
+// 设置项「候选字大小」(ime_cand_size，像素高，档位 34/45/56/68，45=标准) 的**唯一**
+// 权威实现。两个消费者必须逐像素同一份：虚拟键盘的候选条(editor_vk.cpp)与实体键盘的
+// 输入法条(drawIMEUI)。输入法按这里量出来的宽度分页，画的时候若换个字号或换套量法，
+// "一行放几个候选"就会算错——多出来的被挤出屏幕右边，看不见也点不到。
+// **行高不在这一组里**：那随版面（键盘面板要指尖点得着，行高 px+20；输入法条是贴身
+// 一条，px+8），见 editor_vk.cpp 的 evkCandRowH 与 ui_helpers.cpp 的 imeBarRowH。
+int imeCandFontPx();                // 设置值 clamp 到 [28,96]，认不出 → 45
+int imeCandAscent();                // 该字号下的 ascent（字体没就绪 → 0.78em 近似）
+int imeCandStrW(const char *s);     // 候选串在该字号下的像素宽（ASCII = 半格，CJK = 字号宽）
+// 按候选字号直绘一段候选串（ASCII 半格走图标/比例拉丁，CJK 走 TTF）。invert = 反白
+// （调用方已填黑底，这里把字画白）。内部临时切到内容面，画完还原。
+void imeCandDrawText(int x, int baseline, const char *s, bool invert);
+
 // IME drawing helpers
 int imeStatusPanelTopY();
+// 输入法条（编码行 + 候选行）的总高。面板贴 bottomY 往上排，顶边 = bottomY - 本值。
+// 「候选字大小」改了它跟着变，所以给正文留位时要用这个函数，别写死行数。
+int imeBarPanelH();
 int imeFullscreenPanelTopY();
 int imeCandidateLineWidth();
 std::string imeStatusLabel(bool active);
-void drawIMEUI(int baseY, bool anchorBottom = false);
+// 画输入法条（编码行 + 候选行，两行贴着 bottomY 往上排）。三种落点见下面三个包装。
+void drawIMEUI(int bottomY);
 void drawIMEUIWithStatusBar();
 void drawIMEUIFullscreen();
-// 全屏候选面板的"给状态栏让位"版：整块面板上移一行，最后一行（候选）的下沿落在
+// 全屏候选面板的"给状态栏让位"版：整块面板上移，候选行的下沿落在
 // 状态栏上沿之上 3px——面板和状态栏**同时**要画时用它（计划模式加/重命名任务的
 // 输入框就是：面板按原样贴屏幕底，候选行整个被状态栏的白底盖住）。灵感/润色那些
 // "面板与状态栏二选一"的屏仍用 drawIMEUIFullscreen()：那里候选行贴底才对。

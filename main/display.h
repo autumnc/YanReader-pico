@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "epd_highlevel.h"
@@ -40,6 +41,13 @@ extern "C" {
 
 void rails_keepalive(void);
 void rails_idle_check(int64_t now_ms);
+
+/// 全设备夜间反色开关。反色的实施点在 display.c 的推屏处（front/back 成对取反），
+/// **不在** HalDisplay —— 后者只覆盖阅读器一族，其余界面由渲染任务直呼本文件，
+/// 从那里走（见 display.c 顶部说明）。由 board_set_night() 统一转发。
+/// / Global night-inversion switch. Applied inside display.c's present sites, not in
+/// HalDisplay (which only the reader family goes through).
+void display_set_night(bool on);
 
 /// 大量文件I/O期间增加扫描预填，调用方离开时恢复。/ Increase scan prefill during bulk file I/O; caller restores on exit.
 void display_set_bulk_io(bool active);
@@ -97,6 +105,14 @@ int display_pclk_mhz(void);
 /// 出现供数不足就退回安全频率并整屏重刷，其它错误码原样忽略。
 /// On underrun, drop to the safe clock and full-refresh; other error bits are ignored.
 void guard_draw_result(EpdiyHighlevelState* hl, enum EpdDrawError result);
+
+/// 软刷预算（残影计数）的读写口。整页差分刷攒够 APP_GC16_EVERY 次要升一次全像素
+/// GC16 —— 这份预算由 display.c 独有，UI 那条路（ui_render.cpp 的全屏推送）问它
+/// 要不要升、升完通知它归零，两边就不再各记一份。见 display.c 里的说明。
+/// / Shared soft-refresh budget: ui_render's full-screen present asks display.c whether
+/// this refresh should be promoted to GC16 and resets the budget after a GC16.
+bool display_soft_refresh_due(void);
+void display_soft_refresh_reset(void);
 
 #ifdef __cplusplus
 }

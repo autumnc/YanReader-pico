@@ -100,6 +100,38 @@ constexpr bool iequalsAscii(std::string_view value, std::string_view lowercaseKe
                     [](char a, char b) { return asciiToLower(a) == b; });
 }
 
+// 不区分大小写的 ASCII 子串查找。lowercaseNeedle 必须已经是小写。
+// 用途只有一个：`text-decoration` 里出现 "wavy"（含 Duokan 私有的 `duokan-wavyline`）。
+// 这里刻意用子串而不是整词比较 —— 供应商前缀的名字没法穷举，而 "wavy" 这个词根在
+// CSS 值里不会以别的意思出现。
+constexpr bool icontainsAscii(std::string_view haystack, std::string_view lowercaseNeedle) {
+  if (lowercaseNeedle.empty() || lowercaseNeedle.size() > haystack.size()) return false;
+  for (size_t i = 0; i + lowercaseNeedle.size() <= haystack.size(); ++i) {
+    if (iequalsAscii(haystack.substr(i, lowercaseNeedle.size()), lowercaseNeedle)) return true;
+  }
+  return false;
+}
+
+// `border-bottom-style` 的关键字全集里"确实会画出一条线"的那些（none/hidden 不在列）。
+constexpr bool isVisibleBorderStyle(std::string_view token) {
+  return iequalsAscii(token, "solid") || iequalsAscii(token, "double") || iequalsAscii(token, "dashed") ||
+         iequalsAscii(token, "dotted") || iequalsAscii(token, "groove") || iequalsAscii(token, "ridge") ||
+         iequalsAscii(token, "inset") || iequalsAscii(token, "outset");
+}
+
+// 非实线的那些：虚线/点线在古籍 CSS 里就是**书名线**（波浪线的廉价替身 —— 真波浪线要么用
+// border-image 图片，要么用多看私有的 `duokan-wavyline`，见春秋左传注的 .q2）。我们按波浪
+// 笔法画，好让它跟专名线的实线分得开：那本书正是 `span.q`（书名，dashed）对 `u`（专名，solid）。
+// 扫过的书里只有这一本用虚线；其余 7 本的专名线/书名线都是 solid。
+constexpr bool isNonSolidBorderStyle(std::string_view token) {
+  return iequalsAscii(token, "dashed") || iequalsAscii(token, "dotted");
+}
+
+// `border-bottom` 速记或 `border-bottom-style` 的值里有没有可见线样式。
+// 宽度和颜色一概不看 —— 古籍的书名线写的是 `3px solid transparent`，颜色过滤会把
+// 它整个滤掉（transparent 只是为了让 border-image 显形）。
+bool hasVisibleBorderLine(std::string_view value);  // 定义见 forEachDelimitedToken 之后
+
 // Walk s and invoke fn(token) for each non-empty run between delimiters.
 // Tokens are boundary-trimmed and yielded as string_views into s; no
 // allocation. Runs of consecutive delimiters coalesce — no empty tokens are
@@ -116,6 +148,23 @@ void forEachDelimitedToken(std::string_view s, Pred isDelimiter, F&& fn) {
       start = i + 1;
     }
   }
+}
+
+bool hasVisibleBorderLine(std::string_view value) {
+  bool found = false;
+  forEachDelimitedToken(value, isCssWhitespace, [&](std::string_view token) {
+    if (isVisibleBorderStyle(token)) found = true;
+  });
+  return found;
+}
+
+// 同上的另一问：这条边框线是虚线/点线吗（→ 按书名线的波浪笔法画）。
+bool hasNonSolidBorderLine(std::string_view value) {
+  bool found = false;
+  forEachDelimitedToken(value, isCssWhitespace, [&](std::string_view token) {
+    if (isNonSolidBorderStyle(token)) found = true;
+  });
+  return found;
 }
 
 // Parse the entirety of s as a number into `out`. Accepts an optional leading
@@ -512,6 +561,10 @@ CssTextDecoration CssParser::interpretDecoration(std::string_view val) {
       result = result | CssTextDecoration::Underline;
     } else if (iequalsAscii(token, "line-through")) {
       result = result | CssTextDecoration::LineThrough;
+    } else if (icontainsAscii(token, "wavy")) {
+      // 古籍书名线：`text-decoration: duokan-wavyline`（Duokan）或 `wavy`（标准
+      // text-decoration-style 值混进速记里）。整词比较在这里没用 —— 名字带厂商前缀。
+      result = result | CssTextDecoration::Wavy;
     }
   });
   return explicitNone ? CssTextDecoration::None : result;
@@ -633,8 +686,49 @@ void CssParser::parseDeclarationIntoStyle(std::string_view decl, CssStyle& style
     style.fontFamilyHash = fontFamilyHash(value);
     style.defined.fontFamily = 1;
   } else if (iequalsAscii(name, "text-decoration") || iequalsAscii(name, "text-decoration-line")) {
-    style.textDecoration = interpretDecoration(value);
+    // 速记法/line 里出现 "wavy" 一定意味着作者想要一条波浪线（没有别的理由写它），
+    // 而 `text-decoration-style: wavy` 只是修饰既有的线 —— 所以这里把 Wavy 补上
+    // Underline，而下面的 text-decoration-style 分支只补 Wavy、不补 Underline。
+    // 两条路合起来，"underline + 别的声明说 wavy" 也能得到波浪线。
+    CssTextDecoration decoration = interpretDecoration(value);
+    if ((decoration & CssTextDecoration::Wavy) != CssTextDecoration::None &&
+        (decoration & CssTextDecoration::Underline) == CssTextDecoration::None) {
+      decoration = decoration | CssTextDecoration::Underline;
+    }
+    // 整体接管，但同一块里先声明的 border-bottom 那条线要活下来 —— `text-decoration: none`
+    // 管不着边框（见 mergeBorderLine）。春秋左传注的 span.q / u 就是 `border-bottom` 紧跟
+    // `text-decoration: none` 的写法。
+    style.textDecoration = mergeBorderLine(decoration, style.textDecoration);
     style.defined.textDecoration = 1;
+  } else if (iequalsAscii(name, "text-decoration-style") || iequalsAscii(name, "-moz-text-decoration-style") ||
+             iequalsAscii(name, "-webkit-text-decoration-style")) {
+    // 只认 wavy。solid/double/dotted/dashed 在 1bpp 上都是同一条实线，忽略即可。
+    // 这里**或**进去（不是赋值）：本属性修饰的是同一规则里已经/将要出现的 underline，
+    // 覆盖掉它会随声明顺序丢线。`text-decoration-style: none` 也不去清已有的线 ——
+    // 没见过这种写法，而"清"要靠 text-decoration 那条路。
+    if (icontainsAscii(value, "wavy")) {
+      style.textDecoration = style.textDecoration | CssTextDecoration::Wavy;
+      style.defined.textDecoration = 1;
+    }
+  } else if (iequalsAscii(name, "border-bottom") || iequalsAscii(name, "border-bottom-style")) {
+    // 古籍的专名线/书名线用的是 `border-bottom: 1px solid #000` / `border-bottom: 3px
+    // solid transparent`（晋书、祖堂集、趙州録校注、玄鵺小说集、老子想尔注 —— 5/7 本）。
+    //
+    // **只认 border-bottom，绝不能顺手把 `border` 速记也认了**：扫过这 7 本书的全部 CSS，
+    // 块级元素（.yanwen、hr、td/th、ol.duokan-footnote-content、.calibre3）清一色用
+    // `border:` 速记，而 border-bottom 只出现在 span 上。认了速记就会给整段文字（以及
+    // 表格单元格、脚注列表）画上下划线；只认这一个属性刚好把它们全避开，也就不需要
+    // 把选择器/元素名传进来做内联元素判定。
+    if (hasVisibleBorderLine(value)) {
+      // BorderLine 只是出处标记（"这条线来自边框"），让后面的 `text-decoration: none`
+      // 抹不掉它；真正画线的是 Underline。非实线（虚线/点线）在这套 CSS 方言里是书名线，
+      // 按波浪笔法画，好跟专名线的实线分开。
+      style.textDecoration = style.textDecoration | CssTextDecoration::Underline | CssTextDecoration::BorderLine;
+      if (hasNonSolidBorderLine(value)) {
+        style.textDecoration = style.textDecoration | CssTextDecoration::Wavy;
+      }
+      style.defined.textDecoration = 1;
+    }
   } else if (iequalsAscii(name, "text-indent")) {
     style.textIndent = interpretLength(value);
     style.defined.textIndent = 1;

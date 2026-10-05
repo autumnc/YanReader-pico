@@ -8,12 +8,10 @@
 #include <cstdlib>
 #include <cstring>
 
-#include <esp_crt_bundle.h>
-#include <esp_http_client.h>
 #include <esp_log.h>
-#include <esp_timer.h>
 
 #include "json_parser.h"
+#include "net/http.h"
 
 static const char *TAG = "DictStore";
 
@@ -123,111 +121,20 @@ static inline uint32_t crc32Update(uint32_t crc, const uint8_t *p, size_t n) {
   return crc;
 }
 
-// ── HTTP 核心 ───────────────────────────────────────────────────────────
-// perform + ON_DATA 流式收 body：只有 perform 会跟随重定向，而 GitHub Release
-// 的下载地址必然 302 跳到 objects.githubusercontent.com。
-struct HttpSink {
-  std::string *mem = nullptr;                  // 收进内存（清单）
-  FILE *fp = nullptr;                          // 落盘（词典文件）
-  const std::function<void(size_t, size_t)> *progress = nullptr;
-  size_t got = 0;
-  size_t cap = 0;                              // >0 时超过即停
-  bool overflow = false;                       // 落盘/超限失败
-  bool wantCrc = false;
-  uint32_t crc = 0xFFFFFFFF;
-  int64_t deadline_us = 0;                     // >0：整个请求的墙钟上限
-  bool timed_out = false;
-};
-
-static esp_err_t httpEventHandler(esp_http_client_event_t *evt) {
-  HttpSink *s = static_cast<HttpSink *>(evt->user_data);
-  if (!s) return ESP_OK;
-  if (evt->event_id != HTTP_EVENT_ON_DATA || evt->data_len <= 0) return ESP_OK;
-  // 整体墙钟上限，理由见 opds_client.cpp 同处注释：timeout_ms 是每次读的超时，
-  // 会被每个到达的字节重置，对端慢慢挤字节就能把主任务永远钉在 perform 里。
-  if (s->deadline_us && esp_timer_get_time() > s->deadline_us) {
-    s->timed_out = true;
-    if (evt->client) esp_http_client_set_timeout_ms(evt->client, 1);
-    return ESP_OK;
-  }
-  if (evt->client) {
-    // 每个分片都重取状态码（不能锁存）：跟重定向时中间那个 302 也带一小段
-    // body，锁存会把正式内容一起丢掉。见 opds_client.cpp 同处注释。
-    int st = esp_http_client_get_status_code(evt->client);
-    if (st < 200 || st >= 300) return ESP_OK;
-  }
-  const size_t n = static_cast<size_t>(evt->data_len);
-  if (s->cap && s->got + n > s->cap) {
-    s->overflow = true;
-    return ESP_FAIL;  // 中止请求
-  }
-  if (s->mem) {
-    s->mem->append(static_cast<const char *>(evt->data), n);
-  }
-  if (s->fp) {
-    if (fwrite(evt->data, 1, n, s->fp) != n) {
-      s->overflow = true;
-      return ESP_FAIL;
-    }
-  }
-  if (s->wantCrc) s->crc = crc32Update(s->crc, static_cast<const uint8_t *>(evt->data), n);
-  s->got += n;
-  if (s->progress && *s->progress) {
-    size_t total = 0;
-    if (evt->client) {
-      int64_t cl = esp_http_client_get_content_length(evt->client);
-      if (cl > 0) total = static_cast<size_t>(cl);
-    }
-    (*s->progress)(s->got, total);
-  }
-  return ESP_OK;
-}
-
-// 执行一次 GET，body 交给 sink 处理。返回 true 表示 2xx 且完整收完。
-static bool httpGet(const std::string &url, HttpSink &sink, std::string &err) {
-  esp_http_client_config_t cfg = {};
-  cfg.url = url.c_str();
-  cfg.timeout_ms = 30000;
-  cfg.skip_cert_common_name_check = true;
-  cfg.crt_bundle_attach = esp_crt_bundle_attach;
-  cfg.max_redirection_count = 5;
-  cfg.buffer_size = 4096;
-  cfg.user_data = &sink;
-  cfg.event_handler = httpEventHandler;
+// ── HTTP ────────────────────────────────────────────────────────────────
+// 收发本身在 net/http（perform + ON_DATA，才能跟随重定向：GitHub Release 的
+// 下载地址必然 302 跳到 objects.githubusercontent.com）。这里只管 URL 与
+// "收到的东西往哪放"。
+static net::Request makeRequest(const std::string &url) {
+  net::Request req;
+  req.url = url;
+  req.headers = {{"User-Agent", "pjournal-pico/1.0"},
+                 {"Accept-Encoding", "identity"}};  // 免 gzip 解压
+  req.buffer_size = 4096;
   // 单次请求的墙钟上限：词典文件可能很大、链路可能很慢，给 10 分钟；超过说明对端
   // 在挤牙膏（或链路已死而 socket 还活着），中止比把 UI 卡死强。
-  sink.deadline_us = esp_timer_get_time() + 10LL * 60 * 1000000;
-
-  esp_http_client_handle_t client = esp_http_client_init(&cfg);
-  if (!client) {
-    err = "HTTP 初始化失败";
-    return false;
-  }
-  esp_http_client_set_header(client, "User-Agent", "pjournal-pico/1.0");
-  esp_http_client_set_header(client, "Accept-Encoding", "identity");  // 免 gzip 解压
-
-  esp_err_t e = esp_http_client_perform(client);
-  if (e != ESP_OK) {
-    ESP_LOGW(TAG, "请求失败: %s errno=%d url=%s", esp_err_to_name(e),
-             esp_http_client_get_errno(client), url.c_str());
-    err = sink.timed_out ? std::string("请求超时")
-                         : (std::string("请求失败: ") + esp_err_to_name(e));
-    esp_http_client_cleanup(client);
-    return false;
-  }
-  int status = esp_http_client_get_status_code(client);
-  esp_http_client_cleanup(client);
-  if (status < 200 || status >= 300) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "HTTP %d", status);
-    err = buf;
-    return false;
-  }
-  if (sink.overflow) {
-    err = "写入失败(空间不足?)";
-    return false;
-  }
-  return true;
+  req.deadline_ms = 10LL * 60 * 1000;
+  return req;
 }
 
 // ── 清单 ────────────────────────────────────────────────────────────────
@@ -239,11 +146,15 @@ bool dictCatalogFetch(const std::string &url, DictCatalog &out, std::string &err
     return false;
   }
 
-  std::string body;
-  HttpSink sink;
-  sink.mem = &body;
-  sink.cap = 512 * 1024;
-  if (!httpGet(url, sink, err)) return false;
+  net::Request req = makeRequest(url);
+  req.cap = 512 * 1024;  // 硬上限：清单超了必有蹊跷，直接中止
+  req.cap_hard = true;
+  net::Response resp = net::stream(req);  // sink 为空 → body 收进内存
+  if (!resp.ok) {
+    err = resp.error;
+    return false;
+  }
+  const std::string &body = resp.body;
   ESP_LOGI(TAG, "清单 %u 字节", static_cast<unsigned>(body.size()));
 
   JsonValue root = JsonValue::parse(body);
@@ -264,6 +175,13 @@ bool dictCatalogFetch(const std::string &url, DictCatalog &out, std::string &err
   if (out.baseUrl.back() != '/') out.baseUrl += '/';
 
   const JsonValue &arr = root["dictionaries"];
+  // size() 对**对象**返回 memberKeys.size()，而 operator[](size_t) 取的是 elements[]，
+  // 清单里把 dictionaries 写成对象（而不是数组）时两者口径不一致 → 空 vector 取下标
+  // → 崩。清单正文来自网络，必须先确认是数组。
+  if (!arr.isArray()) {
+    err = "清单格式错误：dictionaries 不是数组";
+    return false;
+  }
   for (size_t i = 0; i < arr.size(); i++) {
     const JsonValue &d = arr[i];
     DictCatalogItem it;
@@ -279,6 +197,7 @@ bool dictCatalogFetch(const std::string &url, DictCatalog &out, std::string &err
     it.description = d["description"].asString();
     it.revision = d["revision"].asInt(1);
     const JsonValue &files = d["files"];
+    if (!files.isArray()) continue;   // 同上：不是数组就别按下标取
     for (size_t k = 0; k < files.size(); k++) {
       const JsonValue &f = files[k];
       DictFileRef fr;
@@ -358,8 +277,6 @@ bool dictInstall(const DictCatalog &cat, int idx,
   removeTree(staging);
   ensureDir(staging);
 
-  std::function<void(size_t, size_t)> fileCb;  // 每轮的进度桥（栈上，勿换 new）
-
   for (int i = 0; i < fileCount; i++) {
     const DictFileRef &fr = it.files[i];
     const std::string url = cat.baseUrl + fr.name;
@@ -381,50 +298,53 @@ bool dictInstall(const DictCatalog &cat, int idx,
     static char s_fbuf[4096] __attribute__((aligned(64)));
     setvbuf(fp, s_fbuf, _IOFBF, sizeof(s_fbuf));
 
-    HttpSink sink;
-    sink.fp = fp;
-    sink.wantCrc = true;
+    net::Request req = makeRequest(url);
     if (progress) {
-      fileCb = [&progress, i, fileCount, phase](size_t got, size_t total) {
+      req.progress = [&progress, i, fileCount, phase](size_t got, size_t total) {
         progress(i, fileCount, got, total, phase);
       };
-      sink.progress = &fileCb;
     }
-    bool ok = httpGet(url, sink, err);
+    uint32_t crc = 0xFFFFFFFF;  // 边落盘边算，省一遍读
+    net::Response resp = net::stream(req, [fp, &crc](const uint8_t *d, size_t n) {
+      if (fwrite(d, 1, n, fp) != n) return false;
+      crc = crc32Update(crc, d, n);
+      return true;
+    });
     fclose(fp);
-    sink.progress = nullptr;
 
-    if (!ok) {
+    if (resp.sink_failed) err = "写入失败(空间不足?)";
+    if (!resp.ok) {
+      if (err.empty()) err = resp.error;
       ESP_LOGW(TAG, "下载 %s 失败: %s", fr.name.c_str(), err.c_str());
       removeTree(staging);
       return false;
     }
-    if (sink.got == 0) {
+    if (resp.got == 0) {
       err = fr.name + " 内容为空";
       removeTree(staging);
       return false;
     }
     // 校验：大小必须完全一致；crc32 仅在清单给了非 0 值时校验。
-    if (fr.size && sink.got != fr.size) {
+    if (fr.size && resp.got != fr.size) {
       char b[96];
       snprintf(b, sizeof(b), "%s 大小不符 (%u/%u)", fr.name.c_str(),
-               static_cast<unsigned>(sink.got), static_cast<unsigned>(fr.size));
+               static_cast<unsigned>(resp.got), static_cast<unsigned>(fr.size));
       err = b;
       removeTree(staging);
       return false;
     }
     if (fr.crc32) {
-      uint32_t crc = sink.crc ^ 0xFFFFFFFFu;
-      if (crc != fr.crc32) {
+      uint32_t got = crc ^ 0xFFFFFFFFu;
+      if (got != fr.crc32) {
         char b[96];
         snprintf(b, sizeof(b), "%s 校验失败 (%08x/%08x)", fr.name.c_str(),
-                 static_cast<unsigned>(crc), static_cast<unsigned>(fr.crc32));
+                 static_cast<unsigned>(got), static_cast<unsigned>(fr.crc32));
         err = b;
         removeTree(staging);
         return false;
       }
     }
-    if (progress) progress(i, fileCount, sink.got, sink.got, "校验通过");
+    if (progress) progress(i, fileCount, resp.got, resp.got, "校验通过");
   }
 
   if (!writeMarker(staging, it.revision)) {

@@ -276,8 +276,13 @@ void ChapterHtmlSlimParser::applyDirectionToEntry(StyleStackEntry& entry, const 
 
 EpdFontFamily::Style ChapterHtmlSlimParser::fontStyleForTextDecoration(const CssTextDecoration decoration) {
   EpdFontFamily::Style style = EpdFontFamily::REGULAR;
-  if ((decoration & CssTextDecoration::Underline) != CssTextDecoration::None) {
-    style = static_cast<EpdFontFamily::Style>(style | EpdFontFamily::UNDERLINE);
+  const bool underline = (decoration & CssTextDecoration::Underline) != CssTextDecoration::None;
+  const bool wavy = (decoration & CssTextDecoration::Wavy) != CssTextDecoration::None;
+  if (underline) {
+    // Wavy 本身不画线，只是把线换成波浪笔法；单独一个 Wavy（没有 Underline）到此为止，
+    // 与 `text-decoration-style: wavy` 后面没跟线的写法一致（见 CssStyle.h）。
+    style = static_cast<EpdFontFamily::Style>(
+        style | (wavy ? EpdFontFamily::WAVY_UNDERLINE : EpdFontFamily::UNDERLINE));
   }
   if ((decoration & CssTextDecoration::LineThrough) != CssTextDecoration::None) {
     style = static_cast<EpdFontFamily::Style>(style | EpdFontFamily::STRIKETHROUGH);
@@ -436,6 +441,36 @@ void ChapterHtmlSlimParser::updateEffectiveInlineStyle() {
   }
 }
 
+void ChapterHtmlSlimParser::armInlineAnchor(const std::string& id, const char* elementName) {
+  // 只有 `<a>` 是"行内、可导航"的边界情况。别的都走延后那条路：
+  //   · `<p id=…>` / `<li id=…>` 这些块元素：延后到 startNewTextBlock 记，本来就准；
+  //   · `<sup id=…>`（晋书）：不在块边界上，但现网一直这么记，读者侧的启发式也照它
+  //     调过，不动它；
+  //   · `<span id=…>`：在进这个函数之前就被 isNonNavigableInlineElement 挡掉了。
+  if (elementName == nullptr || std::strcmp(elementName, "a") != 0) return;
+  if (!currentTextBlock) return;
+  // 上限只是防病态输入（一个 <p> 里挂几千个 id）。真到上限就退回延后那条路，宁可贵一点。
+  if (inlineAnchorArms.size() >= 64) return;
+  inlineAnchorArms.push_back({currentTextBlock.get(), static_cast<int>(currentTextBlock->size()), id});
+}
+
+void ChapterHtmlSlimParser::resolveInlineAnchors(TextBlock* line) {
+  if (inlineAnchorArms.empty() || line == nullptr) return;
+  const int lineEnd = wordsExtractedInBlock + static_cast<int>(line->wordCount());
+  for (size_t i = 0; i < inlineAnchorArms.size();) {
+    const InlineAnchorArm& arm = inlineAnchorArms[i];
+    // 只结算**当前这一块**的：别的块要么还没排，要么是同一块更后面的锚点。
+    // 同一条锚点只结算一次，结算完立刻从表里摘掉。
+    if (arm.block == currentTextBlock.get() && arm.wordOffset < lineEnd) {
+      anchorData.push_back({arm.id, static_cast<uint16_t>(completedPageCount),
+                            static_cast<uint16_t>(currentPage ? currentPage->elements.size() : 0)});
+      inlineAnchorArms.erase(inlineAnchorArms.begin() + static_cast<long>(i));
+      continue;
+    }
+    ++i;
+  }
+}
+
 void ChapterHtmlSlimParser::flushPendingAnchor() {
   if (hasFailed()) return;
   if (pendingAnchorId.empty()) return;
@@ -470,6 +505,11 @@ bool ChapterHtmlSlimParser::allocatePage() {
   currentPage = std::move(page);
   currentPageNextY = 0;
   currentPageVisibleOffsetSet = false;
+  // 上一页的最后一行记录作废。光靠 `lastLinePage == currentPage.get()` 比指针不够：
+  // 上一页被 completePageFn 交出去后 currentPage 置空，但它那块内存会被下一页重新
+  // 分配回来——地址一样，于是"这一行属于当前页"会误判成真，行内图片就按上一页的
+  // y 落位。换页时显式清掉，指针相等才算数。
+  lastLinePage = nullptr;
   return true;
 }
 
@@ -523,10 +563,14 @@ void ChapterHtmlSlimParser::flushPartWordBuffer() {
 
   uint8_t linkId = 0;
   if (collectTouchLinks && insideFootnoteLink) {
-    if (!currentTextBlock->linkTargetMatches(currentFootnoteLinkId, currentFootnote.href)) {
-      currentFootnoteLinkId = currentTextBlock->addLinkTarget(currentFootnote.href);
+    if (!currentTextBlock->linkTargetMatches(currentFootnoteLinkId, currentFootnote.href.c_str())) {
+      currentFootnoteLinkId = currentTextBlock->addLinkTarget(currentFootnote.href.c_str());
     }
     linkId = currentFootnoteLinkId;
+  } else if (collectTouchLinks && syntheticMarkerLinkId != 0) {
+    // 合成注号：不是 <a> 包着的，但照样给它挂一个链接矩形，href 是私有 scheme
+    // "fn:<序号>"。读端按这个 id 直取脚注，不必拿被点中的字形去比号码串。
+    linkId = syntheticMarkerLinkId;
   }
   currentTextBlock->addWord(partWordBuffer, fontStyle, false, nextWordContinues, partWordVisibleOffset, linkId);
   if (insideTableCell && !tableRowStacked) {
@@ -607,6 +651,9 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
   // block is flushed so the chapter starts on a fresh page.
   flushPendingAnchor();
   if (hasFailed()) return;
+  // 上一个块刚刚在 makePages() 里排完，它的行内锚点该结算的都结算了 —— 剩下的都是排不到
+  // 的（比如 id 落在被裁掉的内容里）。一并清掉：换块之后指针可能被复用，留着会张冠李戴。
+  inlineAnchorArms.clear();
   currentTextBlock = makeUniqueNoThrow<ParsedText>(extraParagraphSpacing, firstLineIndent, hyphenationEnabled,
                                                    focusReadingEnabled, blockStyle, collectTouchLinks);
   if (!currentTextBlock) {
@@ -888,6 +935,79 @@ void ChapterHtmlSlimParser::finishTableRow() {
   clearLayoutLines();
 }
 
+// 「这张图小得不像插图吗」——只读图头，结果按 src 记账（见 .h 的说明）。
+// 探不出尺寸（坏图、不认识的格式）一律算"不小"：宁可退回整块插图那条老路，也不要
+// 把一张没读懂的图换成上标数字、把图本身弄丢。
+bool ChapterHtmlSlimParser::isTinyMarkerImage(const std::string& resolvedSrc) {
+  for (const auto& cached : tinyImageProbes) {
+    if (cached.src == resolvedSrc) return cached.tiny;
+  }
+  bool tiny = false;
+  if (epub && !resolvedSrc.empty()) {
+    ImageDimsProbe probe;
+    epub->readItemContentsToStream(resolvedSrc, probe, 1024, /*allowEarlyStop=*/true);
+    ImageDimensions dims = {0, 0};
+    if (probe.getDimensions(dims))
+      tiny = dims.width > 0 && dims.height > 0 && dims.width <= FOOTNOTE_MARKER_MAX_PX &&
+             dims.height <= FOOTNOTE_MARKER_MAX_PX;
+  }
+  // 记账上限只是防病态输入把内存吃干：正常一章里"行内小图 + alt"就那么几种 src
+  // （斐洞整章 813 枚注号共用同一张 img001.png）。超了不再记账，那些 src 每次都会重探。
+  if (tinyImageProbes.size() < 64) tinyImageProbes.push_back({resolvedSrc, tiny});
+  return tiny;
+}
+
+// 几条判据（QQ 阅读器的 class 名、Duokan 的脚注内链、"裸 alt + 小图"）认出来之后走的是
+// 同一段：不发图，改发一个上标序号词，注文整篇塞进 FootnoteEntry.href 的 "alt:" 哨兵前缀
+// （这样不用动 Page 的缓存结构；href 已经是变长的 std::string，多长的注文都放得下）。
+void ChapterHtmlSlimParser::appendAltFootnoteMarker(const std::string& altText) {
+  if (partWordBufferIndex > 0) {
+    flushPartWordBuffer();
+    if (hasFailed()) return;
+  }
+  // 标记文字就是本条注的顺序号；push 一个 SUP 内联样式，让它以上标形态画出来。
+  // 序号必须**本页唯一**：点注那套（rdTapOnFootnote）是拿按中的词去比**本页**注号列表的，
+  // 重号的话点哪条都只会弹第一条。见 nextFootnoteMarker 的说明。
+  const std::string marker = nextFootnoteMarker();
+  StyleStackEntry supEntry;
+  supEntry.depth = depth;
+  supEntry.hasSup = true;
+  supEntry.sup = true;
+  inlineStyleStack.push_back(supEntry);
+  updateEffectiveInlineStyle();
+
+  // 给这颗注号字挂一条**私有链接**：href = "fn:<序号>"，序号与下面 FootnoteEntry.number
+  // **同源**（都是 nextFootnoteMarker 发的那个号）。于是"上标字 → 脚注条目"是解析时就
+  // 接好的一条边，读端点中这个矩形就顺着 id 直取，不用再拿被点中的字形去比号码串
+  // （那套比对是"8 弹到 86"的根源，见 screen_reader.cpp::rdTapOnLink）。
+  // 顺带解决"注号只有 1/3 字宽、手指点不中"：链接矩形走的是同一套放宽后的触摸容差。
+  if (collectTouchLinks && currentTextBlock) {
+    const std::string markerHref = "fn:" + marker;
+    syntheticMarkerLinkId = currentTextBlock->addLinkTarget(markerHref.c_str());
+  }
+
+  syntheticCharacterData = true;
+  characterData(this, marker.c_str(), marker.length());
+  syntheticCharacterData = false;
+  // 立刻落成词：linkId 只该跟着注号这一颗字，不能漏给后面的正文。
+  if (syntheticMarkerLinkId != 0) {
+    if (partWordBufferIndex > 0) flushPartWordBuffer();
+    syntheticMarkerLinkId = 0;
+  }
+  inlineStyleStack.pop_back();
+  updateEffectiveInlineStyle();
+  if (hasFailed()) return;
+
+  FootnoteEntry entry;
+  strncpy(entry.number, marker.c_str(), sizeof(entry.number) - 1);
+  entry.number[sizeof(entry.number) - 1] = '\0';
+  entry.href = "alt:" + altText;
+  const int wordIndex =
+      wordsExtractedInBlock + (currentTextBlock ? static_cast<int>(currentTextBlock->size()) : 0);
+  pendingFootnotes.push_back({wordIndex, entry});
+  nextWordContinues = false;
+}
+
 void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char* name, const XML_Char** atts) {
   auto* self = static_cast<ChapterHtmlSlimParser*>(userData);
   if (!self->checkMemory()) return;
@@ -944,6 +1064,15 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
           if (!self->pendingAnchorId.empty()) {
             self->flushPendingAnchor();
             if (self->hasFailed()) return;
+          }
+          // id 挂在**行内**的 <a> 上（`<p><a id="10" href="#7">〔一〕</a>太阿：…`，
+          // 趙州録校注整章都是这个形状）时不走 pendingAnchorId，改记"本块第几个词"，
+          // 等这块排版时精确换算成页内元素序号。理由见 armInlineAnchor 的注释。
+          // TOC 锚点例外：它要的是"另起一页"那套，必须留在延后那条路上。
+          if (!isTocAnchor) {
+            const size_t before = self->inlineAnchorArms.size();
+            self->armInlineAnchor(idValue, name);
+            if (self->inlineAnchorArms.size() != before) continue;  // 已按行内锚点收下
           }
           self->pendingAnchorId = idValue;
         }
@@ -1175,36 +1304,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       // 认出来：**不发图**，改发一个上标标记词，注释正文存进 FootnoteEntry.href 的
       // "alt:" 哨兵前缀里（这样不用动 FootnoteEntry 结构 / Page 缓存格式）。
       if (!alt.empty() && isFootnoteImageClass(klass)) {
-        if (self->partWordBufferIndex > 0) {
-          self->flushPartWordBuffer();
-          if (self->hasFailed()) return;
-        }
-        // 标记文字就是本条注的顺序号；push 一个 SUP 内联样式，让它以上标形态画出来。
-        const std::string marker = std::to_string(self->pendingFootnotes.size() + 1);
-        StyleStackEntry supEntry;
-        supEntry.depth = self->depth;
-        supEntry.hasSup = true;
-        supEntry.sup = true;
-        self->inlineStyleStack.push_back(supEntry);
-        self->updateEffectiveInlineStyle();
-        self->syntheticCharacterData = true;
-        self->characterData(userData, marker.c_str(), marker.length());
-        self->syntheticCharacterData = false;
-        self->inlineStyleStack.pop_back();
-        self->updateEffectiveInlineStyle();
-        if (self->hasFailed()) return;
-
-        FootnoteEntry entry;
-        strncpy(entry.number, marker.c_str(), sizeof(entry.number) - 1);
-        entry.number[sizeof(entry.number) - 1] = '\0';
-        const std::string altHref = "alt:" + alt;
-        strncpy(entry.href, altHref.c_str(), sizeof(entry.href) - 1);
-        entry.href[sizeof(entry.href) - 1] = '\0';
-        const int wordIndex =
-            self->wordsExtractedInBlock + (self->currentTextBlock ? static_cast<int>(self->currentTextBlock->size()) : 0);
-        self->pendingFootnotes.push_back({wordIndex, entry});
-        self->nextWordContinues = false;
-
+        self->appendAltFootnoteMarker(alt);
         self->depth += 1;  // 与其它自闭合元素一致：闭合回调里再 -= 1
         return;
       }
@@ -1216,15 +1316,16 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       // 而链接里一个文字都没有 → currentFootnote.number 为空 → 闭合时不登记脚注，点哪
       // 都弹不出来。这里补一条：**在脚注内链里的**图（href 是纯页内锚点、图就是整条链接
       // 的标签、class/src 也像注号）不发图，改发一个上标序号 —— 闭合时照常登记脚注。
-      if (self->insideFootnoteLink && self->currentFootnote.href[0] == '#' &&
+      if (self->insideFootnoteLink && !self->currentFootnote.href.empty() &&
+          self->currentFootnote.href[0] == '#' &&
           self->currentFootnoteLinkTextLen == 0 && isFootnoteMarkerImage(klass, src)) {
         if (self->partWordBufferIndex > 0) {
           self->flushPartWordBuffer();
           if (self->hasFailed()) return;
         }
-        // 序号取本章第几条脚注，与 QQ 阅读器那条路一致：注号得**唯一**，不然点哪条
-        // 都只会弹第一条（rdTapOnFootnote 是拿按中的词去比注号列表）。
-        const std::string marker = std::to_string(self->pendingFootnotes.size() + 1);
+        // 序号取本章第几条脚注，与 QQ 阅读器那条路一致：注号得**本页唯一**，不然点哪条
+        // 都只会弹第一条（rdTapOnFootnote 是拿按中的词去比本页注号列表的）。
+        const std::string marker = self->nextFootnoteMarker();
         StyleStackEntry supEntry;
         supEntry.depth = self->depth;
         supEntry.hasSup = true;
@@ -1240,6 +1341,40 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
 
         self->depth += 1;  // 与其它自闭合元素一致：闭合回调里再 -= 1
         return;
+      }
+
+      // 第三条（最宽松的一条）：一枚**内联小图 + 一段 alt 正文**，既没有 class、
+      // 也不在任何内链里。斐洞（希腊文、汉文对照）就是这样：整章 807 枚注号共用同一张
+      // 48×48 的小图
+      //   <img alt="斐洞（Φαίδων）来自伯罗奔尼撒半岛的城邦厄里斯……" src="../Images/img001.png"/>
+      // 注文整篇就压在 alt 里（这本书的 <p class="note"> 只有 29 条，绝大多数注只有
+      // 这一份 alt）。上面两条判据都认不出它（没 class、外面没链接），于是 807 枚注号
+      // 被当 807 张插图排进去：正文被切成 807 段、每张还要往 SD 上抠一个 imgN.png，
+      // 而点它不弹注 —— 点注那套是**按词**找的，图上没有词可点。
+      //
+      // 判据只能是"这张图小得不像插图"（isTinyMarkerImage，按 src 记账只探一次）。
+      // 为什么不用 alt 判：这本书里最短的一条注是「见75d。」五个字，正经注文也有这么
+      // 短的，按长度或字数筛会漏掉十几条；尺寸反而干净 —— 注号 48×48、分数图 18×54，
+      // 真正要放的插图都是几百像素。
+      //
+      // 前面还要卡一道**行内**：注号是插在句子中间的（"斐洞啊<img/>，你本人…"），
+      // 插图则总是自己独占一段。没有这道闸，任何"小图 + alt"都会被认成注号 —— 而 alt
+      // 恰恰是**图注**最常见的位置；而且每张不同的 src 都要开一次 zip entry 去量尺寸，
+      // 一本插图多的书能白探几百次。探图那一步（isTinyMarkerImage）在这道闸后面。
+      const bool inlineInTextRun =
+          self->partWordBufferIndex > 0 ||
+          (self->currentTextBlock != nullptr && !self->currentTextBlock->isEmpty());
+      if (inlineInTextRun && !alt.empty() && !src.empty()) {
+        std::string probeSrc = src;
+        const size_t probeHash = probeSrc.find('#');
+        if (probeHash != std::string::npos) probeSrc.resize(probeHash);
+        const std::string probeResolved =
+            FsHelpers::normalisePath(FsHelpers::decodeUriEscapes(self->contentBase + probeSrc));
+        if (self->isTinyMarkerImage(probeResolved)) {
+          self->appendAltFootnoteMarker(alt);
+          self->depth += 1;  // 与其它自闭合元素一致：闭合回调里再 -= 1
+          return;
+        }
       }
 
       const size_t fragmentPos = src.find('#');
@@ -1504,10 +1639,18 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                         self->setCurrentPageVisibleOffset(self->visibleTextOffset);
                         // 续排的正文要躲开图片：把"左边被占了多宽"记到当前这个空块上，
                         // 它只作用于这个块的首行，也不会传给别的块（见 BlockStyle）。
+                        //
+                        // 同时把**纵向**段前距清零。续排的第一个词是接在上面那一行
+                        // 右边的，不是新起一段；而 makePages() 会在排这个块之前把
+                        // blockStyle.marginTop/paddingTop 加到 currentPageNextY 上
+                        // （约 .cpp:2797），那会让半句话中间凭空空出一段——`p{margin:1em 0}`
+                        // 这种书尤其明显。横向的 inset 和对齐要留着：续排得接着原行排。
                         if (self->currentTextBlock && self->currentTextBlock->isEmpty()) {
                           BlockStyle contStyle = self->currentTextBlock->getBlockStyle();
                           const int inset = imgX + displayWidth + inlineGap - contStyle.leftInset();
                           contStyle.firstLineInset = static_cast<int16_t>(inset > 0 ? inset : 0);
+                          contStyle.marginTop = 0;
+                          contStyle.paddingTop = 0;
                           self->currentTextBlock->setBlockStyle(contStyle);
                         }
                         LOG_DBG("EHP", "行内图片: %dx%d 接在 y=%d x=%d 之后", displayWidth, displayHeight, imgY, imgX);
@@ -1711,9 +1854,11 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
       self->insideFootnoteLink = true;
       self->footnoteLinkDepth = self->depth;
       self->currentFootnoteLinkId = self->currentTextBlock ? self->currentTextBlock->addLinkTarget(href) : 0;
-      self->currentFootnote.href[0] = '\0';
-      if (strnlen(href, sizeof(self->currentFootnote.href)) < sizeof(self->currentFootnote.href)) {
-        strcpy(self->currentFootnote.href, href);
+      // 变长 href：不再有 256 字节的坎（原来超长就整条丢掉，注号点不出来）。
+      // 只留一个损坏数据的闸：离谱长的 href 当没有处理，与旧行为一致。
+      self->currentFootnote.href.clear();
+      if (href != nullptr && strlen(href) <= FOOTNOTE_MAX_TEXT_BYTES) {
+        self->currentFootnote.href = href;
       }
       self->currentFootnote.number[0] = '\0';
       self->currentFootnoteLinkTextLen = 0;
@@ -2351,12 +2496,11 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
     // 登记了就会在注文页多出几条指向正文的假脚注。链接矩形（addLinkTarget）照留 ——
     // 阅读器正是靠它按 href 跳回上标。
     if (!self->currentFootnoteIsBackref && self->currentFootnote.number[0] != '\0' &&
-        self->currentFootnote.href[0] != '\0') {
+        !self->currentFootnote.href.empty()) {
       FootnoteEntry entry;
       strncpy(entry.number, self->currentFootnote.number, sizeof(entry.number) - 1);
       entry.number[sizeof(entry.number) - 1] = '\0';
-      strncpy(entry.href, self->currentFootnote.href, sizeof(entry.href) - 1);
-      entry.href[sizeof(entry.href) - 1] = '\0';
+      entry.href = self->currentFootnote.href;
       int wordIndex =
           self->wordsExtractedInBlock + (self->currentTextBlock ? static_cast<int>(self->currentTextBlock->size()) : 0);
       self->pendingFootnotes.push_back({wordIndex, entry});
@@ -2725,6 +2869,11 @@ bool ChapterHtmlSlimParser::addLineToPage(std::unique_ptr<TextBlock> line, const
   }
   setCurrentPageVisibleOffset(visibleOffset);
 
+  // 结算落在这一行上的**行内**锚点（见 armInlineAnchor）。必须赶在 `wordsExtractedInBlock`
+  // 累加这一行之前、且在这行的 PageLine 入页之前：此刻的 currentPage 就是它的页，
+  // elements.size() 就是这一行即将占的那个序号。
+  resolveInlineAnchors(line.get());
+
   // Track cumulative words to assign footnotes to the page containing their anchor
   wordsExtractedInBlock += line->wordCount();
   auto footnoteIt = pendingFootnotes.begin();
@@ -2745,23 +2894,26 @@ bool ChapterHtmlSlimParser::addLineToPage(std::unique_ptr<TextBlock> line, const
       LOG_DBG("EHP", "Dropped page link: %.48s", link.href);
     }
   }
+  // 记下这一行的几何，供行内图片（`<img>` 夹在正文里）接在它右边。最后一个字的
+  // xpos 是排版时算好的（已含缩进/居中/两端对齐的拉伸），再加它自己的宽度就是行尾。
+  // **这一段必须在下面 std::move(line) 之前**——移进 pageLine 之后 line 就成了空
+  // 指针，再解引用就是拿 null+偏移 当地址读（EXCVADDR 0x2a，LoadProhibited）。
+  const uint16_t lastWordIndex = line->wordCount();
+  const int16_t lineEndX = [&] {
+    if (lastWordIndex == 0) return xOffset;
+    const uint16_t wi = static_cast<uint16_t>(lastWordIndex - 1);
+    return static_cast<int16_t>(
+        xOffset + line->wordXpos(wi) + renderer.getTextWidth(lineFontId, line->wordText(wi), line->wordStyle(wi)));
+  }();
+
   auto pageLine = makeUniqueNoThrow<PageLine>(std::move(line), xOffset, currentPageNextY);
   if (!pageLine) {
     LOG_ERR("EHP", "OOM: PageLine (%u bytes)", static_cast<unsigned>(sizeof(PageLine)));
     failAllocation("page layout");
     return false;
   }
-  // 记下这一行的几何，供行内图片（<img> 夹在正文里）接在它右边。最后一个字的
-  // xpos 是排版时算好的（已含缩进/居中/两端对齐的拉伸），再加它自己的宽度就是行尾。
-  // **必须在 std::move(line) 之前取**——移进 pageLine 之后 line 就是个空指针了。
-  const uint16_t lastWordIndex = line->wordCount();
-  if (lastWordIndex > 0) {
-    const uint16_t wi = static_cast<uint16_t>(lastWordIndex - 1);
-    lastLineEndX = static_cast<int16_t>(
-        xOffset + line->wordXpos(wi) + renderer.getTextWidth(lineFontId, line->wordText(wi), line->wordStyle(wi)));
-  } else {
-    lastLineEndX = xOffset;
-  }
+  // 这一行真的进页了，才把它记成"最后一行"——分配失败时上面已经返回，几何不动。
+  lastLineEndX = lineEndX;
   lastLinePage = currentPage.get();
   lastLineY = currentPageNextY;
   lastLineBottom = static_cast<int16_t>(currentPageNextY + lineHeight);

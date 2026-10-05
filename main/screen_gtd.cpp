@@ -12,6 +12,7 @@
 #include "ui_render.h"
 
 #include "ime/IME.h"
+#include "ui/ime_field.h"   // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/阅读共用一份）
 
 #include "hw/input.h"   // input_tap_xy / input_drag_xy：触摸点按与拖动增量
 
@@ -20,7 +21,7 @@
 #include "text_sel.h"   // 单行输入框的触摸选字 / 粘贴板（三模式共享底层件）
 
 #include "settings_manager.h"   // g_settings：计划模式独立方向（"gtd_orientation"）
-#include "hw/board_reader.h"    // board_force_*/board_restore_orientation（最小旋转原型）
+#include "hw/board.h"    // board_force_*/board_restore_orientation（模式方向切换）
 
 #include "esp_timer.h"
 
@@ -1896,6 +1897,10 @@ static void drawList() {
 
 
         // Status bar: left=help hint | selected task info
+        //
+        // 左边以前是 `←→层级 ↑↓顺序` —— 那是**左下角那排方向浮动按钮**（drawGtdDirPad）
+        // 说自己功能的快捷键说明，按钮画在眼前，再写一行字是重复。现在按 GTD 其余视图的
+        // 口径（见任务列表那条 `?:帮助|...`）只留选中任务的 @情境/#标签/截止日期。
         char statusLine[128];
         statusLine[0] = '\0';
         if (g.sel >= 0 && g.sel < (int)g_visibleTreeIdx.size()) {
@@ -1919,10 +1924,10 @@ static void drawList() {
             }
             while (!parts.empty() && parts.back() == ' ') parts.pop_back();
             if (!parts.empty())
-                snprintf(statusLine, sizeof(statusLine), "←→层级 ↑↓顺序|%s", parts.c_str());
+                snprintf(statusLine, sizeof(statusLine), "?:帮助|%s", parts.c_str());
         }
         if (statusLine[0] == '\0')
-            snprintf(statusLine, sizeof(statusLine), "←→层级 ↑↓顺序");
+            snprintf(statusLine, sizeof(statusLine), "?:帮助");
         char rbuf[40]; gtdStatusRight(rbuf, sizeof(rbuf));
         ui_draw_status(statusLine, rbuf);
 
@@ -2825,7 +2830,10 @@ static void drawPicker() {
 
             u8g2_SetDrawColor(g_u8g2, 1);
 
-            g_font.drawText(boxX + 8, iy, display.c_str(), false);
+            // invert=true：u8g2 的 draw color 对 TTF 渲染器（g_font.drawText → ttf_*）无效，
+            // 它的"反色"是字形自己按 fg=15/bg=0 画白字黑底，必须显式传进去 —— 否则就是
+            // 黑底黑字，选中项看不见（原样照抄 u8g2_DrawStr 的写法留下的坑）。
+            g_font.drawText(boxX + 8, iy, display.c_str(), true);
 
             u8g2_SetDrawColor(g_u8g2, 0);
 
@@ -3717,6 +3725,31 @@ static void applyGtdOrientation() {
 // 公开版：切模式回来时只重套方向、不重跑 init（init 会把当前 tab 清成收集箱首页）。
 void screen_gtd_apply_orientation() { applyGtdOrientation(); }
 
+// ── 进入 / 离开计划模式（main.cpp 的 kScreens 生命周期钩子）───────────────────
+// "本次开机只 init 一次"这条规则原来长在 main.cpp 的 scrGtd() 里（一份 `static bool
+// gtdInited` + 一段解释）。搬到状态自己所在的文件：**重跑 screen_gtd_init() 会把
+// g.view 清回收件箱**，而当前 tab / 项目下钻 / 光标全都活在文件级静态 g 里 —— 切模式
+// 回来（或者从别的界面 Esc 回来）必须原样续上，所以只有第一次才 init。
+static bool s_gtdInited = false;
+
+void screen_gtd_enter(ScreenContext &ctx) {
+    (void)ctx;
+    if (!s_gtdInited) {
+        screen_gtd_init();
+        s_gtdInited = true;
+    } else {
+        // 重进只补方向：screen_gtd_exit() 离开时已经把方向还给了全局，
+        // 而这次进来可能是在竖屏的写作模式里切过来的。
+        screen_gtd_apply_orientation();
+    }
+}
+
+void screen_gtd_leave(AppState next) {
+    (void)next;
+    // **故意不清 s_gtdInited**：下次进来还要接着用 g 里的 tab/下钻/光标。
+    screen_gtd_exit();
+}
+
 // 退出计划模式：把方向还给全局设置（写作模式可能选了别的方向）。
 void screen_gtd_exit() {
     board_restore_orientation();
@@ -4060,6 +4093,14 @@ static bool gtdFlatField(std::string **buf, int **cur, TextSelLine *ln, TextSelV
     return true;
 }
 
+// ── 同一个"当前编辑缓冲"的 ImeField 形态 ────────────────────────────────
+// 落串/退格/光标左右移全部走 ui/ime_field.h 那一份算术（UTF-8 边界只有一处实现）。
+// 模式与缓冲的对应关系跟 gtdFlatField 是一回事，只是那边还要屏幕几何（触摸选字用）。
+// 每个都是**当场构造**的轻量视图（两个指针），不持有所有权。
+static ImeField gtdEditField()  { return ImeField{&g.editBuf, &g.editCur}; }
+static ImeField gtdNoteField()  { return ImeField{&g.noteLines[g.noteRow], &g.noteCol}; }
+static ImeField gtdFilterField() { return ImeField{&g.filterText, /*cursor=*/nullptr}; }
+
 // 选区会话期间"本模式重绘一次"。按钮条贴着虚拟键盘上沿，所以这里就是普通重绘。
 static void gtdRedrawFieldMode() {
     switch (g.mode) {
@@ -4087,137 +4128,23 @@ static void gtdFieldOverlay(const std::string &buf) {
     textSelDraw(buf, view);
 }
 
-AppState screen_gtd_handle(int key, ScreenContext &ctx) {
+// P3c：原来 2415 行的 screen_gtd_handle 按 g.mode 拆成下列函数（逐个原样搬出，
+// 逻辑未改）。这里先给一组前置声明 —— gtdHandleItemMenu 的 handOff 分支要落到
+// 列表主体 gtdHandleBrowse，而后者在文件末尾定义。
+static AppState gtdHandleBrowse(int key, ScreenContext &ctx);
 
-    // 切进"要打字"的模式（新建/重命名/编辑字段/写笔记/筛选）时，自动把虚拟键盘
-    // 弹出来（没连蓝牙键盘的话）。只在**模式切换**的那一刻自动展示：用户在本模式里
-    // 手动点状态栏图标收起后，不会被下一帧又弹回来。
-    static int s_prevMode = M_BROWSE;
-    if (g.mode != s_prevMode) {
-        if (gtdVkEditing()) editorVkAutoShow();
-        // 换了模式 = 换了字段：上一个字段的选区 / 按钮条作废，
-        // 免得把 A 的选区贴到 B 上（也顺带把 g.field* 的旧值挤掉）。
-        textSelReset();
-        g.fieldX = 0;
-    }
-    s_prevMode = g.mode;
-
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleAdd(int key) {
     auto &tasks = g.data["tasks"];
 
-    // 点按坐标只读一次：下面键盘拦截和一般分流都要用，读第二遍就空了。
-    int tapX = 0, tapY = 0;
-    bool hasTap = ((key == 0x0A || key == 0x0D) && input_tap_xy(&tapX, &tapY));
-
-    // 虚拟键盘（编辑态，与写作模式同一套）：先认状态栏上的键盘开关图标，再认
-    // 键盘面板。命中就把点按翻译成普通键码（或翻转待发状态），交给下面既有的
-    // 输入逻辑——不重复实现任何输入。key 置 0 时各编辑块照旧重绘，正好刷出反馈。
-    if (gtdVkEditing()) editorVkSyncBtState();   // 蓝牙键盘连上就自动收起
-    if (hasTap && gtdVkEditing()) {
-        if (editorVkIconHit(tapX, tapY)) {
-            editorVkSetVisible(!editorVkVisible());
-            hasTap = false; key = 0;
-        } else if (editorVkVisible() && tapY >= editorVkTop()) {
-            EditorVkHit hit;
-            int k = editorVkHitTest(tapX, tapY, &hit);
-            hasTap = false; key = 0;
-            // 按下反馈：记下命中键，反色随下面的重绘一起上屏（不额外推屏）。
-            if (k != EVK_NONE) editorVkMarkPressed(hit);
-            // EVK_PAGE：换面板已在命中测试里完成，key 保持 0 → 下面照样重绘
-            if (k == EVK_LANG) {
-                // 未开输入法 → 开中文；已开 → 拼音/英文互切（与物理 Ctrl+Space 等价）
-                if (!g.imeActive) { g.imeActive = true; g_ime.setActive(true); }
-                else g_ime.toggleEnglish();
-            } else if (k > 0) {
-                key = k;
-            }
-            // EVK_CTRL/EVK_SHIFT：待发状态已在命中测试内翻转，重绘即反馈
-            // EVK_NONE：点在键盘空白处，吞掉本次点按
-        }
-    }
-
-    // T9 候选面板里的上下滑（与写作/阅读同一套实现）：左列滚读音、宫格翻候选页。
-    // 必须放在下面把 PAGE_UP/DOWN 折成 UP/DOWN 之前——那一折是给子界面的单步移动用的，
-    // 滚面板不能走那条路；否则滚一下面板会顺带把正文/列表也挪一格。
-    if ((key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) && gtdVkActive()) {
-        int px = 0, py = 0;
-        if (input_press_xy(&px, &py) &&
-            editorVkSwipeScroll(px, py, key == KEY_PAGE_DOWN ? +1 : -1)) {
-            key = 0;   // 这一划归面板；各编辑块照旧重绘，正好把滚动的结果刷出去
-        }
-    }
-
-    // ── 共享的单行输入框触摸编辑（长按选字 / 复制 / 剪切 / 粘贴 / 全选）──────
-    // **排在虚拟键盘之后**：键盘上的点按优先（上面已经翻成普通键码了）——
-    // 会话开着时在键盘上敲字，会先在这里吃掉选区（"全选后直接打字"就地替换）。
-    // **排在下面的坐标分流之前**：按钮条落在正文区中部，若先过 gtdKeyFromTap 会被
-    // 当成"点列表空白"翻成 0，这一按就白点了。
-    {
-        std::string *fb = nullptr;
-        int *fc = nullptr;
-        TextSelLine fln;
-        TextSelView fview;
-        if (gtdFlatField(&fb, &fc, &fln, &fview)) {
-            if (key == KEY_TOUCH_LONG) {
-                int lx = 0, ly = 0;
-                if (input_tap_xy(&lx, &ly) && textSelBegin(*fb, *fc, fview, lx, ly)) {
-                    g_ime.cancelComposition();   // 别让未上屏的组合悬着
-                    gtdRedrawFieldMode();
-                    return APP_GTD;
-                }
-                key = 0x1B;   // 没落在输入行上 → 维持"长按 = 返回"的老语义
-            } else if (key != 0 &&
-                       textSelHandleKey(*fb, *fc, fview, key, tapX, tapY, hasTap,
-                                        &ctx.statusMessage)) {
-                gtdRedrawFieldMode();
-                return APP_GTD;
-            }
-        } else if (textSelActive() && g.mode != M_EDIT_NOTE) {
-            // 字段没了（提交/取消/切视图）→ 收起会话。备注编辑器是**多行**宿主，
-            // 走下面自己那一套（拍平镜像），别在这儿把它的会话误收掉。
-            textSelReset();
-        }
-    }
-
-    // 触摸点按再按坐标分流：命中标签栏/列表行/详情栏/选择器项/悬浮「+」时，
-    // gtdKeyFromTap 会把它换成对应的键（或就地处理），下面的键盘逻辑照旧执行；
-    // 没命中的点按保持 '\n'，仍旧是原来的 Enter 语义。
-    if (hasTap) {
-        int k = gtdKeyFromTap(tapX, tapY);
-        if (k >= 0) key = k;
-    }
-
-    // main.cpp 把触摸上下滑的翻页键原样留给计划模式（列表要整页翻），
-    // 其余子界面（添加/详情/选择器/日历…）这里退回单步，保持原有手感。
-    if (g.mode != M_BROWSE) {
-        if (key == KEY_PAGE_UP) key = KEY_UP;
-        else if (key == KEY_PAGE_DOWN) key = KEY_DOWN;
-        // 拖动增量只对列表有意义；子界面把它连同增量一起丢掉，
-        // 免得这个新键码流进输入法/编辑逻辑里。
-        if (key == KEY_TOUCH_DRAG) {
-            input_drag_xy(nullptr, nullptr);
-            key = 0;
-        }
-    }
-
-
-
-    // ── M_ADD: adding new task ──────────────────────────────────────
-
-    if (g.mode == M_ADD) {
 
         if (g.imeActive && key != 0) {
 
             std::string imeOut;
 
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, false, imeOut)) {
 
-                if (!imeOut.empty()) {
-
-                    g.editBuf.insert(g.editCur, imeOut);
-
-                    g.editCur += (int)imeOut.length();
-
-                }
+                if (!imeOut.empty()) imeFieldInsert(gtdEditField(), imeOut);
 
                 drawAdd();
 
@@ -4313,43 +4240,19 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         } else if (key == 0x7F || key == 0x08) {
 
-            if (g.editCur > 0) {
-
-                int prev = g.editCur - 1;
-
-                while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--;
-
-                g.editBuf.erase(prev, g.editCur - prev);
-
-                g.editCur = prev;
-
-            }
+            imeFieldBackspace(gtdEditField());
 
         } else if (key == KEY_LEFT) {
 
-            if (g.editCur > 0) {
-
-                g.editCur--;
-
-                while (g.editCur > 0 && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur--;
-
-            }
+            imeFieldMoveLeft(gtdEditField());
 
         } else if (key == KEY_RIGHT) {
 
-            if (g.editCur < (int)g.editBuf.length()) {
-
-                g.editCur++;
-
-                while (g.editCur < (int)g.editBuf.length() && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur++;
-
-            }
+            imeFieldMoveRight(gtdEditField());
 
         } else if (key >= 0x20 && key <= 0x7E) {
 
-            g.editBuf.insert(g.editCur, 1, (char)key);
-
-            g.editCur++;
+            imeFieldInsert(gtdEditField(), std::string(1, (char)key));
 
         }
 
@@ -4357,27 +4260,20 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         return APP_GTD;
 
-    }
+}
 
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleRename(int key) {
+    auto &tasks = g.data["tasks"];
 
-
-    // ── M_RENAME: quick rename task title ───────────────────────────────
-
-    if (g.mode == M_RENAME) {
 
         if (g.imeActive && key != 0) {
 
             std::string imeOut;
 
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, false, imeOut)) {
 
-                if (!imeOut.empty()) {
-
-                    g.editBuf.insert(g.editCur, imeOut);
-
-                    g.editCur += (int)imeOut.length();
-
-                }
+                if (!imeOut.empty()) imeFieldInsert(gtdEditField(), imeOut);
 
                 drawAdd();
 
@@ -4423,43 +4319,19 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         } else if (key == 0x7F || key == 0x08) {
 
-            if (g.editCur > 0) {
-
-                int prev = g.editCur - 1;
-
-                while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--;
-
-                g.editBuf.erase(prev, g.editCur - prev);
-
-                g.editCur = prev;
-
-            }
+            imeFieldBackspace(gtdEditField());
 
         } else if (key == KEY_LEFT) {
 
-            if (g.editCur > 0) {
-
-                g.editCur--;
-
-                while (g.editCur > 0 && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur--;
-
-            }
+            imeFieldMoveLeft(gtdEditField());
 
         } else if (key == KEY_RIGHT) {
 
-            if (g.editCur < (int)g.editBuf.length()) {
-
-                g.editCur++;
-
-                while (g.editCur < (int)g.editBuf.length() && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur++;
-
-            }
+            imeFieldMoveRight(gtdEditField());
 
         } else if (key >= 0x20 && key <= 0x7E) {
 
-            g.editBuf.insert(g.editCur, 1, (char)key);
-
-            g.editCur++;
+            imeFieldInsert(gtdEditField(), std::string(1, (char)key));
 
         }
 
@@ -4467,15 +4339,10 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         return APP_GTD;
 
-    }
+}
 
-
-
-    // ── M_ITEM_MENU: 长按列表项弹出的编辑菜单 ────────────────────────
-    // 浮层：选中项用 ↑↓/点按移动，回车执行，Esc 关掉。动作要么转交给既有入口
-    // （gtdBeginRename / gtdBeginDelete），要么**把 key 换成对应的普通键码**继续往下走
-    // —— 挂子任务='i'、提升层级='h'、降低层级='l' —— 与键盘那三处是同一条实现。
-    if (g.mode == M_ITEM_MENU) {
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleItemMenu(int key, ScreenContext &ctx) {
         int mn = 0;
         const GtdMenuAct *acts = gtdItemMenuActs(&mn);
         bool handOff = false;   // 退出浮层并把动作交给下面的键盘逻辑
@@ -4514,13 +4381,15 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
             return APP_GTD;
         }
         // handOff：浮层已关，key 已换成 'i'/'h'/'l'，往下走同一条键盘逻辑
-    }
+    // handOff：key 已换成 'i'/'h'/'l'，落到列表那条路上（与原来"掉出本块"等价）。
+    return gtdHandleBrowse(key, ctx);
 
+}
 
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleConfirm(int key, ScreenContext &ctx) {
+    auto &tasks = g.data["tasks"];
 
-    // ── M_CONFIRM: confirmation dialog ────────────────────────────────
-
-    if (g.mode == M_CONFIRM) {
 
         ui_clear();
 
@@ -4578,21 +4447,20 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         return APP_GTD;
 
-    }
+}
 
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleTaxNameEdit(int key) {
+    auto &tasks = g.data["tasks"];
 
-
-    // ── M_ADD_PROJECT / M_RENAME_PROJECT ─────────────────────────────
-
-    if (g.mode == M_ADD_PROJECT || g.mode == M_RENAME_PROJECT || g.mode == M_RENAME_CONTEXT || g.mode == M_RENAME_TAG) {
 
         if (g.imeActive && key != 0) {
 
             std::string imeOut;
 
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, false, imeOut)) {
 
-                if (!imeOut.empty()) { g.editBuf.insert(g.editCur, imeOut); g.editCur += (int)imeOut.length(); }
+                if (!imeOut.empty()) imeFieldInsert(gtdEditField(), imeOut);
 
                 drawAdd(); return APP_GTD;
 
@@ -4730,27 +4598,20 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         } else if (key == 0x7F || key == 0x08) {
 
-            if (g.editCur > 0) { int prev = g.editCur - 1; while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--; g.editBuf.erase(prev, g.editCur - prev); g.editCur = prev; }
+            imeFieldBackspace(gtdEditField());
 
-        } else if (key >= 0x20 && key <= 0x7E) { g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++; }
+        } else if (key >= 0x20 && key <= 0x7E) { imeFieldInsert(gtdEditField(), std::string(1, (char)key)); }
 
         drawAdd();
 
         return APP_GTD;
 
-    }
+}
 
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleDetailViews(int key) {
+    auto &tasks = g.data["tasks"];
 
-
-    // ── M_DETAIL: task detail view ───────────────────────────────────
-
-    // ── M_EDIT_FIELD: editing a field inside detail ──────────────────
-
-    // ── M_PICKER: popup selector for p/t/j fields ───────────────────
-
-    // ── M_CALENDAR: date picker for due field ────────────────────────
-
-    if (g.mode == M_DETAIL || g.mode == M_EDIT_FIELD || g.mode == M_PICKER || g.mode == M_CALENDAR) {
 
         if (g.mode == M_CALENDAR) {
 
@@ -4858,6 +4719,23 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
             auto &df = DETAIL_FIELDS[g.pickerField];
 
+            // 'g'（标签）选择器在一条标签都没有时是空的：drawPicker 会直接不画，
+            // 但按键侧若继续走 pickerOpts[g.pickerSel] 就是空 vector 越界读 → 崩。
+            // 空选择器直接退回详情页（它本来就不可见，用户看到的就是"没反应"）。
+            if (g.pickerOpts.empty()) {
+
+                g.mode = M_DETAIL;
+
+                ui_render_begin_overlay();
+
+                drawDetail();
+
+                ui_commit();
+
+                return APP_GTD;
+
+            }
+
             if (key == 0x1B) {
 
                 g.mode = M_DETAIL;
@@ -4949,15 +4827,9 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
                 std::string imeOut;
 
-                if (g_ime.handleKey(key, imeOut)) {
+                if (imeFieldKeyText(g_ime, key, false, imeOut)) {
 
-                    if (!imeOut.empty()) {
-
-                        g.editBuf.insert(g.editCur, imeOut);
-
-                        g.editCur += (int)imeOut.length();
-
-                    }
+                    if (!imeOut.empty()) imeFieldInsert(gtdEditField(), imeOut);
 
                     drawDetail();
 
@@ -4995,9 +4867,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
                 // Multi-line: Enter inserts newline
 
-                g.editBuf.insert(g.editCur, 1, '\n');
-
-                g.editCur++;
+                imeFieldInsert(gtdEditField(), "\n");
 
             } else if (key == '\t' && df.type == 'm') {
 
@@ -5033,35 +4903,19 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
             } else if (key == 0x7F || key == 0x08) {
 
-                if (g.editCur > 0) {
-
-                    int prev = g.editCur - 1;
-
-                    while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--;
-
-                    g.editBuf.erase(prev, g.editCur - prev);
-
-                    g.editCur = prev;
-
-                }
+                imeFieldBackspace(gtdEditField());
 
             } else if (key == KEY_LEFT) {
 
-                if (g.editCur > 0) { g.editCur--;
-
-                    while (g.editCur > 0 && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur--; }
+                imeFieldMoveLeft(gtdEditField());
 
             } else if (key == KEY_RIGHT) {
 
-                if (g.editCur < (int)g.editBuf.length()) { g.editCur++;
-
-                    while (g.editCur < (int)g.editBuf.length() && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur++; }
+                imeFieldMoveRight(gtdEditField());
 
             } else if (key >= 0x20 && key <= 0x7E) {
 
-                g.editBuf.insert(g.editCur, 1, (char)key);
-
-                g.editCur++;
+                imeFieldInsert(gtdEditField(), std::string(1, (char)key));
 
             }
 
@@ -5171,13 +5025,11 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         return APP_GTD;
 
-    }
+}
 
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleTaxMgr(int key) {
 
-
-    // ── M_CONTEXT_MGR / M_TAG_MGR / M_ADD_CONTEXT / M_ADD_TAG ──────────
-
-    if (g.mode == M_CONTEXT_MGR || g.mode == M_TAG_MGR) {
 
         bool isCtx = (g.mode == M_CONTEXT_MGR);
 
@@ -5406,13 +5258,10 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         return APP_GTD;
 
-    }
+}
 
-
-
-    // M_ADD_CONTEXT / M_ADD_TAG
-
-    if (g.mode == M_ADD_CONTEXT || g.mode == M_ADD_TAG) {
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleTaxAdd(int key) {
 
         bool isCtx = (g.mode == M_ADD_CONTEXT);
 
@@ -5420,9 +5269,9 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
             std::string imeOut;
 
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, false, imeOut)) {
 
-                if (!imeOut.empty()) { g.editBuf.insert(g.editCur, imeOut); g.editCur += (int)imeOut.length(); }
+                if (!imeOut.empty()) imeFieldInsert(gtdEditField(), imeOut);
 
                 drawAdd(); return APP_GTD;
 
@@ -5468,21 +5317,18 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         } else if (key == 0x7F || key == 0x08) {
 
-            if (g.editCur > 0) { int prev = g.editCur - 1; while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--; g.editBuf.erase(prev, g.editCur - prev); g.editCur = prev; }
+            imeFieldBackspace(gtdEditField());
 
-        } else if (key >= 0x20 && key <= 0x7E) { g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++; }
+        } else if (key >= 0x20 && key <= 0x7E) { imeFieldInsert(gtdEditField(), std::string(1, (char)key)); }
 
         drawAdd();
 
         return APP_GTD;
 
-    }
+}
 
-
-
-    // ── M_SUMMARY: task summary dialog ────────────────────────────
-
-    if (g.mode == M_SUMMARY) {
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleSummary(int key) {
 
         if (key == 0x1B || key == 'q' || key == 'Q') {
 
@@ -5517,13 +5363,10 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         return APP_GTD;
 
-    }
+}
 
-
-
-    // ── M_ARCHIVE: archive manager ────────────────────────────────────
-
-    if (g.mode == M_ARCHIVE) {
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleArchive(int key) {
 
         if (key == 0x1B || key == 'q' || key == 'Q') {
             if (g.archiveBrowsing) {
@@ -5572,13 +5415,10 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         if (g.mode != M_HELP) drawArchiveMgr();
         return APP_GTD;
-    }
+}
 
-
-
-    // ── M_HELP: shortcut help dialog ─────────────────────────────────
-
-    if (g.mode == M_HELP) {
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleHelp(int key) {
 
         if (key == 0x1B || key == 'q' || key == 'Q' || key == 0x0A || key == 0x0D) {
 
@@ -5611,13 +5451,12 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         return APP_GTD;
 
-    }
+}
 
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleNote(int key, ScreenContext &ctx, bool hasTap) {
+    auto &tasks = g.data["tasks"];
 
-
-    // ── M_EDIT_NOTE: multi-line note editor ──────────────────────────
-
-    if (g.mode == M_EDIT_NOTE) {
 
         // 触摸编辑（共享件 text_sel）：长按备注行 → 复制/剪切/粘贴/全选。
         // **排在 IME 分支之前**：会话靠这里吃掉拖动/长按键，免得漏进 g_ime（有未上屏
@@ -5658,17 +5497,9 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
             std::string imeOut;
 
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, false, imeOut)) {
 
-                if (!imeOut.empty()) {
-
-                    g.noteLines[g.noteRow].insert(g.noteCol, imeOut);
-
-                    g.noteCol += (int)imeOut.length();
-
-                    g.noteVrowsDirty = true;
-
-                }
+                if (!imeOut.empty()) { imeFieldInsert(gtdNoteField(), imeOut); g.noteVrowsDirty = true; }
 
                 drawNoteEditor();
 
@@ -5746,13 +5577,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
             if (g.noteCol > 0) {
 
-                int prev = g.noteCol - 1;
-
-                while (prev > 0 && ((unsigned char)g.noteLines[g.noteRow][prev] & 0xC0) == 0x80) prev--;
-
-                g.noteLines[g.noteRow].erase(prev, g.noteCol - prev);
-
-                g.noteCol = prev;
+                imeFieldBackspace(gtdNoteField());
 
                 g.noteVrowsDirty = true;
 
@@ -5800,9 +5625,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
             if (g.noteCol > 0) {
 
-                g.noteCol--;
-
-                while (g.noteCol > 0 && ((unsigned char)g.noteLines[g.noteRow][g.noteCol] & 0xC0) == 0x80) g.noteCol--;
+                imeFieldMoveLeft(gtdNoteField());
 
             } else if (g.noteRow > 0) {
 
@@ -5816,9 +5639,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
             if (g.noteCol < (int)g.noteLines[g.noteRow].length()) {
 
-                g.noteCol++;
-
-                while (g.noteCol < (int)g.noteLines[g.noteRow].length() && ((unsigned char)g.noteLines[g.noteRow][g.noteCol] & 0xC0) == 0x80) g.noteCol++;
+                imeFieldMoveRight(gtdNoteField());
 
             } else if (g.noteRow < (int)g.noteLines.size() - 1) {
 
@@ -5830,9 +5651,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         } else if (key >= 0x20 && key <= 0x7E) {
 
-            g.noteLines[g.noteRow].insert(g.noteCol, 1, (char)key);
-
-            g.noteCol++;
+            imeFieldInsert(gtdNoteField(), std::string(1, (char)key));
 
             g.noteVrowsDirty = true;
 
@@ -5842,25 +5661,18 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         return APP_GTD;
 
-    }
+}
 
-
-
-    // ── M_FILTER: filter input ──────────────────────────────────────
-
-    if (g.mode == M_FILTER) {
+// 从 screen_gtd_handle 里原样搬出来的一个 g.mode 分支（见那边的分发表）。
+static AppState gtdHandleFilter(int key) {
 
         if (g.imeActive && key != 0) {
 
             std::string imeOut;
 
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, false, imeOut)) {
 
-                if (!imeOut.empty()) {
-
-                    g.filterText += imeOut;
-
-                }
+                if (!imeOut.empty()) imeFieldInsert(gtdFilterField(), imeOut);
 
                 rebuildFilter();
 
@@ -5906,17 +5718,11 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         } else if (key == 0x7F || key == 0x08) {
 
-            if (!g.filterText.empty()) {
-
-                g.filterText.pop_back();
-
-                rebuildFilter();
-
-            }
+            if (imeFieldBackspace(gtdFilterField())) rebuildFilter();
 
         } else if (key >= 0x20 && key <= 0x7E) {
 
-            g.filterText += (char)key;
+            imeFieldInsert(gtdFilterField(), std::string(1, (char)key));
 
             rebuildFilter();
 
@@ -5928,9 +5734,11 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         return APP_GTD;
 
-    }
+}
 
-
+// 从 screen_gtd_handle 里原样搬出来的 M_BROWSE 主体（列表交互 + 落尾重绘）。
+static AppState gtdHandleBrowse(int key, ScreenContext &ctx) {
+    auto &tasks = g.data["tasks"];
 
     // ── M_BROWSE: main list view ─────────────────────────────────────
 
@@ -6501,4 +6309,142 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
     return APP_GTD;
 
+}
+
+
+AppState screen_gtd_handle(int key, ScreenContext &ctx) {
+
+    // 切进"要打字"的模式（新建/重命名/编辑字段/写笔记/筛选）时，自动把虚拟键盘
+    // 弹出来（没连蓝牙键盘的话）。只在**模式切换**的那一刻自动展示：用户在本模式里
+    // 手动点状态栏图标收起后，不会被下一帧又弹回来。
+    static int s_prevMode = M_BROWSE;
+    if (g.mode != s_prevMode) {
+        if (gtdVkEditing()) editorVkAutoShow();
+        // 换了模式 = 换了字段：上一个字段的选区 / 按钮条作废，
+        // 免得把 A 的选区贴到 B 上（也顺带把 g.field* 的旧值挤掉）。
+        textSelReset();
+        g.fieldX = 0;
+    }
+    s_prevMode = g.mode;
+
+
+    // 点按坐标只读一次：下面键盘拦截和一般分流都要用，读第二遍就空了。
+    int tapX = 0, tapY = 0;
+    bool hasTap = ((key == 0x0A || key == 0x0D) && input_tap_xy(&tapX, &tapY));
+
+    // 虚拟键盘（编辑态，与写作模式同一套）：先认状态栏上的键盘开关图标，再认
+    // 键盘面板。命中就把点按翻译成普通键码（或翻转待发状态），交给下面既有的
+    // 输入逻辑——不重复实现任何输入。key 置 0 时各编辑块照旧重绘，正好刷出反馈。
+    if (gtdVkEditing()) editorVkSyncBtState();   // 蓝牙键盘连上就自动收起
+    if (hasTap && gtdVkEditing()) {
+        if (editorVkIconHit(tapX, tapY)) {
+            editorVkSetVisible(!editorVkVisible());
+            hasTap = false; key = 0;
+        } else if (editorVkVisible() && tapY >= editorVkTop()) {
+            EditorVkHit hit;
+            int k = editorVkHitTest(tapX, tapY, &hit);
+            hasTap = false; key = 0;
+            // 按下反馈：记下命中键，反色随下面的重绘一起上屏（不额外推屏）。
+            if (k != EVK_NONE) editorVkMarkPressed(hit);
+            // EVK_PAGE：换面板已在命中测试里完成，key 保持 0 → 下面照样重绘
+            if (k == EVK_LANG) {
+                // 未开输入法 → 开中文；已开 → 拼音/英文互切（与物理 Ctrl+Space 等价）
+                if (!g.imeActive) { g.imeActive = true; g_ime.setActive(true); }
+                else g_ime.toggleEnglish();
+            } else if (k > 0) {
+                key = k;
+            }
+            // EVK_CTRL/EVK_SHIFT：待发状态已在命中测试内翻转，重绘即反馈
+            // EVK_NONE：点在键盘空白处，吞掉本次点按
+        }
+    }
+
+    // T9 候选面板里的上下滑（与写作/阅读同一套实现）：左列滚读音、宫格翻候选页。
+    // 必须放在下面把 PAGE_UP/DOWN 折成 UP/DOWN 之前——那一折是给子界面的单步移动用的，
+    // 滚面板不能走那条路；否则滚一下面板会顺带把正文/列表也挪一格。
+    if ((key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) && gtdVkActive()) {
+        int px = 0, py = 0;
+        if (input_press_xy(&px, &py) &&
+            editorVkSwipeScroll(px, py, key == KEY_PAGE_DOWN ? +1 : -1)) {
+            key = 0;   // 这一划归面板；各编辑块照旧重绘，正好把滚动的结果刷出去
+        }
+    }
+
+    // ── 共享的单行输入框触摸编辑（长按选字 / 复制 / 剪切 / 粘贴 / 全选）──────
+    // **排在虚拟键盘之后**：键盘上的点按优先（上面已经翻成普通键码了）——
+    // 会话开着时在键盘上敲字，会先在这里吃掉选区（"全选后直接打字"就地替换）。
+    // **排在下面的坐标分流之前**：按钮条落在正文区中部，若先过 gtdKeyFromTap 会被
+    // 当成"点列表空白"翻成 0，这一按就白点了。
+    {
+        std::string *fb = nullptr;
+        int *fc = nullptr;
+        TextSelLine fln;
+        TextSelView fview;
+        if (gtdFlatField(&fb, &fc, &fln, &fview)) {
+            if (key == KEY_TOUCH_LONG) {
+                int lx = 0, ly = 0;
+                if (input_tap_xy(&lx, &ly) && textSelBegin(*fb, *fc, fview, lx, ly)) {
+                    g_ime.cancelComposition();   // 别让未上屏的组合悬着
+                    gtdRedrawFieldMode();
+                    return APP_GTD;
+                }
+                key = 0x1B;   // 没落在输入行上 → 维持"长按 = 返回"的老语义
+            } else if (key != 0 &&
+                       textSelHandleKey(*fb, *fc, fview, key, tapX, tapY, hasTap,
+                                        &ctx.statusMessage)) {
+                gtdRedrawFieldMode();
+                return APP_GTD;
+            }
+        } else if (textSelActive() && g.mode != M_EDIT_NOTE) {
+            // 字段没了（提交/取消/切视图）→ 收起会话。备注编辑器是**多行**宿主，
+            // 走下面自己那一套（拍平镜像），别在这儿把它的会话误收掉。
+            textSelReset();
+        }
+    }
+
+    // 触摸点按再按坐标分流：命中标签栏/列表行/详情栏/选择器项/悬浮「+」时，
+    // gtdKeyFromTap 会把它换成对应的键（或就地处理），下面的键盘逻辑照旧执行；
+    // 没命中的点按保持 '\n'，仍旧是原来的 Enter 语义。
+    if (hasTap) {
+        int k = gtdKeyFromTap(tapX, tapY);
+        if (k >= 0) key = k;
+    }
+
+    // main.cpp 把触摸上下滑的翻页键原样留给计划模式（列表要整页翻），
+    // 其余子界面（添加/详情/选择器/日历…）这里退回单步，保持原有手感。
+    if (g.mode != M_BROWSE) {
+        if (key == KEY_PAGE_UP) key = KEY_UP;
+        else if (key == KEY_PAGE_DOWN) key = KEY_DOWN;
+        // 拖动增量只对列表有意义；子界面把它连同增量一起丢掉，
+        // 免得这个新键码流进输入法/编辑逻辑里。
+        if (key == KEY_TOUCH_DRAG) {
+            input_drag_xy(nullptr, nullptr);
+            key = 0;
+        }
+    }
+
+
+
+    // ── 按 g.mode 分发 ──────────────────────────────────────────────────
+    // 每一块原来都是这里的一段 `if (g.mode == …) { … return APP_GTD; }`，现在整体搬进
+    // 下面同名函数（P3c）。**逻辑一行没改**，所有分支都返回 APP_GTD，所以这里是
+    // 一张纯分发表；没命中的落到 M_BROWSE 主体。
+    if (g.mode == M_ADD) return gtdHandleAdd(key);
+    if (g.mode == M_RENAME) return gtdHandleRename(key);
+    if (g.mode == M_ITEM_MENU) return gtdHandleItemMenu(key, ctx);
+    if (g.mode == M_CONFIRM) return gtdHandleConfirm(key, ctx);
+    if (g.mode == M_ADD_PROJECT || g.mode == M_RENAME_PROJECT ||
+        g.mode == M_RENAME_CONTEXT || g.mode == M_RENAME_TAG)
+        return gtdHandleTaxNameEdit(key);
+    if (g.mode == M_DETAIL || g.mode == M_EDIT_FIELD || g.mode == M_PICKER ||
+        g.mode == M_CALENDAR)
+        return gtdHandleDetailViews(key);
+    if (g.mode == M_CONTEXT_MGR || g.mode == M_TAG_MGR) return gtdHandleTaxMgr(key);
+    if (g.mode == M_ADD_CONTEXT || g.mode == M_ADD_TAG) return gtdHandleTaxAdd(key);
+    if (g.mode == M_SUMMARY) return gtdHandleSummary(key);
+    if (g.mode == M_ARCHIVE) return gtdHandleArchive(key);
+    if (g.mode == M_HELP) return gtdHandleHelp(key);
+    if (g.mode == M_EDIT_NOTE) return gtdHandleNote(key, ctx, hasTap);
+    if (g.mode == M_FILTER) return gtdHandleFilter(key);
+    return gtdHandleBrowse(key, ctx);
 }

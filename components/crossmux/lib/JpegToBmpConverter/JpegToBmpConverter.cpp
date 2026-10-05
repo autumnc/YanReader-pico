@@ -599,14 +599,21 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
 
   LOG_DBG("JPG", "JPEG dimensions: %dx%d", srcWidth, srcHeight);
 
-  constexpr int MAX_IMAGE_WIDTH = 2048;
-  constexpr int MAX_IMAGE_HEIGHT = 3072;
-
-  if (srcWidth <= 0 || srcHeight <= 0 || srcWidth > MAX_IMAGE_WIDTH || srcHeight > MAX_IMAGE_HEIGHT) {
-    LOG_DBG("JPG", "Image too large or invalid (%dx%d), max supported: %dx%d", srcWidth, srcHeight, MAX_IMAGE_WIDTH,
-            MAX_IMAGE_HEIGHT);
+  // 源图尺寸这里只挡病态文件；**真正的内存约束是缩放后的宽度**，见下面 scaleSrcWidth
+  // 那处检查。原来这里直接拿 2048×3072 卡源尺寸，比真约束严得多：2644×3840 的扫描封面
+  // 走 1/8 缩放后一行只有 331 px，离解码器内部像素缓冲（JPEGDEC 的 MAX_BUFFERED_PIXELS
+  // = 2048）还差得远，却会被当成 "too large" 整本丢掉。而且原来那句是 LOG_DBG，默认日志
+  // 级别下连一行提示都没有，用户侧的表现就是"这本书没有封面"。实测（主机端跑同一份
+  // JPEGDEC）：2644×3840 渐进式封面在 1/8 缩放下 rc=1，解码完全正常。
+  constexpr int MAX_SOURCE_DIM = 16384;  // JPEG 规格上限 65535，取 2^14 做兜底
+  if (srcWidth <= 0 || srcHeight <= 0 || srcWidth > MAX_SOURCE_DIM || srcHeight > MAX_SOURCE_DIM) {
+    LOG_WRN("JPG", "Image has invalid or absurd dimensions (%dx%d)", srcWidth, srcHeight);
     return false;
   }
+
+  // 输出侧的上限（BMP 行缓冲 / 缩放后 MCU 行）。
+  constexpr int MAX_IMAGE_WIDTH = 2048;
+  constexpr int MAX_IMAGE_HEIGHT = 3072;
 
   // Calculate output dimensions (pre-scale to fit display exactly)
   int outWidth = srcWidth;
@@ -646,6 +653,16 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   const int scaleSrcHeight = (srcHeight + scaleDenominator - 1) / scaleDenominator;
   LOG_DBG("JPG", "JPEG decoder scale: 1/%d (%dx%d -> %dx%d), output=%dx%d", scaleDenominator, srcWidth, srcHeight,
           scaleSrcWidth, scaleSrcHeight, outWidth, outHeight);
+
+  // 解码器内部只有一行 MAX_BUFFERED_PIXELS 宽的像素缓冲，>会写穿，<不会。这才是"图片
+  // 太大"的真正判据，也是 MCU 行缓冲（MAX_MCU_HEIGHT × scaleSrcWidth）的实际上限：
+  // 卡在 2048 时最坏 16×2048 = 32 KB，与旧代码（源宽 ≤ 2048 时 scaleSrcWidth 也 ≤ 2048）
+  // 的峰值完全一致 —— 所以放宽源尺寸不会让内存占用变大，只是不再误杀大扫描件。
+  if (scaleSrcWidth > MAX_BUFFERED_PIXELS) {
+    LOG_WRN("JPG", "Scaled width %d exceeds decoder buffer (%d): src %dx%d at 1/%d", scaleSrcWidth,
+            MAX_BUFFERED_PIXELS, srcWidth, srcHeight, scaleDenominator);
+    return false;
+  }
 
   if (scaleSrcWidth != outWidth || scaleSrcHeight != outHeight) {
     scaleX_fp = (static_cast<uint32_t>(scaleSrcWidth) << 16) / outWidth;

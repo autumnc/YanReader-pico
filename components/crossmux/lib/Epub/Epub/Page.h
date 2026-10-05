@@ -89,7 +89,7 @@ class Page {
   // progress without a second section-file open per page turn.
   uint32_t visibleTextOffset = 0;
 
-  void addFootnote(const char* number, const char* href);
+  void addFootnote(const char* number, const std::string& href);
 
   bool addLink(const char* href, int16_t x, int16_t y, int16_t width, int16_t height);
 

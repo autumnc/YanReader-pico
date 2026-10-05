@@ -200,7 +200,7 @@ static void drawTracked(const Canvas &c, int dx, int baseline, int px, const cha
         const int L = utf8Len((unsigned char)starts[i][0]);
         memcpy(buf, starts[i], (size_t)L);
         buf[L] = '\0';
-        ttf_draw_text_px(c.fb, cur, base, pxp, buf, EPD_DRAW_ALIGN_LEFT,
+        ttf_draw_text_px(c.fb, cur, base, pxp, buf, TTF_ALIGN_LEFT,
                          (uint8_t)fg, (uint8_t)(fg == 0 ? 15 : 0));
         cur += widths[i] + trk;
     }

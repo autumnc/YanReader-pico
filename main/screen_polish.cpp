@@ -5,6 +5,7 @@
 #include "font_renderer.h"
 #include "ui_helpers.h"
 #include "ime/IME.h"
+#include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划/阅读共用一份）
 #include "wifi_manager.h"
 #include "editor_vk.h"   // 虚拟键盘：优化指令对话框没连蓝牙键盘时的唯一输入途径
 
@@ -42,6 +43,8 @@ static struct {
     int instrCur = 0;
     bool imeActive = false;
 } g;
+
+static ImeField polishInstrField() { return ImeField{&g.instrBuf, &g.instrCur}; }
 
 // Set by the entry path (BOOT double-click = whole text, Ctrl+O = selection).
 static PolishScope g_scope = POLISH_WHOLE;
@@ -230,10 +233,9 @@ AppState screen_polish_handle(int key, ScreenContext &ctx) {
         }
         if (g.imeActive && key != 0) {
             std::string imeOut;
-            if (g_ime.handleKey(key, imeOut)) {
+            if (imeFieldKeyText(g_ime, key, false, imeOut)) {
                 if (!imeOut.empty()) {
-                    g.instrBuf.insert(g.instrCur, imeOut);
-                    g.instrCur += (int)imeOut.length();
+                    imeFieldInsert(polishInstrField(), imeOut);
                 }
                 drawInstrDialog();
                 return APP_POLISH;
@@ -270,15 +272,9 @@ AppState screen_polish_handle(int key, ScreenContext &ctx) {
             return APP_POLISH;
         }
         if (key == 0x7F || key == 0x08) {
-            if (g.instrCur > 0) {
-                int prev = g.instrCur - 1;
-                while (prev > 0 && ((unsigned char)g.instrBuf[prev] & 0xC0) == 0x80) prev--;
-                g.instrBuf.erase(prev, g.instrCur - prev);
-                g.instrCur = prev;
-            }
+            imeFieldBackspace(polishInstrField());
         } else if (key >= 0x20 && key <= 0x7E) {
-            g.instrBuf.insert(g.instrCur, 1, (char)key);
-            g.instrCur++;
+            imeFieldInsert(polishInstrField(), std::string(1, (char)key));
         }
         drawInstrDialog();
         return APP_POLISH;

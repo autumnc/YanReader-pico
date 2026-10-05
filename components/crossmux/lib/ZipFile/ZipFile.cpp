@@ -13,6 +13,21 @@
 
 #include "ZipParsing.h"
 
+#include <esp_heap_caps.h>
+
+// ZIP 解压的输入缓冲。两件事：
+//  1) 尺寸 1KB → 4KB：一次 fread 顶以前四次，章节解压少几百次 VFS/FatFS 簇层往返。
+//  2) **64 字节对齐的内部 RAM**：SDMMC 只按对齐判定能否直接 DMA（见 [[sd-dma-buffer-hazard]]），
+//     未对齐会退回内部弹跳缓冲，而那块 DMA RAM 只剩 ~30KB，分配失败即读失败。显式对齐
+//     后不会再走弹跳。拿不到内部块时退回普通 malloc（与改动前一致，不因优化反而失败）。
+constexpr size_t ZIP_READ_BUF_BYTES = 4096;
+uint8_t* zipAllocReadBuf(const size_t want) {
+  auto* p = static_cast<uint8_t*>(
+      heap_caps_aligned_alloc(64, want, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (!p) p = static_cast<uint8_t*>(malloc(want));
+  return p;
+}
+
 struct ZipInflateCtx {
   HalFile* file = nullptr;
   size_t fileRemaining = 0;
@@ -350,6 +365,10 @@ bool ZipFile::close() {
   }
   lastCentralDirPos = 0;
   lastCentralDirPosValid = false;
+  // 缓存下来的中央目录偏移/条目数不能活过一次 close()：同一个对象再次 open() 的
+  // 可能是磁盘上已被替换的文件，残留的 centralDirOffset/totalEntries 会让下一个
+  // 消费者读到上一本书的目录。isSet=false 即可让全部读取点回落到重新解析。
+  zipDetails = ZipDetails{};
   return true;
 }
 
@@ -452,7 +471,7 @@ uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const boo
 
     // Continue out of block with data set
   } else if (fileStat.method == ZIP_METHOD_DEFLATED) {
-    auto* fileReadBuffer = static_cast<uint8_t*>(malloc(1024));
+    auto* fileReadBuffer = zipAllocReadBuf(ZIP_READ_BUF_BYTES);
     if (!fileReadBuffer) {
       LOG_ERR("ZIP", "Failed to allocate memory for zip file read buffer");
       free(data);
@@ -463,7 +482,7 @@ uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const boo
     ctx.file = &file;
     ctx.fileRemaining = deflatedDataSize;
     ctx.readBuf = fileReadBuffer;
-    ctx.readBufSize = 1024;
+    ctx.readBufSize = ZIP_READ_BUF_BYTES;
 
     // One-shot mode: `data` holds the entire output, so back-references
     // resolve inside it and no 32KB window is allocated.
@@ -529,7 +548,11 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
       return false;
     }
 
-    size_t remaining = inflatedDataSize;
+    // STORED 条目压缩前后等长，但中心目录里两个 size 都是条目自报的：只信
+    // uncompressedSize 时，一条"uncompressed 远大于 compressed"的畸形/手工构造条目会把
+    // 该条目**之后**的内容（后续条目、中央目录）一路写进 sink，直到 EOF 才收手。取两者
+    // 较小者封顶。
+    size_t remaining = std::min<size_t>(inflatedDataSize, deflatedDataSize);
     while (remaining > 0) {
       // HalFile::read 的返回类型是 int，出错时是负数。直接赋给 size_t 会变成 SIZE_MAX，
       // 于是 remaining 下溢（循环几乎不收敛），out.write 还会拿一个天文数字的长度去读
@@ -560,7 +583,10 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
       return streamDeflatedPrefix(file, out, chunkSize, deflatedDataSize, inflatedDataSize);
     }
 
-    auto* fileReadBuffer = static_cast<uint8_t*>(malloc(chunkSize));
+    // 输入缓冲至少 4KB（调用方给的 chunkSize 常常只有 1KB）；输出缓冲仍按 chunkSize
+    // 走 —— 它决定一次写出的粒度，不该跟着变大。
+    const size_t readBufBytes = std::max(chunkSize, ZIP_READ_BUF_BYTES);
+    auto* fileReadBuffer = zipAllocReadBuf(readBufBytes);
     if (!fileReadBuffer) {
       LOG_ERR("ZIP", "Failed to allocate memory for zip file read buffer");
       return false;
@@ -577,7 +603,7 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
     ctx.file = &file;
     ctx.fileRemaining = deflatedDataSize;
     ctx.readBuf = fileReadBuffer;
-    ctx.readBufSize = chunkSize;
+    ctx.readBufSize = readBufBytes;
 
     InflateStream inflate;
     if (!inflate.init(true)) {

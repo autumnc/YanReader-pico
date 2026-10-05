@@ -50,6 +50,34 @@ void rails_idle_check(int64_t now_ms) {
     }
 }
 
+// ── 全设备夜间反色 ───────────────────────────────────────────────────────
+// 反色的**唯一实施点**是这里，不是 HalDisplay。原因：本文件才是所有推屏的落地点 ——
+// 阅读器经 HalDisplay::displayBuffer → s_mode_refresh → update_display_reader 到这里；
+// 其余每个界面（书架/菜单/设置/写作/GTD/待机）由 core1 的渲染任务**直呼**
+// update_display_* 到这里，那条路根本不经过 HalDisplay。以前反色只挂在 HalDisplay 上，
+// 所以"夜间模式只对阅读模式生效" —— 这就是根因。
+//
+// front_fb 与 back_fb **成对**翻：epdiy 的差分就发生在这两者之间
+// （epd_difference_image_cropped(front,bak)），只翻 front 会让"两者处处不等"，差分矩形
+// 退化成整屏，打字每按一键就整屏驱动一遍（还闪）。翻完再翻回来，所以两块在静止时都是
+// **不反色**的 —— 全仓读 fb 的地方（渲染任务的 diff_bounding_rect、阅读器直画 front_fb、
+// 待机保留帧、u8g2/GfxRenderer）看到的仍是正常色，不需要任何"感知夜间"的分支。
+// epdiy 对 back_fb 的局部回写也被"翻出去、翻回来"自动保住：写过的行 = ~(~front) = front，
+// 没写的行 = ~(~back) = back，与不反色时的终态逐字节相同。
+static bool s_night;
+
+void display_set_night(bool on) { s_night = on; }
+
+static void night_flip(EpdiyHighlevelState *hl) {
+    const size_t n = (size_t)epd_width() / 2 * epd_height();
+    for (size_t i = 0; i < n; i++) hl->front_fb[i] = (uint8_t)~hl->front_fb[i];
+    for (size_t i = 0; i < n; i++) hl->back_fb[i] = (uint8_t)~hl->back_fb[i];
+}
+
+// 罩住一次推屏。必须成对调用（中间不能提前 return）。
+static void night_enter(EpdiyHighlevelState *hl) { if (s_night) night_flip(hl); }
+static void night_leave(EpdiyHighlevelState *hl) { if (s_night) night_flip(hl); }
+
 // 20 相完整/原厂 DU 按厂家时序走 FULL；只有触摸笔迹用的 8 帧跟随 DU 走 FAST。
 // 20-phase full / vendor DU uses FULL timing; the 8-frame FOLLOW DU used for ink trails uses FAST.
 static void use_scan_for(const EpdWaveform* waveform, enum EpdDrawMode mode) {
@@ -92,6 +120,20 @@ static int s_soft_refreshes;
 // screen-wide gray floor, and counting them would let a few menu taps trip a
 // full black-white flash. FOLLOW DU has only a DU table and does not count or
 // promote.
+// 软刷预算的对外两个口。UI 那条路（ui_render.cpp 的 do_full_refresh）自己也有整屏
+// 推送，它挑"这次升不升 GC16"必须用**同一份**预算：两条路各记各的，"攒 N 次软刷升
+// 一次全刷"就变成"每条路各攒 N 次"，总残影比设想的翻倍；反过来，一条路刚升过 GC16
+// （残影已清），另一条的计数不跟着归零，就会紧接着再闪一次全屏黑白。
+// 只有**整页**软刷记这份账（区域刷不记，理由见上），两处口径一致。
+// / The soft-refresh budget is shared: ui_render's own full-screen present must make
+// its GC16 decision against the same counter, or each path accumulates its own N and
+// the ghost budget doubles (or the other path flashes right after a GC16 that already
+// cleared the panel). Only whole-page soft updates count.
+bool display_soft_refresh_due(void) {
+    return APP_GC16_EVERY > 0 && s_soft_refreshes + 1 >= APP_GC16_EVERY;
+}
+void display_soft_refresh_reset(void) { s_soft_refreshes = 0; }
+
 static enum EpdDrawError hl_update(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode, bool full,
     const EpdRect* area
@@ -107,11 +149,18 @@ static enum EpdDrawError hl_update(
             ESP_LOGI(TAG, "promote to GC16 after %d soft refreshes", APP_GC16_EVERY);
         }
     }
+    enum EpdDrawError r;
     if (area != NULL) {
-        return full ? epd_hl_update_area_full(hl, mode, 25, *area)
-                    : epd_hl_update_area(hl, mode, 25, *area);
+        night_enter(hl);
+        r = full ? epd_hl_update_area_full(hl, mode, 25, *area)
+                 : epd_hl_update_area(hl, mode, 25, *area);
+        night_leave(hl);
+        return r;
     }
-    return full ? epd_hl_update_screen_full(hl, mode, 25) : epd_hl_update_screen(hl, mode, 25);
+    night_enter(hl);
+    r = full ? epd_hl_update_screen_full(hl, mode, 25) : epd_hl_update_screen(hl, mode, 25);
+    night_leave(hl);
+    return r;
 }
 
 enum EpdDrawError update_display_mode(
@@ -130,7 +179,9 @@ enum EpdDrawError update_display_from_white_with(
     use_scan_for(waveform, mode);
     epd_poweron();
     epd_hl_waveform(hl, waveform);
+    night_enter(hl);
     enum EpdDrawError result = epd_hl_update_screen_from_white(hl, mode, 25);
+    night_leave(hl);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     s_soft_refreshes = 0;
     rails_keepalive();
@@ -215,7 +266,9 @@ enum EpdDrawError update_display_gray8_text(EpdiyHighlevelState* hl) {
     use_scan_for(&E0470_GRAY8_TEXT_WAVEFORM, MODE_GL16);
     epd_poweron();
     epd_hl_waveform(hl, &E0470_GRAY8_TEXT_WAVEFORM);
+    night_enter(hl);
     enum EpdDrawError result = epd_hl_update_screen_full(hl, MODE_GL16, 25);
+    night_leave(hl);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     ++s_soft_refreshes;
     rails_keepalive();
@@ -280,7 +333,10 @@ static enum EpdDrawError update_display_page_turn(EpdiyHighlevelState* hl, e0470
     read_pico_epd_use_scan(READ_PICO_EPD_SCAN_FAST);
     epd_lcd_set_prefill_lines(s_bulk_io ? 56 : 44);
     epd_poweron();
+    // 揭页内部也是 front/back 差分 + 成功时把 front 抄回 back，所以成对翻即可（同 hl_update）。
+    night_enter(hl);
     enum EpdDrawError result = e0470_page_turn_ex(hl, logical_full_screen(), dir, wf, mode);
+    night_leave(hl);
     // 不管成败都把档位/预填还原成常规 GL16 的值，下一次普通刷新才不会被这次带偏。
     use_scan_for(&E0470_WAVEFORM, MODE_GL16);
     rails_keepalive();
@@ -315,12 +371,19 @@ enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
         // 失败就落到下面走这一档本来该走的普通刷新。
     }
     switch (kind) {
+        // 这三档**不能直接 return**：它们自己都不调 guard_draw_result，直接返回就绕过了
+        // 欠载兜底 —— 一旦线队列供数不足（GRAY8_TEXT 正是阅读器正文翻页的默认档），
+        // PCLK 不会退回安全值、也不做"清屏 + from-white 重推"，它自己又不会恢复，
+        // 于是之后每一帧继续欠载，屏幕长期花屏/半页。赋给 result 落到底下统一处理。
         case DISPLAY_KIND_FULL:
-            return update_display_full(hl);
+            result = update_display_full(hl);
+            break;
         case DISPLAY_KIND_GRAY8:
-            return update_display_gray8(hl);
+            result = update_display_gray8(hl);
+            break;
         case DISPLAY_KIND_GRAY8_TEXT:
-            return update_display_gray8_text(hl);
+            result = update_display_gray8_text(hl);
+            break;
         default: {
             // HALF(局刷 GL16) / FAST(极速 DU)：差分刷，走 hl_update —— GL16 会被
             // 强制成全像素（白底补 1 帧），DU 走跟随表不计数；攒够 APP_GC16_EVERY
@@ -379,7 +442,9 @@ void guard_draw_result(EpdiyHighlevelState* hl, enum EpdDrawError result) {
     epd_clear();
     // 清物理屏后仅重置旧帧基准，保留目标页；否则局部刷新会留下整页白屏。
     // Reset only the old-frame baseline after clearing; preserving the target prevents blank pages after partial updates.
+    night_enter(hl);
     epd_hl_update_screen_from_white(hl, MODE_GC16, 25);
+    night_leave(hl);
     s_soft_refreshes = 0;
     rails_keepalive();
     ESP_LOGW(TAG, "line queue underrun, pclk back to %d MHz", DISPLAY_PCLK_SAFE_MHZ);

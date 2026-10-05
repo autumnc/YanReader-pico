@@ -164,6 +164,12 @@ public:
     // 上屏计数器: commit() 每成功一次 +1。推屏侧拿它认"这一帧是上屏那一拍" ——
     // 编码区/候选区只在那时清一遍(打字中途一次全刷都不做,见 ui_render.cpp)。
     uint32_t commitSeq() const { return _commitSeq; }
+    // 句读计数器: 一次「句读」（，。！？；：、……—— 以及半角 ,.!?;:）落进正文时 +1。
+    // 和 commitSeq 分开记 —— 句读**不走上屏那条路**（没有候选，handleFullwidthPunct /
+    // imePunctForKey / v 模式符号都是直通进正文的），所以它换不出残影，但**用户敲完
+    // 它天然会停一下**，那一停正是清残影的好时机（见 ui_render.cpp 的
+    // IME_CLEAN_PUNCT_PAUSE_US）。推屏侧只认"这一帧刚吐出一个句读"，判定留在 core0。
+    uint32_t punctSeq() const { return _punctSeq; }
     std::string modeLabel() const;
     void clearLearningContext();
     // 文档级上下文: 编辑器喂入正文尾部(约 200 字), 已出现在正文里的词在小范围加分
@@ -285,6 +291,7 @@ private:
     std::string _lastCommitChar;
     std::string _lastCommitText;
     uint32_t _commitSeq = 0;   // 见 commitSeq()
+    uint32_t _punctSeq = 0;    // 见 punctSeq()
     std::string _statusMessage;
     int _partialStart = 0;
     int _maxMatchLen = 0;
@@ -374,6 +381,9 @@ private:
     void appendRecentCommitCandidates(const std::string &code,
                                       const std::vector<std::string> &aliasCodes,
                                       int typedLen);
+    // 「最近删除」名单：删词模式删掉一个学出来的词之后，挡它别再被学回来。
+    // **作用范围只到多字词**——单字永不进名单、也永不被它过滤，否则一个被删的单字会
+    // 从所有候选（含内置单字表）里消失，再也打不出来。见 IME.cpp 的实现处说明。
     bool recentlyDeletedWord(const std::string &word) const;
     bool recentlyDeletedWordHash(uint32_t hash) const;
     void rememberDeletedWord(const std::string &word);
@@ -586,6 +596,9 @@ private:
     bool pagePrev();
     bool pageNext();
     bool commit(int idx, std::string &out, bool bySpace = false);
+    // handleKey 的本体。外面套一层 handleKey 只为了统一认句读 —— 句读的发射点散在
+    // 好几处（见 IME.cpp 里那个外壳的说明），逐个埋计数器迟早漏一个。
+    bool handleKeyImpl(int key, std::string &out);
     bool handleFullwidthPunct(int key, std::string &out);
     bool handleFullwidthChar(int key, std::string &out);
 };

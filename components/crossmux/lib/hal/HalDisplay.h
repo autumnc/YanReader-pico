@@ -37,6 +37,11 @@ class HalDisplay {
 
   void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false,
                      DisplayRefreshContext context = DisplayRefreshContext::Normal);
+  // 阅读模式虚拟键盘的"打字帧"：只驱动与上一帧有差异的那块矩形（判据与波形见
+  // crossmux_platform.h 的 vk_present，实现在 ui_render.cpp 的 reader_vk_present）。
+  // panel_top = 键盘面板顶边，cand_h = 编码/候选两行总高（逻辑像素）。夜间反色与本类
+  // 其它推屏出口一致，由这里罩住；没注册钩子时退回 displayBuffer(HALF_REFRESH)。
+  void displayBufferVk(int panel_top, int cand_h);
   void displayBufferAsync(RefreshMode mode = RefreshMode::FAST_REFRESH,
                           DisplayRefreshContext context = DisplayRefreshContext::Normal);
   void waitRefreshComplete();

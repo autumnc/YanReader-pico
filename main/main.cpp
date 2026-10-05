@@ -15,6 +15,7 @@
 #include "screen_settings.h"
 #include "screen_gtd.h"
 #include "screen_outline.h"
+#include "screen_inspiration.h"
 #include "screen_bt_manage.h"
 #include "screen_file_manager.h"
 #include "screen_polish.h"
@@ -23,10 +24,11 @@
 #include "screen_reader.h"
 #include "ui_helpers.h"
 #include "ui_render.h"
+#include "ui/screen.h"   // Screen：每屏一行（handle/idle_ms/键盘宿主/局刷）
 #include "typing_click.h"
 #include "pcf85063.h"
 #include "standby_clock.h"
-#include "boot_splash.h"  // Yan Reader 开机动画（研读｜研墨｜研虑）
+#include "boot_splash.h"  // Yan Reader 开机动画（研读｜研墨｜研行）
 
 #include "board.h"
 #include "board_hw.h"
@@ -34,7 +36,7 @@
 #include "hw/input.h"
 #include "crossmux_platform.h"
 #include "display.h"
-#include "settings.h"
+#include "font_store.h"
 #include "read_pico_board.h"
 #include "read_pico_pmu.h"
 #include "read_pico_sd.h"
@@ -410,12 +412,333 @@ static void checkLightSleep(AppState state) {
     }
 }
 
+// ── 每屏的 handle（Screen 表的实现，见 main/ui/screen.h）────────────────
+// 这一批函数是**从主循环那个 switch 里原样搬出来的 case 体**：`break` 换成
+// `return 下一个界面`，`currentState` 换成局部 `next`，其余一字未改——包括各屏自己
+// 那份 `static bool xxxInited` 和退出时的清零，语义与搬迁前逐条对应。
+// 空转时**不在这里睡**（除了 idle_ms=0 的几屏，它们本来就在体内 vTaskDelay）。
+
+// 空转等待期间补采样触摸。触摸只在主循环顶部 input_poll() 采一次，而各界面空转
+// 时靠 vTaskDelay 睡 50~200ms；cst836u 只返回"当前"按下状态（没有锁存寄存器），
+// 一次 60~120ms 的点按若整个落在同一个睡眠窗口里就会**彻底丢失** —— 手感就是
+// "点了没反应，得再点一次"。这里把等待切成小段、每段前补采一次；采到的按键由
+// hw/input.cpp 暂存（input_tick），下一轮 input_poll() 取走。
+static void idleWaitWithTouch(int total_ms) {
+    const int step_ms = 20;   // 40~50Hz：60ms 的点按至少能采到两拍
+    for (int left = total_ms; left > 0; ) {
+        int step = (left > step_ms) ? step_ms : left;
+        input_tick();
+        vTaskDelay(pdMS_TO_TICKS(step));
+        left -= step;
+    }
+}
+
+// 界面属于哪个模式（appModeOfState）定义搬到 pjournal_app.h 了：screen_editor 的
+// leave 钩子也要用它判断"这次离开是不是切模式"。
+
+// 主循环里几个跨 case 要用的现场（原来是循环内的 static/local）。
+static int64_t s_lap_t0 = 0, s_lap_t1 = 0;  // 帧探针的三次采样点
+static AppState inspReturnTo = APP_MAIN;        // 灵感面板：退出回哪儿
+static AppState inspEditorReturnTo = APP_MAIN;  // 灵感面板 → 编辑器：回来时的落点
+
+static AppState scrMain(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    return screen_main_handle(key, ctx);
+}
+
+static AppState scrEditor(int key, ScreenContext &ctx) {
+    g_font.setSize(g_settings.fontSize());
+    {
+        int fs = g_font.fontSize();
+        IME::getInstance().setPageSize(fs <= 22 ? 7 : 5);
+    }
+    AppState next = APP_EDITOR;
+    if (key > 0) next = screen_editor_handle(key, ctx);
+    else {
+        screen_editor_idle(ctx, false);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return next;
+}
+
+static AppState scrBrowser(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    return screen_browser_handle(key, ctx);
+}
+
+static AppState scrViewer(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    return screen_viewer_handle(key, ctx);
+}
+
+static AppState scrHistory(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    return screen_history_handle(key, ctx);
+}
+
+static AppState scrSettings(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    IME::getInstance().setPageSize(7);
+    return screen_settings_handle(key, ctx);
+}
+
+static AppState scrBtManage(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    return screen_bt_manage_handle(key, ctx);
+}
+
+static AppState scrFileManager(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    return screen_file_manager_handle(key, ctx);
+}
+
+static AppState scrGtd(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    IME::getInstance().setPageSize(7);
+    return screen_gtd_handle(key, ctx);
+}
+
+static AppState scrOutline(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    IME::getInstance().setPageSize(7);
+    return screen_outline_handle(key, ctx);
+}
+
+static AppState scrInspiration(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    IME::getInstance().setPageSize(7);
+    return screen_inspiration_handle(key, ctx);
+}
+
+static AppState scrPolish(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    IME::getInstance().setPageSize(7);
+    return screen_polish_handle(key, ctx);
+}
+
+static AppState scrPolishPrompt(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    IME::getInstance().setPageSize(7);
+    return screen_polish_prompt_handle(key, ctx);
+}
+
+static AppState scrFlomo(int key, ScreenContext &ctx) {
+    g_font.setSize(20);
+    IME::getInstance().setPageSize(7);
+    return screen_flomo_handle(key, ctx);
+}
+
+// WebDAV 同步：整屏就是一串异步状态（Idle → Running → 结果停留 2s → 回主菜单），
+// 每拍自己 vTaskDelay（idle_ms = 0）。
+static AppState scrSyncWebdav(int key, ScreenContext &ctx) {
+    (void)key; (void)ctx;
+    g_font.setSize(20);
+    IME::getInstance().setPageSize(7);
+    if (s_webdavState == AsyncUiState::Idle) {
+        lockAsyncResult();
+        s_webdavResult = {false, ""};
+        unlockAsyncResult();
+        s_webdavResultUntil = 0;
+        s_webdavState = AsyncUiState::Running;
+        TaskHandle_t h = nullptr;
+        if (xTaskCreate(webdavSyncTask, "webdav_sync", 12288, nullptr, 1, &h) != pdPASS) {
+            s_webdavResult = {false, "系统繁忙,请重试"};
+            s_webdavState = AsyncUiState::Done;
+        }
+    }
+
+    if (s_webdavState == AsyncUiState::Running) {
+        drawCenteredBusy("WebDAV 同步", "正在同步...");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        return APP_SYNC_WEBDAV;
+    }
+
+    if (s_webdavResultUntil == 0) {
+        s_webdavResultUntil = esp_timer_get_time() + 2000000;
+        lockAsyncResult();
+        std::string message = s_webdavResult.message;
+        unlockAsyncResult();
+        drawCenteredBusy("WebDAV 同步",
+                         message.empty() ? "同步结束" : message.c_str());
+        return APP_SYNC_WEBDAV;
+    }
+    if (esp_timer_get_time() < s_webdavResultUntil) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        return APP_SYNC_WEBDAV;
+    }
+    s_webdavState = AsyncUiState::Idle;
+    return APP_MAIN;
+}
+
+// Flomo 发送：同 WebDAV，另外多一份"正文从哪儿来"的判断（编辑器 / 待发管道）。
+static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
+    (void)key; (void)ctx;
+    if (s_flomoState == AsyncUiState::Idle) {
+        if (!g_flomoPendingText.empty()) {
+            s_flomoText = std::move(g_flomoPendingText);
+            g_flomoPendingText.clear();
+            s_flomoReturnTo = g_flomoReturnTo;
+        } else {
+            s_flomoText = app_get_editor_text();
+            s_flomoReturnTo = APP_EDITOR;
+        }
+        lockAsyncResult();
+        s_flomoResult = {false, ""};
+        unlockAsyncResult();
+        s_flomoResultUntil = 0;
+        s_flomoState = AsyncUiState::Running;
+        TaskHandle_t h = nullptr;
+        if (xTaskCreate(flomoSendTask, "flomo_send", 8192, nullptr, 1, &h) != pdPASS) {
+            s_flomoResult = {false, "系统繁忙,请重试"};
+            s_flomoState = AsyncUiState::Done;
+        }
+    }
+
+    if (s_flomoState == AsyncUiState::Running) {
+        ui_clear();
+        ui_show_message_centered("正在发送...");
+        ui_commit();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        return APP_SYNC_SEND_FLOMO;
+    }
+
+    if (s_flomoResultUntil == 0) {
+        s_flomoResultUntil = esp_timer_get_time() + 2000000;
+        lockAsyncResult();
+        std::string message = s_flomoResult.message;
+        unlockAsyncResult();
+        ui_clear();
+        ui_show_message_centered(message.empty() ? "发送结束" : message.c_str());
+        ui_commit();
+        return APP_SYNC_SEND_FLOMO;
+    }
+    if (esp_timer_get_time() < s_flomoResultUntil) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        return APP_SYNC_SEND_FLOMO;
+    }
+    s_flomoText.clear();
+    s_flomoState = AsyncUiState::Idle;
+    return s_flomoReturnTo;
+}
+
+static AppState scrReader(int key, ScreenContext &ctx) {
+    // 阅读模式用 crossmux 自己的 GfxRenderer + ttf_font 渲染，不用 g_font。
+    const int64_t tEntry = esp_timer_get_time();
+    AppState next = APP_READER;
+    if (key > 0) next = screen_reader_handle(key, ctx);
+    else { screen_reader_handle(0, ctx); idleWaitWithTouch(80); }
+    const int64_t tExit = esp_timer_get_time();
+    // 临时帧探针：整趟超 400ms 就打一行（正常一趟只有几十 ms）。
+    // 前置 = 上一趟收尾(状态切换尾巴/空转等待) + 本轮 checkLightSleep/IME 冲刷。
+    static int64_t sPrevExit = 0;
+    if (tExit - s_lap_t0 > 400000 || (sPrevExit && s_lap_t0 - sPrevExit > 400000))
+        ESP_LOGW(TAG, "帧探针: 前置 %lldms 取键 %lldms 处理 %lldms 共 %lldms key=%d",
+                 sPrevExit ? (s_lap_t0 - sPrevExit) / 1000 : -1,
+                 (s_lap_t1 - s_lap_t0) / 1000, (tExit - tEntry) / 1000,
+                 (tExit - s_lap_t0) / 1000, key);
+    sPrevExit = tExit;
+    // 离开阅读模式的收尾（记进度 + 释放书对象 + 还方向）不在这里了：它是 kScreens 里
+    // 那一行的 leave（screen_reader_leave），主循环无论从哪条路走出去都会调到。
+    return next;
+}
+
+// ── 各屏的 enter 适配层 ─────────────────────────────────────────────────
+// 屏自己的 init 签名不一样（有的要 ctx 里的东西，有的要"回到哪儿"），这里做一次薄
+// 适配，塞进 kScreens 的 enter 列。**要不要重建**这条策略不在这一层 —— 多数屏是
+// "每次进来都重建"，所以在 enter 里直接调 init；两个例外（计划模式和编辑器）各自
+// 把策略收在自己的 .cpp 里（screen_gtd_enter / screen_editor_enter）。
+static void browserEnter(ScreenContext &ctx) { (void)ctx; screen_browser_init(); }
+static void viewerEnter(ScreenContext &ctx) { screen_viewer_init(ctx.selectedEntry); }
+static void historyEnter(ScreenContext &ctx) { screen_history_init(ctx.selectedEntry, ctx.prevState); }
+static void settingsEnter(ScreenContext &ctx) { (void)ctx; screen_settings_init(); }
+static void btManageEnter(ScreenContext &ctx) { (void)ctx; screen_bt_manage_init(); }
+static void fileManagerEnter(ScreenContext &ctx) { (void)ctx; screen_file_manager_init(); }
+static void outlineEnter(ScreenContext &ctx) { (void)ctx; screen_outline_init(); }
+static void inspirationEnter(ScreenContext &ctx) {
+    (void)ctx;
+    screen_inspiration_init(inspReturnTo, inspEditorReturnTo);
+}
+static void polishEnter(ScreenContext &ctx) { (void)ctx; screen_polish_init(); }
+static void polishPromptEnter(ScreenContext &ctx) { (void)ctx; screen_polish_prompt_init(); }
+static void flomoEnter(ScreenContext &ctx) { (void)ctx; screen_flomo_init(APP_MAIN); }
+
+// ── 表 ─────────────────────────────────────────────────────────────────
+// 一行一个界面。**没列到的状态**（APP_PROMPT_SEL）没有 handle，主循环按 default
+// 处理——回主菜单，与搬迁前那个 switch 的 default 分支一致。
+//
+// 用**具名初始化**（C++20 designated initializers）：这一版起一行有七个槽，位置写法
+// 读一次错一次；写上字段名之后，"这屏有没有 leave""idle 睡多久"是看出来的。
+// 没写的字段取 Screen 里的默认值（idle_ms=100、vk_host=false、local_only=false）。
+static const Screen kScreens[APP_QUIT + 1] = {
+    /* APP_MAIN          */ {.name = "main",           .handle = scrMain,         .idle_ms = 200, .local_only = true },
+    /* APP_EDITOR        */ {.name = "editor",         .enter = screen_editor_enter, .handle = scrEditor,
+                             .leave = screen_editor_leave, .idle_ms = 0, .vk_host = true },
+    /* APP_BROWSER       */ {.name = "browser",        .enter = browserEnter,     .handle = scrBrowser },
+    /* APP_VIEWER        */ {.name = "viewer",         .enter = viewerEnter,      .handle = scrViewer },
+    /* APP_HISTORY       */ {.name = "history",        .enter = historyEnter,     .handle = scrHistory },
+    /* APP_SETTINGS      */ {.name = "settings",       .enter = settingsEnter,    .handle = scrSettings,
+                             .vk_host = true, .local_only = true },
+    /* APP_PROMPT_SEL    */ {.name = "prompt_sel"},   // 没有 handle：主循环回主菜单
+    /* APP_SYNC_WEBDAV   */ {.name = "sync_webdav",    .handle = scrSyncWebdav,   .idle_ms = 0 },
+    /* APP_SYNC_SEND_FLOMO*/{.name = "sync_flomo",     .handle = scrSyncSendFlomo,.idle_ms = 0 },
+    /* APP_BT_MANAGE     */ {.name = "bt_manage",      .enter = btManageEnter,    .handle = scrBtManage,
+                             .idle_ms = 30 },
+    /* APP_FILE_MANAGER  */ {.name = "file_manager",   .enter = fileManagerEnter, .handle = scrFileManager,
+                             .idle_ms = 200 },
+    // 计划模式的 enter/leave 收在 screen_gtd.cpp 自己手里：**重跑 init 会把 tab 清回
+    // 收集箱**，所以只有本次开机第一次进来才 init，之后重进只补方向。
+    /* APP_GTD           */ {.name = "gtd",            .enter = screen_gtd_enter, .handle = scrGtd,
+                             .leave = screen_gtd_leave, .vk_host = true },
+    /* APP_OUTLINE       */ {.name = "outline",        .enter = outlineEnter,     .handle = scrOutline,
+                             .vk_host = true },
+    /* APP_INSPIRATION   */ {.name = "inspiration",    .enter = inspirationEnter, .handle = scrInspiration,
+                             .vk_host = true },
+    /* APP_POLISH        */ {.name = "polish",         .enter = polishEnter,      .handle = scrPolish,
+                             .vk_host = true },
+    /* APP_POLISH_PROMPT */ {.name = "polish_prompt",  .enter = polishPromptEnter,.handle = scrPolishPrompt,
+                             .vk_host = true },
+    /* APP_FLOMO         */ {.name = "flomo",          .enter = flomoEnter,       .handle = scrFlomo,
+                             .vk_host = true },
+    // 阅读模式**是**虚拟键盘宿主：它自己有一整套键盘的开关/命中/绘制（screen_reader
+    // 里 20 多处翻 st.vkVisible）。这一列原来是 false —— 于是主循环每一轮都拿
+    // editorVkSetVisible(false) 把阅读模式刚摆出来的键盘收掉，顺带把 s_userOverride
+    // 钉成 true（那个标记的语义是"用户手动关过，别再自动弹回来"，被这么用一次就废了），
+    // 还每轮白跑一遍 invalidateCandidateWidths()。见 [[vk-host-reader]]。
+    // enter/leave = 真正的重建与收尾（阅读器没有"续上上次现场"这种东西：它自己用
+    // s_return 记返回点，见 rdRestoreReturnPoint）。
+    /* APP_READER        */ {.name = "reader",         .enter = screen_reader_enter, .handle = scrReader,
+                             .leave = screen_reader_leave, .idle_ms = 0, .vk_host = true },
+};
+static_assert(sizeof(kScreens) / sizeof(kScreens[0]) == APP_QUIT + 1,
+              "kScreens 必须一个界面一行（含 APP_QUIT 占位）");
+
+// ── 界面生命周期：只有"进入"和"离开"两个事件 ────────────────────────────
+// s_activeScreen = **已经跑过 enter** 的那个界面。主循环里任何改了 currentState 的
+// 地方（电源键切模式、Ctrl+I 弹灵感、各屏 handle 的返回值）都不必自己记着"该不该
+// init/收尾"——调一次 syncScreenLifecycle() 就行，它是幂等的：
+//   换了界面 → 先 leave 旧屏、再 enter 新屏；没换 → 什么都不做。
+// 调用点在派发**前后**各一次：前面那次收"派发之前就改了 currentState"的（切模式/
+// 全局键），后面那次收各屏自己返回的 next。
+static AppState s_activeScreen = APP_QUIT;
+
+static void syncScreenLifecycle(AppState state, ScreenContext &ctx) {
+    if (state == s_activeScreen) return;
+    if (s_activeScreen != APP_QUIT) {
+        const Screen &old = kScreens[s_activeScreen];
+        if (old.leave) old.leave(state);   // 参数是"去哪儿"（编辑器要按目的地决定收尾）
+    }
+    s_activeScreen = state;
+    if (state == APP_QUIT) return;
+    const Screen &cur = kScreens[state];
+    if (cur.enter) cur.enter(ctx);
+}
+
 // ── Application Main Loop ──────────────────────────────────────────────
 
 
 
 extern "C" void app_main() {
-    ESP_LOGI(TAG, "Yan Reader v" PJOURNAL_VERSION " starting...");
+    ESP_LOGI(TAG, "Yan Reader v" YAN_READER_VERSION " starting...");
 
     // 装黑匣子要在任何大分配之前：开机阶段（WiFi 静态池、epdiy 行队列）正是内堆
     // 最紧、最可能失败的时候，见下方 onAllocFailed。
@@ -477,9 +800,13 @@ extern "C" void app_main() {
     // ——GL16 全像素、软刷升 GC16 这两条防残影机制在那两档上是缺的，而正文翻页恰好
     // 全走 HALF。注册统一出口后五档全部回到 display.c 的同一处。
     crossmux_platform_set_mode_refresh(update_display_reader);
+    // 阅读模式虚拟键盘的打字帧：只推"与上一帧有差异的那块矩形"（编码候选两行快刷、
+    // 键盘区/文本输入区局刷）。不注册的话每一帧都走上面的 HALF(整屏 GL16)→被升级成
+    // 整屏全像素，用户侧就是"按一个按键就全刷一次"。见 ui_render.cpp 的 reader_vk_present。
+    crossmux_platform_set_vk_present(reader_vk_present);
 
     // 从 NVS 读回外置字体路径（须在字体初始化前，才能让 ttf_font_init 打开 SD 字体）。
-    settings_init();
+    font_store_init();
 
     // 套用全设备夜间反色（在推屏唯一出口 HalDisplay::displayBuffer 处逐帧取反）。
     // 必须在第一帧之前设好，否则开机首屏按日间画、之后才翻黑。
@@ -565,7 +892,7 @@ extern "C" void app_main() {
     clipboardLoad();
 
     // Initialize the UI font AFTER SD mount so SD 外置字体 (ttf_font_init →
-    // app_settings_font_path → ttf_font_open) 能真正打开；无卡/路径无效回落内建。
+    // font_store_get_path → ttf_font_open) 能真正打开；无卡/路径无效回落内建。
     // 界面文本也用**用户选的字体**（除了图标/状态符号与虚拟键盘），所以 g_font 的
     // 文本面就是内容面；没装外置字体时内容面 = 内置，与从前逐像素一致。
     g_font.begin(TTF_ROLE_CONTENT);          // 界面文本：用户字体（未选则内置）
@@ -692,13 +1019,11 @@ extern "C" void app_main() {
     // Set candidate page size based on the default UI font size (20pt)
     ime.setPageSize(7);
     // 候选字按显示宽度动态分页: 可用宽度与各界面候选行一致。
-    // 量宽度必须跟着"谁在画候选"走: 虚拟键盘自己按 ime_cand_size 档位直写像素
-    // (editor_vk.cpp 的 evkCandStrW)，其余界面走 drawIMEUI 那套界面字号 —— 两边的
-    // 实际字宽不同，用错量法就会把候选挤出候选行(大字号时最后一两个看不见也点不到)。
-    ime.setWidthFn([](const char *s) -> int {
-        if (editorVkVisible()) return editorVkCandidateWidth(s);
-        return g_content_font.textWidth(s);
-    });
+    // 量宽度只有一个口径：候选行(虚拟键盘的候选条、实体键盘的输入法条)都按
+    // 「候选字大小」设置直写像素，见 ui_helpers 的 imeCandStrW —— 输入法算"一行放
+    // 几个"和面板实际画得下几个，必须是同一份结论，否则大字号时最后一两个候选
+    // 会被挤出候选行，看不见也点不到。
+    ime.setWidthFn([](const char *s) -> int { return imeCandStrW(s); });
     ime.setDisplayWidth(imeCandidateLineWidth());
 
     // Initialize Bluetooth keyboard in background (non-blocking, faster boot)
@@ -714,8 +1039,6 @@ extern "C" void app_main() {
         ctx.prevState = APP_SETTINGS;  // 编辑器 Esc → 设置, 设置 Esc → 编辑器
         ctx.promptText = "";
     }
-    static AppState inspReturnTo = APP_MAIN;
-    static AppState inspEditorReturnTo = APP_MAIN;
     // 三种模式各自的"上次停留界面"：power 键在 阅读 → 写作 → 计划 → 阅读 间轮换。
     // 计划模式目前只有 GTD(任务/项目)这一块，根界面就是 APP_GTD。
     static AppState s_writingState = APP_MAIN;
@@ -726,20 +1049,17 @@ extern "C" void app_main() {
     // 未保存的草稿活在 screen_editor.cpp 的 g_editor 里，阅读模式的书 / 页码 / 标签
     // 活在 screen_reader.cpp 的 st（外加退出时记下的 s_return 返回点）。
     // 所以规则只有一条：**切模式时不要重跑那个模式的 init**——静态原样还在。
-    // 各 case 里的 `xxxInited` 因此只在"本模式本次开机第一次进入"时置位，之后切模式、
-    // 退回写作菜单都不清零；重跑 init 才是把用户工作冲掉的唯一原因（screen_gtd_init
-    // 会把 tab 清成收集箱、screen_editor_init 会把正文清空重载）。
+    // 各屏自己的"是否已经 init 过"现在住在屏幕自己的文件里（screen_gtd.cpp 的
+    // s_gtdInited、screen_editor.cpp 的 s_editorInited），只在"本模式本次开机第一次
+    // 进入"时置位，之后切模式、退回写作菜单都不清零；重跑 init 才是把用户工作冲掉的
+    // 唯一原因（screen_gtd_init 会把 tab 清成收集箱、screen_editor_init 会把正文清空
+    // 重载）。这个"什么时候置位"的决定归各屏的 enter 钩子，main 不再过问。
     // 唯一要"每次进入都补做"的是模式自己的方向设置（退出时还给了全局）。
-    // 某个界面属于哪个模式：0=阅读 1=写作 2=计划。按界面归属判断而不是另存一个
-    // mode 变量，这样用户在模式内部乱走(从 GTD 退回写作菜单)也不会把模式标错。
-    auto appModeOfState = [](AppState s) {
-        if (s == APP_READER) return 0;
-        if (s == APP_GTD) return 2;
-        return 1;
-    };
-    if (currentState == APP_READER) {
-        screen_reader_init();
-    }
+    // 某个界面属于哪个模式：0=阅读 1=写作 2=计划。appModeOfState 见文件顶部。
+    //
+    // 开机首帧在这里同步一次生命周期：把 s_activeScreen（APP_QUIT）切到 currentState，
+    // 跑一遍它的 enter（阅读器开局在书架时等价于原来的 screen_reader_init()）。
+    syncScreenLifecycle(currentState, ctx);
 
     // 物理按键状态(时间制,不依赖主循环节拍)。电容键由 input_key_held 消抖后驱动。
     struct BtnState {
@@ -749,33 +1069,13 @@ extern "C" void app_main() {
         bool long_fired = false;      // 本次按下已触发长按
     } btn_user, btn_boot;
 
-    // 空闲等待期间补采样触摸。触摸只在主循环顶部 input_poll() 采一次，而各界面空转
-    // 时靠 vTaskDelay 睡 50~200ms；cst836u 只返回"当前"按下状态（没有锁存寄存器），
-    // 一次 60~120ms 的点按若整个落在同一个睡眠窗口里就会**彻底丢失** —— 手感就是
-    // "点了没反应，得再点一次"。这里把等待切成小段、每段前补采一次；采到的按键由
-    // hw/input.cpp 暂存（input_tick），下一轮 input_poll() 取走。
-    // （搬 core1 渲染任务时 input_tick() 的 6 个调用点全被删了，于是它变成了死代码，
-    //   空隙也就没了补采样 —— 这里把它复活。）
-    auto idleWaitWithTouch = [](int total_ms) {
-        const int step_ms = 20;   // 40~50Hz：60ms 的点按至少能采到两拍
-        for (int left = total_ms; left > 0; ) {
-            int step = (left > step_ms) ? step_ms : left;
-            input_tick();
-            vTaskDelay(pdMS_TO_TICKS(step));
-            left -= step;
-        }
-    };
-
     while (currentState != APP_QUIT) {
         checkLightSleep(currentState);
-
-        // 冲刷合并窗口已到期的 IME 编码/候选条局刷（每轮一次，见 ui_helpers.cpp）。
-        ui_flush_ime_deferred();
 
         // ── 临时帧探针（定位"翻页后 ~8s 无响应"，定位到就删） ──────────────
         // 三次采样把主循环一趟切成"前置/取键/处理"三段；只要总时长超阈值就打一行，
         // 于是"卡在哪一段"是从日志读出来的，不是猜的。
-        int64_t lapT0 = esp_timer_get_time();
+        s_lap_t0 = esp_timer_get_time();
 
         int key = g_bt.readKey();
         g_key_from_ble = (key != 0);
@@ -787,6 +1087,7 @@ extern "C" void app_main() {
             if (hw != 0 && key == 0) key = hw;
         }
         int64_t lapT1 = esp_timer_get_time();
+        s_lap_t1 = lapT1;
 
         // BLE 键盘输入视为活动,重置空闲休眠计时
         if (key > 0) s_last_activity_us = esp_timer_get_time();
@@ -831,11 +1132,6 @@ extern "C" void app_main() {
         // Check for key repeat events
         g_bt.checkKeyRepeat();
 
-        // 本轮的"进入界面之前"是哪个界面。必须**在下面电源键切模式之前**取——切模式会
-        // 在这之前就把 currentState 改掉，放在 switch 前面取的话切模式那帧会误判成
-        // "没换界面"，于是切回编辑器时不重绘（屏幕停在阅读器画面上，直到按第一个键）。
-        AppState prevState = currentState;
-
         // 电源键短按 → 阅读/写作/计划三模式轮换（全局，最高优先级，不被任何界面吞掉）。
         // **双击待机已取消**：300ms 的双击窗口对电源键太短，实际按不出来。待机改由
         // 长按中间确认键触发（见下面那一段）。
@@ -847,33 +1143,30 @@ extern "C" void app_main() {
             int cur = appModeOfState(currentState);
             if (cur == 1) {
                 s_writingState = currentState;
-                // 正坐在编辑器里被切走：触摸选区/按钮条/粘贴板列表一并收掉。
-                // 切回来是直接复用 currentState（不重进 init），留着就会挂上一次的选区。
-                // 只在"确实在编辑器里"时清：写作模式这一族还包括润色/灵感/大纲等，
-                // 它们各有各的现场（润色的选区就存在暂存的编辑器快照里）。
-                if (currentState == APP_EDITOR) app_editor_leave_cleanup();
+                // 编辑器被切走时"收选区/按钮条/粘贴板"那件事搬进了 screen_editor_leave
+                // （它是切模式下唯一还留在屏幕上的现场清理，属于编辑器的内部事务）。
             } else if (cur == 2) {
                 s_planState = currentState;
             }
             int next = (cur + 1) % 3;
-            if (cur == 0) screen_reader_exit();
-            // 计划模式同理：它可能有自己的方向（「计划模式方向」），切走这一帧走的是
-            // 上面的通用分支，**不会**经过 APP_GTD 那个 case，所以退出清理得在这里做，
-            // 否则方向一直留在计划模式那一套上（切回写作/阅读也不还原）。
-            else if (cur == 2) screen_gtd_exit();
+            // 阅读器/计划模式的退出清理（释放书对象、还方向）现在由 Screen 表的 leave 钩子
+            // 在下面 syncScreenLifecycle 里统一做 —— 这里只负责把 currentState 改掉。
             // 阅读器直绘 framebuffer 绕过了 ui_commit 的快照；写作/计划界面若本轮
             // 渲染结果与陈旧快照一致，memcmp 会误判"无变化"而跳过整屏重发，
             // 导致屏上残留阅读器画面。这里强制作废快照，下一次 ui_commit 必发。
             ui_invalidate_snapshot();
             if (next == 0) {
                 currentState = APP_READER;
-                screen_reader_init();
             } else if (next == 1) {
                 currentState = s_writingState;
             } else {
                 currentState = s_planState;
             }
             ESP_LOGI(TAG, "switch to mode %d (%d)", next, (int)currentState);
+            // 切模式这一帧必须立刻跑一次生命周期：leave(旧) + enter(新)。放在 switch 之后
+            // 也能兜住（dispatch 后面的收口还是同一对状态），但那要等本帧 dispatch 走完，
+            // 中间如果 next==0 会进 scrReader 而阅读器还没 init。所以这里先同步一次。
+            syncScreenLifecycle(currentState, ctx);
             key = 0;
         }
 
@@ -1278,312 +1571,33 @@ extern "C" void app_main() {
         // 成机关枪。开关本身在 typingClickPlay 内部的 typingClickEnabled() 把关。
         if (key > 0 && currentState != APP_EDITOR && key != KEY_TOUCH_DRAG) typingClickPlay(1);
 
-        switch (currentState) {
-        case APP_MAIN:
-            g_font.setSize(20);
-            if (key > 0) currentState = screen_main_handle(key, ctx);
-            else { screen_main_handle(0, ctx); idleWaitWithTouch(200); }  // 200ms for power saving
-            break;
+        // 界面生命周期收口（前半）：上面那些"在派发之前就改了 currentState"的地方
+        // （电源键切模式、Ctrl+I 弹灵感）在这一行得到 enter/leave。放在派发之前是因为
+        // 各屏的 enter 里有"第一帧就要成立"的东西（阅读器重建 + 画首屏、计划模式定方向）。
+        syncScreenLifecycle(currentState, ctx);
 
-        case APP_EDITOR: {
-            g_font.setSize(g_settings.fontSize());
-            {
-                int fs = g_font.fontSize();
-                IME::getInstance().setPageSize(fs <= 22 ? 7 : 5);
-            }
-            static bool editorInited = false;
-            if (app_editor_needs_reinit()) editorInited = false;
-            if (!editorInited) { screen_editor_init(ctx); editorInited = true; }
-            if (key > 0) currentState = screen_editor_handle(key, ctx);
-            else {
-                screen_editor_idle(ctx, false);
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-            // Preserve editorInited when going to inspiration/polish (editor should resume)
-            // Reset editorInited when editor is opened FROM another screen (new content)
-            if (currentState != APP_EDITOR && currentState != APP_SYNC_SEND_FLOMO) {
-                if (currentState == APP_INSPIRATION || currentState == APP_POLISH || currentState == APP_HISTORY) {
-                    // editor state preserved across the overlay panel
-                } else {
-                    editorInited = false;
-                }
-            }
-            break;
-        }
-
-        case APP_BROWSER: {
-            g_font.setSize(20);
-            static bool browserInited = false;
-            if (!browserInited) { screen_browser_init(); browserInited = true; }
-            if (key > 0) currentState = screen_browser_handle(key, ctx);
-            else { screen_browser_handle(0, ctx); idleWaitWithTouch(100); }
-            if (currentState != APP_BROWSER) browserInited = false;
-            break;
-        }
-
-        case APP_VIEWER: {
-            g_font.setSize(20);
-            static bool viewerInited = false;
-            if (!viewerInited) { screen_viewer_init(ctx.selectedEntry); viewerInited = true; }
-            if (key > 0) currentState = screen_viewer_handle(key, ctx);
-            else { screen_viewer_handle(0, ctx); idleWaitWithTouch(100); }
-            if (currentState != APP_VIEWER) viewerInited = false;
-            break;
-        }
-
-        case APP_HISTORY: {
-            g_font.setSize(20);
-            static bool historyInited = false;
-            if (!historyInited) { screen_history_init(ctx.selectedEntry, ctx.prevState); historyInited = true; }
-            if (key > 0) currentState = screen_history_handle(key, ctx);
-            else { screen_history_handle(0, ctx); idleWaitWithTouch(100); }
-            if (currentState != APP_HISTORY) historyInited = false;
-            break;
-        }
-
-        case APP_SETTINGS: {
-            g_font.setSize(20);
-            IME::getInstance().setPageSize(7);
-            static bool settingsInited = false;
-            if (!settingsInited) { screen_settings_init(); settingsInited = true; }
-            if (key > 0) currentState = screen_settings_handle(key, ctx);
-            else { screen_settings_handle(0, ctx); idleWaitWithTouch(100); }
-            if (currentState != APP_SETTINGS) settingsInited = false;
-            break;
-        }
-
-        case APP_BT_MANAGE: {
-            g_font.setSize(20);
-            static bool btInited = false;
-            if (!btInited) { screen_bt_manage_init(); btInited = true; }
-            if (key > 0) currentState = screen_bt_manage_handle(key, ctx);
-            else { screen_bt_manage_handle(0, ctx); idleWaitWithTouch(30); }
-            if (currentState != APP_BT_MANAGE) btInited = false;
-            break;
-        }
-
-        case APP_FILE_MANAGER: {
-            g_font.setSize(20);
-            static bool fileMgrInited = false;
-            if (!fileMgrInited) { screen_file_manager_init(); fileMgrInited = true; }
-            if (key > 0) currentState = screen_file_manager_handle(key, ctx);
-            else { screen_file_manager_handle(0, ctx); idleWaitWithTouch(200); }
-            if (currentState != APP_FILE_MANAGER) fileMgrInited = false;
-            break;
-        }
-
-        case APP_GTD: {
-            g_font.setSize(20);
-            IME::getInstance().setPageSize(7);
-            // 只在本模式**本次开机第一次进入**时 init（载数据 + 归零）。之后不管是电源键
-            // 切模式回来，还是 Esc/边缘返回划回写作菜单再进来，都直接续上原来的界面：
-            // 当前 tab、项目下钻、光标全在 screen_gtd 的静态 g 里。**重跑 init 才是
-            // "切模式回来 tab 变回收集箱"的原因**（screen_gtd_init 里那句 g.view = 0）。
-            static bool gtdInited = false;
-            // 方向只在**刚进来那一拍**补一次，判据直接用 prevState —— 电源键切模式那帧
-            // currentState 已经被改掉，而 prevState 是在切之前取的，正好表示"上一帧在哪"。
-            // 原来靠一个 gtdEntered 标志，可它只在下面那个 if 里重新置位；电源键切走走的
-            // 是 main 的通用分支，根本不会经过那里，标志于是永远停在 false —— 重进时方向
-            // 一次都不补，屏幕就一直跟着写作模式的全局方向走（用户报的就是这个）。
-            if (!gtdInited) {
-                screen_gtd_init();
-                gtdInited = true;
-            } else if (prevState != APP_GTD) {
-                screen_gtd_apply_orientation();  // 重进：方向得补套回来
-            }
-            if (key > 0) currentState = screen_gtd_handle(key, ctx);
-            else { screen_gtd_handle(0, ctx); idleWaitWithTouch(100); }
-            if (currentState != APP_GTD) {
-                // 计划模式可以有自己的方向（设置里「计划模式方向」），退出时还给全局
-                // ——与阅读模式的 board_restore_orientation 对称。
-                // **故意不清 gtdInited**：进来时还要接着用 g 里的 tab/下钻/光标。
-                if (gtdInited) screen_gtd_exit();
-            }
-            break;
-        }
-
-        case APP_OUTLINE: {
-            g_font.setSize(20);
-            IME::getInstance().setPageSize(7);
-            static bool outlineInited = false;
-            if (!outlineInited) { screen_outline_init(); outlineInited = true; }
-            if (key > 0) currentState = screen_outline_handle(key, ctx);
-            else { screen_outline_handle(0, ctx); idleWaitWithTouch(100); }
-            if (currentState != APP_OUTLINE) outlineInited = false;
-            break;
-        }
-
-        case APP_INSPIRATION: {
-            g_font.setSize(20);
-            IME::getInstance().setPageSize(7);
-            static bool inspInited = false;
-            if (!inspInited) {
-                screen_inspiration_init(inspReturnTo, inspEditorReturnTo);
-                inspInited = true;
-            }
-            if (key > 0) currentState = screen_inspiration_handle(key, ctx);
-            else { screen_inspiration_handle(0, ctx); idleWaitWithTouch(100); }
-            if (currentState != APP_INSPIRATION) inspInited = false;
-            break;
-        }
-
-        case APP_POLISH: {
-            g_font.setSize(20);
-            IME::getInstance().setPageSize(7);
-            static bool polishInited = false;
-            if (!polishInited) {
-                screen_polish_init();
-                polishInited = true;
-            }
-            if (key > 0) currentState = screen_polish_handle(key, ctx);
-            else { screen_polish_handle(0, ctx); idleWaitWithTouch(100); }
-            if (currentState != APP_POLISH) polishInited = false;
-            break;
-        }
-
-        case APP_POLISH_PROMPT: {
-            g_font.setSize(20);
-            IME::getInstance().setPageSize(7);
-            static bool ppInited = false;
-            if (!ppInited) {
-                screen_polish_prompt_init();
-                ppInited = true;
-            }
-            if (key > 0) currentState = screen_polish_prompt_handle(key, ctx);
-            else { screen_polish_prompt_handle(0, ctx); idleWaitWithTouch(100); }
-            if (currentState != APP_POLISH_PROMPT) ppInited = false;
-            break;
-        }
-
-        case APP_FLOMO: {
-            g_font.setSize(20);
-            IME::getInstance().setPageSize(7);
-            static bool flomoInited = false;
-            if (!flomoInited) { screen_flomo_init(APP_MAIN); flomoInited = true; }
-            if (key > 0) currentState = screen_flomo_handle(key, ctx);
-            else { screen_flomo_handle(0, ctx); idleWaitWithTouch(100); }
-            if (currentState != APP_FLOMO) flomoInited = false;
-            break;
-        }
-
-        case APP_SYNC_WEBDAV: {
-            g_font.setSize(20);
-            IME::getInstance().setPageSize(7);
-            if (s_webdavState == AsyncUiState::Idle) {
-                lockAsyncResult();
-                s_webdavResult = {false, ""};
-                unlockAsyncResult();
-                s_webdavResultUntil = 0;
-                s_webdavState = AsyncUiState::Running;
-                TaskHandle_t h = nullptr;
-                if (xTaskCreate(webdavSyncTask, "webdav_sync", 12288, nullptr, 1, &h) != pdPASS) {
-                    s_webdavResult = {false, "系统繁忙,请重试"};
-                    s_webdavState = AsyncUiState::Done;
-                }
-            }
-
-            if (s_webdavState == AsyncUiState::Running) {
-                drawCenteredBusy("WebDAV 同步", "正在同步...");
-                vTaskDelay(pdMS_TO_TICKS(100));
-                break;
-            }
-
-            if (s_webdavResultUntil == 0) {
-                s_webdavResultUntil = esp_timer_get_time() + 2000000;
-                lockAsyncResult();
-                std::string message = s_webdavResult.message;
-                unlockAsyncResult();
-                drawCenteredBusy("WebDAV 同步",
-                                 message.empty() ? "同步结束" : message.c_str());
-                break;
-            }
-            if (esp_timer_get_time() < s_webdavResultUntil) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                break;
-            }
-            s_webdavState = AsyncUiState::Idle;
+        // ── 派发（表驱动，见 main/ui/screen.h 与文件上方的 kScreens）──────────
+        // 每屏一行；没列到的状态（APP_PROMPT_SEL）没有 handle，回主菜单——与原来的
+        // switch default 分支一致。空转路径的睡眠统一在这里做（scrXxx 自己不睡），
+        // idle_ms == 0 的那几屏（编辑器/WebDAV/Flomo/阅读器）在体内自己 vTaskDelay。
+        const Screen &scr = kScreens[currentState];
+        if (!scr.handle) {
             currentState = APP_MAIN;
-            break;
+        } else if (key > 0) {
+            currentState = scr.handle(key, ctx);
+        } else {
+            currentState = scr.handle(0, ctx);
+            if (scr.idle_ms > 0) idleWaitWithTouch(scr.idle_ms);
         }
 
-        case APP_SYNC_SEND_FLOMO: {
-            if (s_flomoState == AsyncUiState::Idle) {
-                if (!g_flomoPendingText.empty()) {
-                    s_flomoText = std::move(g_flomoPendingText);
-                    g_flomoPendingText.clear();
-                    s_flomoReturnTo = g_flomoReturnTo;
-                } else {
-                    s_flomoText = app_get_editor_text();
-                    s_flomoReturnTo = APP_EDITOR;
-                }
-                lockAsyncResult();
-                s_flomoResult = {false, ""};
-                unlockAsyncResult();
-                s_flomoResultUntil = 0;
-                s_flomoState = AsyncUiState::Running;
-                TaskHandle_t h = nullptr;
-                if (xTaskCreate(flomoSendTask, "flomo_send", 8192, nullptr, 1, &h) != pdPASS) {
-                    s_flomoResult = {false, "系统繁忙,请重试"};
-                    s_flomoState = AsyncUiState::Done;
-                }
-            }
+        // 界面生命周期收口（后半）：收各屏 handle 返回的 next（Esc 退出、进子页…）。
+        // 与上面那次同一个函数，幂等 —— 界面没换就是一次比较。
+        syncScreenLifecycle(currentState, ctx);
 
-            if (s_flomoState == AsyncUiState::Running) {
-                ui_clear();
-                ui_show_message_centered("正在发送...");
-                ui_commit();
-                vTaskDelay(pdMS_TO_TICKS(100));
-                break;
-            }
-
-            if (s_flomoResultUntil == 0) {
-                s_flomoResultUntil = esp_timer_get_time() + 2000000;
-                lockAsyncResult();
-                std::string message = s_flomoResult.message;
-                unlockAsyncResult();
-                ui_clear();
-                ui_show_message_centered(message.empty() ? "发送结束" : message.c_str());
-                ui_commit();
-                break;
-            }
-            if (esp_timer_get_time() < s_flomoResultUntil) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                break;
-            }
-            s_flomoText.clear();
-            s_flomoState = AsyncUiState::Idle;
-            currentState = s_flomoReturnTo;
-            break;
-        }
-
-        case APP_READER: {
-            // 阅读模式用 crossmux 自己的 GfxRenderer + ttf_font 渲染，不用 g_font。
-            const int64_t tEntry = esp_timer_get_time();
-            if (key > 0) currentState = screen_reader_handle(key, ctx);
-            else { screen_reader_handle(0, ctx); idleWaitWithTouch(80); }
-            const int64_t tExit = esp_timer_get_time();
-            // 临时帧探针：整趟超 400ms 就打一行（正常一趟只有几十 ms）。
-            // 前置 = 上一趟收尾(状态切换尾巴/空转等待) + 本轮 checkLightSleep/IME 冲刷。
-            static int64_t sPrevExit = 0;
-            if (tExit - lapT0 > 400000 || (sPrevExit && lapT0 - sPrevExit > 400000))
-                ESP_LOGW(TAG, "帧探针: 前置 %lldms 取键 %lldms 处理 %lldms 共 %lldms key=%d",
-                         sPrevExit ? (lapT0 - sPrevExit) / 1000 : -1,
-                         (lapT1 - lapT0) / 1000, (tExit - tEntry) / 1000,
-                         (tExit - lapT0) / 1000, key);
-            sPrevExit = tExit;
-            if (currentState != APP_READER) screen_reader_exit();
-            break;
-        }
-
-        default:
-            currentState = APP_MAIN;
-            break;
-        }
-
-        // 状态在本轮切换进编辑器时,屏幕已被上一界面盖过,置脏以便下轮重绘。
-        if (currentState != prevState) {
-            if (currentState == APP_EDITOR) screen_editor_reset_drawn();
-        }
+        // 网页端「设为待机画面」的取件点。投递方是 httpd 任务（栈只有 8KB，解不了
+        // 几百万像素的大图），真正解图必须落在主任务（16KB）上，见 screen_reader.h。
+        // 没待办时就是一次原子读 + 提前返回。
+        readerStandbyPump();
 
         // 离开"键盘宿主"界面就收起虚拟键盘。editorVkVisible() 是全局标志,不收起的话
         // 它会一直留在 true,ui_render 的 ime_top_now() 就会把**别的界面**的下半屏也
@@ -1593,10 +1607,9 @@ extern "C" void app_main() {
         // flomo)：它们各自在"可打字的子状态"里调 editorVkAutoShow()，退出子状态时调
         // editorVkAutoHide()——不在这里按子状态收，是因为那样收完这一帧没人重画，键盘
         // 面板会僵在屏幕上直到下次按键。这里只管**整界面**进出时的兜底。
-        const bool vkHost = (currentState == APP_EDITOR) || (currentState == APP_GTD) ||
-                            (currentState == APP_OUTLINE) || (currentState == APP_SETTINGS) ||
-                            (currentState == APP_INSPIRATION) || (currentState == APP_POLISH) ||
-                            (currentState == APP_POLISH_PROMPT) || (currentState == APP_FLOMO);
+        // 名单**不在这一行了**，它是 kScreens 的 vk_host 列（main/ui/screen.h）——
+        // 加一个会打字的界面时改表，别再在这里补一个 ||。
+        const bool vkHost = scr.vk_host;
         if (!vkHost && editorVkVisible()) editorVkSetVisible(false);
         // 打字极速刷新（整屏 DU 差分，每键约 220ms，比 GL16 整屏 410ms 快一倍）只在
         // **实体键盘**输入时开：物理键连发才需要抢这半拍。虚拟键盘是手点的，一键一次、
@@ -1624,8 +1637,7 @@ extern "C" void app_main() {
         // 新扩的宿主（灵感/润色/提示词/flomo）只在**键盘真弹着**时算：没弹键盘时它们
         // 本来就没有抢时间的输入，走默认规则。
         const bool gtdBrowsing = (currentState == APP_GTD) && !typingHere;
-        ui_set_local_only((vkHost && vkHere) || currentState == APP_SETTINGS ||
-                          currentState == APP_MAIN || gtdBrowsing);
+        ui_set_local_only((vkHost && vkHere) || scr.local_only || gtdBrowsing);
 
         // 蓝牙键盘低电提示：电量是 HID 异步上报的（bt_keyboard 的事件回调），这里
         // 把待发标记取出来，借现成的居中提示通道报 1.5s。状态栏那个蓝牙图标只表示

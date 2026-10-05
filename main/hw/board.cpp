@@ -4,6 +4,7 @@
 #include <cstring>
 #include <esp_log.h>
 
+#include "display.h"   // display_set_night：反色的唯一实施点（见 board_set_night）
 #include "epdiy.h"
 #include "read_pico_pmu.h"
 #include "u8g2_shim.h"
@@ -54,8 +55,11 @@ EpdiyHighlevelState *board_hl() {
 }
 
 void board_set_night(bool on) {
-    // 全局标志在 HalDisplay 里（每个推屏出口统一取反一次），所以这里只翻标志。
+    // 两处都要置：HalDisplay 的 s_inverted 只供 isInverted() 查询用；**实际反色**
+    // 发生在 display.c 的推屏处 —— 那才是所有界面的落地点（渲染任务直呼它，不经过
+    // HalDisplay），见 display.c 顶部。全设备夜间就靠这一条统一转发。
     display.setInverted(on);
+    display_set_night(on);
 }
 
 void board_apply_orientation(const char *orientation) {
@@ -78,7 +82,7 @@ void board_apply_orientation(const char *orientation) {
 }
 
 // 阅读模式强制横屏：screen_reader.cpp 不能 include epdiy.h（EpdFont 符号与
-// crossmux 冲突），旋转切换集中在这里，经 board_reader.h 暴露最小原型。
+// crossmux 冲突），旋转切换集中在这里，原型在 hw/board.h（epdiy 无关那一半）。
 void board_force_landscape() {
     epd_set_rotation(EPD_ROT_LANDSCAPE);
     ESP_LOGI(TAG, "orientation=landscape (reader) → logical %d×%d",

@@ -56,6 +56,24 @@ class Dictionary {
   // the viewer may lay them out through the EPUB rendering pipeline.
   bool definitionsAreHtml() const { return htmlDefinitions; }
 
+  // Flatten a definition's HTML to plain text (see DictionaryText.cpp): known
+  // block tags and <br> become '\n', tags/comments are dropped, common entities
+  // are decoded, and HTML source whitespace collapses — so the result is what
+  // the reader's wrappedText() can lay out. Deliberately conservative: only
+  // whitelisted tag names are stripped, so "<see also>" or "5 < 10" in a
+  // definition survive intact. (The cost of the whitelist: "a<b>c" loses the
+  // <b>, since it is a real tag name.)
+  //
+  // Two rules keep plain-text definitions safe, so callers do not need to gate
+  // this on definitionsAreHtml() — call it unconditionally:
+  //   * A definition containing **no** markup at all is returned **verbatim**,
+  //     entities and all. Its '\n' characters are hard breaks, not HTML source
+  //     whitespace, and must not be collapsed.
+  //   * Whitespace between two multibyte (CJK) characters is dropped, but only
+  //     when it came from a source newline/tab. An authored single space — and
+  //     &nbsp; — is kept, exactly like a browser renders it.
+  static std::string htmlToPlainText(const std::string& html);
+
   bool needsIndex();
 
   // Why an index build failed — the scan buffer is a heap allocation, so the

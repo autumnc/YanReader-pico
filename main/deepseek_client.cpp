@@ -1,13 +1,11 @@
 #include "deepseek_client.h"
 #include "settings_manager.h"
 #include "json_utils.h"
+#include "net/http.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <esp_log.h>
-#include <esp_http_client.h>
-#include <esp_crt_bundle.h>
-#include <esp_timer.h>
 
 static const char *TAG = "Deepseek";
 DeepseekClient g_deepseek;
@@ -61,84 +59,39 @@ static std::string extractContent(const std::string &response) {
 // POST the already-built request body to the DeepSeek chat API and return the
 // assistant content. Shared by generatePrompt and polishText.
 static DeepseekResult runChat(const std::string &body, volatile bool *cancel = nullptr) {
-    esp_http_client_config_t cfg = {};
-    cfg.url = DEEPSEEK_API_URL;
-    cfg.method = HTTP_METHOD_POST;
-    cfg.timeout_ms = 30000;
-    cfg.skip_cert_common_name_check = true;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    net::Request req;
+    req.url = DEEPSEEK_API_URL;
+    req.method = net::Method::Post;
+    req.headers = {{"Content-Type", "application/json"},
+                   {"User-Agent", "pjournal-esp32/1.0"},
+                   {"Authorization", "Bearer " + g_settings.deepseekKey()}};
+    req.body = body;
+    req.timeout_ms = 30000;
+    req.deadline_ms = 30000;  // 整个请求的墙钟上限（对付"每 29 秒挤一个字节"的对端）
+    req.cap = 32768;          // 软上限：响应最多收这么多
+    req.cancel = cancel;      // 非空时按 1s 粒度轮询
 
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return {false, "HTTP客户端初始化失败"};
-
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "User-Agent", "pjournal-esp32/1.0");
-    std::string auth = "Bearer " + g_settings.deepseekKey();
-    esp_http_client_set_header(client, "Authorization", auth.c_str());
-
-    std::string response;
-    DeepseekResult result = {false, "API请求失败"};
-    bool cancelled = (cancel && *cancel);
-    bool timedOut = false;
-
-    esp_err_t err = cancelled ? ESP_ERR_INVALID_STATE
-                              : esp_http_client_open(client, (int)body.size());
     ESP_LOGI(TAG, "Request body: %d bytes", (int)body.size());
-    if (err == ESP_OK) {
-        esp_http_client_write(client, body.c_str(), (int)body.size());
-        esp_http_client_fetch_headers(client);
-        int status = esp_http_client_get_status_code(client);
-        if (status == 200) {
-            char buf[512];
-            // Cancellable read: shorten the per-read timeout so the loop can
-            // poll the flag every second; the 30s overall deadline still bounds
-            // a hung server. Reads return -ESP_ERR_HTTP_EAGAIN on a per-read
-            // timeout, 0/negative on end-of-body or error.
-            if (cancel) esp_http_client_set_timeout_ms(client, 1000);
-            int64_t deadline = esp_timer_get_time() + 30000000;
-            while (true) {
-                if (cancel && *cancel) { cancelled = true; break; }
-                if (esp_timer_get_time() > deadline) { timedOut = true; break; }
-                int len = esp_http_client_read(client, buf, sizeof(buf) - 1);
-                if (len > 0) {
-                    buf[len] = 0;
-                    response += buf;
-                    if (response.size() > 32768) break;
-                } else if (len == -ESP_ERR_HTTP_EAGAIN) {
-                    continue;   // no data yet, retry
-                } else {
-                    break;      // 0 = body complete; <0 = transport error
-                }
-            }
-            if (!timedOut) {
-                std::string content = extractContent(response);
-                if (!content.empty()) {
-                    result.success = true;
-                    result.content = content;
-                }
-            } else {
-                result.content = "API响应超时";
-            }
-        } else {
-            // Read error response body for debugging
-            char buf[512];
-            int len;
-            std::string errorResponse;
-            while ((len = esp_http_client_read(client, buf, sizeof(buf) - 1)) > 0) {
-                buf[len] = 0;
-                errorResponse += buf;
-                if (errorResponse.size() > 1024) break;
-            }
-            ESP_LOGW(TAG, "API returned status %d, response: %s", status, errorResponse.c_str());
-            result.content = "API返回错误";
+    net::Response resp = net::request(req);
+    DeepseekResult result = {false, "API请求失败"};
+
+    if (resp.cancelled) {
+        result.content = "已取消";
+    } else if (resp.timed_out) {
+        result.content = "API响应超时";
+    } else if (resp.ok) {
+        std::string content = extractContent(resp.body);
+        if (!content.empty()) {
+            result.success = true;
+            result.content = content;
         }
+    } else if (resp.status != 0) {
+        ESP_LOGW(TAG, "API returned status %d, response: %s", resp.status, resp.body.c_str());
+        result.content = "API返回错误";
     } else {
-        ESP_LOGW(TAG, "HTTP request failed: %d", err);
+        ESP_LOGW(TAG, "HTTP request failed: %s", esp_err_to_name(resp.err));
         result.content = "网络请求失败";
     }
-
-    esp_http_client_cleanup(client);
-    if (cancelled) result.content = "已取消";
     return result;
 }
 

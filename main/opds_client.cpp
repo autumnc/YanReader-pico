@@ -1,13 +1,11 @@
 #include "opds_client.h"
 
-#include <esp_crt_bundle.h>
-#include <esp_http_client.h>
 #include <esp_log.h>
-#include <esp_timer.h>
-#include <esp_tls.h>
 
 #include <cstdio>
 #include <cstring>
+
+#include "net/http.h"
 
 static const char *TAG = "OPDS";
 
@@ -122,113 +120,15 @@ std::string opdsFilenameFromUrl(const std::string &url) {
 }
 
 // ── HTTP 公共配置 ───────────────────────────────────────────────────────
-static void fillConfig(esp_http_client_config_t &cfg, const std::string &url) {
-  cfg = {};
-  cfg.url = url.c_str();
-  cfg.timeout_ms = 30000;
-  cfg.skip_cert_common_name_check = true;
-  cfg.crt_bundle_attach = esp_crt_bundle_attach;
-  cfg.max_redirection_count = 5;
-  cfg.buffer_size = 4096;
-}
-
-static void setCommonHeaders(esp_http_client_handle_t client) {
-  esp_http_client_set_header(client, "User-Agent", "pjournal-pico/1.0");
-  esp_http_client_set_header(client, "Accept-Encoding", "identity");  // 免去 gzip 解压
-}
-
-// ── HTTP 请求（流式，走 perform 以便自动跟随重定向）───────────────────────
-// 低层 open/fetch_headers API 不会跟随重定向（只有 perform 才会），而 OPDS
-// 下载地址常 302 跳镜像；所以统一用 perform + ON_DATA 事件流式收 body。
-struct HttpCtx {
-  OpdsParser *parser = nullptr;
-  FILE *fp = nullptr;
-  const std::function<void(size_t, size_t)> *progress = nullptr;
-  size_t got = 0;
-  bool overflow = false;
-  size_t cap = 0;  // >0 时超过即停（防 feed 无上限）
-  int64_t deadline_us = 0;  // >0：整个请求的墙钟上限
-  bool timed_out = false;
-};
-
-static esp_err_t httpEventHandler(esp_http_client_event_t *evt) {
-  HttpCtx *c = static_cast<HttpCtx *>(evt->user_data);
-  if (!c) return ESP_OK;
-  if (evt->event_id != HTTP_EVENT_ON_DATA || evt->data_len <= 0) return ESP_OK;
-  // 整体墙钟上限。cfg.timeout_ms 是**每次读**的超时，每收到一个字节就重置；对端只要
-  // 每隔 29 秒挤一个字节，perform 就永远回不来，而它是在主任务上同步跑的 —— 整个 UI
-  // 卡死，且按键取消也排不上队。到点把传输超时压到 1ms：下一次读立刻返回超时，
-  // perform 随即退出。set_timeout_ms 是无锁公开 API，可以在事件回调里直接改。
-  // 只在 ON_DATA 上判定就够：真的一个字节都不来，单次读的 30s 超时自然兜底。
-  if (c->deadline_us && esp_timer_get_time() > c->deadline_us) {
-    c->timed_out = true;
-    if (evt->client) esp_http_client_set_timeout_ms(evt->client, 1);
-    return ESP_OK;
-  }
-  if (evt->client) {
-    // 每个分片都重新取状态，**不能**用锁存：跟随重定向时中间那个 302 响应
-    // 也可能带一小段 body（HTML 提示页），锁存会把后面的正式内容一起丢掉。
-    int st = esp_http_client_get_status_code(evt->client);
-    if (st < 200 || st >= 300) return ESP_OK;  // 跳过重定向页/错误页的 body
-  }
-  // 上限（cap>0 时生效）：服务器端异常/恶意 feed 可以一直发，parser 里的条目表跟着长。
-  // 到顶就不再喂，后面的数据丢掉（下载路径另有 fp 的写入失败兜底）。
-  if (c->cap && c->got >= c->cap) {
-    c->overflow = true;
-    return ESP_OK;
-  }
-  if (c->parser) {
-    c->parser->write(static_cast<const uint8_t *>(evt->data), static_cast<size_t>(evt->data_len));
-  }
-  if (c->fp) {
-    size_t w = fwrite(evt->data, 1, static_cast<size_t>(evt->data_len), c->fp);
-    if (w != static_cast<size_t>(evt->data_len)) c->overflow = true;
-  }
-  c->got += static_cast<size_t>(evt->data_len);
-  if (c->progress && *c->progress) {
-    size_t total = 0;
-    if (evt->client) {
-      int64_t cl = esp_http_client_get_content_length(evt->client);
-      if (cl > 0) total = static_cast<size_t>(cl);
-    }
-    (*c->progress)(c->got, total);
-  }
-  return ESP_OK;
-}
-
-// 执行一次 GET。返回 true 表示 2xx 且 body 已通过 ctx 处理完。
-static bool httpGet(const std::string &url, const char *accept, HttpCtx &ctx, std::string &err) {
-  esp_http_client_config_t cfg;
-  fillConfig(cfg, url);
-  cfg.user_data = &ctx;
-  cfg.event_handler = httpEventHandler;
-  esp_http_client_handle_t client = esp_http_client_init(&cfg);
-  if (!client) {
-    err = "HTTP 初始化失败";
-    return false;
-  }
-  setCommonHeaders(client);
-  if (accept) esp_http_client_set_header(client, "Accept", accept);
-
-  esp_err_t e = esp_http_client_perform(client);  // 内部自动跟随重定向
-  if (e != ESP_OK) {
-    ESP_LOGW(TAG, "请求失败: %s (%d) errno=%d url=%s", esp_err_to_name(e), (int)e,
-             esp_http_client_get_errno(client), url.c_str());
-    err = ctx.timed_out ? std::string("请求超时")
-                        : (std::string("请求失败: ") + esp_err_to_name(e));
-    esp_http_client_cleanup(client);
-    return false;
-  }
-  int status = esp_http_client_get_status_code(client);
-  if (status < 200 || status >= 300) {
-    char buf[48];
-    snprintf(buf, sizeof(buf), "HTTP %d", status);
-    err = buf;
-    esp_http_client_cleanup(client);
-    return false;
-  }
-  esp_http_client_cleanup(client);
-  return true;
+// 请求构造集中在这里；收发本身在 net/http（见 [[net/http]] 的文件头注释）。
+static net::Request makeRequest(const std::string &url, const char *accept) {
+  net::Request req;
+  req.url = url;
+  req.headers = {{"User-Agent", "pjournal-pico/1.0"},
+                 {"Accept-Encoding", "identity"},  // 免去 gzip 解压
+                 {"Accept", accept}};
+  req.buffer_size = 4096;
+  return req;
 }
 
 // ── 拉取 feed ───────────────────────────────────────────────────────────
@@ -243,12 +143,18 @@ bool opdsFetchFeed(const std::string &url, std::vector<OpdsEntry> &entries,
   }
 
   OpdsParser parser;
-  HttpCtx ctx;
-  ctx.parser = &parser;
-  ctx.cap = 512 * 1024;  // feed 上限：正常目录几百 KB 都到不了，超了必有蹊跷
-  ctx.deadline_us = esp_timer_get_time() + 60LL * 1000000;  // 整个 feed 最多 60 秒
-  if (!httpGet(url, "application/atom+xml,application/xml;q=0.9,*/*;q=0.8", ctx, err)) return false;
-  size_t total = ctx.got;
+  net::Request req = makeRequest(url, "application/atom+xml,application/xml;q=0.9,*/*;q=0.8");
+  req.cap = 512 * 1024;           // 软上限：正常目录几百 KB 都到不了，超了必有蹊跷
+  req.deadline_ms = 60LL * 1000;  // 整个 feed 最多 60 秒
+  net::Response resp = net::stream(req, [&parser](const uint8_t *d, size_t n) {
+    parser.write(d, n);
+    return true;
+  });
+  if (!resp.ok) {
+    err = resp.error;
+    return false;
+  }
+  size_t total = resp.got;
 
   if (parser.error()) {
     err = "feed 解析失败";
@@ -287,27 +193,30 @@ bool opdsDownloadFile(const std::string &url, const std::string &destPath,
   static char fbuf[4096];
   setvbuf(fp, fbuf, _IOFBF, sizeof(fbuf));
 
-  HttpCtx ctx;
-  ctx.fp = fp;
-  ctx.progress = &progress;
+  net::Request req = makeRequest(url, "application/epub+zip,*/*;q=0.8");
   // 下载给足时间（大书 + 慢链路），但仍有上限：卡在"每 29 秒一个字节"的对端上时，
   // 主任务不能陪着它耗到天荒地老。到点会中止并在下面按失败清理掉半截文件。
-  ctx.deadline_us = esp_timer_get_time() + 15LL * 60 * 1000000;
-  bool ok = httpGet(url, "application/epub+zip,*/*;q=0.8", ctx, err);
+  req.deadline_ms = 15LL * 60 * 1000;
+  req.progress = progress;
+  net::Response resp = net::stream(req, [fp](const uint8_t *d, size_t n) {
+    return fwrite(d, 1, n, fp) == n;
+  });
   fclose(fp);
 
-  if (ok && ctx.overflow) {
+  bool ok = resp.ok;
+  if (resp.sink_failed) {
     err = "写入 SD 卡失败(空间不足?)";
     ok = false;
   }
-  if (ok && ctx.got == 0) {
+  if (ok && resp.got == 0) {
     err = "下载内容为空";
     ok = false;
   }
   if (!ok) {
+    if (err.empty()) err = resp.error;
     remove(destPath.c_str());
     return false;
   }
-  ESP_LOGI(TAG, "下载完成 %s (%u 字节)", destPath.c_str(), static_cast<unsigned>(ctx.got));
+  ESP_LOGI(TAG, "下载完成 %s (%u 字节)", destPath.c_str(), static_cast<unsigned>(resp.got));
   return true;
 }

@@ -434,7 +434,9 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
         } else if (key == 0x1B || key == 'q' || key == 'Q') {
             g_btState.menuOpen = false;
         }
-        drawManage();
+        // ↑↓ 只挪 menuSel，浮层还开着 —— 必须重画浮层（drawBtMenu），否则选择框
+        // 纹丝不动；回车/Esc 把 menuOpen 落了地，这时才回到平铺管理页。
+        if (g_btState.menuOpen) drawBtMenu(); else drawManage();
         return APP_BT_MANAGE;
     }
 
@@ -452,7 +454,7 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
                     g_btState.menuTarget = g_btState.selection;
                     g_btState.menuSel = 0;
                     g_btState.menuOpen = true;
-                    drawManage();
+                    drawBtMenu();   // 弹的是浮层，不是平铺页（以前这里调 drawManage，菜单永远看不见）
                     return APP_BT_MANAGE;
                 }
             }
