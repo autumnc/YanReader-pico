@@ -30,10 +30,11 @@
 #include "settings_manager.h"
 #include "read_pico_buzzer.h"
 
-extern "C" esp_err_t read_pico_buzzer_pcm_open(uint32_t sample_rate) __attribute__((weak));
-extern "C" void read_pico_buzzer_pcm_write(const int16_t *samples, int count) __attribute__((weak));
-extern "C" void read_pico_buzzer_pcm_close(void) __attribute__((weak));
-extern "C" void read_pico_buzzer_pcm_close_fade(int fade_ms) __attribute__((weak));
+// 这里**不能**再自己弱声明 read_pico_buzzer_pcm_* 那几个函数来探测"实现有没有链进来"：
+// read_pico_buzzer.h 本身就声明了它们（esp_err_t 返回，本机这份是 pcm_write:pcm_close_fade），
+// 再声明一遍就是 conflicting declaration；而且 read_pico 组件在本工程是无条件编译的，
+// GCC 看得见定义，`f != nullptr` 这种判空一律吃 -Werror=address。
+// "PCM 会话开不出来"这条退化路径由下面的 open 失败退避负责，与链接期无关。
 
 namespace {
 
@@ -98,13 +99,6 @@ static int64_t s_open_retry_at_us = 0;  // 开会话失败后的退避截止时�
 // 只看开关，不看输入模式：按键反馈音也是虚拟键盘的按键反馈，非打字机模式下同样该能开。
 bool enabled() {
     return g_settings.typingClickEnabled();
-}
-
-bool pcmAvailable() {
-    return read_pico_buzzer_pcm_open != nullptr &&
-           read_pico_buzzer_pcm_write != nullptr &&
-           read_pico_buzzer_pcm_close != nullptr &&
-           read_pico_buzzer_pcm_close_fade != nullptr;
 }
 
 int clamp16(long v) { return v > 32767 ? 32767 : v < -32767 ? -32767 : (int)v; }
@@ -237,14 +231,6 @@ void clickTask(void *) {
                 read_pico_buzzer_pcm_close();
                 restoreMap();
                 open = false;
-            }
-            continue;
-        }
-
-        if (!pcmAvailable()) {
-            for (int k = 0; k < n && !s_abort.load(std::memory_order_acquire); k++) {
-                read_pico_buzzer_tone(900, (uint32_t)(TC_HIT_S * 1000));
-                if (k + 1 < n) vTaskDelay(pdMS_TO_TICKS(TC_GAP_MS));
             }
             continue;
         }
