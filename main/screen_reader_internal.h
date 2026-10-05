@@ -108,7 +108,8 @@ enum class RdMode {
   StatsDay,    // 某一天的阅读详情
   StatsProfile,// 阅读档案（4 轴雷达 + 总分）
   StatsAdjust, // 调整某本书某一天的阅读时长
-  StatsSettings// 统计设置（每日目标）
+  StatsSettings,// 统计设置（每日目标）
+  RefreshTest   // 灰阶自检页（16 级梯 / 细线 / 抖动三档对比 / 各刷法耗时，自推屏）
 };
 
 // 主界面五个根标签：0=书架 1=文件 2=笔记 3=设置 4=统计。标签栏只画图标（tab_icons.h），
@@ -331,6 +332,13 @@ struct RdState {
   int marginIdx = kDefaultMarginIdx;        // 边距档位
   int readingLine = 0;                      // 阅读线：0 无 1 虚线 2 点线 3 实线（正文行间引导线）
   bool imageBilinear = true;                // 图片缩放：true 双线性 false 最近邻
+  // 图片抖动档：0 有序 1 行扩散 2 关。存 int 而不是 DitherMode，这个头就不必
+  // include crossmux 的 DitherUtils.h（档位序号与 kRdDitherKeys 一一对应）。
+  int imageDither = 0;
+  // 本帧内容是否带真中灰（插图页/图片查看器/灰阶自检页）。renderCurrent 每帧先清，
+  // 三条路径自己置位；**推屏之后**用它记下"面板现在是什么"，供白底参考帧纪律消费
+  // （中间灰不能当差分刷的参考帧，见 reader_refresh_bridge.h）。
+  int frameGray = 0;
   bool night = false;                       // 夜间反色
   std::string orientation = "landscape";    // 阅读器方向
 
@@ -467,6 +475,13 @@ struct RdState {
   // 关于页滚动位置
   int aboutTop = 0;
 
+  // 灰阶自检页：选中动作（0..4，见 reader_refresh_test_present 的 which）+ 每个动作的
+  // 上次耗时 ms（-1 = 没跑过）。自检页自己推屏，所以 renderCurrent 的推屏那一段要
+  // 绕过；rtPushed 就是"本帧已经推过了"的一次性标志（照 s_vk_incr_ok 的先例）。
+  int rtSel = 0;
+  int rtMs[5] = {-1, -1, -1, -1, -1};
+  int rtPending = -1;   // >= 0：这一帧不走走常规推屏，改用该动作的刷法自推（见 renderCurrent）
+
   // ── 阅读统计（第 5 个根标签）─────────────────────────────────────────
   int statsSel = 0;       // 主页交互列表的选中行
   int statsTop = 0;       // 子界面（更多详情/档案/调整）的滚动位置
@@ -585,6 +600,8 @@ void renderStatusBarSet();
 void handleStatusBarSet(int key);
 void renderAbout();
 void handleAbout(int key);
+void renderRefreshTest();   // 灰阶自检页（16 级梯 / 抖动对比 / 各刷法耗时，自推屏）
+void handleRefreshTest(int key);
 void netShareConnect();
 void renderNetShare();
 void handleNetShare(int key);

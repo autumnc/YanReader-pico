@@ -36,6 +36,7 @@
 #include <Bitmap.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
+#include <ImageBlock.h>  // ImageBlock::ditherModeEnabled()（图片查看器与插图同一档抖动）
 #include <ImageDecoderFactory.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -1170,7 +1171,7 @@ void renderImage() {
     cfg.maxWidth = dstW;
     cfg.maxHeight = dstH;
     cfg.useGrayscale = true;
-    cfg.useDithering = true;
+    cfg.ditherMode = ImageBlock::ditherModeEnabled();
     cfg.performanceMode = false;
     cfg.useExactDimensions = true;
     cfg.bilinearScaling = st.imageBilinear;
@@ -1190,6 +1191,8 @@ void renderImage() {
     if (!ok) ESP_LOGE(TAG, "图片解码失败: %s", path.c_str());
   }
   st.imgFailed = !ok;
+  // 图片查看器整屏都是灰阶照片：面板上会留下真中灰，记账给白底纪律用（见 renderCurrent 尾）。
+  if (ok) st.frameGray = 1;
   if (!ok) drawCenteredLine(areaH / 2, "无法解码此图片");
 
   // 页脚：索引/文件名/缩放 + 设为待机的快捷键（s）。没有列就只报个数 —— 页脚一行

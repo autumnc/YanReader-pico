@@ -55,6 +55,8 @@ struct PngContext {
   // 16.16 source-column step for the bilinear sampler, computed once per image so
   // the inner loop never divides.
   int32_t stepXFP{0};
+  // 16 级量化的横向误差状态（只有 DitherMode::Row 档用）。
+  DitherRowState ditherState;
   uint32_t lastYieldMs{0};  // throttle state for yieldDuringDecode()
 };
 
@@ -265,7 +267,7 @@ void emitBilinearRow(PngContext& ctx, const int dstY, const uint8_t* rowTop, con
     }
   }
 
-  const bool useDithering = ctx.config->useDithering;
+  const DitherMode ditherMode = ctx.config->ditherMode;
   const int lastX = ctx.visibleWidth > 0 ? ctx.visibleWidth - 1 : 0;
   // Source column advances by a fixed 16.16 step, so no division is needed per
   // pixel (a 64-bit divide per pixel cost more than the interpolation itself).
@@ -299,15 +301,9 @@ void emitBilinearRow(PngContext& ctx, const int dstY, const uint8_t* rowTop, con
     if (outX >= ctx.screenWidth) continue;
     const uint8_t alpha = ctx.alphaLineBuffer ? ctx.alphaLineBuffer[x0] : 255;
     if (alpha < 8 || alpha <= alphaThreshold4x4(outX, outY)) continue;
-    uint8_t ditheredGray;
-    if (useDithering) {
-      ditheredGray = applyBayerDither4Level(sample, outX, outY);
-    } else {
-      const int level = sample / 85;
-      ditheredGray = static_cast<uint8_t>(level > 3 ? 3 : level);
-    }
-    if (writeFramebuffer) pw.writePixel(outX, ditheredGray, ctx.alphaLineBuffer != nullptr);
-    if (caching) cw.writePixel(outX, ditheredGray);
+    const uint8_t level = grayToLevel16(sample, outX, outY, ditherMode, ctx.ditherState);
+    if (writeFramebuffer) pw.writeGray16(outX, level);
+    if (caching) cw.writeGray16(outX, level);
   }
 }
 
@@ -394,7 +390,7 @@ int pngDrawCallback(PNGDRAW* pDraw) {
   int dstWidth = ctx->dstWidth;
   int outXBase = ctx->config->x;
   int screenWidth = ctx->screenWidth;
-  bool useDithering = ctx->config->useDithering;
+  const DitherMode ditherMode = ctx->config->ditherMode;
   const bool writeFramebuffer = ctx->config->output == DecodeOutput::FrameBufferAndCache;
 
   // Pre-compute orientation and render-mode state once per callback.
@@ -432,17 +428,10 @@ int pngDrawCallback(PNGDRAW* pDraw) {
       if (outX < screenWidth) {
         const uint8_t alpha = ctx->alphaLineBuffer ? ctx->alphaLineBuffer[srcX] : 255;
         if (alpha >= 8 && alpha > alphaThreshold4x4(outX, outY)) {
-          uint8_t gray = ctx->grayLineBuffer[srcX];
-
-          uint8_t ditheredGray;
-          if (useDithering) {
-            ditheredGray = applyBayerDither4Level(gray, outX, outY);
-          } else {
-            ditheredGray = gray / 85;
-            if (ditheredGray > 3) ditheredGray = 3;
-          }
-          if (writeFramebuffer) pw.writePixel(outX, ditheredGray, ctx->alphaLineBuffer != nullptr);
-          if (caching) cw.writePixel(outX, ditheredGray);
+          const uint8_t gray = ctx->grayLineBuffer[srcX];
+          const uint8_t level = grayToLevel16(gray, outX, outY, ditherMode, ctx->ditherState);
+          if (writeFramebuffer) pw.writeGray16(outX, level);
+          if (caching) cw.writeGray16(outX, level);
         }
       }
 

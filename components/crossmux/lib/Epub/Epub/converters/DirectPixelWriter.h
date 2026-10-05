@@ -6,6 +6,8 @@
 
 #include <cassert>
 
+#include "DitherUtils.h"  // setNibble() for the .pxc payload
+
 // Direct framebuffer writer that eliminates per-pixel overhead from the image
 // rendering hot path.  Pre-computes orientation transform as linear coefficients
 // and caches render-mode state so the inner loop is: one multiply, one add,
@@ -197,6 +199,34 @@ struct DirectPixelWriter {
       fb[byteIndex] = static_cast<uint8_t>((fb[byteIndex] & 0xF0) | ink);
     }
   }
+
+  // Write one 16-level gray value (0 = 全墨 … 15 = 全白) to the native 4bpp
+  // framebuffer. Same addressing and the same two guards as writePixel() above
+  // (band/row clip, physical column bound) — deliberately *not* routed through
+  // fb_fast_set_gray(), which owns a core0-side static cache and its own rotation
+  // table and therefore has no band semantics. Skips mapTwoBitPixel()/renderMode
+  // entirely: the byte is epdiy's own pixel format, exactly what
+  // epd_draw_pixel(x, y, gray << 4) writes.
+  //
+  // ⚠ byteIndex must stay uint32_t for the reason documented above (415,872 B
+  // framebuffer on this panel).
+  inline void writeGray16(int logicalX, uint8_t level) const {
+    const int phyX = rowPhyXBase + logicalX * phyXStepX;
+    const int phyY = rowPhyYBase + logicalX * phyYStepX;
+
+    const int sy = phyY - originY;
+    if (static_cast<unsigned>(sy) >= static_cast<unsigned>(clipRows)) return;
+    if (static_cast<unsigned>(phyX) >= static_cast<unsigned>(displayWidthBytes) * 2u) return;
+
+    const uint32_t byteIndex = static_cast<uint32_t>(sy) * displayWidthBytes + static_cast<uint32_t>(phyX >> 1);
+    const uint8_t ink = static_cast<uint8_t>(level & 0x0F);
+    // 偶列低半字节、奇列高半字节（epdiy epd_draw_pixel 的约定）。
+    if (phyX & 1) {
+      fb[byteIndex] = static_cast<uint8_t>((fb[byteIndex] & 0x0F) | (ink << 4));
+    } else {
+      fb[byteIndex] = static_cast<uint8_t>((fb[byteIndex] & 0xF0) | ink);
+    }
+  }
 };
 
 // Direct cache writer that eliminates per-pixel overhead from PixelCache::setPixel().
@@ -240,5 +270,17 @@ struct DirectCacheWriter {
     if (static_cast<unsigned>(byteIdx) >= static_cast<unsigned>(bytesPerRow)) return;
     const int bitShift = 6 - (localX & 3) * 2;  // MSB first: pixel 0 at bits 6-7
     rowPtr[byteIdx] = (rowPtr[byteIdx] & ~(0x03 << bitShift)) | ((value & 0x03) << bitShift);
+  }
+
+  // Write one 16-level gray value (0 = 全墨 … 15 = 全白) into the pixel cache.
+  // The cache is 4bpp like the framebuffer itself (two pixels per byte, LOW
+  // nibble = even column), so the payload can be memcpy'd back pixel-for-pixel
+  // and the cached image is no longer re-quantized on every render.
+  inline void writeGray16(int screenX, uint8_t level) const {
+    if (!rowPtr) return;
+    const int localX = screenX - originX;
+    // The unsigned compare covers both ends (a negative localX wraps huge).
+    if (static_cast<unsigned>(localX) >= static_cast<unsigned>(bytesPerRow) * 2u) return;
+    setNibble(rowPtr, localX, static_cast<uint8_t>(level & 0x0F));
   }
 };

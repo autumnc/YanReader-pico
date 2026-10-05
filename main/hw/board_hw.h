@@ -14,9 +14,20 @@
 
 #include "read_pico_init.h"  // read_pico_handle_t（内含 epd_highlevel.h）
 
+// 这几个句柄的**定义**在 hw/board.cpp（C++），但 display.c 也要用它们（灰阶自检页的
+// 自推屏要自己拿 epdiy 句柄）—— 不加 extern "C" 的话 C 侧看到的是 C++ 修饰名，链接期
+// undefined reference。
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // 板级句柄（定义于 hw/board.cpp）：触摸 / 加速度计 / PMU 就绪标志。
 // 注意 g_hw.hl 只在 board.cpp 内部用；推屏要拿 epdiy 句柄请用下面的 board_hl()。
 extern read_pico_handle_t g_hw;
 
 // epdiy 高层状态（波形 + front/back 帧缓冲）。推屏路径的唯一入口。
 EpdiyHighlevelState *board_hl();
+
+#ifdef __cplusplus
+}
+#endif

@@ -29,11 +29,11 @@ class ImageBlock final : public Block {
   void renderPlaceholder(GfxRenderer& renderer, int x, int y) const;
   static void clearSessionRenderFailures();
 
-  // A page render draws its image up to ~13 times (BW double-refresh plus every
-  // grayscale band pass), and each draw streams the whole .pxc off SD. The
-  // first draw caches the pixel payload in RAM (chunked, heap-gated, falls back
-  // to streaming when it doesn't fit); the reader calls this when the page
-  // render completes so nothing stays resident between pages.
+  // A page render draws its image more than once (every full re-render of the
+  // page), and each draw streams the whole .pxc off SD. The first draw caches
+  // the pixel payload in RAM (chunked, heap-gated, falls back to streaming when
+  // it doesn't fit); the reader calls this when the page render completes so
+  // nothing stays resident between pages.
   static void releaseRenderCache();
 
   // Lazy extraction hook: the section build only header-probes images for their
@@ -53,6 +53,13 @@ class ImageBlock final : public Block {
   // Current filter; the pixel-cache path is derived from it (see getCachePath).
   static bool bilinearScalingEnabled() { return bilinearScaling; }
 
+  // Reader-scoped dither mode for the 8-bit → 16-level quantization of inline
+  // images (same push-don't-reach-in pattern as the resampling filter). The mode
+  // is baked into the cached pixels, so it is part of the pixel-cache identity:
+  // switching it re-decodes instead of serving the other mode's cache.
+  static void setDitherMode(DitherMode mode);
+  static DitherMode ditherModeEnabled() { return ditherMode; }
+
   BlockType getType() override { return IMAGE_BLOCK; }
   bool isEmpty() override { return false; }
 
@@ -70,7 +77,8 @@ class ImageBlock final : public Block {
 
   static void* extractCtx;
   static ExtractFn extractFn;
-  static bool bilinearScaling;  // reader-pushed resampling filter
+  static bool bilinearScaling;      // reader-pushed resampling filter
+  static DitherMode ditherMode;     // reader-pushed dither mode (cache identity)
 
   bool renderInternal(GfxRenderer& renderer, int x, int y, PixelCachePolicy cachePolicy, DecodeOutput output);
 };

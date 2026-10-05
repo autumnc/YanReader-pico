@@ -5,6 +5,8 @@
 #include <memory>
 #include <string>
 
+#include "DitherUtils.h"
+
 class GfxRenderer;
 
 struct ImageDimensions {
@@ -15,14 +17,15 @@ struct ImageDimensions {
 enum class DecodeOutput : uint8_t {
   FrameBufferAndCache,
   CacheOnly,
-  NativeGrayscale16,  // Gray8 samples directly to a borrowed native frame; no pixel cache.
 };
 
 struct RenderConfig {
   int x, y;
   int maxWidth, maxHeight;
   bool useGrayscale = true;
-  bool useDithering = true;
+  // 8 位灰 → 16 级灰的抖动档。阅读器把用户设置推给 ImageBlock::setDitherMode()
+  // 后落到这里；独立图片查看器直接填。
+  DitherMode ditherMode = DitherMode::Ordered;
   bool performanceMode = false;
   bool useExactDimensions = false;  // If true, use maxWidth/maxHeight as exact output size (no recalculation)
   float sourceCropX = 0.0f;         // Fraction cropped equally from the left and right edges

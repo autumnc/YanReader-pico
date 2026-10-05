@@ -13,11 +13,17 @@
 
 #include "Epub/converters/DirectPixelWriter.h"
 #include "Epub/converters/ImageDecoderFactory.h"
+#include "Epub/converters/PixelCache.h"
 
 // Cache file format:
 // - uint16_t width
 // - uint16_t height
-// - uint8_t pixels[...] - 2 bits per pixel, packed (4 pixels per byte), row-major order
+// - uint8_t version (= PixelCache::kFormatVersion, 2 = 16-level 4bpp)
+// - uint8_t pixels[...] - 4 bits per pixel, packed (2 pixels per byte: even column
+//   in the low nibble), row-major order
+//
+// 4bpp 而不是 2bpp：与 framebuffer 同一口径，16 级灰原样进出，渲染时不再
+// 二次量化。
 
 ImageBlock::ImageBlock(const std::string& imagePath, const std::string& srcPath, int16_t width, int16_t height)
     : imagePath(imagePath), srcPath(srcPath), width(width), height(height) {}
@@ -30,6 +36,9 @@ ImageBlock::ExtractFn ImageBlock::extractFn = nullptr;
 // setExtractor()) and the decode path reads it here.
 bool ImageBlock::bilinearScaling = false;
 
+// 16 级量化的抖动档。库不读应用设置，由阅读器推入（同 setBilinearScaling）。
+DitherMode ImageBlock::ditherMode = DitherMode::Ordered;
+
 void ImageBlock::setExtractor(void* ctx, ExtractFn fn) {
   extractCtx = ctx;
   extractFn = fn;
@@ -41,8 +50,17 @@ void ImageBlock::setBilinearScaling(const bool enabled) {
   // Logged on every transition: the filter also changes the pixel-cache name, so
   // this line is what proves the reader actually re-decoded with the new setting
   // rather than serving the other variant's cache.
-  LOG_INF("IMG", "Image resampling filter -> %s (cache suffix %s)", enabled ? "bilinear" : "nearest",
-          enabled ? ".b.pxc" : ".pxc");
+  LOG_INF("IMG", "Image resampling filter -> %s", enabled ? "bilinear" : "nearest");
+}
+
+void ImageBlock::setDitherMode(const DitherMode mode) {
+  if (ditherMode == mode) return;
+  ditherMode = mode;
+  const char* name = mode == DitherMode::Row ? "row" : (mode == DitherMode::None ? "none" : "ordered");
+  // Same reasoning as setBilinearScaling: the dither pattern is baked into the
+  // cached pixels, so this line is the ground truth for "did the reader really
+  // re-decode with the new mode".
+  LOG_INF("IMG", "Image dither mode -> %s", name);
 }
 
 bool ImageBlock::imageExists() const { return Storage.exists(imagePath.c_str()); }
@@ -50,10 +68,25 @@ bool ImageBlock::imageExists() const { return Storage.exists(imagePath.c_str());
 namespace {
 
 std::string getCachePath(const std::string& imagePath) {
-  // Replace extension with .pxc (pixel cache). The resampling filter is part of
-  // the cache identity: the cached file holds already-scaled pixels, so a
-  // nearest-decoded cache must not be served after switching to bilinear.
-  const char* suffix = ImageBlock::bilinearScalingEnabled() ? ".b.pxc" : ".pxc";
+  // Replace extension with a cache name that encodes the payload format, the
+  // resampling filter and the dither mode. The cached file holds *already
+  // quantized* pixels, so any of the three changing must not serve the old file:
+  //   g16 = 16-level 4bpp payload   (2bpp caches from older builds never match,
+  //                                  and are simply never opened again)
+  //   b   = bilinear resampling     (pixels are scaled before caching)
+  //   o/r/n = Ordered / Row / None  (the dither pattern is baked in)
+  // e.g. ".g16o.pxc", ".g16br.pxc". The version byte in the header is the second
+  // line of defence; this one avoids even opening a mismatched file.
+  const char* mode = "o";
+  switch (ImageBlock::ditherModeEnabled()) {
+    case DitherMode::Row: mode = "r"; break;
+    case DitherMode::None: mode = "n"; break;
+    case DitherMode::Ordered:
+    default: break;
+  }
+  std::string suffix = ImageBlock::bilinearScalingEnabled() ? ".g16b" : ".g16";
+  suffix += mode;
+  suffix += ".pxc";
   const size_t dotPos = imagePath.rfind('.');
   if (dotPos != std::string::npos) {
     return imagePath.substr(0, dotPos) + suffix;
@@ -61,9 +94,16 @@ std::string getCachePath(const std::string& imagePath) {
   return imagePath + suffix;
 }
 
+// bytesPerRow of the 4bpp payload for a given image width.
+constexpr size_t cacheRowBytes(int width) { return static_cast<size_t>((width + 1) / 2); }
+
 bool readValidCacheHeader(HalFile& cacheFile, const int expectedWidth, const int expectedHeight, uint16_t& cachedWidth,
                           uint16_t& cachedHeight) {
   if (cacheFile.read(&cachedWidth, 2) != 2 || cacheFile.read(&cachedHeight, 2) != 2) {
+    return false;
+  }
+  uint8_t version = 0;
+  if (cacheFile.read(&version, 1) != 1 || version != PixelCache::kFormatVersion) {
     return false;
   }
 
@@ -73,8 +113,7 @@ bool readValidCacheHeader(HalFile& cacheFile, const int expectedWidth, const int
     return false;
   }
 
-  const size_t bytesPerRow = (cachedWidth + 3) / 4;
-  const size_t expectedSize = 4 + bytesPerRow * cachedHeight;
+  const size_t expectedSize = PixelCache::kHeaderBytes + cacheRowBytes(cachedWidth) * cachedHeight;
   return cacheFile.size() >= expectedSize;
 }
 
@@ -110,25 +149,30 @@ void rememberImageFailure(const std::string& path) {
 }
 
 // --- Per-page-render RAM slot for the pixel cache ----------------------------
-// The tiled grayscale flow re-renders an image page once for the BW
-// double-refresh and again for every band of both gray planes, and each pass
-// re-read the whole .pxc off SD (~100 ms for a full-page image, ~13 passes).
-// Column clipping cannot reduce the SD traffic: the row stride (~100 B) is
-// smaller than an SD sector, so every sector is touched regardless of the band
-// window. Instead the first pass loads the payload into RAM and later passes
-// render from it. Chunked allocation because a single full-image block (up to
-// 96 KB) rarely fits the fragmented mid-render heap; all chunks are allocated
-// before the file is read, and any failure falls back to streaming. The reader
-// releases the slot when the page render completes, so nothing stays resident
-// across page turns.
+// A page render draws its image more than once (each full re-render of the page:
+// opening a menu overlay, leaving the settings tab, ...), and each draw re-reads
+// the whole .pxc off SD (~100 ms for a full-page image). Column clipping cannot
+// reduce the SD traffic: the row stride is smaller than an SD sector, so every
+// sector is touched regardless of the band window. Instead the first draw loads
+// the payload into RAM and later draws render from it. Chunked allocation
+// because a single full-image block (up to 192 KB at 4bpp) rarely fits the
+// fragmented mid-render heap; all chunks are allocated before the file is read,
+// and any failure falls back to streaming. The reader releases the slot when the
+// page render completes, so nothing stays resident across page turns.
 constexpr size_t PXC_CHUNK_SHIFT = 14;  // 16 KB chunks
 constexpr size_t PXC_CHUNK_SIZE = 1u << PXC_CHUNK_SHIFT;
-constexpr size_t PXC_MAX_CHUNKS = 6;  // 96 KB: a full-screen 2bpp image
+// 192 KB. Was 6 chunks (96 KB) at 2bpp: the payload doubles with the 4bpp cache,
+// so keeping 6 would drop every medium illustration that used to fit into RAM
+// (48-96 KB at 2bpp) back onto the streaming path. Full-page images never fit at
+// either size and stream as before.
+constexpr size_t PXC_MAX_CHUNKS = 12;
 constexpr size_t PXC_HEAP_RESERVE = 24 * 1024;
 constexpr size_t PXC_MAX_ALLOC_RESERVE = 8 * 1024;
-// Rows can straddle a chunk boundary; they are reassembled into a stack
-// buffer. (screenWidth + 3) / 4 caps at 200 B for an 800px panel.
-constexpr int PXC_MAX_BYTES_PER_ROW = 208;
+// Rows can straddle a chunk boundary; they are reassembled into a stack buffer.
+// 208 B was the 2bpp row of an 832px-wide image; the 4bpp equivalent (416 B) keeps
+// the same coverage. Portrait body images are ~600px wide (300 B) and fit;
+// landscape full-width ones (~1100px) exceeded the 2bpp limit already and still do.
+constexpr int PXC_MAX_BYTES_PER_ROW = 420;
 
 memory::ByteBuffer pxcChunks[PXC_MAX_CHUNKS];
 uint64_t pxcSlotHash = 0;
@@ -206,7 +250,7 @@ bool loadPxcSlot(uint64_t cacheHash, HalFile& cacheFile, uint16_t cachedWidth, u
 }
 
 void renderRowsFromPxcSlot(GfxRenderer& renderer, int x, int y) {
-  const int bytesPerRow = (pxcSlotWidth + 3) / 4;
+  const int bytesPerRow = (pxcSlotWidth + 1) / 2;
   uint8_t tempRow[PXC_MAX_BYTES_PER_ROW];
 
   DirectPixelWriter pw;
@@ -218,10 +262,7 @@ void renderRowsFromPxcSlot(GfxRenderer& renderer, int x, int y) {
     int colStart, colEnd;
     pw.bandColRange(x, pxcSlotWidth, colStart, colEnd);
     for (int col = colStart; col < colEnd; col++) {
-      const int byteIdx = col >> 2;            // col / 4
-      const int bitShift = 6 - (col & 3) * 2;  // MSB first within byte
-      const uint8_t pixelValue = (rowBuffer[byteIdx] >> bitShift) & 0x03;
-      pw.writePixel(x + col, pixelValue);
+      pw.writeGray16(x + col, getNibble(rowBuffer, col));
     }
   }
 }
@@ -253,7 +294,7 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
 
   LOG_DBG("IMG", "Loading from cache: %s (%dx%d)", cachePath.c_str(), cachedWidth, cachedHeight);
 
-  const int bytesPerRow = (cachedWidth + 3) / 4;  // 2 bits per pixel, 4 pixels per byte
+  const int bytesPerRow = static_cast<int>(cacheRowBytes(cachedWidth));  // 4bpp: 2 pixels per byte
   // cachedWidth 来自 .pxc 头（缓存损坏/被手改时可能是 0），此时 bytesPerRow == 0：
   // 下面 4096 / bytesPerRow 会先除零崩（SIGFPE），轮不到 rowsPerRead < 1 那条兜底。
   if (bytesPerRow < 1) {
@@ -277,7 +318,7 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
 
   // Streaming fallback (slot didn't fit). A failed slot load may have consumed
   // part of the payload; rewind to just past the header.
-  cacheFile.seek(4);
+  cacheFile.seek(PixelCache::kHeaderBytes);
 
   // Read several rows per SD access. A one-row-per-read loop here means
   // cachedHeight (~728) tiny reads through the storage mutex + SdFat; batching
@@ -324,11 +365,7 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
     int colStart, colEnd;
     pw.bandColRange(x, cachedWidth, colStart, colEnd);
     for (int col = colStart; col < colEnd; col++) {
-      const int byteIdx = col >> 2;            // col / 4
-      const int bitShift = 6 - (col & 3) * 2;  // MSB first within byte
-      uint8_t pixelValue = (rowBuffer[byteIdx] >> bitShift) & 0x03;
-
-      pw.writePixel(x + col, pixelValue);
+      pw.writeGray16(x + col, getNibble(rowBuffer, col));
     }
   }
 
@@ -473,7 +510,7 @@ bool ImageBlock::renderInternal(GfxRenderer& renderer, const int x, const int y,
   config.maxWidth = width;
   config.maxHeight = height;
   config.useGrayscale = true;
-  config.useDithering = true;
+  config.ditherMode = ditherMode;
   config.performanceMode = false;
   config.useExactDimensions = true;  // Use pre-calculated dimensions to avoid rounding mismatches
   config.cachePath = cachePath;      // Enable caching during decode

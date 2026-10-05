@@ -17,6 +17,7 @@
 #include "screen_reader.h"
 #include "screen_reader_internal.h"  // RdState/共享原语（P3b 拆文件后的内部层）
 #include "reader_page_turn.h"  // 揭页提示：只有裸声明，不会拖进 epdiy.h
+#include "reader_refresh_bridge.h"  // 白底纪律记账 / 自检页自推屏（同样只有裸声明）
 #include "ui_render.h"   // ui_render_drain：进阅读器前等在飞的 UI 推屏收尾
 #include "ui_helpers.h"  // drawIMEUI / imeBarPanelH：实体键盘打字时的输入法条（见 drawRdImeBar）
 
@@ -2239,7 +2240,10 @@ static void renderEpubPage() {
   if (st.section) {
     auto page = st.section->loadPage(st.page);
     if (page) {
-      if (page->hasImages()) st.fullRefresh = true;
+      if (page->hasImages()) {
+        st.fullRefresh = true;
+        st.frameGray = 1;  // 插图页会在面板上留下真中灰（白底纪律记账，见 renderCurrent 尾）
+      }
       // 先把文字地图建出来（它只查排版块，与帧缓冲无关），再用它做整页预取，
       // 最后才画。顺序不能反：预取必须整页一次性做，逐词做就没意义了。
       g_pageText = rdBuildPageText(*page, fontId, bodyMargin(), RD_BODY_TOP);
@@ -3376,11 +3380,35 @@ static void renderToc() {
   drawFooter("↑↓ 选择  上下滑翻页  Enter 跳转  Esc 返回");
 }
 
+// ── 图片抖动（设置 → 排版设定 → 图片抖动）────────────────────────────────
+// 8 位灰量化成面板的 16 级时用哪种抖动。默认"有序"（Bayer）：它是 (灰度,x,y)
+// 的纯函数，同一张图每次重绘逐像素相同 —— 差分刷新不会因为图案漂移而叠影。
+// "行扩散"把量化误差沿一行向右传，渐变更细腻，但图案取决于解码出点顺序；
+// "关"直接量化，用于对比/排查。档位值进 .pxc 缓存名，换档必然重解码。
+static const char *kRdDitherKeys[] = {"ordered", "row", "none"};
+static const char *kRdDitherNames[] = {"有序", "行扩散", "关"};
+static const int kRdDitherCount = 3;
+static int imageDitherIndex() {
+  const std::string k = g_settings.getString("reader_image_dither", "ordered");
+  for (int i = 0; i < kRdDitherCount; i++) {
+    if (k == kRdDitherKeys[i]) return i;
+  }
+  return 0;  // 有序
+}
+static DitherMode ditherModeOf(int idx) {
+  switch (idx) {
+    case 1: return DitherMode::Row;
+    case 2: return DitherMode::None;
+    default: return DitherMode::Ordered;
+  }
+}
+
 // ── 阅读菜单：动作 + 动态条目 ───────────────────────────────────────────
 enum class MenuAct {
-  Toc, Font, FontFamily, LineSpacing, ParaSpacing, Indent, Align, Margin, Image, ReadingLine, Night, Orient,
+  Toc, Font, FontFamily, LineSpacing, ParaSpacing, Indent, Align, Margin, Image, ImageDither, ReadingLine, Night,
+  Orient,
   ToggleBookmark, Bookmarks, Footnotes, FootnoteBack, Percent, Qr, LayoutMenu,
-  Dict, DictDl, ResDl, Weread, Wifi, Opds, NetShare, KeyMap, StatusBar, About, Standby,
+  Dict, DictDl, ResDl, Weread, Wifi, Opds, NetShare, KeyMap, StatusBar, About, RefreshTest, Standby,
   ClockFace, ShelfStyle, RefreshStrategy, FullEvery, TurnAnim, StyleSource, EmbeddedFont, AutoStandby,
   ToShelf, Back
 };
@@ -3593,6 +3621,8 @@ static std::vector<MenuItem> layoutMenuItems() {
   m.push_back({std::string("对齐: ") + (embedded ? "随书" : kAlignLabels[clampI(st.alignMode, 0, 3)]), MenuAct::Align});
   m.push_back({std::string("边距: ") + (st.marginIdx == 0 ? "窄" : st.marginIdx == 1 ? "标准" : "宽"), MenuAct::Margin});
   m.push_back({std::string("图片: ") + (st.imageBilinear ? "双线性" : "最近邻"), MenuAct::Image});
+  m.push_back({std::string("图片抖动: ") + kRdDitherNames[clampI(st.imageDither, 0, kRdDitherCount - 1)],
+               MenuAct::ImageDither});
   m.push_back({std::string("阅读线: ") + kReadingLineNames[clampI(st.readingLine, 0, 3)], MenuAct::ReadingLine});
   return m;
 }
@@ -4155,6 +4185,13 @@ static void applyReaderOrientation() {
 // 全局设置同步到那个标志。**绝不能**再自己逐字节取反 fb —— 会和出口处的取反叠加，
 // 两次相消等于没开。读 settings 而非 st.night：设置界面里改的键才是唯一真源。
 void applyNightMode() {
+  // 灰阶自检页要看的正是真实的灰度关系：夜间反色会把 16 级梯整条翻过来（白↔黑），
+  // 跟"从黑到白数台阶"的直觉打架，也会把抖动对比条整条改观。这一页强制日间
+  // （离开这一页的下一帧 applyNightMode 就把全局夜间恢复回去）。
+  if (st.mode == RdMode::RefreshTest) {
+    board_set_night(false);
+    return;
+  }
   board_set_night(g_settings.nightMode());
 }
 
@@ -4858,7 +4895,12 @@ void renderCurrent() {
   s_vk_incr_ok = false;
   if (vkIncr) {
     drawVk();
-  } else switch (st.mode) {   // 常规帧：整页重画
+  } else {
+  // 本帧内容默认是纯黑白（正文/菜单/列表），插图页/图片查看器/自检页会自己把它置位。
+  // 这是"面板上现在是什么"的账，**在推屏之后**才交给推屏层（见 renderCurrent 末尾），
+  // 放这里只是"本帧还没画，先按默认算"。
+  st.frameGray = 0;
+  switch (st.mode) {   // 常规帧：整页重画
     case RdMode::Browser: renderBrowser(); break;
     case RdMode::Reading: renderReading(); break;
     case RdMode::Toc: renderToc(); break;
@@ -4889,6 +4931,7 @@ void renderCurrent() {
     case RdMode::KeyMap: renderKeyMap(); break;
     case RdMode::StatusBar: renderStatusBarSet(); break;
     case RdMode::About: renderAbout(); break;
+    case RdMode::RefreshTest: renderRefreshTest(); break;
     case RdMode::Settings: renderSettingsTab(); break;
     case RdMode::Notes: renderNotes(); break;
     case RdMode::NoteEdit: renderNoteEdit(); break;
@@ -4903,6 +4946,7 @@ void renderCurrent() {
     case RdMode::StatsAdjust: renderStatsAdjust(); break;
     case RdMode::StatsSettings: renderStatsSettings(); break;
   }
+  }  // end 常规帧（见上面 st.frameGray 那段）
   // 脚注弹注：盖在正文页上的一层（自己就是内容，不是提示），所以在所有别的浮层之前画。
   drawFootnotePopup();
   // 设置标签的选择弹层：也是"盖在底图上的一层"，底图由上面那个 case 画好，这里叠上去。
@@ -5075,7 +5119,15 @@ void renderCurrent() {
     const bool textLike = (frameChange >= 0 && frameChange < 300);
     reader_hint_page_turn(turnDirFor(turn), textLike ? 1 : 0);
   }
-  if (vkTyping && !st.fullRefresh) {
+  bool rtPresented = false;   // 本帧是自检页的自推屏（下面收尾要再置一次 dirty，见尾注）
+  if (st.rtPending >= 0) {
+    // 灰阶自检页（renderRefreshTest）的 Enter：这一帧的画已经画好了，但推屏要用它选的
+    // 那条刷法（读者 TU 不碰波形类型，落地点在 display.c）——自推一次，跳过常规推屏。
+    const int which = st.rtPending;
+    st.rtPending = -1;
+    st.rtMs[which] = reader_refresh_test_present(which);
+    rtPresented = true;
+  } else if (vkTyping && !st.fullRefresh) {
     // 虚拟键盘打字帧：只驱动与上一帧有差异的那块矩形（编码/候选两行快刷，键盘区与
     // 文本输入区局刷），与写作模式的虚拟键盘同一套判据 —— 见 reader_vk_present。
     // st.fullRefresh 那一帧不走这条：进界面首帧本来就该整屏 GC16 清场（那是应该的整屏刷）。
@@ -5086,8 +5138,15 @@ void renderCurrent() {
     if (m == HalDisplay::FULL_REFRESH) ui_render_reader_vk_settle_forget();
     g_rd.displayBuffer(m);
   }
+  // 白底参考帧纪律：**推屏之后**记下"面板上现在是不是中灰"（语义是面板现状，放在
+  // 渲染入口记会让同一页的下一帧被自己置位 → 每帧白闪）。下一次走差分档的推屏会先
+  // GC16 铺白再画（消费方在 display.c，只对差分档生效），这笔账随即清掉。
+  reader_set_gray_panel(st.frameGray);
   st.fullRefresh = false;
   st.dirty = 0;
+  // 自检页自推的那一帧：再画一次把刚测出的耗时显示出来（那一帧内容只差一行小字，
+  // 差分刷很便宜）。放在 st.dirty = 0 之后，否则会被上面那行清掉。
+  if (rtPresented) st.dirty = 1;
   // 这一帧已经推出去了，用户正盯着新页看 —— 正是把排版余量补回来的空档。
   rdPrebuildAhead();
 }
@@ -6261,11 +6320,21 @@ static void doMenuAction(MenuAct act) {
       st.mode = RdMode::About;
       st.fullRefresh = true;
       break;
+    case MenuAct::RefreshTest:
+      st.rtSel = 0;
+      st.rtPending = -1;
+      for (int i = 0; i < 5; i++) st.rtMs[i] = -1;
+      st.vkVisible = false;
+      st.retMode = RdMode::Settings;  // Esc 回设置标签（与关于页同一套单层回退）
+      st.mode = RdMode::RefreshTest;
+      st.fullRefresh = true;
+      break;
     // 轮换制条目：全部改成弹出式选择（openRdPick 弹层，落定后走 applyRdPick）。
     // 弹层比循环好在"有哪些档位、现在是哪档"一眼看清，也不用按好几次才跳到目标档。
     case MenuAct::ShelfStyle:
     case MenuAct::StyleSource:
     case MenuAct::EmbeddedFont:
+    case MenuAct::ImageDither:
     case MenuAct::RefreshStrategy:
     case MenuAct::FullEvery:
     case MenuAct::TurnAnim:
@@ -6374,6 +6443,7 @@ static std::vector<MenuItem> settingsItems() {
   m.push_back({std::string("自动待机: ") + autoStandbyLabel(g_settings.autoStandbyMinutes()),
                MenuAct::AutoStandby});
   m.push_back({"待机时钟", MenuAct::Standby});
+  m.push_back({"屏幕自检", MenuAct::RefreshTest});
   m.push_back({"关于本机", MenuAct::About});
   return m;
 }
@@ -6502,6 +6572,10 @@ static void rdPickFill(int act) {
       st.pickTitle = "刷新策略";
       for (int i = 0; i < kRdRefreshCount; i++) add(kRdRefreshNames[i], kRdRefreshKeys[i]);
       break;
+    case MenuAct::ImageDither:
+      st.pickTitle = "图片抖动";
+      for (int i = 0; i < kRdDitherCount; i++) add(kRdDitherNames[i], kRdDitherKeys[i]);
+      break;
     case MenuAct::FullEvery:
       st.pickTitle = "全刷频率";
       for (int i = 0; i < kRdFullEveryCount; i++) add(kRdFullEveryNames[i], kRdFullEveryKeys[i]);
@@ -6544,6 +6618,7 @@ static std::string rdPickCurValue(int act) {
     case MenuAct::StyleSource: return kStyleSrcKeys[clampI(styleSource(), 0, kStyleSrcCount - 1)];
     case MenuAct::EmbeddedFont: return kEmbFontKeys[clampI(embeddedFontMode(), 0, kEmbFontCount - 1)];
     case MenuAct::RefreshStrategy: return kRdRefreshKeys[clampI(refreshStrategy(), 0, kRdRefreshCount - 1)];
+    case MenuAct::ImageDither: return kRdDitherKeys[clampI(st.imageDither, 0, kRdDitherCount - 1)];
     case MenuAct::FullEvery: {
       const int v = fullRefreshEvery();
       for (int i = 0; i < kRdFullEveryCount; i++)
@@ -6634,6 +6709,20 @@ static void applyRdPick(int act, const std::string &value) {
       s_pagesSinceFull = 0;
       st.fullRefresh = true;
       break;
+    case MenuAct::ImageDither: {
+      // 不 reopenBook：抖动档进了 .pxc 缓存名，当前页下一帧取缓存时路径已经不同，
+      // 自然落到解码分支重解一次，重排是白费的。
+      g_settings.setString("reader_image_dither", value);
+      for (int i = 0; i < kRdDitherCount; i++) {
+        if (value == kRdDitherKeys[i]) st.imageDither = i;
+      }
+      ImageBlock::setDitherMode(ditherModeOf(st.imageDither));
+      rdShowFloat(std::string("图片抖动: ") + kRdDitherNames[clampI(st.imageDither, 0, kRdDitherCount - 1)],
+                  "本页下次重绘时按新档重解码", 1500);
+      st.fullRefresh = true;
+      st.dirty = 1;
+      break;
+    }
     case MenuAct::FullEvery:
       // 计数从改动这一刻重新开始。
       g_settings.setString("reader_full_every", value);
@@ -7530,6 +7619,8 @@ void screen_reader_init() {
   st.readingLine = clampI(atoi(g_settings.getString("reader_reading_line", "0").c_str()), 0, 3);
   st.imageBilinear = g_settings.getString("reader_image_scaling", "1") != "0";
   ImageBlock::setBilinearScaling(st.imageBilinear);
+  st.imageDither = imageDitherIndex();
+  ImageBlock::setDitherMode(ditherModeOf(st.imageDither));
   st.night = g_settings.nightMode();  // 全设备夜间（旧键 reader_night 由访问器迁移）
   board_set_night(st.night);          // 进阅读模式时套用一次，保证与其他界面同向
   loadBookmarks();
@@ -7874,6 +7965,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     case RdMode::KeyMap: handleKeyMap(key); break;
     case RdMode::StatusBar: handleStatusBarSet(key); break;
     case RdMode::About: handleAbout(key); break;
+    case RdMode::RefreshTest: handleRefreshTest(key); break;
     case RdMode::Settings: handleSettingsTab(key); break;
     case RdMode::Notes: handleNotes(key); break;
     case RdMode::NoteEdit: handleNoteEdit(key); break;

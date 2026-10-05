@@ -8,24 +8,32 @@
 #include <cstring>
 #include <string>
 
-// Streaming cache writer for 2-bit pixels (4 levels). Packs 4 pixels per byte,
-// MSB first.
+// Streaming cache writer for 4bpp pixels (16 levels). Packs 2 pixels per byte —
+// LOW nibble = even column, HIGH nibble = odd column, the same packing as the
+// native framebuffer, so the payload can be copied back pixel-for-pixel without
+// re-quantizing (see DitherUtils.h setNibble/getNibble).
+//
+// File layout: uint16 width, uint16 height, uint8 version (=2), then the payload,
+// row-major. The version byte is what makes a stale 2bpp cache (same name, half
+// the row stride) impossible to misinterpret; ImageBlock additionally puts the
+// format in the file *name* (.g16*.pxc), so old caches are simply never opened.
 //
 // The .pxc file is written incrementally in small row bands rather than holding
-// the whole decoded image in one heap buffer. A full-page image (e.g. 482x728)
-// needs ~88KB packed, which will not fit alongside the ~20KB JPEG decoder on a
-// fragmented 380KB heap (free heap is routinely ~55KB on an image page). When
-// the cache cannot be written, every render pass re-decodes the JPEG from
-// scratch; an anti-aliased image page renders ~14 times (BW + AA restore + two
-// grayscale planes x ~6 strips), so a 2s decode becomes a ~30s freeze / watchdog
-// reset. Streaming keeps the working set to a single MCU-row band, so caching
-// succeeds and the image is decoded exactly once.
+// the whole decoded image in one heap buffer. A full-page image needs ~350KB
+// packed at 4bpp, which will not fit alongside the ~20KB JPEG decoder on a
+// fragmented heap. When the cache cannot be written, every render of the page
+// re-decodes the JPEG from scratch — a 2s decode per render, times however many
+// times the page is re-rendered (menu overlay, settings change, page re-entry).
+// Streaming keeps the working set to a single MCU-row band, so caching succeeds
+// and the image is decoded exactly once.
 //
 // Correctness relies on JPEGDEC delivering blocks in raster MCU order (outer
 // loop over y, inner over x: see jpeg.inl DecodeJPEG). Consecutive MCU rows map
 // to contiguous, non-overlapping destination row ranges, so once a block whose
 // top row is Y arrives, every output row < Y is final and is flushed to disk.
 struct PixelCache {
+  static constexpr uint8_t kFormatVersion = 2;  // 2 = 16-level 4bpp payload
+  static constexpr int kHeaderBytes = 5;        // w16 + h16 + version8
   uint8_t* buffer;   // band buffer: (bandRows + 1) rows; last row kept zeroed
   uint8_t* zeroRow;  // points at the spare zeroed row, for gap/clip fill
   int width;
@@ -68,7 +76,7 @@ struct PixelCache {
     height = h;
     originX = ox;
     originY = oy;
-    bytesPerRow = (w + 3) / 4;  // 2 bits per pixel, 4 pixels per byte
+    bytesPerRow = (w + 1) / 2;  // 4 bits per pixel, 2 pixels per byte
     bandStart = 0;
     flushedRows = 0;
     ok = false;
@@ -109,7 +117,8 @@ struct PixelCache {
 
     uint16_t w16 = (uint16_t)w;
     uint16_t h16 = (uint16_t)h;
-    if (file.write(&w16, 2) != 2 || file.write(&h16, 2) != 2) {
+    const uint8_t version = kFormatVersion;
+    if (file.write(&w16, 2) != 2 || file.write(&h16, 2) != 2 || file.write(&version, 1) != 1) {
       LOG_ERR("IMG", "Failed to write cache header: %s", cachePath.c_str());
       abort();
       return false;
@@ -161,7 +170,7 @@ struct PixelCache {
     }
     file.close();
     LOG_DBG("IMG", "Cache written: %s (%dx%d, %d bytes)", cachePathStr.c_str(), width, height,
-            4 + bytesPerRow * height);
+            5 + bytesPerRow * height);
     ok = false;  // file handed off; nothing left to clean up
     return true;
   }

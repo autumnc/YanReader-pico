@@ -37,6 +37,7 @@
 
 #include <GfxRenderer.h>
 #include <HalStorage.h>
+#include <DitherUtils.h>   // 自检页的抖动三档对比条直接调真的 grayToLevel16（header-only）
 #include <esp_chip_info.h>
 #include <esp_mac.h>
 #include <esp_timer.h>
@@ -1279,6 +1280,165 @@ void handleAbout(int key) {
   if (key == KEY_DOWN) { st.aboutTop = std::min(maxTop, st.aboutTop + 1); st.dirty = 1; return; }
   if (key == KEY_PAGE_UP) { st.aboutTop = std::max(0, st.aboutTop - maxRows); st.dirty = 1; return; }
   if (key == KEY_PAGE_DOWN) { st.aboutTop = std::min(maxTop, st.aboutTop + maxRows); st.dirty = 1; return; }
+}
+
+// ── 灰阶自检页 ──────────────────────────────────────────────────────────
+//
+// 移植官方固件 app_refresh.c 的那块自检画面：把"这块屏到底能表达什么"一次性摆出来。
+//   ① 16 级灰阶梯 —— **(a) 真 16 级写回的主验收**。这块面板的 LUT 会把 16 级并成
+//      **约 11 级可分辨**（E0470_WAVEFORM 只定义 type=1/2/5，没有 DU4/GL4），所以能数出
+//      ~11 根台阶就是正常，别当成 bug 去追。
+//   ② 实心块 / 1px 描边块对 —— 灰阶边缘。
+//   ③ 8px 棋盘 + 1px 细线 —— 对齐、串扰、细线保持。
+//   ④ 文字锐度行 —— 当前正文字号下的中英混排边缘。
+//   ⑤ 抖动三档对比条 —— **(d) 抖动档的主验收**：同一条 0→255 渐变用 Ordered / Row /
+//      None 三档各画一遍（调的是**真的** grayToLevel16，不是复制一份公式）。
+//   底部一行是"自推屏"动作：用五种刷法把**同一份 framebuffer** 各推一遍并当场记下耗时
+//   （实现在 display.c 的 reader_refresh_test_present —— 这个 TU 不碰波形/模式类型，
+//   见 reader_refresh_bridge.h）。
+//
+// 自检页自己推屏，所以 renderCurrent 的常规推屏段必须让路：st.rtPending >= 0 的那一帧
+// 走 reader_refresh_test_present，不再走 g_rd.displayBuffer（照 s_vk_incr_ok 的先例）。
+static const char *kRtActionNames[] = {
+    "整屏 GC16（默认表）", "8 灰阶表整屏", "16 灰 from-white", "8 灰阶 from-white", "上半屏 DU",
+};
+static const int kRtActionCount = 5;
+
+void renderRefreshTest() {
+  g_rd.clearScreen();
+  // 这一页整屏都是灰阶图元：面板上留下的就是中灰（白底参考帧纪律要记账，见 st.frameGray）。
+  st.frameGray = 1;
+
+  const int w = g_rd.getScreenWidth();
+  const int M = MARGIN;
+  const int lh = uiLineHeight();
+  const int innerW = w - 2 * M;
+
+  // 灰阶图元：整块填 / 1px 线（都走 drawGrayscale16Pixel，与 XTC 渲染同一条路）。
+  auto fillGray = [&](int x, int y, int bw, int bh, int level) {
+    for (int yy = 0; yy < bh; yy++)
+      for (int xx = 0; xx < bw; xx++)
+        g_rd.drawGrayscale16Pixel(x + xx, y + yy, static_cast<uint8_t>(level));
+  };
+  auto hLineGray = [&](int x, int y, int bw, int level) {
+    for (int xx = 0; xx < bw; xx++) g_rd.drawGrayscale16Pixel(x + xx, y, static_cast<uint8_t>(level));
+  };
+  auto vLineGray = [&](int x, int y, int bh, int level) {
+    for (int yy = 0; yy < bh; yy++) g_rd.drawGrayscale16Pixel(x, y + yy, static_cast<uint8_t>(level));
+  };
+
+  int y = drawTitle("屏幕自检") + 6;
+  const int infoRowH = lh + 6;
+  const int bodyBottom = statusTop() - infoRowH - 6;
+  // 一屏的高度预算：横屏（684 高）是紧的那一档，下面这些基准值是照它定的；竖屏富余很多，
+  // 按 sc 把各块等比放大（上限 1.9 倍，免得拉开得很难看）。
+  const int base = 6 * lh + 40 + 198;
+  int availH = bodyBottom - y;
+  float sc = (base > 0) ? static_cast<float>(availH) / base : 1.0f;
+  if (sc < 1.0f) sc = 1.0f;
+  if (sc > 1.9f) sc = 1.9f;
+
+  // ① 16 级灰阶梯 —— 0 = 全墨 … 15 = 全白。
+  drawLineText(M, y, "① 16 级灰阶梯（本屏预期约 11 级可分辨）", true);
+  y += lh + 2;
+  {
+    const int barH = static_cast<int>(70 * sc);
+    const int barW = innerW / 16;
+    for (int i = 0; i < 16; i++) {
+      const int bx = M + i * barW;
+      const int bw = (i == 15) ? (innerW - 15 * barW) : barW;  // 最后一根补齐余数
+      fillGray(bx, y, bw, barH, i);
+    }
+    y += barH + 6;
+  }
+
+  // ② 实心块 / 1px 描边块（同灰度的两种边缘形态）。
+  drawLineText(M, y, "② 实心块 / 1px 描边块", true);
+  y += lh + 2;
+  {
+    const int blkH = static_cast<int>(40 * sc);
+    const int blkW = std::min(72, std::max(24, innerW / 10));
+    const int levels[4] = {3, 6, 9, 12};
+    int bx = M;
+    for (int k = 0; k < 4; k++) {
+      const int L = levels[k];
+      fillGray(bx, y, blkW, blkH, L);
+      bx += blkW + 8;
+      if (bx + blkW > w - M) break;
+      fillGray(bx, y, blkW, blkH, 15);  // 白底 + 1px 描边
+      hLineGray(bx, y, blkW, L);
+      hLineGray(bx, y + blkH - 1, blkW, L);
+      vLineGray(bx, y, blkH, L);
+      vLineGray(bx + blkW - 1, y, blkH, L);
+      bx += blkW + 10;
+    }
+    y += blkH + 6;
+  }
+
+  // ③ 8px 棋盘（左半） + 1px 细线（右半）。
+  drawLineText(M, y, "③ 棋盘（8px） / 1px 细线", true);
+  y += lh + 2;
+  {
+    const int h3 = static_cast<int>(34 * sc);
+    const int halfW = innerW / 2 - 12;
+    const int cell = std::max(4, h3 / 4);
+    for (int yy = 0; yy < h3; yy++)
+      for (int xx = 0; xx < halfW; xx++)
+        g_rd.drawGrayscale16Pixel(M + xx, y + yy,
+                                  (((xx / cell) + (yy / cell)) & 1) ? 0 : 15);
+    const int lx0 = M + halfW + 24;
+    const int nLines = 20;
+    for (int k = 0; k < nLines; k++) vLineGray(lx0 + k * (halfW / nLines), y, h3, 0);
+    y += h3 + 6;
+  }
+
+  // ④ 文字锐度（当前正文字号）。
+  drawLineText(M, y, "④ 文字锐度（当前字号，中英混排）", true);
+  y += lh + 2;
+  drawLineText(M, y, "永和九年，岁在癸丑 Hunan 0123456789 菜单设置", true,
+               BODY_FONT_ID_BASE + st.fontLevel);
+  y += lh + 6;
+
+  // ⑤ 抖动三档对比：同一条 0→255 渐变，上→下 = 有序 / 行扩散 / 关。
+  drawLineText(M, y, "⑤ 抖动三档对比 上→下：有序 / 行扩散 / 关", true);
+  y += lh + 2;
+  {
+    const int stripH = std::max(4, static_cast<int>(54 * sc) / 3);
+    const DitherMode modes[3] = {DitherMode::Ordered, DitherMode::Row, DitherMode::None};
+    const int denom = std::max(1, innerW - 1);
+    for (int r = 0; r < 3; r++) {
+      DitherRowState rs;  // 每行一份状态（Row 档靠"列不连续"在 x=0 处自动重置）
+      for (int xx = 0; xx < innerW; xx++) {
+        const uint8_t gray = static_cast<uint8_t>(xx * 255 / denom);
+        const uint8_t lvl = grayToLevel16(gray, xx, r, modes[r], rs);
+        for (int yy = 0; yy < stripH; yy++)
+          g_rd.drawGrayscale16Pixel(M + xx, y + r * stripH + yy, lvl);
+      }
+    }
+    y += 3 * stripH + 6;
+  }
+
+  // 底部：自推屏动作选择 + 上一次的耗时。
+  const int iy = statusTop() - infoRowH + 2;
+  char info[128];
+  snprintf(info, sizeof(info), "动作 %d/%d：%s", st.rtSel + 1, kRtActionCount,
+           kRtActionNames[st.rtSel]);
+  drawLineText(M, iy, info, true);
+  if (st.rtMs[st.rtSel] >= 0) {
+    char msb[48];
+    snprintf(msb, sizeof(msb), "上次 %d ms", st.rtMs[st.rtSel]);
+    const int mw = g_rd.getTextWidth(uiFontId(), msb);
+    drawLineText(w - M - mw, iy, msb, true);
+  }
+  drawFooter("↑↓ 换动作  Enter 推屏  Esc 返回");
+}
+
+void handleRefreshTest(int key) {
+  const int n = kRtActionCount;
+  if (key == 0x1B) { st.mode = st.retMode; st.fullRefresh = true; st.dirty = 1; return; }
+  if (key == KEY_UP) { st.rtSel = (st.rtSel + n - 1) % n; st.dirty = 1; return; }
+  if (key == KEY_DOWN) { st.rtSel = (st.rtSel + 1) % n; st.dirty = 1; return; }
+  if (key == '\n') { st.rtPending = st.rtSel; st.dirty = 1; return; }
 }
 
 // ── WiFi 传书 ───────────────────────────────────────────────────────────

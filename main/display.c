@@ -18,7 +18,9 @@
 #include "e0470_page_turn.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "hw/board_hw.h"  // board_hl()：自检页自推屏要自己拿 epdiy 句柄
 #include "reader_page_turn.h"
+#include "reader_refresh_bridge.h"
 
 static const char* TAG = "read_pico";
 static bool s_bulk_io;
@@ -209,6 +211,11 @@ bool display_take_white_exit(void) {
     return hold;
 }
 
+// ── 白底参考帧纪律（阅读器侧的裸声明桥，见 reader_refresh_bridge.h）──────────
+void reader_set_gray_panel(int on) {
+    display_hold_white_exit(on != 0);
+}
+
 enum EpdDrawError update_display_full(EpdiyHighlevelState* hl) {
     use_scan_for(&E0470_WAVEFORM, MODE_GC16);
     epd_poweron();
@@ -357,6 +364,19 @@ static enum EpdDrawError update_display_page_turn(EpdiyHighlevelState* hl, e0470
 
 enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
     enum EpdDrawError result;
+
+    // 白底参考帧纪律：上一帧在面板上留下了中灰（插图页/图片查看器/自检页），
+    // 而这一帧要走差分刷 —— 那就是拿着中间灰当参考帧，先 GC16 铺一屏白再从白底
+    // 出这一屏。**只对差分档做**：FULL/GRAY8 本来就是整屏全像素 GC16（每个像素
+    // 都被重新驱动一遍，等价于从已知态出下一屏），再铺一次只是白花一次全刷 ——
+    // 这条过滤同时保证了"图片页整屏重绘"和"图片查看器 Esc 回正文"不会变成两次全刷。
+    // 放在读走 s_turn_dir 之前：翻页动画那一帧也是从白底出，更干净。
+    if (display_take_white_exit() &&
+        (kind == DISPLAY_KIND_HALF || kind == DISPLAY_KIND_FAST || kind == DISPLAY_KIND_GRAY8_TEXT)) {
+        ESP_LOGI(TAG, "gray panel -> wipe to white before this differential frame");
+        guard_draw_result(hl, update_display_white(hl));
+    }
+
     // 待处理的揭页方向（一次性）。只用在下面两个"差分正文刷"档位上：
     //   HALF(局刷 GL16) 与 GRAY8_TEXT(8 灰阶正文刷) 都是翻页会走到的档位；
     //   FULL/GRAY8 是整屏全像素清账，动画替代它们反而清不掉残影；FAST 是用户显式
@@ -425,6 +445,53 @@ enum EpdDrawError update_display_area_with(
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     rails_keepalive();
     return result;
+}
+
+// ── 灰阶自检页的自推屏（阅读器侧的裸声明桥，见 reader_refresh_bridge.h）────────
+//
+// 自检页要把**同一份 framebuffer** 用五条不同的刷法各推一遍、当场把耗时记下来，
+// 但它所在的那个 TU 不能 include display.h（EpdFont 冲突，见 reader_page_turn.h）。
+// 所以波形/模式类型只在这里出现，阅读器那头只递一个 `which` 序号上来。
+//
+// 这五条正好把官方固件 app_refresh.c 里那几个按钮的刷法一一对上：
+//   0 整屏 GC16（默认表）—— 全刷基准，最快能到 ~0.6s 量级
+//   1 8 灰阶表整屏 —— 30 相，~360ms（阅读器"清账档"用的就是它）
+//   2 from-white 16 灰 —— GC16 但基准强制为白（官方的"白底出图"）
+//   3 8 灰阶表 from-white —— 就是上面那条换 30 相表
+//   4 局部 DU（上半屏）—— 差分档，看局部残影/串扰
+// 返回耗时 ms（含 epd_poweron 的轨上电），参数不认识返回 -1。
+int reader_refresh_test_present(int which) {
+    EpdiyHighlevelState* hl = board_hl();
+    if (!hl) return -1;
+
+    const int64_t t0 = esp_timer_get_time();
+    enum EpdDrawError result;
+    switch (which) {
+        case 0:
+            result = update_display_full(hl);
+            break;
+        case 1:
+            result = update_display_gray8(hl);
+            break;
+        case 2:
+            result = update_display_from_white(hl);
+            break;
+        case 3:
+            result = update_display_from_white_with(hl, &E0470_GRAY8_WAVEFORM, MODE_GC16);
+            break;
+        case 4: {
+            EpdRect area = logical_full_screen();
+            area.height /= 2;  // 上半屏
+            result = update_display_area_with(hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, area);
+            break;
+        }
+        default:
+            return -1;
+    }
+    const int ms = (int)((esp_timer_get_time() - t0) / 1000);
+    ESP_LOGI(TAG, "refresh self-test: which=%d %dms result=%d", which, ms, (int)result);
+    // 这一屏是自检页自己推上去的，推完还要照常把"面板上现在是灰"记上（(b) 的白底纪律）。
+    return ms;
 }
 
 // ── 清一块区域的残影（输入法那两行）────────────────────────────────────────

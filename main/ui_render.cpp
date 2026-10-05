@@ -405,6 +405,14 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
     if (rel_idx >= 0) s_last_idx = rel_idx;
     EpdiyHighlevelState *hl = board_hl();
 
+    // 白底参考帧纪律的第二消费点：阅读器退出前若在面板上留下了中灰（插图页/图片查看器），
+    // 那笔账留在 display.c。退出阅读模式这一帧由 ui_invalidate_snapshot → s_force_full_next
+    // 强制整屏 GC16（每个像素都重驱动一遍），本来就等价于"从已知态出下一屏"，所以这里
+    // **只销账、不铺白** —— 若不销，这笔账会一直留到用户下次进阅读模式、且刚好走到差分
+    // 档时才被消费，凭空多一次白闪。
+    if (display_take_white_exit())
+        ESP_LOGI(TAG, "灰度面板交回 UI：本帧强制整屏 GC16，无需再铺白");
+
     if (job.force_full || s_force_full_next) {
         s_force_full_next = false;
         drop_defer();
@@ -869,6 +877,7 @@ static void from_white_now(uint8_t *cur, int rel_idx) {
     s_fast_body_n = 0;
     s_gc16_pending = false;
     ime_clean_forget();   // 整屏 from-white 重推，两行也是全像素
+    display_take_white_exit();   // 面板刚被物理清成白底，阅读器那笔"面板是灰"的账作废
     if (rel_idx >= 0) s_last_idx = rel_idx;
     copy_to_front(hl, cur);
     update_display_from_white(hl);
@@ -884,6 +893,7 @@ static void invalidate_state(void) {
     s_fast_body_n = 0;
     s_gc16_pending = false;
     ime_clean_forget();   // 下一帧就是整屏 GC16，输入法那两行的记账不用留
+    display_take_white_exit();   // 参考帧都丢了，阅读器留下的"面板是灰"的账也没有意义了
     s_rvk_dirty_any = false;   // 阅读器快档那份欠账同理：进阅读器/丢参考帧 = 整屏重推
 }
 

@@ -55,6 +55,9 @@ struct JpegContext {
   PixelCache cache;
   bool caching{false};
 
+  // 16 级量化的横向误差状态（只有 DitherMode::Row 档用）。
+  DitherRowState ditherState;
+
   uint32_t lastYieldMs{0};  // throttle state for yieldDuringDecode()
   bool aborted{false};      // config.abortPoll asked us to stop mid-decode
 };
@@ -166,7 +169,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
 
   if (stride <= 0 || blockH <= 0 || validW <= 0) return 1;
 
-  const bool useDithering = ctx->config->useDithering;
+  const DitherMode ditherMode = ctx->config->ditherMode;
   const bool writeFramebuffer = ctx->config->output == DecodeOutput::FrameBufferAndCache;
   bool caching = ctx->caching;
   const int32_t fineScaleFPX = ctx->fineScaleFPX;
@@ -230,14 +233,12 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
     }
   }
 
+  // 两个写回目标拿到的是**同一个** level：framebuffer 与 .pxc 都是 4bpp、
+  // 每像素 0..15，缓存读回来时原样搬进 framebuffer，不再二次量化。
   const auto writeSample = [&](int outX, int outY, uint8_t gray) {
-    if (ctx->config->output == DecodeOutput::NativeGrayscale16) {
-      renderer.drawGrayscale16Pixel(outX, outY, gray);
-      return;
-    }
-    const uint8_t level = useDithering ? applyBayerDither4Level(gray, outX, outY) : gray / 85;
-    if (writeFramebuffer) pw.writePixel(outX, level);
-    if (caching) cw.writePixel(outX, level);
+    const uint8_t level = grayToLevel16(gray, outX, outY, ditherMode, ctx->ditherState);
+    if (writeFramebuffer) pw.writeGray16(outX, level);
+    if (caching) cw.writeGray16(outX, level);
   };
 
   // === 1:1 fast path: no scaling math ===
@@ -391,9 +392,6 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
                                                      const RenderConfig& config) {
   LOG_DBG("JPG", "Decoding JPEG: %s", imagePath.c_str());
 
-  if (config.output == DecodeOutput::NativeGrayscale16 &&
-      (!renderer.isGrayscale16Active() || !config.cachePath.empty()))
-    return false;
   const bool cacheOnly = config.output == DecodeOutput::CacheOnly;
   if (cacheOnly && config.cachePath.empty()) {
     LOG_ERR("JPG", "Cache-only decode requires a cache path");
