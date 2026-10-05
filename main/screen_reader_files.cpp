@@ -30,7 +30,6 @@
 #include <dirent.h>
 #include <string>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <vector>
 
 #include <Bitmap.h>
@@ -38,6 +37,7 @@
 #include <HalStorage.h>
 #include <ImageBlock.h>  // ImageBlock::ditherModeEnabled()（图片查看器与插图同一档抖动）
 #include <ImageDecoderFactory.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 
@@ -199,17 +199,20 @@ static void fbDrawFab() {
 // 传输进度文案；没在传就返回空串。总数未知（打包下载算不出来）时只报已传字节。
 std::string rdNetXferText() {
   const FmXfer *x = file_manager_get_xfer();
-  if (!x->active) return std::string();
+  if (!x->active.load(std::memory_order_acquire)) return std::string();
   // 名字是 httpd 任务写的，读的时候再复制一份并强制结尾，防止恰好读到改名中途。
   char nm[sizeof(x->name) + 1];
   memcpy(nm, x->name, sizeof(x->name));
   nm[sizeof(x->name)] = '\0';
-  const char *verb = (x->kind == 0) ? "接收" : (x->kind == 1) ? "发送" : "打包发送";
-  std::string s = std::string(verb) + " " + nm + "  " + humanSize(x->done);
-  if (x->total) {
-    int pct = (int)((uint64_t)x->done * 100 / (uint64_t)x->total);
+  const int kind = x->kind.load(std::memory_order_relaxed);
+  const uint32_t done = x->done.load(std::memory_order_relaxed);
+  const uint32_t total = x->total.load(std::memory_order_relaxed);
+  const char *verb = (kind == 0) ? "接收" : (kind == 1) ? "发送" : "打包发送";
+  std::string s = std::string(verb) + " " + nm + "  " + humanSize(done);
+  if (total) {
+    int pct = (int)((uint64_t)done * 100 / (uint64_t)total);
     if (pct > 100) pct = 100;
-    s += " / " + humanSize(x->total) + "  " + std::to_string(pct) + "%";
+    s += " / " + humanSize(total) + "  " + std::to_string(pct) + "%";
   }
   return s;
 }
@@ -241,7 +244,7 @@ static void fbFabShowAddress() {
 
 static void fbFabAction() {
   const FmXfer *x = file_manager_get_xfer();
-  if (x->active) {
+  if (x->active.load(std::memory_order_acquire)) {
     // httpd_stop 是调用方忙等，传到一半停会把主循环冻住几十秒（见 file_manager_server.cpp
     // 里 s_shutdown 的注释），所以传输中拒绝关闭。
     rdShowFloat("正在传输", "传完才能停服务", 3000);
@@ -270,7 +273,7 @@ static void fbFabAction() {
 static bool fbFabLongPress() {
   if (!st.netServerUp) return false;
   const FmXfer *x = file_manager_get_xfer();
-  if (x->active) {
+  if (x->active.load(std::memory_order_acquire)) {
     rdShowFloat("正在传输", "传完才能停服务", 3000);
     return true;
   }
@@ -291,17 +294,18 @@ void rdNetTick() {
   static std::string s_drawn;
   static bool s_wasActive = false;
   static int64_t s_last_us = 0;
-  if (s_wasActive && !x->active) {
+  const bool active = x->active.load(std::memory_order_acquire) != 0;
+  if (s_wasActive && !active) {
     // 结束那一拍给条短提示：进度行直接消失会让人以为传失败了。
     s_wasActive = false;
     s_drawn.clear();
     char nm[sizeof(x->name) + 1];
     memcpy(nm, x->name, sizeof(x->name));
     nm[sizeof(x->name)] = '\0';
-    rdShowFloat(x->kind == 0 ? "已接收" : "已发送", nm, 4000);
+    rdShowFloat(x->kind.load(std::memory_order_relaxed) == 0 ? "已接收" : "已发送", nm, 4000);
     return;
   }
-  if (!x->active) return;
+  if (!active) return;
   s_wasActive = true;
   const std::string s = rdNetXferText();
   if (s == s_drawn) return;
@@ -735,7 +739,8 @@ static bool rdCopyFile(const std::string &src, const std::string &dst) {
   HalFile in, out;
   if (!Storage.openFileForRead("FBM", src, in)) return false;
   if (!Storage.openFileForWrite("FBM", dst, out)) { in.close(); return false; }
-  uint8_t *buf = static_cast<uint8_t *>(malloc(4096));
+  uint8_t *buf = static_cast<uint8_t *>(heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!buf) buf = static_cast<uint8_t *>(malloc(4096));
   if (!buf) { in.close(); out.close(); Storage.remove(dst.c_str()); return false; }
   bool ok = true;
   int r;

@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <freertos/FreeRTOS.h>
@@ -56,8 +57,8 @@ void screen_polish_set_scope(PolishScope scope) {
 // The chain (WiFi + DeepSeek HTTP) runs in a background task so the main loop
 // stays responsive and can honour Esc-cancel. The task never touches the panel;
 // the handle loop draws every frame while it runs.
-static volatile bool s_chainDone = false;
-static volatile bool s_cancel = false;
+static std::atomic<bool> s_chainDone{false};
+static std::atomic_bool s_cancel{false};
 
 static bool isEmptyText(const std::string &s) {
     for (char c : s)
@@ -86,7 +87,7 @@ static void drawWorking(const char *msg) {
     ui_clear();
     ui_draw_text(4, g_font.ascent(), "AI润色", false, true);
     ui_draw_text_centered(SCREEN_H / 2, msg);
-    ui_draw_status(s_cancel ? "正在取消..." : "按Esc取消", "");
+    ui_draw_status(s_cancel.load(std::memory_order_acquire) ? "正在取消..." : "按Esc取消", "");
     ui_commit();
 }
 
@@ -174,7 +175,7 @@ static void runPolishChainTask(void *arg) {
     bool ok = false;
     bool wifiOk = ensure_wifi_connected();
 
-    if (wifiOk && !s_cancel) {
+    if (wifiOk && !s_cancel.load(std::memory_order_acquire)) {
         DeepseekResult dr = g_deepseek.polishText(g.original, g.customInstr, &s_cancel);
         if (dr.success) {
             g.result = dr.content;
@@ -184,13 +185,13 @@ static void runPolishChainTask(void *arg) {
             g.error = dr.content;
         }
     } else {
-        g.error = s_cancel ? "已取消" : "WiFi连接失败";
+        g.error = s_cancel.load(std::memory_order_acquire) ? "已取消" : "WiFi连接失败";
     }
 
     restore_wifi_state(wasConnected);
     g.phase = ok ? P_RESULT : P_ERROR;
     if (ok) prepareResult();
-    s_chainDone = true;
+    s_chainDone.store(true, std::memory_order_release);
     vTaskDelete(nullptr);
 }
 
@@ -206,8 +207,8 @@ void screen_polish_init() {
     g.imeActive = false;
     g_ime.setActive(false);
     IME::getInstance().setPageSize(7);
-    s_cancel = false;
-    s_chainDone = false;
+    s_cancel.store(false, std::memory_order_release);
+    s_chainDone.store(false, std::memory_order_release);
 
     g.original = (g_scope == POLISH_SELECTION) ? app_get_selected_text() : app_get_editor_text();
     g.emptyContent = isEmptyText(g.original);
@@ -284,8 +285,8 @@ AppState screen_polish_handle(int key, ScreenContext &ctx) {
     if (g.phase == P_WORKING) {
         if (!g.requested) {
             g.requested = true;
-            s_cancel = false;
-            s_chainDone = false;
+            s_cancel.store(false, std::memory_order_release);
+            s_chainDone.store(false, std::memory_order_release);
             TaskHandle_t h = nullptr;
             if (xTaskCreate(runPolishChainTask, "polish", 8192, nullptr, 1, &h) != pdPASS) {
                 g.error = "系统繁忙,请重试";
@@ -296,9 +297,9 @@ AppState screen_polish_handle(int key, ScreenContext &ctx) {
             drawWorking("DeepSeek润色中...");
             return APP_POLISH;
         }
-        if (key == 0x1B || key == 'q' || key == 'Q') s_cancel = true;
-        if (s_chainDone) {
-            if (s_cancel) {
+        if (key == 0x1B || key == 'q' || key == 'Q') s_cancel.store(true, std::memory_order_release);
+        if (s_chainDone.load(std::memory_order_acquire)) {
+            if (s_cancel.load(std::memory_order_acquire)) {
                 g_ime.setActive(app_ime_active());
                 return APP_EDITOR;
             }

@@ -15,6 +15,7 @@
 #include "typing_click.h"
 
 #include <string.h>
+#include <atomic>
 #include <cmath>
 #include <vector>
 
@@ -28,6 +29,11 @@
 
 #include "settings_manager.h"
 #include "read_pico_buzzer.h"
+
+extern "C" esp_err_t read_pico_buzzer_pcm_open(uint32_t sample_rate) __attribute__((weak));
+extern "C" void read_pico_buzzer_pcm_write(const int16_t *samples, int count) __attribute__((weak));
+extern "C" void read_pico_buzzer_pcm_close(void) __attribute__((weak));
+extern "C" void read_pico_buzzer_pcm_close_fade(int fade_ms) __attribute__((weak));
 
 namespace {
 
@@ -83,7 +89,7 @@ struct TcReq {
 
 static QueueHandle_t s_q = nullptr;    // 每项 = 一次 play 请求
 static TaskHandle_t s_task = nullptr;
-static volatile bool s_abort = false;  // 请求中断当前连发
+static std::atomic<bool> s_abort{false};  // 请求中断当前连发
 static portMUX_TYPE s_pend_mux = portMUX_INITIALIZER_UNLOCKED;
 static int s_pending = 0;              // 已排队待播的声数
 
@@ -92,6 +98,13 @@ static int64_t s_open_retry_at_us = 0;  // 开会话失败后的退避截止时�
 // 只看开关，不看输入模式：按键反馈音也是虚拟键盘的按键反馈，非打字机模式下同样该能开。
 bool enabled() {
     return g_settings.typingClickEnabled();
+}
+
+bool pcmAvailable() {
+    return read_pico_buzzer_pcm_open != nullptr &&
+           read_pico_buzzer_pcm_write != nullptr &&
+           read_pico_buzzer_pcm_close != nullptr &&
+           read_pico_buzzer_pcm_close_fade != nullptr;
 }
 
 int clamp16(long v) { return v > 32767 ? 32767 : v < -32767 ? -32767 : (int)v; }
@@ -216,7 +229,7 @@ void clickTask(void *) {
         if (s_pending < 0) s_pending = 0;
         portEXIT_CRITICAL(&s_pend_mux);
 
-        s_abort = false;
+        s_abort.store(false, std::memory_order_release);
 
         const int vol = g_settings.typingClickVolume();
         if (vol <= 0) {  // 静音档
@@ -224,6 +237,14 @@ void clickTask(void *) {
                 read_pico_buzzer_pcm_close();
                 restoreMap();
                 open = false;
+            }
+            continue;
+        }
+
+        if (!pcmAvailable()) {
+            for (int k = 0; k < n && !s_abort.load(std::memory_order_acquire); k++) {
+                read_pico_buzzer_tone(900, (uint32_t)(TC_HIT_S * 1000));
+                if (k + 1 < n) vTaskDelay(pdMS_TO_TICKS(TC_GAP_MS));
             }
             continue;
         }
@@ -256,11 +277,11 @@ void clickTask(void *) {
         std::vector<int16_t> hit;
         int frames = 0;
         const int64_t t0 = esp_timer_get_time();
-        for (int k = 0; k < n && !s_abort; k++) {
+        for (int k = 0; k < n && !s_abort.load(std::memory_order_acquire); k++) {
             makeHit(legal_peak, vol, hit);
             read_pico_buzzer_pcm_write(hit.data(), (int)hit.size());
             frames += (int)hit.size();
-            if (k + 1 < n && !s_abort) {
+            if (k + 1 < n && !s_abort.load(std::memory_order_acquire)) {
                 read_pico_buzzer_pcm_write(gap.data(), gap_n);
                 frames += gap_n;
             }
@@ -276,7 +297,7 @@ void clickTask(void *) {
             );
         }
         // 被打断(typingClickRelease)：立刻关会话。
-        if (s_abort) {
+        if (s_abort.load(std::memory_order_acquire)) {
             read_pico_buzzer_pcm_close();
             restoreMap();
             open = false;
@@ -330,7 +351,7 @@ void typingClickAudition(int count) { enqueue(count); }
 
 void typingClickRelease() {
     if (s_task == nullptr) return;
-    s_abort = true;  // 让任务尽快收尾当前连发、并关掉 PCM 会话
+    s_abort.store(true, std::memory_order_release);  // 让任务尽快收尾当前连发、并关掉 PCM 会话
     xQueueReset(s_q);
     portENTER_CRITICAL(&s_pend_mux);
     s_pending = 0;

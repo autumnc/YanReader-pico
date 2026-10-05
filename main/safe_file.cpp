@@ -42,14 +42,30 @@ bool ensureDirPath(const std::string &path) {
     return true;
 }
 
-std::string readWholeFile(const std::string &path) {
+std::string readWholeFile(const std::string &path, size_t maxBytes, bool *truncated) {
+    if (truncated) *truncated = false;
     repairSafeWriteFile(path);
+    struct stat st;
+    if (maxBytes > 0 && stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
+        st.st_size > static_cast<off_t>(maxBytes)) {
+        if (truncated) *truncated = true;
+        ESP_LOGW(TAG, "read skipped: %s is %lld bytes > limit %u",
+                 path.c_str(), (long long)st.st_size, (unsigned)maxBytes);
+        return "";
+    }
     FILE *f = fopen(path.c_str(), "r");
     if (!f) return "";
     std::string result;
     char buf[512];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (maxBytes > 0 && result.size() + n > maxBytes) {
+            const size_t keep = maxBytes > result.size() ? maxBytes - result.size() : 0;
+            if (keep > 0) result.append(buf, keep);
+            if (truncated) *truncated = true;
+            ESP_LOGW(TAG, "read truncated: %s exceeds %u bytes", path.c_str(), (unsigned)maxBytes);
+            break;
+        }
         result.append(buf, n);
     }
     fclose(f);

@@ -10,6 +10,7 @@
 
 static const char *TAG = "BleKeymap";
 #define KEYMAP_PATH "/sdcard/settings/bt_keymap"
+static constexpr size_t kKeymapFileMax = 8 * 1024;
 
 static int s_src[BLE_ACT_COUNT] = {0};  // 动作 → 源键码（0 = 未绑定）
 
@@ -68,7 +69,12 @@ static bool save() {
 
 void bleKeymapLoad() {
   memset(s_src, 0, sizeof(s_src));
-  std::string body = readWholeFile(KEYMAP_PATH);
+  bool truncated = false;
+  std::string body = readWholeFile(KEYMAP_PATH, kKeymapFileMax, &truncated);
+  if (truncated) {
+    ESP_LOGW(TAG, "按键映射文件过大，已忽略");
+    return;
+  }
   if (body.empty()) return;
   size_t pos = 0;
   int n = 0;

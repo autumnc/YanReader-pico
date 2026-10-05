@@ -51,6 +51,7 @@
 #include <esp_sleep.h>
 #include <nvs_flash.h>
 #include <esp_sntp.h>
+#include <esp_vfs_fat.h>
 #include <driver/gpio.h>
 #include <sys/time.h>
 #include <freertos/semphr.h>
@@ -58,7 +59,6 @@
 #include <cerrno>
 #include <cstring>
 #include <atomic>
-#include <sys/statvfs.h>
 
 static const char *TAG = "Main";
 
@@ -89,11 +89,11 @@ enum class AsyncUiState {
     Done,
 };
 
-static volatile AsyncUiState s_webdavState = AsyncUiState::Idle;
+static std::atomic<AsyncUiState> s_webdavState{AsyncUiState::Idle};
 static SyncResult s_webdavResult = {false, ""};
 static int64_t s_webdavResultUntil = 0;
 
-static volatile AsyncUiState s_flomoState = AsyncUiState::Idle;
+static std::atomic<AsyncUiState> s_flomoState{AsyncUiState::Idle};
 static FlomoResult s_flomoResult = {false, ""};
 static std::string s_flomoText;
 static AppState s_flomoReturnTo = APP_EDITOR;
@@ -142,7 +142,7 @@ static void webdavSyncTask(void *arg) {
     lockAsyncResult();
     s_webdavResult = result;
     unlockAsyncResult();
-    s_webdavState = AsyncUiState::Done;
+    s_webdavState.store(AsyncUiState::Done, std::memory_order_release);
     vTaskDelete(nullptr);
 }
 
@@ -163,7 +163,7 @@ static void flomoSendTask(void *arg) {
     lockAsyncResult();
     s_flomoResult = result;
     unlockAsyncResult();
-    s_flomoState = AsyncUiState::Done;
+    s_flomoState.store(AsyncUiState::Done, std::memory_order_release);
     vTaskDelete(nullptr);
 }
 
@@ -547,20 +547,24 @@ static AppState scrSyncWebdav(int key, ScreenContext &ctx) {
     (void)key; (void)ctx;
     g_font.setSize(20);
     IME::getInstance().setPageSize(7);
-    if (s_webdavState == AsyncUiState::Idle) {
+    AsyncUiState state = s_webdavState.load(std::memory_order_acquire);
+    if (state == AsyncUiState::Idle) {
         lockAsyncResult();
         s_webdavResult = {false, ""};
         unlockAsyncResult();
         s_webdavResultUntil = 0;
-        s_webdavState = AsyncUiState::Running;
+        s_webdavState.store(AsyncUiState::Running, std::memory_order_release);
         TaskHandle_t h = nullptr;
         if (xTaskCreate(webdavSyncTask, "webdav_sync", 12288, nullptr, 1, &h) != pdPASS) {
+            lockAsyncResult();
             s_webdavResult = {false, "系统繁忙,请重试"};
-            s_webdavState = AsyncUiState::Done;
+            unlockAsyncResult();
+            s_webdavState.store(AsyncUiState::Done, std::memory_order_release);
         }
+        state = s_webdavState.load(std::memory_order_acquire);
     }
 
-    if (s_webdavState == AsyncUiState::Running) {
+    if (state == AsyncUiState::Running) {
         drawCenteredBusy("WebDAV 同步", "正在同步...");
         vTaskDelay(pdMS_TO_TICKS(100));
         return APP_SYNC_WEBDAV;
@@ -579,14 +583,15 @@ static AppState scrSyncWebdav(int key, ScreenContext &ctx) {
         vTaskDelay(pdMS_TO_TICKS(100));
         return APP_SYNC_WEBDAV;
     }
-    s_webdavState = AsyncUiState::Idle;
+    s_webdavState.store(AsyncUiState::Idle, std::memory_order_release);
     return APP_MAIN;
 }
 
 // Flomo 发送：同 WebDAV，另外多一份"正文从哪儿来"的判断（编辑器 / 待发管道）。
 static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
     (void)key; (void)ctx;
-    if (s_flomoState == AsyncUiState::Idle) {
+    AsyncUiState state = s_flomoState.load(std::memory_order_acquire);
+    if (state == AsyncUiState::Idle) {
         if (!g_flomoPendingText.empty()) {
             s_flomoText = std::move(g_flomoPendingText);
             g_flomoPendingText.clear();
@@ -599,15 +604,18 @@ static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
         s_flomoResult = {false, ""};
         unlockAsyncResult();
         s_flomoResultUntil = 0;
-        s_flomoState = AsyncUiState::Running;
+        s_flomoState.store(AsyncUiState::Running, std::memory_order_release);
         TaskHandle_t h = nullptr;
         if (xTaskCreate(flomoSendTask, "flomo_send", 8192, nullptr, 1, &h) != pdPASS) {
+            lockAsyncResult();
             s_flomoResult = {false, "系统繁忙,请重试"};
-            s_flomoState = AsyncUiState::Done;
+            unlockAsyncResult();
+            s_flomoState.store(AsyncUiState::Done, std::memory_order_release);
         }
+        state = s_flomoState.load(std::memory_order_acquire);
     }
 
-    if (s_flomoState == AsyncUiState::Running) {
+    if (state == AsyncUiState::Running) {
         ui_clear();
         ui_show_message_centered("正在发送...");
         ui_commit();
@@ -630,7 +638,7 @@ static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
         return APP_SYNC_SEND_FLOMO;
     }
     s_flomoText.clear();
-    s_flomoState = AsyncUiState::Idle;
+    s_flomoState.store(AsyncUiState::Idle, std::memory_order_release);
     return s_flomoReturnTo;
 }
 
@@ -864,13 +872,14 @@ extern "C" void app_main() {
     // ── SD 写自检：确认卡已挂载且可写，并报告剩余空间。──
     // "保存失败，请检查SD卡" 通常是满卡/坏卡/只读，这里在启动时直接验证并打出 errno。
     {
-        struct statvfs vfs;
-        if (statvfs("/sdcard", &vfs) == 0) {
-            unsigned long long free_mb = (unsigned long long)vfs.f_bsize * vfs.f_bavail / (1024 * 1024);
-            unsigned long long total_mb = (unsigned long long)vfs.f_bsize * vfs.f_blocks / (1024 * 1024);
+        uint64_t total_bytes = 0;
+        uint64_t free_bytes = 0;
+        if (esp_vfs_fat_info("/sdcard", &total_bytes, &free_bytes) == ESP_OK) {
+            unsigned long long free_mb = (unsigned long long)(free_bytes / (1024 * 1024));
+            unsigned long long total_mb = (unsigned long long)(total_bytes / (1024 * 1024));
             ESP_LOGI(TAG, "SD: free=%llu MB total=%llu MB", free_mb, total_mb);
         } else {
-            ESP_LOGW(TAG, "SD: statvfs failed errno=%d (%s)", errno, strerror(errno));
+            ESP_LOGW(TAG, "SD: info query failed errno=%d (%s)", errno, strerror(errno));
         }
 
         const char *p = "/sdcard/.sd_write_test";

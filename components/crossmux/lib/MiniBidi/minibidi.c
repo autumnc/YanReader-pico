@@ -508,6 +508,7 @@ static inline void dss_pop(DirStatusStack* s, uchar* emb, uchar* ovr, bool* isol
  * ═══════════════════════════════════════════════════════════════════════ */
 
 int do_bidi(bool autodir, int paragraphLevel, bidi_char* line, int count) {
+  if (count <= 0) return 0;
   if (count > BIDI_MAX_LINE) count = BIDI_MAX_LINE;
 
   uchar currentEmbedding, currentOverride;

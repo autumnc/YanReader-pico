@@ -1,4 +1,5 @@
 #include "http.h"
+#include "http_cap.h"
 
 #include <cstdio>
 
@@ -77,7 +78,7 @@ esp_err_t onData(esp_http_client_event_t *evt) {
     // 随即退出（见文件头第 2 条）。只在 ON_DATA 上判定就够——真的一个字节都不来，
     // 单次读的 timeout_ms 自然兜底。
     const bool past_deadline = c->deadline_us != 0 && esp_timer_get_time() > c->deadline_us;
-    const bool cancelled = c->req->cancel && *c->req->cancel;
+    const bool cancelled = c->req->cancel && c->req->cancel->load(std::memory_order_acquire);
     if (past_deadline || cancelled) {
         c->timed_out = past_deadline;
         c->cancelled = cancelled;
@@ -98,27 +99,24 @@ esp_err_t onData(esp_http_client_event_t *evt) {
     }
 
     const size_t n = static_cast<size_t>(evt->data_len);
-    if (c->req->cap != 0) {
-        if (c->req->cap_hard) {
-            if (c->got + n > c->req->cap) {
-                c->overflow = true;
-                return ESP_FAIL;  // 中止请求
-            }
-        } else if (c->got >= c->req->cap) {
-            c->truncated = true;  // 丢弃余下，但请求继续跑完（got 不再增长）
-            return ESP_OK;
-        }
+    const CapDecision cap = decideCapKeep(c->got, n, c->req->cap, c->req->cap_hard);
+    const size_t keep = cap.keep;
+    if (cap.overflow) {
+        c->overflow = true;
+        return ESP_FAIL;  // 中止请求
     }
+    if (cap.truncated) c->truncated = true;
+    if (keep == 0 && c->req->cap != 0) return ESP_OK;
 
     if (c->sink) {
-        if (!(*c->sink)(static_cast<const uint8_t *>(evt->data), n)) {
+        if (keep > 0 && !(*c->sink)(static_cast<const uint8_t *>(evt->data), keep)) {
             c->sink_failed = true;
             return ESP_FAIL;  // 回调喊停（写盘失败等）
         }
     } else if (c->mem) {
-        c->mem->append(static_cast<const char *>(evt->data), n);
+        if (keep > 0) c->mem->append(static_cast<const char *>(evt->data), keep);
     }
-    c->got += n;
+    c->got += keep;
 
     if (c->req->progress) {
         size_t total = 0;
@@ -211,7 +209,7 @@ Response request(const Request &req) {
         r.error = "URL 为空";
         return r;
     }
-    if (req.cancel && *req.cancel) {
+    if (req.cancel && req.cancel->load(std::memory_order_acquire)) {
         r.cancelled = true;
         r.error = "已取消";
         return r;
@@ -259,7 +257,7 @@ Response request(const Request &req) {
 
     char buf[1024];
     while (true) {
-        if (req.cancel && *req.cancel) {
+        if (req.cancel && req.cancel->load(std::memory_order_acquire)) {
             r.cancelled = true;
             break;
         }
@@ -274,8 +272,17 @@ Response request(const Request &req) {
         }
         const int n = esp_http_client_read(client, buf, sizeof(buf));
         if (n > 0) {
-            r.body.append(buf, static_cast<size_t>(n));
-            r.got += static_cast<size_t>(n);
+            const CapDecision cap = decideCapKeep(r.got, static_cast<size_t>(n), req.cap, req.cap_hard);
+            const size_t keep = cap.keep;
+            if (cap.overflow) {
+                r.overflow = true;
+                break;
+            }
+            if (cap.truncated) r.truncated = true;
+            if (keep > 0) {
+                r.body.append(buf, keep);
+                r.got += keep;
+            }
         } else if (n == -ESP_ERR_HTTP_EAGAIN) {
             continue;  // 单次读超时，回头再看标志
         } else {

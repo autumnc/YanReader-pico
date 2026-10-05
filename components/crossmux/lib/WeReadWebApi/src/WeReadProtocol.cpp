@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -753,6 +754,7 @@ bool encodeId(const char* value, Md5Function md5, char* out, size_t outSize) {
       if (!append(encoded, sizeof(encoded), encodedLen, byteHex, static_cast<size_t>(count))) return false;
     }
     char lengthHex[3];
+    if (encodedLen > 0xFF) return false;
     snprintf(lengthHex, sizeof(lengthHex), "%02x", static_cast<unsigned>(encodedLen));
     if (!append(out, outSize, pos, lengthHex, 2) || !append(out, outSize, pos, encoded, encodedLen)) return false;
   }
@@ -999,7 +1001,7 @@ size_t swapPositions(const size_t encodedLength, const uint8_t* tail, const size
     for (uint8_t bit = 0; bit < 8; ++bit) {
       if ((value >> bit) & 1U) transformed += 1U << (2U * bit);
     }
-    const int written = snprintf(decimal + decimalLen, sizeof(decimal) - decimalLen, "%u", transformed);
+    const int written = snprintf(decimal + decimalLen, sizeof(decimal) - decimalLen, "%" PRIu32, transformed);
     if (written <= 0 || static_cast<size_t>(written) >= sizeof(decimal) - decimalLen) return 0;
     decimalLen += static_cast<size_t>(written);
   }

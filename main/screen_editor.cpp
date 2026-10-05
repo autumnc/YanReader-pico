@@ -22,6 +22,7 @@
 #include <cstdlib>   // rand()：状态栏模式标记/Ctrl+P 取内置提示词
 #include <cstring>
 #include <ctime>
+#include <atomic>
 #include <set>
 #include <esp_timer.h>
 #include <esp_log.h>
@@ -149,7 +150,7 @@ static EditorState g_editor;
 static EditorState s_stashedEditor;
 static bool s_hasStashedEditor = false;
 
-static volatile bool s_promptTaskDone = false;
+static std::atomic<bool> s_promptTaskDone{false};
 static DeepseekResult s_promptTaskResult = {false, ""};
 static std::string s_promptTaskContext;
 static SemaphoreHandle_t s_promptResultMutex = nullptr;
@@ -2230,7 +2231,7 @@ static void runPromptTask(void *arg) {
     lockPromptResult();
     s_promptTaskResult = result;
     unlockPromptResult();
-    s_promptTaskDone = true;
+    s_promptTaskDone.store(true, std::memory_order_release);
     vTaskDelete(nullptr);
 }
 
@@ -2247,7 +2248,7 @@ static void startAiPromptGeneration(ScreenContext &ctx) {
     lockPromptResult();
     s_promptTaskResult = {false, ""};
     unlockPromptResult();
-    s_promptTaskDone = false;
+    s_promptTaskDone.store(false, std::memory_order_release);
     g_editor.promptGenerating = true;
     TaskHandle_t h = nullptr;
     if (xTaskCreate(runPromptTask, "prompt_gen", 8192, nullptr, 1, &h) != pdPASS) {
@@ -2597,7 +2598,7 @@ void screen_editor_init(ScreenContext &ctx) {
     }
     g_editor.lastRecoveryHash = 0;
     g_editor.promptGenerating = false;
-    s_promptTaskDone = false;
+    s_promptTaskDone.store(false, std::memory_order_release);
 }
 
 // 键盘整块换图样（键位布局、中/英）后的重绘。这两种切换会把键位、键帽标签、
@@ -2962,7 +2963,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     s_vkAteCommitClick = false;
 
     if (g_editor.promptGenerating) {
-        if (!s_promptTaskDone) {
+        if (!s_promptTaskDone.load(std::memory_order_acquire)) {
             drawPromptGenerating();
             return APP_EDITOR;
         }
@@ -3693,7 +3694,7 @@ bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw) {
     // 分支都不会走到（drawEditor 也不跑），得在这里补一帧。见 editorSelDragIdleScroll。
     if (editorSelDragIdleScroll()) return true;
     if (g_editor.promptGenerating) {
-        if (s_promptTaskDone) {
+        if (s_promptTaskDone.load(std::memory_order_acquire)) {
             g_editor.promptGenerating = false;
             lockPromptResult();
             DeepseekResult result = s_promptTaskResult;

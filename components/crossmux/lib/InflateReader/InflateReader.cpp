@@ -1,10 +1,21 @@
 #include "InflateReader.h"
 
+#include <Memory.h>
+
 #include <cstring>
+#include <cstdlib>
 #include <type_traits>
 
 namespace {
 constexpr size_t INFLATE_DICT_SIZE = InflateReader::RING_BYTES;
+
+void* allocLarge(size_t size) {
+#if CROSSPOINT_MEMORY_HAS_HEAP_CAPS
+  void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (p) return p;
+#endif
+  return malloc(size);
+}
 }
 
 // Guarantee the cast pattern in the header comment is valid.
@@ -17,7 +28,7 @@ bool InflateReader::init(const bool streaming) {
   deinit();  // free any previously allocated ring buffer and reset state
 
   if (streaming) {
-    ringBuffer = static_cast<uint8_t*>(malloc(INFLATE_DICT_SIZE));
+    ringBuffer = static_cast<uint8_t*>(allocLarge(INFLATE_DICT_SIZE));
     if (!ringBuffer) return false;
     ownsRing = true;
     memset(ringBuffer, 0, INFLATE_DICT_SIZE);

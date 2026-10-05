@@ -7,7 +7,11 @@
 #include <cstring>
 #include <dirent.h>
 #include <sys/stat.h>
+#ifdef ESP_PLATFORM
+#include "esp_vfs_fat.h"
+#else
 #include <sys/statvfs.h>
+#endif
 
 // SD 挂载点（与 pjournal 主组件一致）。
 static constexpr const char* SD_ROOT = "/sdcard";
@@ -77,11 +81,15 @@ void HalStorage::endUsbDrive() {}
 UsbDriveState HalStorage::usbDriveState() const { return UsbDriveState::Unsupported; }
 
 bool HalStorage::getSpace(uint64_t& totalBytes, uint64_t& freeBytes) {
+#ifdef ESP_PLATFORM
+  return esp_vfs_fat_info(SD_ROOT, &totalBytes, &freeBytes) == ESP_OK;
+#else
   struct statvfs st;
   if (statvfs(SD_ROOT, &st) != 0) return false;
   totalBytes = static_cast<uint64_t>(st.f_bsize) * st.f_blocks;
   freeBytes = static_cast<uint64_t>(st.f_bsize) * st.f_bavail;
   return true;
+#endif
 }
 
 HalStorage::StorageLock::StorageLock() {}
@@ -181,11 +189,16 @@ static bool removeDirRecursive(const std::string& path) {
 }
 bool HalStorage::removeDir(const char* path) { return removeDirRecursive(toNativePath(path)); }
 
-std::string HalStorage::readFile(const char* path, bool* ok) {
+std::string HalStorage::readFile(const char* path, bool* ok, size_t maxBytes) {
   if (ok) *ok = false;
   HalFile f = open(path, FS_RDONLY);
   if (!f.isOpen()) return std::string();
   const size_t size = f.fileSize();
+  if (maxBytes > 0 && size > maxBytes) {
+    LOG_ERR("STORAGE", "readFile refused oversized file: %s (%u > %u)", path,
+            static_cast<unsigned>(size), static_cast<unsigned>(maxBytes));
+    return std::string();
+  }
   std::string out(size, '\0');
   if (size > 0 && f.read(&out[0], size) != static_cast<int>(size)) return std::string();
   f.close();

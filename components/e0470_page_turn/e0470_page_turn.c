@@ -23,6 +23,17 @@
 
 static const char* TAG = "e0470_turn";
 
+void epd_set_line_phase_luts(const uint8_t* const* luts, const int8_t* line_phase)
+    __attribute__((weak));
+void epd_set_col_phase_luts(
+    const uint8_t* const* luts,
+    const int* band0,
+    const int* band1,
+    const int8_t* band_phase,
+    int bands
+) __attribute__((weak));
+void epd_clear_phase_luts(void) __attribute__((weak));
+
 #define TURN_BANDS 16
 #define TURN_PHASE_CAP 40
 #define TURN_LINE_MAX 2048
@@ -328,6 +339,11 @@ static enum EpdDrawError turn_impl(
     EpdiyHighlevelState* hl, EpdRect area, e0470_turn_dir_t dir, const EpdWaveform* waveform, int mode
 ) {
     if (hl == NULL || waveform == NULL) return EPD_DRAW_NO_PHASES_AVAILABLE;
+    if (epd_set_line_phase_luts == NULL || epd_set_col_phase_luts == NULL ||
+        epd_clear_phase_luts == NULL) {
+        ESP_LOGW(TAG, "epdiy phase LUT hooks missing; falling back to normal refresh");
+        return EPD_DRAW_NO_PHASES_AVAILABLE;
+    }
     if (dir > E0470_TURN_BTT) dir = E0470_TURN_RTL;
 
     const EpdWaveformPhases* gl = e0470_waveform_phases(waveform, mode);

@@ -88,7 +88,6 @@
 
 #include <dirent.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 
 #include <esp_chip_info.h>
 #include <esp_heap_caps.h>

@@ -3,6 +3,7 @@
 #include <Print.h>
 #include <common/FsApiConstants.h>  // for oflag_t
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -44,7 +45,7 @@ class HalStorage {
   // 递归建目录（微信读书的缓存层级较深）。已存在视为成功。
   bool ensureDirectoryExists(const char* path) { return mkdir(path, true); }
   // 读整个小文件（返回内容；失败返回空串，*ok 区分"空文件"和"读失败"）。
-  std::string readFile(const char* path, bool* ok = nullptr);
+  std::string readFile(const char* path, bool* ok = nullptr, size_t maxBytes = 64 * 1024);
   // 整体覆写一个文件。
   bool writeFile(const char* path, const std::string& content);
 

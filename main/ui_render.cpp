@@ -31,6 +31,7 @@
 #include "settings_manager.h"   // imeCleanMode()（同样只在 core0 侧读，见 ime_clean_policy）
 #include "u8g2_shim.h"
 
+#include <atomic>
 #include <cstring>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
@@ -41,6 +42,10 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+
+#ifndef E0470_GRAY8_TEXT_WAVEFORM
+#define E0470_GRAY8_TEXT_WAVEFORM E0470_GRAY8_WAVEFORM
+#endif
 
 static const char *TAG = "ui_render";
 
@@ -158,7 +163,7 @@ static portMUX_TYPE s_free_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t s_q;
 static SemaphoreHandle_t s_free;  // 计数信号量（初值 2）
 static int s_last_idx = -1;       // 渲染任务：最后一次推上屏的缓冲
-static volatile bool s_active;    // init 完成
+static std::atomic<bool> s_active{false};    // init 完成
 
 // ── 渲染任务私有状态（core0 只写三个开关）────────────────────────────────
 static bool s_force_full_next = true;  // 首帧从白底出图，必须整屏 GC16
@@ -175,19 +180,23 @@ static uint8_t *s_defer_cur;
 static EpdRect s_defer_rect;
 static EpdRect s_defer_cand;   // 本次合并窗口的编码区候选区矩形（core0 提交时带上来的）
 static bool s_defer_commit;    // 本次合并窗口是"上屏"那一拍（要顺手清一遍候选区）
-static volatile bool s_fast_partial, s_fast_partial_first, s_local_only;
+static std::atomic<bool> s_fast_partial{false};
+static std::atomic<bool> s_fast_partial_first{false};
+static std::atomic<bool> s_local_only{false};
 
 // ── 策略开关（core0 调用，渲染任务读）────────────────────────────────────
 void ui_render_set_fast_partial(bool enable) {
-    if (enable && !s_fast_partial) s_fast_partial_first = true;
-    s_fast_partial = enable;
+    if (enable && !s_fast_partial.load(std::memory_order_relaxed)) {
+        s_fast_partial_first.store(true, std::memory_order_relaxed);
+    }
+    s_fast_partial.store(enable, std::memory_order_relaxed);
 }
 
-void ui_render_set_local_only(bool enable) { s_local_only = enable; }
+void ui_render_set_local_only(bool enable) { s_local_only.store(enable, std::memory_order_relaxed); }
 
 // ── 缓冲取还 ─────────────────────────────────────────────────────────────
 static int acquire_buffer(TickType_t wait) {
-    if (!s_active) return -1;
+    if (!s_active.load(std::memory_order_acquire)) return -1;
     if (xSemaphoreTake(s_free, wait) != pdTRUE) return -1;
     int idx = -1;
     portENTER_CRITICAL(&s_free_mux);
@@ -374,7 +383,7 @@ static bool follow_du_refresh(EpdiyHighlevelState *hl, uint8_t *cur, EpdRect r) 
     guard_draw_result(hl, update_display_area_with(hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, r));
     if (++s_follow_partials >= FOLLOW_GC16_EVERY) {
         s_follow_partials = 0;
-        if (s_local_only || s_fast_partial) {
+        if (s_local_only.load(std::memory_order_relaxed) || s_fast_partial.load(std::memory_order_relaxed)) {
             // 正在打字（VK 局刷 / 实体键快刷）：只记账，不刷。404ms 的整屏 GC16
             // 会打断输入节奏，且它清的是"打字区之外"的残影，不值得打断用户。
             s_gc16_pending = true;
@@ -482,7 +491,8 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
 
     // 打字状态已结束（实体键/VK 都收起），而打字期间攒下过一次没做的清残影：
     // 这次提交无论多小都整屏 GC16 一次补上，并把两个计数归零重新攒。
-    if (s_gc16_pending && !s_local_only && !s_fast_partial) {
+    if (s_gc16_pending && !s_local_only.load(std::memory_order_relaxed) &&
+        !s_fast_partial.load(std::memory_order_relaxed)) {
         s_gc16_pending = false;
         display_soft_refresh_reset();   // 残影预算在 display.c（下面就是整屏 GC16，它也归零）
         s_follow_partials = 0;
@@ -529,7 +539,8 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
         note_ime_clean(job, extra);
     };
 
-    if (s_fast_partial && !s_fast_partial_first) {
+    if (s_fast_partial.load(std::memory_order_relaxed) &&
+        !s_fast_partial_first.load(std::memory_order_relaxed)) {
         // 2) 编辑器实体键快刷：DU 差分整屏，只驱动本帧真正变化的像素。
         //    周期清残影不在这里记账 —— E0470_WAVEFORM 不是 FOLLOW 波形，display.c 的
         //    hl_update() 会按 APP_GC16_EVERY 自己把它升级成 GC16。
@@ -591,13 +602,13 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
             clean_ime_rows();
         }
     } else {
-        s_fast_partial_first = false;
+        s_fast_partial_first.store(false, std::memory_order_relaxed);
         // 3) 局刷判定。虚拟键盘打字（s_local_only）时只可能是"正文区也在变"：差分顶边
         //    落在输入法区之上的那几拍（打字本身只动输入法区，上面就拦下走合并窗口了）。
         //    用 GL16 局刷，画质优先（区域只限制驱动范围，不省时间 —— 见文件头）。
         //    其余界面（设置项选中、单行高亮等）沿用原来的"小变化局刷、大半屏整屏"。
         bool small = d.height <= SCREEN_H / 2;
-        if (s_local_only) {
+        if (s_local_only.load(std::memory_order_relaxed)) {
             // 虚拟键盘打字：**一律局刷，绝不整屏**。打字中途差分只落在候选条那一小条，
             // 而上屏那一拍从正文一路跨到候选条，高度常超半屏 —— 再按 small 判就会掉进
             // 整屏 GL16（≈410ms），每上屏一次闪一屏。区域只限制驱动范围、画质优先。
@@ -659,7 +670,7 @@ static void flush_deferred() {
     }
     if (++s_follow_partials >= FOLLOW_GC16_EVERY) {
         s_follow_partials = 0;
-        if (s_local_only || s_fast_partial) {
+        if (s_local_only.load(std::memory_order_relaxed) || s_fast_partial.load(std::memory_order_relaxed)) {
             s_gc16_pending = true;
         } else {
             do_full_refresh(hl, cur, true);
@@ -1048,7 +1059,7 @@ static void ui_render_release_partial(void) {
 }
 
 void ui_render_init(void) {
-    if (s_active) return;
+    if (s_active.load(std::memory_order_acquire)) return;
     s_fb_size = (size_t)(epd_width() / 2) * epd_height();
     for (int i = 0; i < 2; i++) {
         s_fb[i] = (uint8_t *)heap_caps_malloc(s_fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1070,7 +1081,7 @@ void ui_render_init(void) {
     s_free_list[1] = 1;
     s_free_n = 2;
     s_force_full_next = true;
-    s_active = true;
+    s_active.store(true, std::memory_order_release);
     // 栈放 PSRAM（TCB 按 IDF 规定仍在内部 RAM）。这是"外部栈任务"的硬约束换来的：
     // 它绝不能自己写 flash（NVS 提交、固件写入会临时禁掉 cache，那一刻栈就读不到了）。
     // 本任务只做差分/选波形/推屏，没有任何 NVS/SD/OTA 操作，符合约束。任务常驻不退出，
@@ -1080,7 +1091,7 @@ void ui_render_init(void) {
                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "渲染任务创建失败，退回单缓冲直画");
-        s_active = false;
+        s_active.store(false, std::memory_order_release);
         ui_render_release_partial();
         return;
     }
@@ -1093,13 +1104,13 @@ uint8_t *ui_render_begin_frame(void) {
     if (s_taken >= 0) return s_fb[s_taken];  // 同一帧重复 ui_clear：沿用同一块
 
     int idx = acquire_buffer(pdMS_TO_TICKS(UI_RENDER_TAKE_MS));
-    if (idx < 0 && s_active) {
+    if (idx < 0 && s_active.load(std::memory_order_acquire)) {
         // 再宽限一轮：队列里可能正排着两帧整屏 GC16（每帧 ≤1s），不是卡住。
         ESP_LOGW(TAG, "取渲染缓冲超时，再等一轮");
         idx = acquire_buffer(pdMS_TO_TICKS(UI_RENDER_TAKE_MS));
     }
     if (idx < 0) {
-        if (s_active) {
+        if (s_active.load(std::memory_order_acquire)) {
             // 渲染任务活着、却连着两轮（6 秒）没还回缓冲 —— 判定它卡在 epdiy 里了
             // （最常见是等一个再也不会来的 LCD VSYNC，见 render_lcd.c 的
             // `xSemaphoreTake(frame_done, portMAX_DELAY)`）。
@@ -1165,7 +1176,7 @@ void ui_render_submit(bool force_full) {
 static int s_kept_idx = -1;
 
 void ui_render_drain(void) {
-    if (!s_active) return;
+    if (!s_active.load(std::memory_order_acquire)) return;
     const int target = (s_kept_idx >= 0) ? 1 : 2;
     // 队列空 + 空闲缓冲数到位 = 已提交的帧全推完了。
     for (int i = 0; i < 2000; i++) {
@@ -1178,7 +1189,7 @@ void ui_render_drain(void) {
 void ui_render_invalidate(void) {
     // 必须投给渲染任务做，不能在 core0 直接改：这些 static 里有正在飞的缓冲
     // （drop_defer 会还缓冲），和 core1 的推屏撞上就是缓冲被两边同时用。
-    if (s_active && s_q) {
+    if (s_active.load(std::memory_order_acquire) && s_q) {
         UiJob job = {};
         job.kind = JOB_INVALIDATE;
         job.idx = -1;
@@ -1197,7 +1208,7 @@ void ui_render_full_refresh(void) {
         submit_sync(fb, true);
         return;
     }
-    if (!s_active) return;
+    if (!s_active.load(std::memory_order_acquire)) return;
     if (s_taken >= 0) {  // 当前有一帧开着：把这块直接按 GC16 推掉
         ui_render_submit(true);
         ui_render_drain();
@@ -1214,7 +1225,7 @@ void ui_render_restore(void) {
         submit_sync(fb, true);
         return;
     }
-    if (!s_active) return;
+    if (!s_active.load(std::memory_order_acquire)) return;
     if (s_taken >= 0) ui_render_submit(false);  // 唤醒时不该有开着的帧
     post_last_frame(JOB_FROM_WHITE);
 }
@@ -1222,7 +1233,7 @@ void ui_render_restore(void) {
 // 把"最后一次推上屏的那块缓冲"的内容投一个推屏作业，推完才返回。
 // 当前没有开着的帧时用（有开着的帧走 ui_render_submit 那条路）。
 static void post_last_frame(int kind) {
-    if (!s_active || !s_q) return;
+    if (!s_active.load(std::memory_order_acquire) || !s_q) return;
     ui_render_drain();
     const int idx = acquire_buffer(pdMS_TO_TICKS(UI_RENDER_TAKE_MS));
     if (idx < 0) return;
@@ -1242,7 +1253,7 @@ void ui_render_begin_overlay(void) {
     // 把已推上屏的那帧内容复制进一块空闲缓冲当绘制目标：叠出来的仍是"当前画面"，
     // 而且这块缓冲是 core0 独占的，撞不上推屏。
     // 读 s_fb[s_last_idx] 与渲染任务并发也是安全的 —— 双方都只读。
-    if (!g_u8g2 || !s_active) return;
+    if (!g_u8g2 || !s_active.load(std::memory_order_acquire)) return;
     if (s_taken >= 0 || s_sync_fb) return;  // 已经开着帧，直接往那块上画
     const int idx = acquire_buffer(pdMS_TO_TICKS(UI_RENDER_TAKE_MS));
     if (idx < 0) return;
@@ -1263,7 +1274,7 @@ void ui_render_begin_overlay(void) {
 // 取的是 hl->front_fb 而不是某个工作缓冲：阅读器整条路径直接画 front_fb，
 // "屏上现在的画面"只有它一定对（见 copy_to_front）。
 void ui_render_keep_frame(void) {
-    if (!s_active || s_kept_idx >= 0) return;
+    if (!s_active.load(std::memory_order_acquire) || s_kept_idx >= 0) return;
     ui_render_drain();  // 推完在飞的那一帧，front_fb 才是稳定的
     EpdiyHighlevelState *hl = board_hl();
     if (!hl || !hl->front_fb) return;
@@ -1274,7 +1285,7 @@ void ui_render_keep_frame(void) {
 }
 
 void ui_render_restore_kept(void) {
-    if (!s_active || s_kept_idx < 0) {
+    if (!s_active.load(std::memory_order_acquire) || s_kept_idx < 0) {
         ui_render_restore();  // 没保留过：退化成"把当前缓冲推一遍"
         return;
     }

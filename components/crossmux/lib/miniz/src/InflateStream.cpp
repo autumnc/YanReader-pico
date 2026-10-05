@@ -1,6 +1,7 @@
 #include "InflateStream.h"
 
 #include <BuildScratch.h>
+#include <Memory.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,14 @@ namespace {
 constexpr size_t WINDOW_SIZE = TINFL_LZ_DICT_SIZE;
 // tinfl_decompressor holds mz_uint32 arrays; 8 keeps the window aligned too.
 constexpr size_t STATE_ALIGNED = (sizeof(tinfl_decompressor) + 7) & ~size_t{7};
+
+void* allocLarge(size_t size) {
+#if CROSSPOINT_MEMORY_HAS_HEAP_CAPS
+  void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (p) return p;
+#endif
+  return malloc(size);
+}
 }  // namespace
 
 InflateStream::~InflateStream() { deinit(); }
@@ -33,10 +42,10 @@ bool InflateStream::init(const bool streaming) {
     // Raw malloc (not makeUniqueNoThrow): the header keeps tinfl_decompressor
     // an incomplete type so consumers never include miniz; both blocks are
     // freed in deinit()/the destructor.
-    state = static_cast<tinfl_decompressor*>(malloc(sizeof(tinfl_decompressor)));
+    state = static_cast<tinfl_decompressor*>(allocLarge(sizeof(tinfl_decompressor)));
     if (!state) return false;
     if (streaming) {
-      window = static_cast<uint8_t*>(malloc(WINDOW_SIZE));
+      window = static_cast<uint8_t*>(allocLarge(WINDOW_SIZE));
       if (!window) return false;  // state kept; deinit()/next init reclaims it
     }
   }

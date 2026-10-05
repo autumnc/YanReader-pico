@@ -9,6 +9,7 @@
 
 static const char *TAG = "Clipboard";
 static const char *kPath = "/sdcard/settings/clipboard.txt";
+static constexpr size_t kClipboardFileMax = 64 * 1024;
 
 static std::vector<std::string> s_items;   // s_items[0] = 最新
 static bool s_loaded = false;
@@ -52,7 +53,9 @@ static std::string clampUtf8(const std::string &s, size_t max) {
 
 static void loadFromDisk() {
     s_items.clear();
-    const std::string raw = readWholeFile(kPath);
+    bool truncated = false;
+    const std::string raw = readWholeFile(kPath, kClipboardFileMax, &truncated);
+    if (truncated) ESP_LOGW(TAG, "clipboard file too large, ignored: %s", kPath);
     size_t start = 0;
     for (;;) {
         const size_t nl = raw.find('\n', start);

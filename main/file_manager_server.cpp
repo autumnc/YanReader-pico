@@ -36,20 +36,20 @@ const FmXfer *file_manager_get_xfer() { return &s_xfer; }
 // 开始一次传输。**先把名字写好，最后才置 active** —— 读方看到 active=1 时名字必定
 // 已经落定，不会读到半截字符串。
 static void xferBegin(int kind, const char *name, uint32_t total) {
-    s_xfer.active = 0;
-    s_xfer.kind = kind;
-    s_xfer.done = 0;
-    s_xfer.total = total;
+    s_xfer.active.store(0, std::memory_order_release);
+    s_xfer.kind.store(kind, std::memory_order_relaxed);
+    s_xfer.done.store(0, std::memory_order_relaxed);
+    s_xfer.total.store(total, std::memory_order_relaxed);
     strncpy(s_xfer.name, name ? name : "", sizeof(s_xfer.name) - 1);
     s_xfer.name[sizeof(s_xfer.name) - 1] = '\0';
-    s_xfer.active = 1;
+    s_xfer.active.store(1, std::memory_order_release);
 }
 
-static void xferAdd(uint32_t n) { s_xfer.done += n; }
+static void xferAdd(uint32_t n) { s_xfer.done.fetch_add(n, std::memory_order_relaxed); }
 
 // 结束传输。先清 active：读方这一拍最多看到"active=0 但 done 是旧值"，然后自己
 // 决定要不要显示完成提示。
-static void xferEnd() { s_xfer.active = 0; }
+static void xferEnd() { s_xfer.active.store(0, std::memory_order_release); }
 
 // 传输结束时无条件清 active（handler 里有好几条提前 return 的失败路径，靠析构兜住，
 // 免得界面上留一条永远"传输中"的进度）。

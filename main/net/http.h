@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <string>
 #include <vector>
@@ -61,7 +62,7 @@ struct Request {
     // 进度回调。total > 0 表示服务器给了 content-length（chunked 时为 0）。
     std::function<void(size_t got, size_t total)> progress;
     // 非空时轮询：读到 true 即中止。代价是单次读超时被压到 1s（只有这个粒度）。
-    volatile bool *cancel = nullptr;
+    std::atomic_bool *cancel = nullptr;
 };
 
 struct Response {

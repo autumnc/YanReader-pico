@@ -22,6 +22,10 @@
 #include "reader_page_turn.h"
 #include "reader_refresh_bridge.h"
 
+#ifndef E0470_GRAY8_TEXT_WAVEFORM
+#define E0470_GRAY8_TEXT_WAVEFORM E0470_GRAY8_WAVEFORM
+#endif
+
 static const char* TAG = "read_pico";
 static bool s_bulk_io;
 

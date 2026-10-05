@@ -39,9 +39,10 @@ idf_component_register(
   SRCS ${SOURCES}
   INCLUDE_DIRS ${INCLUDE_DIRS}
   # esp_http_client/esp_wifi/esp_netif/mbedtls 供微信读书联网（WeReadWebApi）使用；
+  # fatfs 供 HalStorage 在 ESP-IDF 下查询 SD 卡空间。
   # 阅读器本身只用前面几个。
   REQUIRES epdiy esp_timer heap log freertos esp_hw_support esp_psram
-           esp_http_client esp_wifi esp_netif mbedtls
+           esp_http_client esp_wifi esp_netif mbedtls fatfs
 )
 
 # 逻辑库用到 C++20（Memory.h 的 requires、ReleaseJsonParser.h 的 std::span）。

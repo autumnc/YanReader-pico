@@ -6,7 +6,7 @@ layout_equiv.cpp 的 [4]）的**对照物**。手抄一份放在测试里，改�
 护栏就会静默失效 —— 它会一直"绿"，只是绿得没有意义。抽出来就没有这个问题：
 对照物永远等于仓库里那个已提交的版本。
 
-抽的范围从 `static int charCellWidth` 到 `buildVrows` 的收尾花括号（HEAD 里这段是连续的）。
+抽的范围从折行宽度 helper 到 `buildVrows` 的收尾花括号（HEAD 里这段是连续的）。
 函数名加 `old_` 前缀，避免与本文件里从工作区抄来的新版同名；`utf8CharLen` 新旧**逐字
 相同**，不重命名、直接用全局那份（抽出来的代码里的调用会解析到它）。
 
@@ -26,9 +26,13 @@ OUT = HERE / "build" / "old_layout.inc"
 # 只有与新代码同名的才需要改；改名后旧代码内部的调用点也一并跟着改。
 RENAME = {
     "charCellWidth": "old_charCellWidth",
+    "charAdvancePx": "old_charAdvancePx",
     "byteToCells": "old_byteToCells",
+    "byteToX": "old_byteToX",
     "cellsToByte": "old_cellsToByte",
+    "xToByte": "old_xToByte",
     "mdIndentCells": "old_mdIndentCells",
+    "mdIndentPx": "old_mdIndentPx",
     "mdPrefixLen": "old_mdPrefixLen",
     "buildVrows": "old_buildVrows",
 }
@@ -44,13 +48,39 @@ def main() -> int:
         OUT.unlink(missing_ok=True)
         return 0
 
-    start = out.index("static int charCellWidth(unsigned char c) {")
+    start = -1
+    modern_px_helper = False
+    for anchor in (
+        "static int charCellWidth(unsigned char c) {",
+        "static int charAdvancePx(unsigned char c) {",
+    ):
+        start = out.find(anchor)
+        if start >= 0:
+            modern_px_helper = "charAdvancePx" in anchor
+            break
+    if start < 0:
+        raise ValueError("layout helper anchor not found")
     b = out.index("std::vector<VRow> buildVrows(", start)
     end = out.index("\n}\n", out.index("return vrows;", b)) + len("\n}\n")
     body = out[start:end]
 
     for new, old in RENAME.items():
         body = re.sub(r"\b%s\b" % new, old, body)
+
+    if modern_px_helper:
+        # HEAD may already contain the pixel-width implementation. The baseline
+        # for this regression still needs the old grid behavior: ASCII advances
+        # by exactly half a CJK cell even when the simulated content face is
+        # proportional. Keep the rest of HEAD's layout code as the baseline.
+        body = re.sub(
+            r"static int old_charAdvancePx\(unsigned char c\) \{.*?\n\}",
+            "static int old_charAdvancePx(unsigned char c) {\n"
+            "    return c < 0x80 ? g_font.halfAdvance() : g_font.cjkAdvance();\n"
+            "}",
+            body,
+            count=1,
+            flags=re.S,
+        )
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(

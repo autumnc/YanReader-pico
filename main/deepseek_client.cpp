@@ -58,7 +58,7 @@ static std::string extractContent(const std::string &response) {
 
 // POST the already-built request body to the DeepSeek chat API and return the
 // assistant content. Shared by generatePrompt and polishText.
-static DeepseekResult runChat(const std::string &body, volatile bool *cancel = nullptr) {
+static DeepseekResult runChat(const std::string &body, std::atomic_bool *cancel = nullptr) {
     net::Request req;
     req.url = DEEPSEEK_API_URL;
     req.method = net::Method::Post;
@@ -120,7 +120,7 @@ DeepseekResult DeepseekClient::generatePrompt(const std::string &userContext) {
 }
 
 DeepseekResult DeepseekClient::polishText(const std::string &text, const std::string &customInstr,
-                                          volatile bool *cancel) {
+                                          std::atomic_bool *cancel) {
     std::string apiKey = g_settings.deepseekKey();
     if (apiKey.empty()) {
         return {false, "请先在设置中配置Deepseek Key"};

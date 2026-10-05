@@ -106,8 +106,9 @@ static void saveQuickHistoryVersion(int idx, const std::string &oldContent) {
 bool quickEditSave(int idx, const std::string &text, bool createHistory) {
     std::string path = quickEditFilePath(idx);
     if (createHistory && g_settings.versionHistory() && fileExists(path)) {
-        std::string old = readWholeFile(path);
-        if (old != text) saveQuickHistoryVersion(idx, old);
+        bool oldTooLarge = false;
+        std::string old = readWholeFile(path, READ_WHOLE_FILE_DEFAULT_MAX, &oldTooLarge);
+        if (!oldTooLarge && old != text) saveQuickHistoryVersion(idx, old);
     }
     if (!safeWriteFile(path, text)) {
         ESP_LOGE(TAG, "Cannot write %s", path.c_str());

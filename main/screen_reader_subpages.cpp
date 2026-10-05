@@ -32,7 +32,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
-#include <sys/statvfs.h>
 #include <vector>
 
 #include <GfxRenderer.h>
@@ -41,6 +40,7 @@
 #include <esp_chip_info.h>
 #include <esp_mac.h>
 #include <esp_timer.h>
+#include <esp_vfs_fat.h>
 
 // 释义折行的行数上限。正常词条几十行封顶，这里只是防病态输入把行表撑爆。
 static const int kDictMaxLines = 2000;
@@ -1213,10 +1213,9 @@ static void fillAboutRows(std::vector<AboutRow> &rows) {
   add("内部 RAM 空闲", dictFormatSize(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
   add("PSRAM 空闲", dictFormatSize(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
 
-  struct statvfs sv;
-  if (statvfs("/sdcard", &sv) == 0 && sv.f_blocks > 0) {
-    uint64_t total = static_cast<uint64_t>(sv.f_blocks) * sv.f_frsize;
-    uint64_t avail = static_cast<uint64_t>(sv.f_bavail) * sv.f_frsize;
+  uint64_t total = 0;
+  uint64_t avail = 0;
+  if (esp_vfs_fat_info("/sdcard", &total, &avail) == ESP_OK && total > 0) {
     snprintf(buf, sizeof(buf), "%s / %s", dictFormatSize(total - avail).c_str(), dictFormatSize(total).c_str());
     add("SD 卡", buf);
   } else {

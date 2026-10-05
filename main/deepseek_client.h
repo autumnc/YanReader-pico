@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 
 struct DeepseekResult {
@@ -16,7 +17,7 @@ public:
     // cancel (optional) is polled during the request; when set, the call
     // aborts quickly and returns success=false with content "已取消".
     DeepseekResult polishText(const std::string &text, const std::string &customInstr,
-                              volatile bool *cancel = nullptr);
+                              std::atomic_bool *cancel = nullptr);
 };
 
 extern DeepseekClient g_deepseek;
