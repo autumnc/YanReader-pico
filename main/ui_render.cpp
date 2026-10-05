@@ -67,19 +67,8 @@ static const char *TAG = "ui_render";
 // 整块面板本来就要扫一遍，见 display.c），约 300 多毫秒。所以不能每个上屏词都清一次。
 // **这是本策略唯一的旋钮**：调大 = 更省刷屏时间、残影留得久；调小 = 更常清。取值要
 // 明显大于"连打时两次按键的间隔"（本机上大概 0.2~0.6s），否则每敲一个键都会触发。
+// 句读（，。！？）不走这条路 —— 那是**当场清**，见 render_present 里的 punct_clean。
 #define IME_CLEAN_PAUSE_US 700000
-
-// 句读（，。！？；：、……—— ,.!?;:）之后的收紧阈值。用户在句读后面天然会停一下
-// 组织下一句 —— 这个停顿是**可预期**的，所以这时候不用再等满上面那个"连打间隔上限"，
-// 直接按这个短期限清。效果：一次句读 = 一次确定的清残影，而不是"等够 700ms 才轮得到"
-// （连打时 IME 条每变一次都会把期限往后推，很可能一整段都轮不上清）。
-//
-// 取值卡在两边之间：**大于**连打时两键的间隔（本机 0.2~0.6s 中的低段，句读之后那一下
-// 基本不会这么快），**小于**句读后想事情的时间。清一遍本身 ≈330ms，所以真正担心的
-// 是"期限刚过、用户又接着打"—— ime_clean_tick 里有一道"队列还有帧就不清"的闸，
-// 那种情况会顺延到下一次真停手，不会插在打字中间。
-// **这是本策略第二个旋钮**：调大 = 更稳、残影多留一会；调小 = 更勤、可能打断刚续上的手。
-#define IME_CLEAN_PUNCT_PAUSE_US 300000
 
 // 打字期间**一次全刷都不做**：键区以前每 7 键把键盘矩形整块过一遍 8 灰阶 GL16 清残影，
 // 结果就是打字打到一半莫名其妙闪一下键盘。现在清残影只针对"上屏后那两行"，而且**推迟
@@ -88,6 +77,8 @@ static const char *TAG = "ui_render";
 // 不多花一遍，见 render_present 的 s_local_only 分支）、实体键盘快刷（s_fast_partial 分支）、
 // 以及那些不开快刷的界面（跟随 DU 那条路）——后两条都是"正常档位走完，到停顿再补一遍这两行"。
 // 整屏那次清账顺延到打字结束（键盘收起）后的下一次提交，见 s_gc16_pending 那条。
+// **句读是唯一的例外**：敲完标点输入法条当场变空，那一刻就该清，而且是当场做完不推迟
+// （见 render_present 的 punct_clean）。
 
 // 正文区（编辑器文本区）的"局刷"档位。区域只用于**限制驱动范围**（少留残影），
 // 不省时间：高层刷新 min_y 恒为 0，整块面板本来就要扫一遍，耗时 = 相位数 × 帧周期。
@@ -103,7 +94,7 @@ struct UiJob {
     int ime_top;     // IME 面板顶（逻辑 y）；-1 = 未在组合输入
     EpdRect cand;    // 编码区+候选区（逻辑）；width<=0 = 键盘没显示
     bool ime_commit; // 这一帧之前刚上屏过一次（IME::commitSeq 变了）
-    bool ime_punct;  // 这一帧刚吐出一个句读（IME::punctSeq 变了）：停顿点在望
+    bool ime_punct;  // 这一帧刚吐出一个句读（IME::punctSeq 变了）：当场清这两行，不推迟
     bool force_full; // 强制整屏 GC16
 };
 
@@ -245,25 +236,19 @@ static bool    s_clean_dirty = false;         // 攒了残影没清
 // 输入法动过一下（按键落在输入法条内的那一帧 / 一次上屏）：把清理期限往后推。
 // **只推期限、不置脏** —— 期限要钉在"最后一次输入法动作"上，不然用户正连着打字时
 // 会从中间插进来一次 330ms 的刷屏，比每词清一次还难受。
-// pause_us 平时用 IME_CLEAN_PAUSE_US；这一拍刚吐出句读时用短的（见下面那个 define）。
 static void ime_clean_arm(int64_t pause_us) {
     s_clean_due_us = esp_timer_get_time() + pause_us;
 }
 
-// 这一帧该按哪个期限算：句读那一拍收紧，其余用默认。
-static int64_t ime_clean_pause_for(const UiJob &job) {
-    return job.ime_punct ? IME_CLEAN_PUNCT_PAUSE_US : IME_CLEAN_PAUSE_US;
-}
-
-// 记账：这两行被写脏了，过 pause_us 之后清一遍。**"置脏"和"推期限"是两件事**，
+// 记账：这两行被写脏了，过 IME_CLEAN_PAUSE_US 之后清一遍。**"置脏"和"推期限"是两件事**，
 // 这里一次做完 —— 只推期限不置脏，那一次清理就永远等不到（ime_clean_tick 第一行
 // 就是 `if (!s_clean_dirty) return;`）。
-static void note_ime_clean(const UiJob &job, int64_t pause_us) {
+static void note_ime_clean(const UiJob &job) {
     if (job.cand.width > 0 && job.cand.height > 0) {
         s_clean_rect = job.cand;
         s_clean_dirty = true;
     }
-    ime_clean_arm(pause_us);
+    ime_clean_arm(IME_CLEAN_PAUSE_US);
 }
 
 // 整屏全像素刷（GC16 / GL16 整屏 / from-white / 失效重刷）之后，这两行本来就被
@@ -282,8 +267,7 @@ static void ime_clean_tick(void) {
     // 队列里还压着没推完的帧 = 用户又动了（或界面在连刷）。清残影是**观感**上的事，
     // 抢在用户下一帧前面只会让那帧多等 330ms（看着就是打字卡一下）。所以让路：
     // 期限不销，等哪一轮真没帧了再清 —— 顺延到下一次真停手，代价只是残影多留一会。
-    // 句读那个短期限（IME_CLEAN_PUNCT_PAUSE_US）尤其需要这道闸：它比连打间隔短，
-    // 用户"句读→想一下→接着打"里那"想一下"若只有三四百毫秒，就正好撞在这一闸上。
+    // 这道闸只管**上屏**那条路（句读是当场清的，不走记账）。
     if (uxQueueMessagesWaiting(s_q) > 0) return;
     s_clean_dirty = false;
     if (s_clean_rect.width <= 0 || s_clean_rect.height <= 0) return;
@@ -357,23 +341,48 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
         return;
     }
 
-    // 句读那一拍（core0 认出来，经 job.ime_punct 传下来）：用户敲完 ，。！？ 就快到
-    // 停顿点了，**在这一拍上把这两行记脏并按短期限等** —— 而不是只把上一次上屏攒下的
-    // 期限收紧。以前只 arm 不置脏，于是它只能"加速"一次本来就会发生的清理：上屏之后
-    // 停够 IME_CLEAN_PAUSE_US（700ms）让那次清理先跑掉、脏账一销，再敲标点就什么都不会
-    // 发生 —— 而"上屏 → 想一下 → 敲标点"正是最常见的节奏。虚拟键盘那条路更是从头到尾
-    // 没置过脏（s_local_only 分支不调 clean_ime_rows，上屏清残影并进了同一次区域刷），
-    // 只 arm 等于空转。
+    // ── 句读那一拍：**当场**把编码区+候选区压回底色 ────────────────────────
     //
-    // 放在差分之前、force_full 之后：所有分支（快刷 / 局刷 / 合并窗口 / 虚拟键盘）都
-    // 从这儿过一遍，句读的记账一次覆盖全部路径；而真正整屏刷的那几拍由 do_full_refresh
-    // 里的 ime_clean_forget 销账，不会重复清。
-    if (job.ime_punct) note_ime_clean(job, IME_CLEAN_PUNCT_PAUSE_US);
+    // 敲完 ，。！？ 之后输入法条自己就会变空（组合结束、候选行清掉），这一刻正是清残影
+    // 最合适的时候：用户就停在这儿组织下一句。做法和上屏那一拍完全一样 —— 把编码区候选区
+    // 并进刷新区域、换成 8 灰阶正文表（15→15 带一帧白推 = **全像素**）驱动一遍，
+    // 区域里的像素全部走到白底，之前反复换字攒的灰痕一次压掉。
+    //
+    // **当场做完就走，不推迟**（这条路上前后试过两版"只 arm 期限"，都不成立）：
+    //   * 只 `ime_clean_arm()` 不置脏 = 空转 —— ime_clean_tick 第一行就是
+    //     `if (!s_clean_dirty) return;`，而脏账只有**上屏那一拍**会置。它只能"加速"一次
+    //     本来就会发生的清理，上屏后停够 700ms 那次先跑掉、脏账一销，再敲标点就什么都不做。
+    //   * 补上置脏（note_ime_clean）也还是不行 —— 它依赖渲染任务的空闲节拍到点再补一遍，
+    //     而这两行这一拍**本来就重新画成白的**，等于把同一块区域的刷新拆成两次。
+    // 现在这样只占一次刷新：区域只限制驱动范围、不额外花时间（见文件头的"区域不省时间"），
+    // 也不必再挂"脏账/期限/空闲节拍"三样东西。整屏刷那几拍由 do_full_refresh 的
+    // ime_clean_forget 销账，不走这里。
+    const bool punct_clean = job.ime_punct && job.cand.width > 0 && job.cand.height > 0;
+    if (job.ime_punct && !punct_clean) {
+        // 拿不到矩形就没得清（面板还没被画过，比如 IME 条一次都没出现过）。留一条日志：
+        // 这条路上"以为清了其实没清"查起来最费劲，现场一行就能定位。
+        static int warned;
+        if (warned++ < 4)
+            ESP_LOGW(TAG, "句读清残影拿不到输入法面板矩形（cand %dx%d）",
+                     job.cand.width, job.cand.height);
+    }
 
     // 差分基准 = 面板上实际的内容（epdiy 的 back_fb）。
     EpdRect d = diff_bounding_rect(cur, hl->back_fb);
     if (d.width <= 0 || d.height <= 0) {
         // 无变化：墨水屏双稳态，不刷。
+        release_buffer(rel_idx);
+        return;
+    }
+
+    if (punct_clean) {
+        // 所有分支（快刷 / 局刷 / 合并窗口 / 虚拟键盘）都在这里统一收口：句读那一拍
+        // 永远是"差异矩形 ∪ 编码区候选区"的一次区域全像素刷。合并窗口也不用走 ——
+        // 句读写进的是正文，差分顶边必然在输入法区之上，本来就落不进那个分支。
+        drop_defer();
+        copy_to_front(hl, cur);
+        guard_draw_result(hl, update_display_area_with(
+            hl, &E0470_GRAY8_TEXT_WAVEFORM, MODE_GL16, rect_union(d, job.cand)));
         release_buffer(rel_idx);
         return;
     }
@@ -388,7 +397,7 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
         s_defer_rect = d;
         s_defer_cand = job.cand;      // flush 时顺手清一遍编码区候选区
         s_defer_commit = job.ime_commit;  // 只有上屏那一拍才清
-        ime_clean_arm(ime_clean_pause_for(job));   // 输入法条动过一下 = 用户还在打字，清理期限往后推
+        ime_clean_arm(IME_CLEAN_PAUSE_US);   // 输入法条动过一下 = 用户还在打字，清理期限往后推
         if (!s_ime_deferred) {
             s_ime_deferred = true;
             s_ime_defer_until = esp_timer_get_time() + IME_DEFER_US;
@@ -425,7 +434,7 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
                 hl, &E0470_GRAY8_TEXT_WAVEFORM, MODE_GL16, job.cand));
             return;
         }
-        note_ime_clean(job, ime_clean_pause_for(job));
+        note_ime_clean(job);
     };
 
     if (s_fast_partial && !s_fast_partial_first) {

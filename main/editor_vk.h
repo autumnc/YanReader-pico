@@ -2,11 +2,11 @@
 
 #include <string>
 
-// 写作模式虚拟键盘：未连接蓝牙键盘时显示，直接接系统拼音输入法(IME)。
+// 虚拟键盘：未连接蓝牙键盘时显示，直接接系统拼音输入法(IME)。
 //
-// 交互语义与阅读器的 VK(screen_reader.cpp)一致，但绘制不能复用：阅读器走
-// GfxRenderer，编辑器的正文/状态栏走 u8g2 shim + g_font，两条渲染栈的坐标
-// 映射不同。这里重写绘制，交互(键表/命中/喂 IME)保持同构。
+// **写作 / 计划 / 阅读三个模式共用这一套**（阅读器也不再自带绘制，见 screen_reader.cpp
+// 的 vkVkTop/editorVkDraw/editorVkHitTest/editorVkPumpTap 转发）。三张键面、四种键位
+// 布局、T9 面板与候选条都在这里，版式说明见根 README 的「虚拟键盘版式」一节。
 //
 // 核心思路：命中测试把点按**翻译成普通键码**，交给 screen_editor_handle 既有的
 // IME 分支 / 回车 / 退格 / ASCII 插入逻辑处理——不重复实现任何输入逻辑。

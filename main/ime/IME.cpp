@@ -5723,8 +5723,9 @@ bool IME::handleFullwidthChar(int key, std::string &out) {
 }
 
 // 句读（换句 / 换气的地方）：，。！？；：、……—— 和中英文混排时的半角 ,.!?;:。
-// 敲完这些用户**天然会停一下**去组织下一句 —— 这是打字过程中最可预期的一次停顿，
-// 拿它当"清残影"的时机比等一个固定阈值准（见 ui_render.cpp 的 IME_CLEAN_PUNCT_PAUSE_US）。
+// 敲完这些，输入法条**自己就变空**（组合结束、候选行清掉）—— 那一拍是把编码区/候选区
+// 压回底色的最好时机，所以它是唯一的"当场清"（其余走上屏后按停顿推迟的那条路）。
+// 见 core0 的 take_ime_punct() 与 ui_render.cpp render_present 的 punct_clean。
 // 只看吐出来那一段的**最后一个字符**：句读总是整段落在尾部（「，」单发、英文词尾补标点、
 // 预测模式下的标点），前缀是不是词不影响判定。
 static bool isPausePunctTail(const std::string &text) {
