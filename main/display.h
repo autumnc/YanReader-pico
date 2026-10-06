@@ -39,6 +39,7 @@ extern "C" {
 #define DISPLAY_PCLK_MAX_MHZ READ_PICO_EPD_PCLK_MAX_MHZ
 #define DISPLAY_PCLK_STEP_MHZ 1
 
+void display_init(void);
 void rails_keepalive(void);
 void rails_idle_check(int64_t now_ms);
 

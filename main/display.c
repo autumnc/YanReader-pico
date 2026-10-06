@@ -18,6 +18,8 @@
 #include "e0470_page_turn.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "hw/board_hw.h"  // board_hl()：自检页自推屏要自己拿 epdiy 句柄
 #include "reader_page_turn.h"
 #include "reader_refresh_bridge.h"
@@ -41,19 +43,56 @@ void display_set_bulk_io(bool active) {
 // drop them — and VCOM — only when nothing is happening.
 #define RAILS_IDLE_TIMEOUT_MS 8000
 
-// 0 表示轨道已断电；否则是到期时间（ms），到点后主循环断电。
+// 0 表示轨道已断电；否则是到期时间（ms），到点后断电。
 // 0 means the rails are off; otherwise a deadline (ms) after which the loop powers them down.
 static int64_t rails_deadline_ms;
 
+// ── HV 轨上电/下电互斥 ──────────────────────────────────────────────────
+// 阅读器在 core0 同步推屏（present_begin → 驱动 → rails_keepalive），而 HV 轨空闲下电在
+// core1 的 ui_render 任务里（ui_render.cpp 末尾的 rails_idle_check）。两核操作的是同一路
+// SY7636A + FCA9555 电源轨，而 `rails_on` 是共享且不同步的布尔：core1 下电要 500ms 放电，
+// 期间 rails_on 仍是 true —— 此刻 core0 来一次上电会看到"已上电"直接返回，然后对着正在
+// 掉电的轨道刷屏 = 白刷一页（用户看到"按了下一页没反应，再按才刷新最后一页"）；反过来，
+// core1 若在 core0 驱动到一半时到点下电，就把正在写的一半刷新掐掉 → 残影/重影/叠字。
+// 所以推屏期间持有本互斥锁（present_begin 拿、rails_keepalive 放）；下电先**试**拿锁，
+// 拿不到（正推屏）就跳过一次。原来注释里的"必须同任务"约束正是被阅读器路径打破的——
+// 阅读器推屏在 core0、下电在 core1，本锁就是补上这层跨核互斥。
+// / HV poweron/poweroff are on different cores: the reader presents on core0, the idle
+// power-off runs on core1's ui_render task. Both drive one SY7636A + FCA9555 rail set,
+// and `rails_on` is an unsynchronized shared bool. board_poweroff discharges for 500 ms
+// while `rails_on` is still true, so a concurrent poweron sees "already on" and skips,
+// then drives a discharging panel (the reported "next page didn't refresh; the one after
+// showed the last content"). A poweroff landing mid-drive cuts a half-finished refresh
+// (ghost/stacked text). Serialize: a present holds the mutex from present_begin through
+// rails_keepalive; the idle check try-locks and skips when a present owns it.
+static SemaphoreHandle_t s_rail_mtx;
+
+void display_init(void) {
+    if (s_rail_mtx == NULL) s_rail_mtx = xSemaphoreCreateMutex();
+}
+
+// 推屏开始：拿锁 + 上电。与 rails_keepalive()（放锁）严格成对。
+// / Present begin: take the lock then power on. Strictly paired with rails_keepalive().
+static void present_begin(void) {
+    if (s_rail_mtx) xSemaphoreTake(s_rail_mtx, portMAX_DELAY);
+    epd_poweron();
+}
+
 void rails_keepalive(void) {
     rails_deadline_ms = esp_timer_get_time() / 1000 + RAILS_IDLE_TIMEOUT_MS;
+    if (s_rail_mtx) xSemaphoreGive(s_rail_mtx);
 }
 
 void rails_idle_check(int64_t now_ms) {
+    if (rails_deadline_ms == 0 || now_ms < rails_deadline_ms) return;
+    // 到点了。推屏会持有 s_rail_mtx，试拿失败就跳过这一次下电；推屏结束后
+    // rails_keepalive 会重新武装 deadline，下一拍再算。
+    if (!s_rail_mtx || xSemaphoreTake(s_rail_mtx, 0) != pdTRUE) return;
     if (rails_deadline_ms != 0 && now_ms >= rails_deadline_ms) {
         rails_deadline_ms = 0;
         epd_poweroff();
     }
+    xSemaphoreGive(s_rail_mtx);
 }
 
 // ── 全设备夜间反色 ───────────────────────────────────────────────────────
@@ -186,7 +225,7 @@ enum EpdDrawError update_display_mode(
     EpdiyHighlevelState* hl, enum EpdDrawMode mode
 ) {
     use_scan_for(&E0470_WAVEFORM, mode);
-    epd_poweron();
+    present_begin();
     enum EpdDrawError result = hl_update(hl, &E0470_WAVEFORM, mode, false, NULL);
     rails_keepalive();
     return result;
@@ -196,7 +235,7 @@ enum EpdDrawError update_display_from_white_with(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode
 ) {
     use_scan_for(waveform, mode);
-    epd_poweron();
+    present_begin();
     epd_hl_waveform(hl, waveform);
     night_enter(hl);
     enum EpdDrawError result = epd_hl_update_screen_from_white(hl, mode, 25);
@@ -239,7 +278,7 @@ void reader_set_gray_panel(int on) {
 
 enum EpdDrawError update_display_full(EpdiyHighlevelState* hl) {
     use_scan_for(&E0470_WAVEFORM, MODE_GC16);
-    epd_poweron();
+    present_begin();
     enum EpdDrawError result = hl_update(hl, &E0470_WAVEFORM, MODE_GC16, true, NULL);
     rails_keepalive();
     return result;
@@ -252,7 +291,7 @@ enum EpdDrawError update_display_full(EpdiyHighlevelState* hl) {
 // instead of 48 (about 360 ms), 8 gray levels instead of 16 — invisible for text.
 enum EpdDrawError update_display_gray8(EpdiyHighlevelState* hl) {
     use_scan_for(&E0470_GRAY8_WAVEFORM, MODE_GC16);
-    epd_poweron();
+    present_begin();
     epd_hl_waveform(hl, &E0470_GRAY8_WAVEFORM);
     enum EpdDrawError result = hl_update(hl, &E0470_GRAY8_WAVEFORM, MODE_GC16, true, NULL);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
@@ -292,7 +331,7 @@ enum EpdDrawError update_display_gray8_text(EpdiyHighlevelState* hl) {
         return update_display_full(hl);
     }
     use_scan_for(&E0470_GRAY8_TEXT_WAVEFORM, MODE_GL16);
-    epd_poweron();
+    present_begin();
     epd_hl_waveform(hl, &E0470_GRAY8_TEXT_WAVEFORM);
     night_enter(hl);
     enum EpdDrawError result = epd_hl_update_screen_full(hl, MODE_GL16, 25);
@@ -360,7 +399,7 @@ static enum EpdDrawError update_display_page_turn(EpdiyHighlevelState* hl, e0470
     const int mode = fast ? MODE_DU : MODE_GL16;
     read_pico_epd_use_scan(READ_PICO_EPD_SCAN_FAST);
     epd_lcd_set_prefill_lines(s_bulk_io ? 56 : 44);
-    epd_poweron();
+    present_begin();
     // 揭页内部也是 front/back 差分 + 成功时把 front 抄回 back，所以成对翻即可（同 hl_update）。
     night_enter(hl);
     enum EpdDrawError result = e0470_page_turn_ex(hl, logical_full_screen(), dir, wf, mode);
@@ -442,7 +481,7 @@ enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
             // 次软刷自动升成整屏 GC16 清灰底。
             const enum EpdDrawMode mode = (kind == DISPLAY_KIND_FAST) ? MODE_DU : MODE_GL16;
             use_scan_for(&E0470_WAVEFORM, mode);
-            epd_poweron();
+            present_begin();
             result = hl_update(hl, &E0470_WAVEFORM, mode, false, NULL);
             rails_keepalive();
             break;
@@ -458,7 +497,7 @@ enum EpdDrawError update_display_with(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode
 ) {
     use_scan_for(waveform, mode);
-    epd_poweron();
+    present_begin();
     epd_hl_waveform(hl, waveform);
     enum EpdDrawError result = hl_update(hl, waveform, mode, false, NULL);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
@@ -471,7 +510,7 @@ enum EpdDrawError update_display_area_with(
     EpdRect area
 ) {
     use_scan_for(waveform, mode);
-    epd_poweron();
+    present_begin();
     epd_hl_waveform(hl, waveform);
     enum EpdDrawError result = hl_update(hl, waveform, mode, false, &area);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
@@ -560,7 +599,7 @@ int reader_refresh_test_present(int which) {
 enum EpdDrawError update_display_area_clean(EpdiyHighlevelState* hl, EpdRect area) {
     if (area.width <= 0 || area.height <= 0) return EPD_DRAW_SUCCESS;
     use_scan_for(&E0470_GRAY8_WAVEFORM, MODE_GC16);
-    epd_poweron();
+    present_begin();
     epd_hl_waveform(hl, &E0470_GRAY8_WAVEFORM);
     night_enter(hl);
     enum EpdDrawError result = epd_hl_update_area_full(hl, MODE_GC16, 25, area);
@@ -581,7 +620,7 @@ void guard_draw_result(EpdiyHighlevelState* hl, enum EpdDrawError result) {
     s_pclk_mhz = DISPLAY_PCLK_SAFE_MHZ;
     read_pico_epd_set_pclk(DISPLAY_PCLK_SAFE_MHZ);
     use_scan_for(&E0470_WAVEFORM, MODE_GC16);
-    epd_poweron();
+    present_begin();
     epd_clear();
     // 清物理屏后仅重置旧帧基准，保留目标页；否则局部刷新会留下整页白屏。
     // Reset only the old-frame baseline after clearing; preserving the target prevents blank pages after partial updates.

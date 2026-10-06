@@ -22,6 +22,9 @@ static u8g2_struct s_u8g2;
 static char s_orientation[16] = "landscape";
 
 bool board_init() {
+    // HV 轨上电/下电互斥锁要先建好：阅读器 core0 推屏与 core1 空闲下电都要用到它。
+    // / Create the HV-rail power mutex before any present (reader core0 vs core1 idle off).
+    display_init();
     if (read_pico_init(&g_hw) != ESP_OK) {
         ESP_LOGE(TAG, "read_pico_init failed");
         return false;
