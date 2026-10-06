@@ -737,6 +737,21 @@ bool openSpine(int idx) {
   return true;
 }
 
+// 打开 spine 并落到它最后一页（回翻上一章、跳书末用）。openSpine 之后只排出了前几页
+// （增量排版），pageCount 是水位不是章总页数 —— 直接 pageCount-1 会落在章首附近，而不是
+// 末页。这里排完整章再取末页；buildSomeMore 有 32KB 源字节上界所以要循环到 isBuildComplete，
+// 让出 CPU 的写法和 buildToPage 同一套。回翻跨章 / 跳书末是低频操作，一次排完可接受。
+static bool openSpineLast(int idx) {
+  if (!openSpine(idx)) return false;
+  if (!st.section) return false;
+  while (!st.section->isBuildComplete()) {
+    if (!st.section->buildSomeMore(16)) break;  // 出错停在已排到的末尾
+    vTaskDelay(1);
+  }
+  st.page = static_cast<int>(st.section->pageCount) > 0 ? static_cast<int>(st.section->pageCount) - 1 : 0;
+  return true;
+}
+
 static size_t measureTxtLine(const std::string &t, size_t start, int fontId, int maxW) {
   size_t i = start;
   std::string acc;
@@ -1192,7 +1207,7 @@ static bool turnEpub(int dir) {
   if (!st.section) return false;
   int np = st.page + dir;
   if (np < 0) {
-    if (st.spineIndex > 0) { openSpine(st.spineIndex - 1); st.page = st.section->pageCount - 1; return true; }
+    if (st.spineIndex > 0) return openSpineLast(st.spineIndex - 1);
     return false;
   }
   if (np < static_cast<int>(st.section->pageCount)) { st.page = np; return true; }
@@ -5124,7 +5139,10 @@ void renderCurrent() {
       //   ≥120‰   整页文字翻页、表格图表 → 8 灰阶 GL16 差分：30 相而非 37 相，
       //           每屏快约 80ms，不变的白像素不驱动所以不闪。正文是黑白像素，
       //           灰阶 16→8 看不出来。
-      //   ≤40‰    空白页之类几乎没变 → 极速 DU。
+      //   ≤40‰    空白页之类几乎没变 → 也走 8 灰阶正文刷。以前这里用极速 DU：
+      //           DU 只有 20 相 + 二值化阈值，残影最重；翻到空白页之后下一页正文
+      //           跟着差分出来，前一页的墨痕还没消净、两页叠在一起（"自适应偶发
+      //           花屏"的根子）。空白页几乎没什么好画的，DU 省的百来毫秒不值当。
       //   其余    默认局刷 GL16，同时把变化量累加成残影预算，攒够 2600‰ 用一次
       //           8 灰阶 GC16 全刷清账（该驱动不变像素、本来就要闪一次，
       //           用 30 相替 36 相省 ~70ms）。
@@ -5133,7 +5151,7 @@ void renderCurrent() {
       } else if (frameChange >= 120) {
         m = HalDisplay::GRAY8_TEXT_REFRESH;
       } else if (frameChange <= 40) {
-        m = HalDisplay::FAST_REFRESH;
+        m = HalDisplay::GRAY8_TEXT_REFRESH;
       } else if (s_ghostAccum + frameChange >= 2600) {
         m = HalDisplay::GRAY8_REFRESH;
       } else {
@@ -5415,7 +5433,7 @@ static void gotoBookEnd() {
   if (st.bookKind == 0) {
     if (st.epub) {
       int n = st.epub->getSpineItemsCount();
-      if (n > 0) { openSpine(n - 1); st.page = st.section ? st.section->pageCount - 1 : 0; }
+      if (n > 0) openSpineLast(n - 1);
     }
   } else if (st.bookKind == 1) {
     st.txtPage = std::max(0, totalPages() - 1);

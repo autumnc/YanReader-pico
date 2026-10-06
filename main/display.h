@@ -57,8 +57,11 @@ enum EpdDrawError update_display_from_white(EpdiyHighlevelState* hl);
 enum EpdDrawError update_display_from_white_with(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode
 );
-/// 把前缓冲铺白再 GC16 全刷，物理屏回到白底。
-/// Paint the front buffer white and GC16 the panel back to white.
+/// 把前缓冲铺白再 GC16 全刷，物理屏回到白底。**会冲掉 front_fb 里已画好的内容**，
+/// 只在"本意就是清屏"时用；要"重置参考帧但保留内容"用 update_display_from_white()。
+/// Paint the front buffer white and GC16 the panel back to white. This clobbers the
+/// content already drawn into front_fb — use only when the intent is to blank the
+/// screen; to reset the reference frame while keeping content, use from_white.
 enum EpdDrawError update_display_white(EpdiyHighlevelState* hl);
 enum EpdDrawError update_display_full(EpdiyHighlevelState* hl);
 /// 8 灰阶全屏全像素刷：换 30 相 8-Gray 表整屏过一次 GC16。相位少近一半（整屏约

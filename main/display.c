@@ -211,6 +211,10 @@ enum EpdDrawError update_display_from_white(EpdiyHighlevelState* hl) {
     return update_display_from_white_with(hl, &E0470_WAVEFORM, MODE_GC16);
 }
 
+// 把 front_fb 铺白再整屏 GC16，物理屏回到白底。**会冲掉 front_fb 里已经画好的内容**：
+// 调用点必须本意就是"清屏"（把当前缓冲里的东西丢掉），不能拿它当"从白底出下一屏"用 ——
+// 那会把下一页已经画好的内容清掉。阅读器里要"重置参考帧但保留内容"请用
+// update_display_from_white()（本文件目前也只剩那条路径在用）。
 enum EpdDrawError update_display_white(EpdiyHighlevelState* hl) {
     epd_hl_set_all_white(hl);
     return update_display_full(hl);
@@ -387,11 +391,22 @@ enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
     // 出这一屏。**只对差分档做**：FULL/GRAY8 本来就是整屏全像素 GC16（每个像素
     // 都被重新驱动一遍，等价于从已知态出下一屏），再铺一次只是白花一次全刷 ——
     // 这条过滤同时保证了"图片页整屏重绘"和"图片查看器 Esc 回正文"不会变成两次全刷。
-    // 放在读走 s_turn_dir 之前：翻页动画那一帧也是从白底出，更干净。
+    //
+    // **不能调 update_display_white()**：它先把 front_fb 铺白再 GC16 —— 但这一帧的
+    // 内容（下一页正文）早在 renderCurrent 里就画进 front_fb 了，铺白把内容冲掉，
+    // 下面那条差分刷拿到的就是一张空 fb，画出来整页空白（用户侧：插图页翻下一页
+    // 必白屏，手动全刷才恢复）。改走 update_display_from_white()：只把 back_fb
+    // （差分参考帧）重置为白、front_fb 内容原样保留，一次整屏全像素 GC16 同时清掉
+    // 灰底 + 出图。出图后 back_fb == front_fb，下面那条差分刷和揭页动画都成了空
+    // 差分（走了也白走），所以这里清掉揭页方向后直接返回。
     if (display_take_white_exit() &&
         (kind == DISPLAY_KIND_HALF || kind == DISPLAY_KIND_FAST || kind == DISPLAY_KIND_GRAY8_TEXT)) {
-        ESP_LOGI(TAG, "gray panel -> wipe to white before this differential frame");
-        guard_draw_result(hl, update_display_white(hl));
+        ESP_LOGI(TAG, "gray panel -> from-white full refresh (reset reference, keep content)");
+        s_turn_dir = -1;
+        s_turn_fast = 0;
+        result = update_display_from_white(hl);
+        guard_draw_result(hl, result);
+        return result;
     }
 
     // 待处理的揭页方向（一次性）。只用在下面两个"差分正文刷"档位上：
