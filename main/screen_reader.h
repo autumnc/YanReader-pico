@@ -30,19 +30,35 @@ void screen_reader_leave(AppState next);
 // 都由它出面。做成"取数"而不是"绘制"：待机表盘画在 ui_render 的工作缓冲上，而这里
 // 能用的画布只有 g_rd（绑在 front_fb 上，见 ui_render.cpp 里那条不变式）。
 
-// 最后阅读的一本书：reader_progress.txt 的第一条（该文件**最新在前**，翻开一本书或
-// 翻页都会把当前书挪到表头）。没有记录（没读过书 / 卡没插）返回 false。
-// coverBmp = 该书封面 BMP 的缓存路径（**可能还没生成**：书没打开过就没有封面文件，
-// 调用方自己判存在）；title / percent = 书名与阅读进度百分比，取不到时留空 / 为 0。
-bool readerLastBookCover(std::string &coverBmp, std::string &title, int &percent);
+// 最后阅读的一本书的信息（reader_progress.txt 的第一条，该文件**最新在前**，
+// 翻开一本书或翻页都会把当前书挪到表头）。没有记录（没读过书 / 卡没插）返回 false。
+struct StandbyBookInfo {
+    std::string coverBmp;   // 该书封面 BMP 的缓存路径（**可能还没生成**，调用方自己判存在）
+    std::string title;      // 书名（统计里没有就退回文件名）
+    std::string chapter;    // 当前章节名（还没读到章节 / 统计里没有就是空串）
+    int percent = 0;          // 全书进度百分比
+    int chapterPercent = 0;   // 本章进度百分比
+    uint64_t readingMs = 0;   // 这本书的累计阅读时长
+};
+bool readerLastBookInfo(StandbyBookInfo &out);
 
-// 待机封面的框：整屏减去短边 2.5% 的一圈边距（面板本身还有 3~4px 盖边，留一点就够，
-// 剩下的全给封面）。生成端（generateStandbyCoverForOpenedBook）和解码端（待机表盘的
-// drawCoverFace）必须用**同一个框**，否则 1:1 直拷那条快路径永远命中不了，而且缓存
-// 文件的尺寸会跟画出来的框对不上。所以框的计算只有这一份，两边都调它。
-// / The standby cover box: the screen minus 2.5% of the short edge. Both the generator
-// and the decoder must use the same box, or the 1:1 fast path never hits.
-void readerStandbyCoverBox(int &x, int &y, int &w, int &h);
+// 待机封面表盘的**版式**：封面框 + 信息区（竖屏在封面下方，横屏在封面右侧）。
+// 生成端（rdBuildStandbyCoverForOpenBook）和解码端（待机表盘的 drawCoverFace）必须用
+// **同一个封面框**，否则 1:1 直拷那条快路径永远命中不了，而且缓存文件的尺寸会跟画出来
+// 的框对不上。所以版式的计算只有这一份，两边都调它。
+//
+// 封面框取 2:3（与常见封面一致，下采样比最小、最清晰）；框的大小为"去掉信息区之后
+// 剩下的地方都给它"：竖屏信息区在下（5 行高），横屏信息区在右。横屏之所以不按竖屏那
+// 样上下排，是因为 1216×684 把下面切掉五行之后只剩两百来像素放封面 —— 那点高度里
+// 2:3 的封面只有 160px 宽，还没巴掌大。
+// / The standby cover layout: cover box plus the info region (below in portrait, right in
+// landscape). Generator and decoder must use the same box, so it is computed once here.
+struct StandbyCoverLayout {
+    int boxX = 0, boxY = 0, boxW = 0, boxH = 0;          // 封面框
+    bool sideBySide = false;                             // true=横屏：信息在封面右侧
+    int infoX = 0, infoY = 0, infoW = 0, infoH = 0;      // 信息区（版式的另一半）
+};
+void readerStandbyCoverLayout(StandbyCoverLayout &out);
 
 // 把封面按"装进 boxW×boxH"缩放成 0..15 灰度（15=白）写进调用方给的 out，并回吐实际
 // 尺寸 dw/dh 与在框内的居中偏移 ox/oy。out 至少要 boxW*boxH 字节 —— 一张整屏封面约

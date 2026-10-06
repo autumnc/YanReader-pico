@@ -955,44 +955,105 @@ static std::string coverBmpPathFor(const std::string &path, int kind) {
 static std::string coverBmpPathFor(const BookEntry &b) { return coverBmpPathFor(b.path, b.kind); }
 
 // 待机「书籍封面」表盘用的封面缓存：**原图**按封面框解出来的那一张，与书架那张
-// 396×528 的 cover_v2.bmp 分开存。名字带版本（v2）：改了解析口径/框尺寸就改个名字，
-// 自然作废重生成，不必写迁移。v1 是"整屏一张封面"那版的框（近整屏），已不用，见
-// generateCoverForOpenedBook 里的顺手清理。生成端见 generateCoverForOpenedBook。
+// 396×528 的 cover_v2.bmp 分开存。名字带版本（v4）：改了解析口径/框尺寸就改个名字，
+// 自然作废重生成，不必写迁移。v2 是"封面 + 时刻"那版的框（封面只占屏宽 2/3）；v3 去掉
+// 时刻、封面吃到 2:3 的整块地方；v4 又把框从 532×798 放大到 593×890（左右边距 1/9 → 1/16）
+// 并把信息区上提到贴着封面框。每次框变了都必须换名字重解 —— 不换的话老缓存（小框）在
+// "只缩不放"的规矩下会原尺寸居中画进大框，四周留一圈白，看起来像封面缩水。
+// v1/v2/v3 都不用，见 generateCoverForOpenedBook 里的顺手清理。
 // / The standby-face cover: the book's ORIGINAL image decoded to the cover box, cached
 // separately from the 396×528 shelf cover. Versioned name so a later change in box or
-// decoding invalidates it without a migration. v1 was the full-screen box of the
-// cover-only layout and is cleaned up opportunistically.
+// decoding invalidates it without a migration. v2 was the "cover + clock" box; v3 dropped
+// the clock; v4 enlarged the box (532x798 -> 593x890). Older names are cleaned up
+// opportunistically.
 static std::string standbyCoverPathFor(const std::string &path, int kind) {
-  return bookCacheDirFor(path, kind) + "/standby_v2.bmp";
+  return bookCacheDirFor(path, kind) + "/standby_v4.bmp";
 }
 
-// 待机封面表盘的**封面框**（版式的上半部分：封面在上，时刻/日期/书名+进度在下）。
-// **生成端（本文件）与绘制端（standby_clock.cpp 的 drawCoverFace）都调这一份**：框只有
-// 一个来源，改了不会一边变一边不变 —— 那正是"生成时按 A 尺寸解、画的时候按 B 尺寸又
-// 缩一遍"的糊法。
+// 待机封面表盘的**版式**（封面框 + 信息区）。**生成端（本文件）与绘制端
+// （standby_clock.cpp 的 drawCoverFace）都调这一份**：框只有一个来源，改了不会一边变
+// 一边不变 —— 那正是"生成时按 A 尺寸解、画的时候按 B 尺寸又缩一遍"的糊法。
 //
-// 尺寸口径：左右各留 1/6（框宽 = 屏宽 2/3 ≈ 456@684）、高取 55%（竖屏）；横屏时屏是
-// 宽扁的，封面占到 55% 就没地方放下面那三行，改成 45%。456:668 ≈ 0.68，与常见封面
-// 的 2:3 几乎一致 —— 框越贴合原图，下采样比越小、糊的越少。
-void readerStandbyCoverBox(int &x, int &y, int &w, int &h) {
+// 封面框一律取 2:3（与常见封面一致：框越贴合原图，下采样比越小、糊的越少），大小为
+// "屏面去掉信息区之后剩下的地方都给它"（面板物理 1216×684，下面是 20pt 字号下算出来的）：
+//   · 竖屏（684×1216）：信息区在封面下面，占 5 行（日期 / 书名 / 章节 / 进度条 / 累计
+//     时长），封面吃到 593×890（原来 456×668 → 532×798 → 现在，左右边距也从 1/9 收到
+//     1/16）。信息区**上沿贴着封面框**排，中间只剩 gap（≈半行），余量全沉到屏底边距。
+//   · 横屏（1216×684）：信息区在封面**右侧**。上下排的话切掉五行之后只剩两百来像素，
+//     2:3 的封面只有 160px 宽，还没巴掌大；左右排封面能有 433×650，信息列也有 720px，
+//     整行日期放得下。
+// 两条不变式：① 信息区一定塞得下那 5 行（5 * 行距 + 进度条那行的余量）；
+// ② 封面框与信息区不重叠、都在屏内。
+void readerStandbyCoverLayout(StandbyCoverLayout &out) {
   const int W = SCREEN_W, H = SCREEN_H;
   const int m = (W < H ? W : H) / 40;   // 短边的 2.5%：面板本身盖边 3~4px，留一点就够
-  const bool portrait = W < H;
-  x = W / 6;
-  y = m;
-  w = W - 2 * (W / 6);
-  h = portrait ? (H * 55 / 100) : (H * 45 / 100);
+  // **字号按界面档取，不按当前格子（FONT_H）取**：本函数生成端（阅读模式里开完书补做
+  // 封面）和绘制端（待机表盘）各在一处调，而阅读模式的正文用的是另一个字号 —— 那时
+  // FONT_H 是正文的 px，跟待机时（界面档）对不上，封面框就会算成两个尺寸，缓存的尺寸
+  // 与画的框对不上，1:1 直拷的清晰度也就没了。uiPxHeight() 恒是界面档，两处一样。
+  const int uiPx = FontRenderer::uiPxHeight();
+  const int lineGap = uiPx * 6 / 5;     // 与 drawClockFace 同一口径的行距
+  const int gap = uiPx / 2;             // 封面与信息区之间的留白
+  // 信息区要的厚度：日期 / 书名 / 章节 / 累计时长四行文字 + 一行进度条。进度条那行也按
+  // 一整行算（条在其中居中），所以就是 5 行。
+  const int infoLines = 5;
+  const int infoNeed = infoLines * lineGap;
+
+  if (W < H) {
+    // 竖屏：封面上、信息下。
+    out.sideBySide = false;
+    // 左右各留屏宽 1/16（≈6%，原来留 1/9 ≈ 11%，四周就显空）。这个边距是封面框**唯一的**
+    // 宽度来源：高度那边已经把"扣掉信息区之后剩下的"全吃了，所以框宽能到多少全看它。
+    const int maxW = W - 2 * (W / 16);
+    int availH = H - 2 * m - infoNeed - gap;
+    if (availH < uiPx) availH = uiPx;   // 兜底：屏再小也得留个封面位
+    int boxH = std::min(availH, maxW * 3 / 2);
+    int boxW = boxH * 2 / 3;
+    if (boxW > maxW) { boxW = maxW; boxH = boxW * 3 / 2; }
+    out.boxW = boxW;
+    out.boxH = boxH;
+    out.boxX = (W - boxW) / 2;
+    out.boxY = m;
+    out.infoX = m;
+    out.infoW = W - 2 * m;
+    // 信息区**紧贴封面框下沿**，不居中：原来是"上沿 = 封面下 + gap，余量上下均分"，那
+    // 均分出来的一半正好落在封面与日期之间 —— 那就是"封面底下很大一片空白"。现在余量
+    // （只在框被宽度夹住时才有）一律沉到屏底当边距，中间只留 gap 那半行。
+    out.infoY = out.boxY + boxH + gap;
+    out.infoH = H - m - out.infoY;
+  } else {
+    // 横屏：封面左、信息右。封面按"满高"起算，再给信息列让出最窄也要占屏面 45% 的宽度。
+    out.sideBySide = true;
+    const int availW = W - 2 * m;
+    int boxH = H - 2 * m;
+    int boxW = boxH * 2 / 3;
+    const int maxBoxW = (availW - gap) * 55 / 100;
+    if (boxW > maxBoxW) { boxW = maxBoxW; boxH = boxW * 3 / 2; }
+    out.boxW = boxW;
+    out.boxH = boxH;
+    out.boxX = m;
+    out.boxY = (H - boxH) / 2;
+    out.infoX = out.boxX + boxW + gap;
+    out.infoW = W - m - out.infoX;
+    out.infoH = H - 2 * m;
+    out.infoY = m + std::max(0, (out.infoH - infoNeed) / 2);   // 信息块在列里垂直居中
+    out.infoH = std::min(out.infoH, infoNeed);
+  }
 }
 
 // 打开书后即时生成封面（用已加载对象，避免二次解压）。
 static void rdCoverThumbForget(const std::string &bmpPath);  // 定义在封面缩放那一段
 static void generateCoverForOpenedBook() {
-  // 顺手清掉两代老封面：改名之后它们再也不会被读到，留着白占卡（每本一两百 KB，
+  // 顺手清掉几代老封面：改名之后它们再也不会被读到，留着白占卡（每本一两百 KB，
   // 几百本就是几十 MB）。删失败也无所谓，下次打开再试。
   const std::string legacy = bookCacheDirFor(st.bookPath, st.bookKind) + "/cover.bmp";      // 更早的整屏封面
   const std::string legacyStandby = bookCacheDirFor(st.bookPath, st.bookKind) + "/standby_v1.bmp";  // 单图版表盘的封面
+  const std::string legacyStandby2 = bookCacheDirFor(st.bookPath, st.bookKind) + "/standby_v2.bmp";  // 「封面+时刻」版表盘的封面
+  const std::string legacyStandby3 = bookCacheDirFor(st.bookPath, st.bookKind) + "/standby_v3.bmp";  // 532×798 框那版待机封面
   if (Storage.exists(legacy.c_str())) Storage.remove(legacy.c_str());
   if (Storage.exists(legacyStandby.c_str())) Storage.remove(legacyStandby.c_str());
+  if (Storage.exists(legacyStandby2.c_str())) Storage.remove(legacyStandby2.c_str());
+  if (Storage.exists(legacyStandby3.c_str())) Storage.remove(legacyStandby3.c_str());
   if (st.bookKind == 0) { if (st.epub) st.epub->generateCoverBmp(); }
   else if (st.bookKind == 1) { Txt t(st.bookPath, CACHE_DIR); if (t.load()) (void)t.generateCoverBmp(); }
   else if (st.bookKind == 2) { if (st.xtc) st.xtc->generateCoverBmp(); }
@@ -1003,17 +1064,17 @@ static void generateCoverForOpenedBook() {
   // 两个补做的时机见 rdBuildStandbyCoverForOpenBook 的头注释。
 }
 
-// 待机整屏封面（「书籍封面」表盘 1:1 上屏的那张 650×1182）。
+// 待机封面（「书籍封面」表盘 1:1 上屏的那张，尺寸 = readerStandbyCoverLayout 的框）。
 //
 // 为什么不在待机时现做：待机是 light sleep 前的最后一屏，那时书对象已经不在手上
 // （screen_reader_exit 会释放），要现做就得重新解压 epub 找封面 —— 而且慢。所以按
 // **原图**提前解好，一本书只做一次（文件在就跳过）。
 //
-// 为什么不用书架那张 cover_v2.bmp：那是 396×528 的格子缩略图，待机整屏的框是
-// 650×1182 上下，拿它上屏就是"缩略图放大"——用户报的"待机封面糊"就是它。
+// 为什么不用书架那张 cover_v2.bmp：那是 396×528 的格子缩略图，比待机封面框小一圈，
+// 拿它上屏就是"缩略图放大"——用户报的"待机封面糊"就是它。
 //
 // XTC 不做：它的 cover_v2.bmp 本来就是第 0 页原分辨率（见 Xtc.cpp 的注释），已经
-// 是能拿到的最好一版，readerLastBookCover 会退回用它。
+// 是能拿到的最好一版，readerLastBookInfo 会退回用它。
 //
 // **它不挂在开书路径上**（原来挂，改掉了）：这本书有没有待机封面，跟"用户此刻要
 // 不要读它"无关，而 3 秒的开销在开书这一趟是实打实的等待。改由这两个时机补：
@@ -1025,8 +1086,9 @@ static void rdBuildStandbyCoverForOpenBook() {
   const std::string out = standbyCoverPathFor(st.bookPath, st.bookKind);
   if (Storage.exists(out.c_str())) return;   // 一书一次
 
-  int bx = 0, by = 0, bw = 0, bh = 0;
-  readerStandbyCoverBox(bx, by, bw, bh);
+  StandbyCoverLayout lay{};
+  readerStandbyCoverLayout(lay);
+  const int bw = lay.boxW, bh = lay.boxH;
   bool ok = false;
   if (st.bookKind == 0) {
     if (st.epub) ok = st.epub->generateStandbyCoverBmp(out, bw, bh);
@@ -4498,28 +4560,34 @@ static void rdSortShelfByRecency() {
 }
 
 // ── 待机表盘「书籍封面」的出口（声明见 screen_reader.h）────────────────────
-bool readerLastBookCover(std::string &coverBmp, std::string &title, int &percent) {
+bool readerLastBookInfo(StandbyBookInfo &out) {
   loadProgress();
   if (s_progress.empty()) return false;
   const RdProgress &r = s_progress.front();   // "最新在前"：表头就是最后读的那本
-  // 优先给待机专用的整屏封面（原图按待机框解的，1:1 上屏）。没有才退回书架那张
+  // 优先给待机专用的封面（原图按待机框解的，1:1 上屏）。没有才退回书架那张
   // 396×528 的缩略封面：老书（这份缓存是后加的，之前打开过的书没生成）、刚打开就
   // 待机（生成还没跑到）、以及 XTC（它的封面本来就是原分辨率，没必要另存一份）。
   const std::string sb = standbyCoverPathFor(r.path, r.kind);
-  coverBmp = Storage.exists(sb.c_str()) ? sb : coverBmpPathFor(r.path, r.kind);
-  title.clear();
-  percent = 0;
+  out.coverBmp = Storage.exists(sb.c_str()) ? sb : coverBmpPathFor(r.path, r.kind);
+  out.title.clear();
+  out.chapter.clear();
+  out.percent = 0;
+  out.chapterPercent = 0;
+  out.readingMs = 0;
   if (const ReadingBookStats *b = ReadingStats::findBook(r.path)) {
-    title = b->title;
-    percent = b->lastProgressPercent;
+    out.title = b->title;
+    out.chapter = b->chapterTitle;
+    out.percent = b->lastProgressPercent;
+    out.chapterPercent = b->chapterProgressPercent;
+    out.readingMs = b->totalReadingMs;
   }
-  if (title.empty()) {
+  if (out.title.empty()) {
     // 统计里还没有这本（刚打开就待机 / 统计未落盘）：退回文件名，去掉目录与扩展名。
     const size_t sl = r.path.find_last_of('/');
     std::string base = (sl == std::string::npos) ? r.path : r.path.substr(sl + 1);
     const size_t dot = base.rfind('.');
     if (dot != std::string::npos && dot > 0) base = base.substr(0, dot);
-    title = base;
+    out.title = base;
   }
   return true;
 }
@@ -6232,7 +6300,13 @@ static bool usbDriveExitHit(int x, int y) {
 static bool usbDriveShouldExit(int key) {
   if (key == '\n') {
     int x, y;
-    if (input_tap_xy(&x, &y)) return usbDriveExitHit(x, y);
+    if (input_tap_xy(&x, &y)) {
+      const UsbDriveBtn b = usbDriveBtn();
+      const bool hit = usbDriveExitHit(x, y);
+      ESP_LOGI(TAG, "usbdrive tap=(%d,%d) btn=(%d,%d,%d,%d) hit=%d", x, y, b.x, b.y, b.w, b.h, hit);
+      return hit;
+    }
+    ESP_LOGW(TAG, "usbdrive confirm without tap coords");
     return false;
   }
   return key == KEY_POWER || key == KEY_BACK;
@@ -7110,7 +7184,16 @@ static void handleSettingPicker(int key) {
   } else if (key == KEY_DOWN) {
     if (st.pickSel < n - 1) st.pickSel++;
   } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-    st.pickSel = clampI(st.pickSel + (key == KEY_PAGE_DOWN ? rows : -rows), 0, n - 1);
+    // 整页翻是**挪窗口**，选中行按同样的位移跟着走（选中行在页首时，翻一页就是新页的
+    // 第一行，相对位置保持不变）。只算"选中行 ±rows"的话，窗口是跟着选中行走的
+    // （见 drawPicker 那两行校正），选中行本来就在页首时窗口只挪得动一行 —— 用户划一下
+    // 看到的就是"几乎没动"。
+    int top = st.pickScroll + (key == KEY_PAGE_DOWN ? rows : -rows);
+    const int maxTop = n > rows ? n - rows : 0;
+    if (top < 0) top = 0;
+    if (top > maxTop) top = maxTop;
+    st.pickSel = clampI(st.pickSel + (top - st.pickScroll), 0, n - 1);
+    st.pickScroll = top;
   } else if (key == '\n') {
     int tx, ty;
     if (input_tap_xy(&tx, &ty)) {
@@ -8219,10 +8302,13 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 触摸上下滑的翻页键（KEY_PAGE_UP/DOWN，主循环不再替阅读模式回退成单步）：
   // 目录和**书架**认它——目录几千章、书架一屏四本（横屏十二本），"一格一格选"或
   // "一行一行挪"都走不动，上下滑要整页翻。**词典**也认它：释义正文常常整屏放不下，
-  // 上下滑要按屏滚（handleDict 收原键）。其余子界面（正文/菜单/书签/笔记…）保持
-  // 原来的单步上下语义。
+  // 上下滑要按屏滚（handleDict 收原键）。**弹层**（字号/字体/书架风格…）同样认它：
+  // 档位表常有十几项（SD 上字体越多越长），一格一格挪根本走不动 —— 弹层是模态的，
+  // 这个键只会喂给 handleSettingPicker，不会漏进下面的翻页动作。其余子界面（正文/
+  // 菜单/书签/笔记…）保持原来的单步上下语义。
   if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-    if (st.mode != RdMode::Toc && st.mode != RdMode::Browser && st.mode != RdMode::Dictionary)
+    if (st.mode != RdMode::Toc && st.mode != RdMode::Browser && st.mode != RdMode::Dictionary
+        && !st.pickOpen)
       key = (key == KEY_PAGE_UP) ? KEY_UP : KEY_DOWN;
   }
 

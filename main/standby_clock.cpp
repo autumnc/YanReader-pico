@@ -7,7 +7,7 @@
 #include "font_renderer.h"
 #include "pcf85063.h"
 #include "ttf_font.h"       // 「关闭」表盘的提示页：按像素高直绘大字
-#include "screen_reader.h"  // readerLastBookCover / readerCoverScale（「书籍封面」表盘）
+#include "screen_reader.h"  // readerLastBookInfo / readerStandbyCoverLayout / readerCoverScale
 #include "ui_helpers.h"
 #include "ui_render.h"      // ui_render_keep_frame（留一份休眠前画面）
 
@@ -139,7 +139,7 @@ static void drawCenteredIn(int x, int w, int baseline, const char *s) {
 }
 
 // HH:MM 五个格子（4 数字 + 冒号）。调用前须 SetDrawColor(0)。
-// 简约时钟表盘与书籍封面表盘共用同一套七段数学，尺寸由调用方按可用宽度定。
+// 简约时钟表盘用（书籍封面表盘去掉了时刻，不再用它；七段数学本身与老黄历的大号日名共用）。
 static void drawTimeSevenSeg(int x, int top, int dw, int dh, int colonW, int gap, bool valid,
                              const struct tm &tm) {
     int cx = x;
@@ -382,14 +382,19 @@ static void drawAlmanacFace(bool valid) {
 }
 
 // ── 书籍封面表盘 ──────────────────────────────────────────────────────────
-// 版式：**上边封面，下来时刻，再下来日期，最底一行书名 + 进度条**（用户要求恢复"改成
-// 整屏单图之前"的那一版）。封面缩到屏宽 2/3、高 55%（框见 readerStandbyCoverBox），
-// 下面那几行才有地方站。
+// 版式：**大封面打头，剩下的是这本书的信息**——日期 / 书名 / 章节 / 进度条 / 累计时长。
+// 竖屏封面在上、信息在下；横屏信息挪到封面右边（上下排放不下，见
+// readerStandbyCoverLayout 的说明）。版式只有 screen_reader 那一份，这里只负责按它画。
+//
+// **这一版没有时刻**：待机是 light sleep，屏上的时刻在整段休眠里不会走，醒来一看是
+// 错的（用户反馈"时间无法自动更新"）。既然报不准，就别占着地方 —— 腾出来的高度全给了
+// 封面（框从 456×668 一路长到 593×890）和信息行。要看时间用「简约时钟」或「老黄历」表盘。
+// 日期行保留：它同样不走，但"今天是几号"不像"现在几点"那样一眼就假，用户要留着。
 //
 // 清晰度靠两件事，都不在绘制这一层：
-//   1) 封面框贴合常见封面的 2:3（456:668@竖屏）：同一张图下采样比更小，丢的细节更
-//      少；待机封面缓存就是按这个框解出来的（standby_v2.bmp），绘制端与它 1:1；
-//   2) readerCoverScale 里改成**只缩不放**（scale ≤ 1）：源图比框小就按原尺寸画。
+//   1) 封面框取常见封面的 2:3：同一张图下采样比更小，丢的细节更少；待机封面缓存就是
+//      按这个框解出来的（standby_v4.bmp），绘制端与它 1:1；
+//   2) readerCoverScale 里**只缩不放**（scale ≤ 1）：源图比框小就按原尺寸画。
 //      放大要么复制像素、要么插值，画出来的细节都是编的，只会更糊。
 // 封面像素用 fb_fast 直写（0..15 灰阶），不走 g_rd.drawGrayscale16Pixel：g_rd 绑的是
 // front_fb，而待机表盘画在 ui_render 的工作缓冲上（见 ui_render.cpp 那条不变式）。
@@ -412,28 +417,30 @@ static std::string ellipsizeToWidth(const std::string &s, int maxW) {
 }
 
 static void drawCoverFace(const struct tm &tm, bool valid) {
-    const int W = SCREEN_W, H = SCREEN_H;
-    // 框的定义挪到 screen_reader 的 readerStandbyCoverBox：待机封面的缓存文件是按
-    // 这个尺寸解的，两边算出来必须一样，那条 1:1 直拷快路径才命中得了。
-    int boxX = 0, boxY = 0, boxW = 0, boxH = 0;
-    readerStandbyCoverBox(boxX, boxY, boxW, boxH);
+    // 版式（封面框 + 信息区）只有一份，在 screen_reader 的 readerStandbyCoverLayout：待机
+    // 封面的缓存文件就是按那个框解的，两边算出来必须一样，1:1 直拷那条快路径才命中得了。
+    // 那条版式按**界面档**字号留的位（见 readerStandbyCoverLayout 里的说明），所以这里画
+    // 的格子也必须是界面档 —— 真混进了正文格子（FONT_H 是正文 px），行距会比预留的大，
+    // 最后一行就顶出屏底。哨兵只报错不改行为：正常路径一次 int 比较，到此为止。
+    UI_FONT_GUARD();
+    StandbyCoverLayout lay{};
+    readerStandbyCoverLayout(lay);
 
-    std::string bmp, title;
-    int percent = 0;
-    const bool hasBook = readerLastBookCover(bmp, title, percent);
+    StandbyBookInfo info;
+    const bool hasBook = readerLastBookInfo(info);
 
     bool drew = false;
     if (hasBook) {
-        const size_t cap = static_cast<size_t>(boxW) * static_cast<size_t>(boxH);
+        const size_t cap = static_cast<size_t>(lay.boxW) * static_cast<size_t>(lay.boxH);
         // 一张封面约 200KB：**必须 PSRAM**（内部 RAM 挤不出这么大一块，见
         // internal-ram-squeeze）。拿不到就退占位框 —— 表盘本身还是要出来的。
         uint8_t *buf = static_cast<uint8_t *>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (buf) {
             int dw = 0, dh = 0, ox = 0, oy = 0;
-            if (readerCoverScale(bmp, boxW, boxH, buf, cap, dw, dh, ox, oy)) {
+            if (readerCoverScale(info.coverBmp, lay.boxW, lay.boxH, buf, cap, dw, dh, ox, oy)) {
                 fb_fast_sync();  // 每帧入口同步一次旋转/尺寸（见 fb_fast.h）
                 uint8_t *fb = u8g2_GetBufferPtr(g_u8g2);
-                const int bx = boxX + ox, by = boxY + oy;
+                const int bx = lay.boxX + ox, by = lay.boxY + oy;
                 for (int y = 0; y < dh; y++) {
                     const uint8_t *row = buf + static_cast<size_t>(y) * static_cast<size_t>(dw);
                     for (int x = 0; x < dw; x++) fb_fast_set_gray(fb, bx + x, by + y, row[x]);
@@ -446,73 +453,94 @@ static void drawCoverFace(const struct tm &tm, bool valid) {
     u8g2_SetDrawColor(g_u8g2, 0);
     if (!drew) {
         // 没有封面可画（没读过书 / 这本书还没生成封面缓存 / PSRAM 要不到）：
-        // 细框 + 一行说明，别让整屏白得看不出"这是待机画面"。下面三行照样画。
-        u8g2_DrawFrame(g_u8g2, boxX, boxY, boxW, boxH);
-        drawCenteredIn(boxX, boxW, boxY + boxH / 2 + g_font.ascent() / 2,
+        // 细框 + 一行说明，别让整屏白得看不出"这是待机画面"。下面几行照样画。
+        u8g2_DrawFrame(g_u8g2, lay.boxX, lay.boxY, lay.boxW, lay.boxH);
+        drawCenteredIn(lay.boxX, lay.boxW, lay.boxY + lay.boxH / 2 + g_font.ascent() / 2,
                        hasBook ? "暂无封面" : "还没读过书");
     }
 
-    // ── 封面下：时刻 / 日期 / 书名 + 进度 ──────────────────────────────────
-    // 下面三行从**底**往上钉（进度条压底、日期/书名依次向上），时刻块吃掉剩下的高度
-    // 再垂直居中。反过来（从上往下累加）在横屏会溢出屏底 —— 那里封面上方的空间只有
-    // 一百多像素。
-    const int lineGap = FONT_H * 6 / 5;      // 与 drawClockFace 同一口径的行距
-    const int bottom = H - boxY;             // 与上边距对称，不另算一套
+    // ── 信息区：日期 / 书名 / 章节 / 进度条 / 累计时长 ─────────────────────
+    // 五行从上往下排，占满版式给出的那一块（readerStandbyCoverLayout 按五行留的位）。
+    // **这里没有时刻**：待机是 light sleep，屏上的时刻在休眠期间不会走，醒来一看是错的
+    // （用户反馈），所以封面表盘不报时刻 —— 要看时间用「简约时钟」/「老黄历」。腾出来的
+    // 这块高度全给了封面（框从 456×668 一路长到 593×890）和下面这几行书的信息。
+    // 这几行的**上沿就是封面框的下沿 + 半行**（版式里定死的，不居中了）：居中会在封面
+    // 与日期之间空出小半行，看着就是"封面底下莫名其妙一大片白"。
+    // 每一行都在信息区里居中画：竖屏时信息区就是整屏宽，横屏时是封面右边那一列。
+    const int lineGap = FONT_H * 6 / 5;   // 与 drawClockFace 同一口径的行距
     const int barH = 18;
-    const int barY = std::max(boxY + boxH + 24, bottom - barH);
-    const int titleBase = barY - FONT_H * 2 / 5;
-    const int dateBase = titleBase - lineGap;
-    const int infoTop = boxY + boxH + 24;
-    int timeAvail = dateBase - FONT_H - infoTop;
-    if (timeAvail < 40) timeAvail = 40;      // 兜底：宁可挤一点也不叠字
+    int y = lay.infoY;
+    const auto lineTop = [&]() { const int t = y; y += lineGap; return t; };
+    const int dateTop = lineTop();
+    const int titleTop = lineTop();
+    const int chapterTop = lineTop();
+    const int barTop = lineTop();      // 进度条这一行：条在其中垂直居中
+    const int durTop = lineTop();
+    const int base = g_font.ascent();  // 行顶 → 基线
 
-    // 时刻块：数字高 = 可用高度，再按宽度收（4 个数字 + 冒号 + 5 个间隙）。
-    const int colGap = 12;
-    const int maxW = W - 2 * boxX;
-    int dh = timeAvail;
-    int dw = static_cast<int>(dh * 0.55f);
-    if (4 * dw + dw * 35 / 100 + 5 * colGap > maxW) {
-        dw = static_cast<int>(static_cast<float>(maxW - 5 * colGap) / 4.35f);
-        dh = static_cast<int>(dw / 0.55f);
-    }
-    if (dw < 20) { dw = 20; dh = static_cast<int>(dw / 0.55f); }
-    const int colonW = dw * 35 / 100;
-    const int totalW = 4 * dw + colonW + 5 * colGap;
-    int tx = (W - totalW) / 2;
-    if (tx < 0) tx = 0;
-    // 按宽度收过之后，把时刻块在"信息区上沿 ~ 日期的上沿"之间重新居中。
-    int timeTop = infoTop + (dateBase - FONT_H - infoTop - dh) / 2;
-    if (timeTop < infoTop) timeTop = infoTop;
-    drawTimeSevenSeg(tx, timeTop, dw, dh, colonW, colGap, valid, tm);
-
-    char dateBuf[64];
+    // 日期用**紧凑写法**（"2026年10月6日 星期二"，年月日之间不留空格）：留空格那版在
+    // 22pt 字号下量出来 650px，正撞上竖屏信息区的宽度（684 减两侧边距 = 650），多一个
+    // 数字就得省略号收尾（老黄历表盘是整屏宽，那边留空格还撑得住）。紧凑版 500px，
+    // 横竖屏、三档字号都放得下。
+    char buf[96];
     if (valid) {
-        snprintf(dateBuf, sizeof(dateBuf), "%d 年 %d 月 %d 日  星期%s",
+        snprintf(buf, sizeof(buf), "%d年%d月%d日 星期%s",
                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, kWdayCn[tm.tm_wday % 7]);
     } else {
-        snprintf(dateBuf, sizeof(dateBuf), "尚未对时");
+        snprintf(buf, sizeof(buf), "尚未对时");
     }
-    drawCentered(dateBase, dateBuf);
+    drawCenteredIn(lay.infoX, lay.infoW, dateTop + base,
+                   ellipsizeToWidth(std::string(buf), lay.infoW).c_str());
 
     if (!hasBook) {
-        drawCentered(titleBase, "还没读过书");
+        drawCenteredIn(lay.infoX, lay.infoW, titleTop + base, "还没读过书");
         return;
     }
     // 书名一行，放不下就省略号截断（折行会把下面的进度条挤出屏）。
-    const std::string shown = ellipsizeToWidth(title, maxW);
-    drawCentered(titleBase, shown.c_str());
+    const std::string shown = ellipsizeToWidth(info.title, lay.infoW);
+    drawCenteredIn(lay.infoX, lay.infoW, titleTop + base, shown.c_str());
 
-    // 进度：横条 + 百分比，整体居中。条画在书名下方那一行，百分比跟在条后面。
-    char pct[16];
-    snprintf(pct, sizeof(pct), "%d%%", percent);
-    const int pctW = g_font.textWidth(pct);
-    const int barW = W * 55 / 100;
-    const int groupW = barW + 16 + pctW;
-    const int gx = (W - groupW) / 2;
-    u8g2_DrawFrame(g_u8g2, gx, barY, barW, barH);
-    int filled = (barW - 4) * (percent < 0 ? 0 : (percent > 100 ? 100 : percent)) / 100;
-    if (filled > 0) u8g2_DrawBox(g_u8g2, gx + 2, barY + 2, filled, barH - 4);
-    g_font.drawText(gx + barW + 16, barY + barH / 2 + g_font.ascent() / 2, pct, false);
+    // 章节一行：章节名 + 本章进度（两个都有才两个都写）。没读到章节就整行留空。
+    if (!info.chapter.empty()) {
+        std::string chap = info.chapter;
+        if (info.chapterPercent > 0) chap += "  " + std::to_string(info.chapterPercent) + "%";
+        drawCenteredIn(lay.infoX, lay.infoW, chapterTop + base,
+                       ellipsizeToWidth(chap, lay.infoW).c_str());
+    }
+
+    // 进度：横条 + 百分比，整体在信息区里居中。百分比跟在条后面。
+    {
+        const int percent = info.percent;
+        char pct[16];
+        snprintf(pct, sizeof(pct), "%d%%", percent);
+        const int pctW = g_font.textWidth(pct);
+        const int barW = lay.infoW * 3 / 5;
+        const int groupW = barW + 16 + pctW;
+        const int gx = lay.infoX + (lay.infoW - groupW) / 2;
+        const int barY = barTop + (lineGap - barH) / 2;
+        u8g2_DrawFrame(g_u8g2, gx, barY, barW, barH);
+        const int filled = (barW - 4) * (percent < 0 ? 0 : (percent > 100 ? 100 : percent)) / 100;
+        if (filled > 0) u8g2_DrawBox(g_u8g2, gx + 2, barY + 2, filled, barH - 4);
+        g_font.drawText(gx + barW + 16, barY + barH / 2 + g_font.ascent() / 2, pct, false);
+    }
+
+    // 累计阅读时长（这本书）。不足一分钟不写"0 小时 0 分"那种，直接"不到 1 分钟"。
+    {
+        const uint64_t mins = info.readingMs / 60000ULL;
+        if (mins > 0) {
+            if (mins >= 60) {
+                snprintf(buf, sizeof(buf), "累计 %llu 小时 %llu 分",
+                         static_cast<unsigned long long>(mins / 60ULL),
+                         static_cast<unsigned long long>(mins % 60ULL));
+            } else {
+                snprintf(buf, sizeof(buf), "累计 %llu 分钟",
+                         static_cast<unsigned long long>(mins));
+            }
+        } else {
+            snprintf(buf, sizeof(buf), "累计 不到 1 分钟");
+        }
+        drawCenteredIn(lay.infoX, lay.infoW, durTop + base, buf);
+    }
 }
 
 // ── 图片表盘 ──────────────────────────────────────────────────────────────
@@ -634,7 +662,7 @@ void standbyClockDraw(StandbyFace face) {
     if (face == StandbyFace::Almanac)
         drawAlmanacFace(valid);
     else if (face == StandbyFace::Cover)
-        drawCoverFace(lt, valid);   // 封面表盘恢复成"封面 + 时刻/日期/书名/进度"
+        drawCoverFace(lt, valid);   // 封面表盘：大封面 + 日期/书名/章节/进度/累计时长（无时刻）
     else if (face == StandbyFace::Image)
         drawImageFace();            // 整屏只有用户选的那张图
     else

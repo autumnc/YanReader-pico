@@ -744,10 +744,18 @@ static AppState settingsPickerHandle(int key, ScreenContext &ctx) {
     } else if (key == KEY_DOWN || key == 'j') {
         if (g_settingsState.pickerSel < n - 1) g_settingsState.pickerSel++;
     } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-        int t = g_settingsState.pickerSel + (key == KEY_PAGE_DOWN ? rows : -rows);
+        // 整页翻是**挪窗口**，选中行按同样的位移跟着走（同 screen_reader 的弹层）：
+        // 选中行本来就在页首时，只按"选中行 ±rows"算的话窗口只挪得动一行，
+        // 上下滑看着就像没翻页。
+        int top = g_settingsState.pickerScroll + (key == KEY_PAGE_DOWN ? rows : -rows);
+        const int maxTop = n > rows ? n - rows : 0;
+        if (top < 0) top = 0;
+        if (top > maxTop) top = maxTop;
+        int t = g_settingsState.pickerSel + (top - g_settingsState.pickerScroll);
         if (t < 0) t = 0;
         if (t > n - 1) t = n - 1;
         g_settingsState.pickerSel = t;
+        g_settingsState.pickerScroll = top;
     } else if (key == 0x0A || key == 0x0D) {
         int tx, ty;
         if (input_tap_xy(&tx, &ty)) {

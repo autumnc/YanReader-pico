@@ -12,7 +12,7 @@ enum class StandbyFace {
     Off = 0,     // 关闭：不画任何东西，屏上原样保留休眠前的画面
     Clock = 1,   // 简约时钟：大号七段数字 HH:MM + 日期 + 农历
     Almanac = 2, // 老黄历：公历日 + 农历干支 + 二十四节气 + 宜忌
-    Cover = 3,   // 书籍封面：最后阅读那本的封面 + 时刻 + 书名/进度
+    Cover = 3,   // 书籍封面：最后阅读那本的大封面 + 日期/书名/章节/进度/累计时长（无时刻）
     Image = 4,   // 图片：用户自己选的一张图铺满整屏（文件管理里「设为待机画面」）
 };
 
@@ -24,9 +24,10 @@ const char *standbyFaceLabel(StandbyFace f); // "关闭" / "简约时钟" / "老
 // 整屏绘制表盘并提交（整屏 GC16）。**表盘都不画底部工具栏**（不留唤醒提示、
 // 不留状态栏/电量）——唤醒源只有电源键，屏上不留提示。face==Off 时什么都不画，
 // 屏上原样保留休眠前的画面。
-// Cover 面读的是「最后阅读的那本书」的封面（reader_progress.txt 表头那本，见
-// screen_reader.h 的 readerLastBookCover）——本书没封面文件时画占位框，没读过书时
-// 只剩时刻与日期。
+// Cover 面读的是「最后阅读的那本书」的封面与信息（reader_progress.txt 表头那本，见
+// screen_reader.h 的 readerLastBookInfo / readerStandbyCoverLayout）——本书没封面文件
+// 时画占位框，没读过书时只剩日期。**不报时刻**（休眠期间不会走，见 standby_clock.cpp
+// 里 drawCoverFace 的说明）。
 // Image 面读的是用户在文件管理里选的那张图（设置键 standby_image，解码缓存见
 // screen_reader.h 的 readerStandbyImage）——**只有图**，不叠时刻/状态栏；没选图或
 // 缓存还没做出来时画占位提示。
