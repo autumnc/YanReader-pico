@@ -146,6 +146,10 @@ static void wait_sd_remounted(void) {
 }
 
 esp_err_t usb_msc_run(usb_msc_should_exit_cb_t should_exit, usb_msc_blocked_cb_t on_blocked) {
+    // 每次进入都从"主机未占用"起算：上一轮退出若走的是拔线（不产生 PREVENT/ALLOW
+    // 或 START STOP UNIT，s_host_hold 不会被清），残留的 true 会让本轮一上来就拒退。
+    s_host_hold = false;
+
     // 1. 应用侧卸载（把 FATFS 句柄与 host 一并释放）。
     esp_err_t sync_err = read_pico_sd_sync();
     if (sync_err != ESP_OK && sync_err != ESP_ERR_NOT_FINISHED &&
@@ -207,18 +211,22 @@ esp_err_t usb_msc_run(usb_msc_should_exit_cb_t should_exit, usb_msc_blocked_cb_t
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+        ESP_LOGI(TAG, "key=0x%02X mounted=%d hold=%d", k, (int)tud_mounted(), (int)s_host_hold);
         if (!should_exit(k)) continue;          // 非退出动作（没点中按钮等）→ 忽略
         if (tud_mounted() && s_host_hold) {
             ESP_LOGW(TAG, "host still holds medium, eject on PC first");
             if (on_blocked) on_blocked();
             continue;
         }
+        ESP_LOGI(TAG, "exit accepted, tearing down");
         break;
     }
 
-    // 5. 逆序卸载：先删存储（关介质/卸 MSC 驱动），再关 USB 栈，最后收裸卡。
-    tinyusb_msc_delete_storage(handle);
+    // 5. 逆序卸载：先关 USB 设备栈（停掉 TinyUSB 任务），再删存储（关介质/卸 MSC 驱动），
+    //    最后收裸卡。顺序不能反：先删存储时 TinyUSB 任务还在跑，主机的读写会在半路撞上
+    //    已关闭的介质，卸载时挂死甚至写坏卡。esp_tinyusb 示例统一先 driver_uninstall。
     tinyusb_driver_uninstall();
+    tinyusb_msc_delete_storage(handle);
     storage_teardown_sdmmc(&card);
 
     // 6. 重挂并等就绪。
