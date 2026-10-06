@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -93,7 +94,7 @@ enum class RdMode {
   Browser, Reading, Toc, Menu, LayoutMenu, Bookmarks, Footnotes, Percent, Qr, Dictionary, Weread, Wifi,
   Apps,        // 1 号根标签「应用」的图标入口页（文件管理 / 微信读书 / 字典）
   ShelfMenu, ShelfInfo, Recent, FileBrowser, Image, Opds, NetShare, DictDl, ResDl, KeyMap, StatusBar, About,
-  Settings, Notes, NoteEdit,
+  Settings, Notes, NoteEdit, NoteDetail,
   WereadQr,    // 扫码登录
   WereadMenu,  // 选中书目的操作菜单
   WereadDl,    // 缓存进度
@@ -393,10 +394,14 @@ struct RdState {
     int64_t time = 0;    // 记录时间
   };
   std::vector<RdNote> notes;
-  int notesSel = 0;
+  int notesSel = 0;           // 当前笔记下标（详情页/搜索回填用；光标见 notesRowSel）
   int notesScroll = 0;
   bool noteDelArm = false;    // 笔记列表里删除的二次确认已就位
   int noteDelIdx = -1;
+  // 笔记列表按书折叠。**存路径不存书名**：书名可能空、可能撞名（见 rdNoteRows）。
+  // 空集合 = 全部折叠（默认态）。持久化在 g_settings 的 reader_notes_fold。
+  std::set<std::string> notesOpen;
+  int notesRowSel = 0;        // 行光标：**含书名分组行**，与 notesSel（笔记下标）分开
 
   // 长按选中的词范围（当前页语言：words 下标）与浮层选择
   bool selActive = false;
@@ -420,7 +425,25 @@ struct RdState {
   std::string noteEditBuf;
   int noteEditIdx = -1;          // >=0 改这条；-1 = 新建（原文在 notePendingText）
   std::string notePendingText;   // 新建笔记待写入的原文
+  bool noteEditBackToDetail = false;  // 保存/取消后回笔记详情页（否则回正文）
   std::string noteStatus;
+
+  // 笔记详情页：显示一条标注的原文全文 + 自己的注释。
+  // 行表把"原文 / 小标题 / 注释"合成一张，共用一个滚动偏移（分两块滚就得判上下键归谁，
+  // 而注释块又没有独立可视高度可言）；折行只在宽度或条目变了时重算一次（同词典页）。
+  struct RdNoteDetailLine {
+    std::string text;
+    int kind = 0;   // 0=原文 1=小标题 2=注释 3=间隔
+  };
+  int noteDetailIdx = -1;              // 正在看的那条笔记（notes 下标）
+  bool noteDetailFromSearch = false;   // 返回目标：true = 回 NotesSearch，false = 回 Notes
+  bool noteDetailDelArm = false;       // 详情页删除的二次确认（与列表的 noteDelArm 独立）
+  int noteDetailScroll = 0;
+  int noteDetailScrollMax = 0;
+  int noteDetailPageLines = 1;
+  std::vector<RdNoteDetailLine> noteDetailLines;
+  int noteDetailLinesW = -1;           // 建表时的排版宽度；-1 = 需重建（含换书/换字号）
+  int noteDetailLinesIdx = -1;         // 建表时的 noteDetailIdx；对不上也要重建
 
   // ── 微信读书 ──────────────────────────────────────────────────────────
   // 复制一份原版的角色分工：状态机（WeReadClient::Operation）在 UI 循环里

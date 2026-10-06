@@ -4114,6 +4114,9 @@ static void renderSettingsTab();  // 「设置」标签（定义在菜单动作�
 void prepareQr();
 static void rdNoteCommit();      // 笔记编辑器保存（定义在文件后段）
 static void renderNotes();       // 「笔记」标签（定义在文件后段）
+static void renderNoteDetail();  // 笔记详情页（定义在文件后段）
+static void rdOpenNoteDetail(int idx, bool fromSearch);  // 进笔记详情页（文件后段定义）
+static std::vector<int> rdNotesHits();  // 笔记搜索的命中表（详情页的"下一条"要用）
 void renderNoteEdit();
 static void rdShelfSearchOpen();  // 打开书架搜索的当前命中（定义在文件后段）
 static void rdNotesSearchOpen();  // 打开笔记搜索的当前命中
@@ -5098,6 +5101,7 @@ void renderCurrent() {
     case RdMode::Apps: renderApps(); break;
     case RdMode::Settings: renderSettingsTab(); break;
     case RdMode::Notes: renderNotes(); break;
+    case RdMode::NoteDetail: renderNoteDetail(); break;
     case RdMode::NoteEdit: renderNoteEdit(); break;
     case RdMode::ShelfSearch: renderShelfSearch(); break;
     case RdMode::NotesSearch: renderNotesSearch(); break;
@@ -5909,7 +5913,14 @@ static void rdNoteCommit() {
   st.notePendingText.clear();
   st.noteEditIdx = -1;
   st.vkVisible = false;
-  st.mode = RdMode::Reading;
+  // 从详情页进来的（改注释）回详情页，并把折行缓存作废——不然显示的还是改之前那段。
+  if (st.noteEditBackToDetail) {
+    st.noteEditBackToDetail = false;
+    st.noteDetailLinesW = -1;
+    st.mode = RdMode::NoteDetail;
+  } else {
+    st.mode = RdMode::Reading;
+  }
   st.fullRefresh = true;
   st.noteStatus = "已保存笔记";
   st.dirty = 1;
@@ -5950,6 +5961,7 @@ static void rdSelActivate() {
                          ? st.notes[st.selNoteIdx].note
                          : std::string();
     st.selActive = false;
+    st.noteEditBackToDetail = false;   // 正文里改的 → 保存后回正文
     st.mode = RdMode::NoteEdit;
     rdVkWantShow();
     st.fullRefresh = true;
@@ -5988,6 +6000,7 @@ static void rdSelActivate() {
   st.noteEditBuf.clear();
   st.notePendingText = selText;
   st.selActive = false;
+  st.noteEditBackToDetail = false;   // 正文里新写的 → 保存后回正文
   st.mode = RdMode::NoteEdit;
   rdVkWantShow();
   st.fullRefresh = true;
@@ -7285,46 +7298,133 @@ static void handleDict(int key) {
 // 列表按书分组：一条书名行 + 该书的每条笔记（原文一行、笔记正文一行）。
 // 笔记行高两行文字，书名行只有一行，所以行高不固定；滚动按"行号"记。
 struct RdNoteRow {
-  int noteIdx;   // -1 = 书名分组行
-  std::string label;
+  int noteIdx = -1;     // -1 = 书名分组行
+  std::string label;    // 分组行 = 《书名》；笔记行 = 原文
+  std::string bookKey;  // 分组行独有：书的 path（折叠状态按它记，见 notesOpen）
 };
+
+// 分组键用**书的 path**：book 字段可能为空（老笔记、跨设备导入），display name 又可能
+// 撞名（上下册同名、扫描件），拿显示名当键会把两本书串成一组、或同一本书拆成两键。
+// 显示名一律现查（rdExportBookTitle：笔记书名 → 书架名 → 文件名）。
+// 分块必须**连续**：先前是"这个书名出现过没有"，笔记顺序 A1,B1,A2 会把 A2 渲染到
+// 《B》底下——折叠一上来那就是该藏的藏错书。
+// 折叠着的那本书只出行名（`rdNoteBookOpen` 判）；行号因此会随折叠变，凡是"记住的行号"
+// 在切换之后都要重锚。
+static bool rdNoteBookOpen(const std::string &path) { return st.notesOpen.count(path) > 0; }
 
 static std::vector<RdNoteRow> rdNoteRows() {
   std::vector<RdNoteRow> rows;
-  std::vector<std::string> seen;
+  std::vector<std::string> order;                 // 书的出现顺序 = 分组顺序
+  std::vector<std::vector<int>> buckets;
+  std::vector<std::string> names;                 // 每本书记着的书名（可能空，见下）
   for (int i = 0; i < static_cast<int>(st.notes.size()); i++) {
-    std::string bk = st.notes[i].book.empty() ? st.notes[i].path : st.notes[i].book;
-    if (bk.empty()) bk = "未知书籍";
-    bool first = true;
-    for (auto &s : seen) {
-      if (s == bk) { first = false; break; }
+    const std::string &p = st.notes[i].path;
+    int k = -1;
+    for (int j = 0; j < static_cast<int>(order.size()); j++) {
+      if (order[j] == p) { k = j; break; }
     }
-    if (first) {
-      seen.push_back(bk);
-      RdNoteRow h;
-      h.noteIdx = -1;
-      h.label = "《" + bk + "》";
-      rows.push_back(h);
+    if (k < 0) {
+      order.push_back(p);
+      buckets.push_back(std::vector<int>());
+      names.push_back(std::string());
+      k = static_cast<int>(order.size()) - 1;
     }
-    RdNoteRow r;
-    r.noteIdx = i;
-    r.label = st.notes[i].text;
-    rows.push_back(r);
+    if (names[k].empty()) names[k] = st.notes[i].book;   // 顺手记下，省一遍全表扫描
+    buckets[k].push_back(i);
+  }
+  for (int k = 0; k < static_cast<int>(order.size()); k++) {
+    RdNoteRow h;
+    h.noteIdx = -1;
+    h.bookKey = order[k];
+    // 这条书里存了书名就直接用（rdExportBookTitle 的第一优先就是它）；没有才现查
+    // 书架名/文件名。这个函数每按一次键要跑两三趟，别在里面按书重扫整张笔记表。
+    h.label = "《" + (names[k].empty() ? rdExportBookTitle(order[k]) : names[k]) + "》";
+    rows.push_back(h);
+    if (!rdNoteBookOpen(order[k])) continue;   // 折叠着：书名行后面什么都不出
+    for (int idx : buckets[k]) {
+      RdNoteRow r;
+      r.noteIdx = idx;
+      r.label = st.notes[idx].text;
+      rows.push_back(r);
+    }
   }
   return rows;
+}
+
+// 折叠状态持久化：g_settings 是 /sdcard/settings/<key> 的原子写文件后端（同书签）。
+// **不能放 /sdcard/.crossmux** ——书架那个「清理缓存」会把整个目录删掉；也不放 /sdcard
+// 根目录——那儿冒出来的新文件会被书架当成一本书扫出来。书路径不会含换行，拿 '\n' 分隔。
+static void rdNoteSaveFold() {
+  std::string s;
+  for (const auto &p : st.notesOpen) {
+    if (!p.empty()) s += p + "\n";
+  }
+  g_settings.setString("reader_notes_fold", s);
+}
+
+static void rdNoteLoadFold() {
+  st.notesOpen.clear();
+  const std::string s = g_settings.getString("reader_notes_fold");
+  size_t pos = 0;
+  while (pos < s.size()) {
+    size_t nl = s.find('\n', pos);
+    if (nl == std::string::npos) nl = s.size();
+    std::string line = s.substr(pos, nl - pos);
+    pos = nl + 1;
+    if (!line.empty()) st.notesOpen.insert(line);
+  }
+}
+
+// 展开/折叠一本书。切完必须把行光标**重锚到切换的那一行**：行号是屏幕位置，展开会把它
+// 后面的所有行整体下移，保住旧值等于让光标跳到别处去了。
+static void rdNoteToggleBook(const std::string &path, int keepRow) {
+  if (path.empty()) return;
+  if (st.notesOpen.count(path)) st.notesOpen.erase(path);
+  else st.notesOpen.insert(path);
+  rdNoteSaveFold();
+  const int nrows = static_cast<int>(rdNoteRows().size());
+  st.notesRowSel = clampI(keepRow, 0, std::max(0, nrows - 1));
+  st.dirty = 1;
+}
+
+// 把行光标挪到某条笔记所在的行（那本书折叠着就找不到，保持不动）。
+static void rdNoteRowSyncToNote(int noteIdx) {
+  if (noteIdx < 0) return;
+  const auto rows = rdNoteRows();
+  for (int i = 0; i < static_cast<int>(rows.size()); i++) {
+    if (rows[i].noteIdx == noteIdx) { st.notesRowSel = i; return; }
+  }
 }
 
 static int rdNoteRowH(const RdNoteRow &r) {
   return (r.noteIdx < 0) ? (uiLineHeight() + 10) : (uiLineHeight() * 2 + 8);
 }
 
-// 点按落在哪条笔记上（书名行/列表外返回 -1）。滚动状态和渲染时一致。
-static int rdNoteRowAtY(int ty) {
-  auto rows = rdNoteRows();
+// 分组行右端的展开/折叠按钮：一个方块，展开时是「−」、折叠时是「+」（两条实心矩形拼，
+// 同文件浏览器画浮标那套）。**整行都可点**，这个方块只负责画——所以不需要命中函数，
+// 但标签截断要知道它左边在哪（rdNoteFoldBtnLeft）。
+static int rdNoteFoldBtnLeft() {
+  return g_rd.getScreenWidth() - MARGIN - uiLineHeight();
+}
+
+static void rdDrawFoldBtn(int y, int h, bool open, bool dark) {
+  const int bs = std::min(h - 8, uiLineHeight());
+  const int bx = rdNoteFoldBtnLeft();
+  const int by = y + (h - bs) / 2;
+  g_rd.drawRect(bx, by, bs, bs, dark);
+  const int t = std::max(2, bs / 8);       // 线宽
+  const int pad = bs / 4;
+  g_rd.fillRect(bx + pad, by + bs / 2 - t / 2, bs - 2 * pad, t, dark);             // 「−」
+  if (!open) g_rd.fillRect(bx + bs / 2 - t / 2, by + pad, t, bs - 2 * pad, dark);  // 再加一竖 → 「+」
+}
+
+// 点按落在哪一行（返回**行下标**，-1 = 没命中）。行表由调用方传进来（点按路径上要连用
+// 两次：先认行、再取行里的笔记），避免每一下点按都重算一遍分组。
+static int rdNoteRowAtY(const std::vector<RdNoteRow> &rows, int ty) {
   int y = rdBarContentTop();   // 列表从搜索栏下方起排（与 renderNotes 的 top 同源）
   for (int i = st.notesScroll; i < static_cast<int>(rows.size()); i++) {
     int h = rdNoteRowH(rows[i]);
-    if (ty >= y && ty < y + h) return rows[i].noteIdx;
+    if (ty >= y && ty < y + h) return i;
     y += h;
     if (y > tabBottom()) break;   // 与 renderNotes 的 bottom 同源：标签页排到物理底边
   }
@@ -7334,25 +7434,34 @@ static int rdNoteRowAtY(int ty) {
 static void rdGotoNote(int idx) {
   if (idx < 0 || idx >= static_cast<int>(st.notes.size())) return;
   const RdState::RdNote &n = st.notes[idx];
-  if (n.path.empty()) { st.noteStatus = "该笔记没有关联文件"; st.dirty = 1; return; }
+  if (n.path.empty()) { rdShowFloat("这条笔记没有关联文件", "", 2500); st.dirty = 1; return; }
   if (n.path != st.bookPath) {
     std::string low;
     for (char c : n.path) low += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
     int kind = 0;
     if (low.size() >= 4 && low.compare(low.size() - 4, 4, ".txt") == 0) kind = 1;
     else if (low.size() >= 4 && low.compare(low.size() - 4, 4, ".xtc") == 0) kind = 2;
-    if (!openBook(n.path, kind)) { st.noteStatus = "打不开这本书（文件可能已移走）"; st.dirty = 1; return; }
+    // 冷开一本大书实测十几秒，先刷一帧"正在…"（e-ink 上不动的屏幕看着就是死机）。
+    rdShowBusy("正在打开…", rdExportBookTitle(n.path));
+    if (!openBook(n.path, kind)) {
+      rdShowFloat("打不开这本书", "文件可能已移走", 3000);
+      st.dirty = 1;
+      return;
+    }
   }
   if (st.bookKind == 0) {
     if (n.spine != st.spineIndex) openSpine(n.spine);
     buildToPage(n.page);
   } else if (st.bookKind == 1) {
     st.txtPage = clampI(n.page, 0, std::max(0, totalPages() - 1));
+  } else if (st.bookKind == 2) {
+    // XTC 是图片页，是按页存的（同书签恢复那一套，见 loadBookmarks）。
+    st.xtcPage = clampI(n.page, 0, st.xtc ? static_cast<int>(st.xtc->getPageCount()) - 1 : 0);
   }
   st.selActive = false;
   st.mode = RdMode::Reading;
   st.fullRefresh = true;
-  st.noteStatus = "已跳到笔记位置";
+  rdShowFloat("已跳到笔记位置", "", 1500);   // noteStatus 没人读，提示一律走浮动框
   st.dirty = 1;
 }
 
@@ -7368,17 +7477,13 @@ static void renderNotes() {
     drawCenteredLine(top + 40 + uiLineHeight() + 8, "阅读时长按文字即可标注/写笔记");
     return;
   }
-  // 选中行：第 st.notesSel 条笔记（不含书名行）。
-  int selRow = -1, k = 0;
-  for (int i = 0; i < static_cast<int>(rows.size()); i++) {
-    if (rows[i].noteIdx < 0) continue;
-    if (k == st.notesSel) { selRow = i; break; }
-    k++;
-  }
-  if (selRow < 0) selRow = 0;
+  // 光标是**行号**（含书名分组行）：分组行也要能选中，才谈得上"点一下展开"。
+  const int nrows = static_cast<int>(rows.size());
+  st.notesRowSel = clampI(st.notesRowSel, 0, nrows - 1);
+  const int selRow = st.notesRowSel;
 
   int bottom = tabBottom();
-  if (st.notesScroll < 0) st.notesScroll = 0;
+  st.notesScroll = clampI(st.notesScroll, 0, nrows - 1);
   if (st.notesScroll > selRow) st.notesScroll = selRow;
   // 向下滚到选中行完全可见为止（行高不一，只能逐行累加）。
   while (st.notesScroll < selRow) {
@@ -7389,17 +7494,21 @@ static void renderNotes() {
   }
 
   int y = top;
-  for (int i = st.notesScroll; i < static_cast<int>(rows.size()); i++) {
+  for (int i = st.notesScroll; i < nrows; i++) {
     int h = rdNoteRowH(rows[i]);
     if (y + h > bottom) break;
+    const bool sel = (i == selRow);
+    if (sel) g_rd.fillRect(2, y, w - 4, h - 2, true);
     if (rows[i].noteIdx < 0) {
-      // 分组行就是书名，同样交给用户字体（理由与状态栏一致）。
-      drawLineText(MARGIN, y + 4, rows[i].label.c_str(), true, uiFontId());
+      // 分组行就是书名，同样交给用户字体（理由与状态栏一致）。标签要给右端的折叠
+      // 按钮让位，不然长书名会被按钮压住。
+      const bool open = rdNoteBookOpen(rows[i].bookKey);
+      const std::string lab = fitWidth(rows[i].label, rdNoteFoldBtnLeft() - MARGIN - 12);
+      drawLineText(MARGIN, y + 4, lab.c_str(), !sel, uiFontId());
+      rdDrawFoldBtn(y, h, open, !sel);
       g_rd.drawLine(MARGIN, y + h - 3, w - MARGIN, y + h - 3, true);
     } else {
       const RdState::RdNote &n = st.notes[rows[i].noteIdx];
-      const bool sel = (i == selRow);
-      if (sel) g_rd.fillRect(2, y, w - 4, h - 2, true);
       const int maxW = w - 2 * MARGIN - 12;
       std::string l1 = g_rd.truncatedText(uiFontId(), n.text.c_str(), maxW, EpdFontFamily::REGULAR);
       drawLineText(MARGIN + 10, y + 3, l1.c_str(), !sel, uiFontId());
@@ -7418,31 +7527,94 @@ static void handleNotes(int key) {
   if (key == KEY_RIGHT) { switchTab(st.tab + 1); return; }
   if (key == 0x1B) { switchTab(0); return; }
   if (key == KEY_LONG_CONFIRM) { switchTab(0); return; }
-  const int n = static_cast<int>(st.notes.size());
+
+  // 这一屏有语义的键就是下面这些（触摸点按走 '\n'），其余一律丢掉。要挡住的主要是两样：
+  // **空转帧（key == 0）**和**拖动增量**——它们原来都落到末尾那记 st.dirty = 1，于是空闲
+  // 时每一拍都要重排一遍整张笔记表再重绘（分组是两层循环，白跑），拖动时更是每帧一次。
+  // 浮动提示的到期清理在上游的空转分支里，不走这里，放心早退。
+  if (key != KEY_UP && key != KEY_DOWN && key != 'z' && key != 'Z' && key != KEY_TOUCH_LONG
+      && key != '\n') {
+    if (key == KEY_TOUCH_DRAG) input_drag_xy(nullptr, nullptr);   // 吃掉增量，别漏给下一屏
+    if (st.noteDelArm) { st.noteDelArm = false; st.dirty = 1; }   // 按别的键 = 撤销删除的挂起态
+    return;
+  }
+
+  const auto rows = rdNoteRows();
+  const int nrows = static_cast<int>(rows.size());
+  // 激活一行：分组行 = 折叠切换（整行都可点），笔记行 = 进详情页看全文。
+  // 跳回书里的位置只是详情页里的一个动作，不再是"点一下就跳走"。
+  auto activate = [&](int row) {
+    if (row < 0 || row >= nrows) return;
+    if (rows[row].noteIdx < 0) {
+      rdNoteToggleBook(rows[row].bookKey, row);
+      return;
+    }
+    rdOpenNoteDetail(rows[row].noteIdx, false);
+  };
 
   if (key == KEY_UP || key == KEY_DOWN) {
-    if (n > 0) {
+    if (nrows > 0) {
       st.noteDelArm = false;
-      st.notesSel = clampI(st.notesSel + (key == KEY_DOWN ? 1 : -1), 0, n - 1);
+      // 走的是行号：全折叠时在书名之间走、展开后又能逐条走，同一个 ±1 就够，不用特判。
+      st.notesRowSel = clampI(st.notesRowSel + (key == KEY_DOWN ? 1 : -1), 0, nrows - 1);
+      const int ni = rows[st.notesRowSel].noteIdx;
+      if (ni >= 0) st.notesSel = ni;
     }
     st.dirty = 1;
     return;
   }
-  if (key == KEY_TOUCH_LONG) {   // 长按 = 删除（二次确认，误触不至于直接丢笔记）
-    if (n > 0) {
-      if (st.noteDelArm && st.noteDelIdx == st.notesSel) {
-        st.notes.erase(st.notes.begin() + st.notesSel);
-        saveNotes();
-        st.notesSel = clampI(st.notesSel, 0, std::max(0, static_cast<int>(st.notes.size()) - 1));
-        st.noteDelArm = false;
-        st.noteStatus = "已删除笔记";
-      } else {
-        st.noteDelArm = true;
-        st.noteDelIdx = st.notesSel;
-        rdShowFloat("再按一次删除该笔记", "", 3000);   // 标签页没有提示栏了，确认提示走浮动框
+  // 键盘侧（触摸有那个方块）：z 折当前这本，Z 全折/全展（同 GTD 大纲的 z/Z）。
+  if (key == 'z' || key == 'Z') {
+    if (key == 'z') {
+      if (st.notesRowSel >= 0 && st.notesRowSel < nrows) {
+        // 光标落在笔记行上时折的是它所属的那本书；折叠后这一行会消失，所以光标要
+        // 退到那本书的书名行上（展开态下书名行就在它上面，往上走到不空 bookKey 为止）。
+        int r = st.notesRowSel;
+        while (r > 0 && rows[r].bookKey.empty()) r--;
+        const std::string k2 = rows[r].bookKey.empty()
+                                   ? st.notes[rows[r].noteIdx].path
+                                   : rows[r].bookKey;
+        rdNoteToggleBook(k2, r);
       }
+    } else {
+      // 还有展开着的就全折，一个都没展开才全展（一次按键干一件可预期的事）。
+      if (st.notesOpen.empty()) {
+        for (const auto &r : rows) {
+          if (!r.bookKey.empty()) st.notesOpen.insert(r.bookKey);
+        }
+      } else {
+        st.notesOpen.clear();
+      }
+      rdNoteSaveFold();
+      st.notesRowSel = 0;
+      st.notesScroll = 0;
       st.dirty = 1;
     }
+    return;
+  }
+  if (key == KEY_TOUCH_LONG) {   // 长按 = 删除（二次确认，误触不至于直接丢笔记）
+    // 删哪一条必须**按落点认**：默认全折叠时屏上只剩书名行，若还按 st.notesSel 删，
+    // 长按书名行就会丢掉一条看不见的笔记。（键盘侧的长按是 KEY_LONG_CONFIRM，已在上面返回。）
+    int x, yy;
+    if (!input_tap_xy(&x, &yy)) return;
+    const int row = rdNoteRowAtY(rows, yy);
+    if (row < 0 || rows[row].noteIdx < 0) { st.noteDelArm = false; st.dirty = 1; return; }
+    const int target = rows[row].noteIdx;
+    st.notesRowSel = row;
+    st.notesSel = target;
+    if (st.noteDelArm && st.noteDelIdx == target) {
+      st.notes.erase(st.notes.begin() + target);
+      saveNotes();
+      st.notesSel = clampI(st.notesSel, 0, std::max(0, static_cast<int>(st.notes.size()) - 1));
+      st.notesRowSel = clampI(row, 0, std::max(0, static_cast<int>(rdNoteRows().size()) - 1));
+      st.noteDelArm = false;
+      rdShowFloat("已删除笔记", "", 2000);   // noteStatus 没人读，提示一律走浮动框
+    } else {
+      st.noteDelArm = true;
+      st.noteDelIdx = target;
+      rdShowFloat("再长按一次删除该笔记", "", 3000);   // 标签页没有提示栏了，确认提示走浮动框
+    }
+    st.dirty = 1;
     return;
   }
   st.noteDelArm = false;
@@ -7458,15 +7630,367 @@ static void handleNotes(int key) {
         rdEnterSearch(RdMode::NotesSearch);
         return;
       }
-      int idx = rdNoteRowAtY(yy);
-      if (idx >= 0) { st.notesSel = idx; rdGotoNote(idx); return; }
+      const int row = rdNoteRowAtY(rows, yy);
+      if (row >= 0) {
+        st.notesRowSel = row;
+        activate(row);
+        return;
+      }
       st.dirty = 1;
       return;
     }
-    rdGotoNote(st.notesSel);
+    activate(st.notesRowSel);   // 无坐标回车（蓝牙键盘）：激活光标那一行
     return;
   }
   st.dirty = 1;
+}
+
+// ── 笔记详情页 ──────────────────────────────────────────────────────────
+// 从列表/搜索点一条进来：完整显示这条标注的原文（自动折行、可滚动）和它的注释。
+// 瞬态页面：不参与 rdSaveReturnPoint（切走再回来不还原），Esc 回进它的那一页。
+// 这是**子页**不是标签页：顶上画标题栏而不是标签栏（同 About），所以没有横滑切标签。
+static constexpr int kNoteLineQuote = 0;   // 原文
+static constexpr int kNoteLineHead = 1;    // 「我的笔记」小标题
+static constexpr int kNoteLineNote = 2;    // 注释正文
+static constexpr int kNoteLineGap = 3;     // 段落间空行
+// 折行上限只为防病态输入（几万行的 vector 会把 PSRAM 撑爆）；正常标注远到不了。
+// 不能用笔记编辑器那个 3 —— 那是缩略图，详情页要的是全文。
+static constexpr int kNoteDetailMaxLines = 2000;
+
+// 折行只在"排版宽度或看的这条变了"时重算一次（同词典页：逐帧重量宽度会拖慢滑动）。
+static void rdBuildNoteDetailLines() {
+  const int maxW = g_rd.getScreenWidth() - 2 * MARGIN - 14;
+  st.noteDetailLinesW = maxW;
+  st.noteDetailLinesIdx = st.noteDetailIdx;
+  st.noteDetailLines.clear();
+  if (st.noteDetailIdx < 0 || st.noteDetailIdx >= static_cast<int>(st.notes.size())) return;
+  const RdState::RdNote &n = st.notes[st.noteDetailIdx];
+  auto push = [](const std::string &t, int kind) {
+    RdState::RdNoteDetailLine l;
+    l.text = t;
+    l.kind = kind;
+    st.noteDetailLines.push_back(l);
+  };
+  auto wrap = [&](const std::string &s, int kind) {
+    auto ls = g_rd.wrappedText(uiFontId(), s.c_str(), maxW, kNoteDetailMaxLines);
+    for (auto &l : ls) push(l, kind);
+  };
+  // wrappedText 已把 '\n' 当硬断行、空行也保留，跨行选中的多段原文天然能原样显示。
+  if (n.text.empty()) push("（这条标注没有原文）", kNoteLineQuote);
+  else wrap(n.text, kNoteLineQuote);
+  push("", kNoteLineGap);
+  push("我的笔记", kNoteLineHead);
+  if (n.note.empty()) push("（未写注释）", kNoteLineNote);
+  else wrap(n.note, kNoteLineNote);
+}
+
+// 进详情页的唯一入口（列表点按 / 搜索回车都走这里，免得两处各写一遍初始化）。
+// 显式关掉虚拟键盘：上一屏要是留着它，这一屏会把正文底边顶上去（且它没有输入目标）。
+static void rdOpenNoteDetail(int idx, bool fromSearch) {
+  if (idx < 0 || idx >= static_cast<int>(st.notes.size())) return;
+  st.noteDetailIdx = idx;
+  st.noteDetailFromSearch = fromSearch;
+  st.notesSel = idx;
+  st.noteDetailScroll = 0;
+  st.noteDetailLinesW = -1;   // 强制重建：换了一条，内容跟着变
+  st.noteDetailLinesIdx = -1;
+  st.noteDetailDelArm = false;
+  st.vkVisible = false;
+  // 上一屏可能是编辑器（输入法还挂着组合串）：这一屏没有文本字段，先收干净，
+  // 免得后面几帧还把按键喂给一个看不见的输入法。
+  IME::getInstance().cancelComposition();
+  st.mode = RdMode::NoteDetail;
+  st.fullRefresh = true;      // 整块换图样（同子页切换的老规矩）
+  st.dirty = 1;
+}
+
+// ── 详情页动作条 ────────────────────────────────────────────────────────
+// 列数按屏宽自适应：横屏 5 列 1 行，竖屏 3 列 2 行。竖屏 684px 下 5 格一排只剩 137px，
+// 装不下 4 个汉字（22pt 就是 184px）；3 列 2 行时最宽的那格 184 < 228 才富余。
+// 绘制与命中必须共用下面这两个几何函数（同 ui/list_view.h 那条纪律）。
+static constexpr int kNoteDetailBtns = 5;
+static int rdNoteDetailBarCols() { return (g_rd.getScreenWidth() >= 900) ? kNoteDetailBtns : 3; }
+static int rdNoteDetailBtnH() { return uiLineHeight() + 14; }
+static int rdNoteDetailBarH() {
+  const int cols = rdNoteDetailBarCols();
+  const int rows = (kNoteDetailBtns + cols - 1) / cols;
+  return rows * rdNoteDetailBtnH() + 8;
+}
+// 动作条排在提示行**上方**，不顶掉它 —— 提示行是这一屏唯一写着"怎么翻页/怎么返回"的地方。
+static int rdNoteDetailBarTop() { return statusTop() - 4 - rdNoteDetailBarH(); }
+static void rdNoteDetailBtnRect(int i, int *bx, int *by, int *bw, int *bh) {
+  const int cols = rdNoteDetailBarCols();
+  const int colW = (g_rd.getScreenWidth() - 2 * MARGIN) / cols;
+  *bx = MARGIN + (i % cols) * colW;
+  *by = rdNoteDetailBarTop() + 4 + (i / cols) * rdNoteDetailBtnH();
+  *bw = colW - 6;
+  *bh = rdNoteDetailBtnH() - 6;
+}
+static int rdNoteDetailBarHit(int x, int y) {   // -1 = 没命中（与绘制同源）
+  for (int i = 0; i < kNoteDetailBtns; i++) {
+    int bx, by, bw, bh;
+    rdNoteDetailBtnRect(i, &bx, &by, &bw, &bh);
+    if (x >= bx && x < bx + bw && y >= by && y < by + bh) return i;
+  }
+  return -1;
+}
+// 标签随状态变：没写过注释的是"写"，写过的是"改"；删除按下的那一趟变"确认删除"。
+static const char *rdNoteDetailBtnLabel(int i) {
+  const bool hasNote = st.noteDetailIdx >= 0 &&
+                       st.noteDetailIdx < static_cast<int>(st.notes.size()) &&
+                       !st.notes[st.noteDetailIdx].note.empty();
+  switch (i) {
+    case 0: return "‹ 上一条";
+    case 1: return "跳转原文";
+    case 2: return hasNote ? "改注释" : "写注释";
+    case 3: return st.noteDetailDelArm ? "确认删除" : "删除";
+    default: return "下一条 ›";
+  }
+}
+static void renderNoteDetailBar() {
+  const int w = g_rd.getScreenWidth();
+  const int top = rdNoteDetailBarTop();
+  g_rd.drawLine(0, top, w, top, true);
+  for (int i = 0; i < kNoteDetailBtns; i++) {
+    int bx, by, bw, bh;
+    rdNoteDetailBtnRect(i, &bx, &by, &bw, &bh);
+    const bool arming = (i == 3 && st.noteDetailDelArm);   // 确认删除那一下反白
+    if (arming) g_rd.fillRect(bx, by, bw, bh, true);
+    else g_rd.drawRect(bx, by, bw, bh, true);
+    const std::string s = fitWidth(rdNoteDetailBtnLabel(i), bw - 10);
+    const int tw = g_rd.getTextWidth(uiFontId(), s.c_str());
+    drawLineText(bx + (bw - tw) / 2, by + (bh - uiLineHeight()) / 2, s.c_str(), !arming, uiFontId());
+  }
+}
+
+// 详情页自己的底边：**不能用 rdBodyBottom()** ——那个按虚拟键盘/输入法条算，会把正文
+// 底边算到提示行上沿，正好压在动作条和提示行底下。这里只认动作条。
+static int rdNoteDetailBodyBottom() { return rdNoteDetailBarTop() - 6; }
+
+// 「上一条/下一条」走哪个序列，由**从哪儿进来**决定：列表进 → 列表上看得见的笔记行；
+// 搜索进 → 命中序列（不然翻到一条根本不匹配关键字的笔记）。折叠之后前者天然只剩
+// 展开着的那些，不用另写一套。
+static std::vector<int> rdNoteDetailDomain() {
+  std::vector<int> out;
+  if (st.noteDetailFromSearch) return rdNotesHits();
+  for (const auto &r : rdNoteRows()) {
+    if (r.noteIdx >= 0) out.push_back(r.noteIdx);
+  }
+  return out;
+}
+
+// 换一条看：**跨书也不开书**（冷开一本大书实测十几秒）。只换下标，内容由详情页现读。
+static void rdNoteDetailStep(int delta) {
+  const std::vector<int> dom = rdNoteDetailDomain();
+  int pos = -1;
+  for (int i = 0; i < static_cast<int>(dom.size()); i++) {
+    if (dom[i] == st.noteDetailIdx) { pos = i; break; }
+  }
+  if (pos < 0) return;
+  const int np = pos + delta;
+  if (np < 0 || np >= static_cast<int>(dom.size())) {
+    rdShowFloat(delta < 0 ? "已经是第一条" : "已经是最后一条", "", 1500);
+    st.dirty = 1;
+    return;
+  }
+  st.noteDetailIdx = dom[np];
+  st.notesSel = st.noteDetailIdx;
+  if (st.noteDetailFromSearch) st.searchSel = np;   // 返回搜索页时停在同一条上
+  st.noteDetailScroll = 0;
+  st.noteDetailLinesW = -1;
+  st.noteDetailLinesIdx = -1;
+  st.noteDetailDelArm = false;
+  st.dirty = 1;
+}
+
+// 进编辑器改这条的注释（复用写作那套，只多一个"回来时回详情页"的标记）。
+static void rdNoteDetailEdit() {
+  if (st.noteDetailIdx < 0 || st.noteDetailIdx >= static_cast<int>(st.notes.size())) return;
+  st.noteEditIdx = st.noteDetailIdx;
+  st.noteEditBuf = st.notes[st.noteDetailIdx].note;
+  st.notePendingText.clear();
+  st.noteEditBackToDetail = true;
+  st.mode = RdMode::NoteEdit;
+  rdVkWantShow();
+  st.fullRefresh = true;
+  st.dirty = 1;
+}
+
+static void rdNoteDetailDelete() {
+  const int idx = st.noteDetailIdx;
+  if (idx < 0 || idx >= static_cast<int>(st.notes.size())) return;
+  const bool fromSearch = st.noteDetailFromSearch;
+  int pos = 0;   // 删掉的那条在序列里的位置：返回后就停在这一位（后一条顶上来了）
+  {
+    const std::vector<int> dom = rdNoteDetailDomain();
+    for (int i = 0; i < static_cast<int>(dom.size()); i++) {
+      if (dom[i] == idx) { pos = i; break; }
+    }
+  }
+  st.notes.erase(st.notes.begin() + idx);
+  saveNotes();
+  st.noteDetailDelArm = false;
+  st.noteDetailIdx = -1;
+  st.noteDetailLinesW = -1;
+  st.noteDetailLinesIdx = -1;
+  // 回进它的那一页：erase 之后 notes 全体前移，详情页里那个下标已经没有意义了。
+  if (fromSearch) {
+    st.searchSel = clampI(pos, 0, std::max(0, static_cast<int>(rdNotesHits().size()) - 1));
+    st.mode = RdMode::NotesSearch;
+  } else {
+    // 删除后 `notes` 全体前移：原来 idx 这一位现在坐的是后一条，行光标就落在它上面
+    // （删的是最后一条时退到前一条）。折叠着导致它不在屏上时 `rdNoteRowSyncToNote`
+    // 什么都不做，行光标保持原值、由 `renderNotes` 夹住。
+    const int syncIdx = std::min(idx, static_cast<int>(st.notes.size()) - 1);
+    st.notesSel = syncIdx;
+    if (syncIdx >= 0) rdNoteRowSyncToNote(syncIdx);
+    st.mode = RdMode::Notes;
+  }
+  rdShowFloat("已删除笔记", "", 2000);
+  st.fullRefresh = true;
+  st.dirty = 1;
+}
+
+static void renderNoteDetail() {
+  g_rd.clearScreen();
+  const int w = g_rd.getScreenWidth();
+  const int top = drawTitle("笔记");
+  const int lh = uiLineHeight() + 4;
+  if (st.noteDetailIdx < 0 || st.noteDetailIdx >= static_cast<int>(st.notes.size())) {
+    drawCenteredLine(top + 40, "这条笔记已不存在");
+    drawFooter("Esc 返回");
+    return;
+  }
+  const RdState::RdNote &n = st.notes[st.noteDetailIdx];
+
+  // 固定头：书名 + 位置（页码按 1 起算，与导出标注同一口径）。**够宽就并成一行**——
+  // 横屏 22pt 档本来只剩七八行正文，省下一行是实打实的；竖屏排不下才分两行。
+  // 两条都走 fitWidth：书名字段可能是整条路径，长到压不住。
+  int y = top;
+  const std::string title = "《" + rdExportBookTitle(n.path) + "》";
+  const std::string date = rdExportNoteDate(n.time);
+  std::string meta = "第 " + std::to_string(n.page + 1) + " 页 · 第 " + std::to_string(n.spine + 1) + " 章";
+  if (!date.empty()) meta += " · " + date;
+  const std::string both = title + " · " + meta;
+  const int availW = w - 2 * MARGIN;
+  if (g_rd.getTextWidth(uiFontId(), both.c_str()) <= availW) {
+    drawLineText(MARGIN, y, both.c_str(), true, uiFontId());
+    y += lh;
+  } else {
+    drawLineText(MARGIN, y, fitWidth(title, availW).c_str(), true, uiFontId());
+    y += lh;
+    drawLineText(MARGIN, y, fitWidth(meta, availW).c_str(), true, uiFontId());
+    y += lh;
+  }
+  y += 2;
+  g_rd.drawLine(MARGIN, y - 4, w - MARGIN, y - 4, true);
+
+  if (st.noteDetailLinesW != w - 2 * MARGIN - 14 || st.noteDetailLinesIdx != st.noteDetailIdx) {
+    rdBuildNoteDetailLines();
+  }
+  const int bottom = rdNoteDetailBodyBottom();
+  const int maxLines = std::max(1, (bottom - y) / lh);
+  const int total = static_cast<int>(st.noteDetailLines.size());
+  // 夹住首行偏移（翻页键只管加，上限在这里兜底，同词典页/脚注弹窗）。
+  int first = std::max(0, std::min(st.noteDetailScroll, std::max(0, total - maxLines)));
+  st.noteDetailScroll = first;
+  st.noteDetailScrollMax = std::max(0, total - maxLines);
+  st.noteDetailPageLines = maxLines;
+  const int last = std::min(total, first + maxLines);
+  for (int i = first; i < last; i++) {
+    const int kind = st.noteDetailLines[i].kind;
+    const std::string &t = st.noteDetailLines[i].text;
+    if (kind == kNoteLineGap) { y += lh / 2; continue; }
+    if (kind == kNoteLineHead) {
+      // 小标题上下各留一点空（所以它比一行高），放不下就整块不画——半截露出来更难看。
+      if (y + 6 + lh > bottom) break;
+      y += 6;
+      drawLineText(MARGIN, y, t.c_str(), true, uiFontId());
+      y += lh;
+      continue;
+    }
+    if (kind == kNoteLineQuote) {
+      // 原文缩进一块：左端一条竖线贯穿整段（逐行画，行是连续的，接起来就是一条）。
+      g_rd.fillRect(MARGIN + 2, y, 3, lh, true);
+      drawLineText(MARGIN + 14, y, t.c_str(), true, uiFontId());
+      y += lh;
+      continue;
+    }
+    drawLineText(MARGIN, y, t.c_str(), true, uiFontId());
+    y += lh;
+  }
+  // 滚不完时在右下角给个页码指示（画在正文区最后一行右边，与词典页同一做法）。
+  if (total > maxLines) {
+    char ind[24];
+    const int pageCount = (total + maxLines - 1) / maxLines;
+    snprintf(ind, sizeof(ind), "%d/%d", first / maxLines + 1, pageCount);
+    const int tw = g_rd.getTextWidth(uiFontId(), ind);
+    drawLineText(w - MARGIN - tw, bottom - lh, ind, true, uiFontId());
+  }
+
+  renderNoteDetailBar();
+  drawFooter("上下划翻页  长按返回");
+}
+
+static void handleNoteDetail(int key) {
+  if (key == 0x1B || key == KEY_LONG_CONFIRM) {   // 长按展平成 Esc（白名单里没放行它）
+    st.mode = st.noteDetailFromSearch ? RdMode::NotesSearch : RdMode::Notes;
+    st.noteDetailDelArm = false;
+    st.fullRefresh = true;
+    st.dirty = 1;
+    return;
+  }
+  // 同笔记列表：空转帧与拖动增量到这儿就停（否则每拍/每帧一次整屏重排重绘）。
+  if (key != KEY_UP && key != KEY_DOWN && key != KEY_PAGE_UP && key != KEY_PAGE_DOWN
+      && key != KEY_LEFT && key != KEY_RIGHT && key != '\n') {
+    if (key == KEY_TOUCH_DRAG) input_drag_xy(nullptr, nullptr);
+    if (st.noteDetailDelArm) { st.noteDetailDelArm = false; st.dirty = 1; }
+    return;
+  }
+
+  if (key == KEY_UP || key == KEY_DOWN) {
+    st.noteDetailScroll = clampI(st.noteDetailScroll + (key == KEY_DOWN ? 1 : -1), 0,
+                                 st.noteDetailScrollMax);
+    st.dirty = 1;
+    return;
+  }
+  if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+    st.noteDetailScroll = clampI(st.noteDetailScroll +
+                                     (key == KEY_PAGE_DOWN ? 1 : -1) * st.noteDetailPageLines,
+                                 0, st.noteDetailScrollMax);
+    st.dirty = 1;
+    return;
+  }
+  // 左右键 = 上一条/下一条（这一屏没有横滑语义，也不会落到标签页切换上：它是子页）。
+  if (key == KEY_LEFT) { rdNoteDetailStep(-1); return; }
+  if (key == KEY_RIGHT) { rdNoteDetailStep(+1); return; }
+  if (key == '\n') {
+    int x, y;
+    if (!input_tap_xy(&x, &y)) return;   // 无坐标回车（蓝牙键盘）：没有默认动作
+    const int btn = rdNoteDetailBarHit(x, y);
+    switch (btn) {
+      case 0: rdNoteDetailStep(-1); return;
+      case 1: rdGotoNote(st.noteDetailIdx); return;   // 内部已把 mode 置回正文
+      case 2: rdNoteDetailEdit(); return;
+      case 3:
+        if (!st.noteDetailDelArm) {   // 二次确认：第一次按只把按钮改成"确认删除"
+          st.noteDetailDelArm = true;
+          rdShowFloat("再点一次「确认删除」", "", 3000);
+          st.dirty = 1;
+          return;
+        }
+        rdNoteDetailDelete();
+        return;
+      case 4: rdNoteDetailStep(+1); return;
+      default: break;
+    }
+    st.noteDetailDelArm = false;
+    st.dirty = 1;
+    return;
+  }
+  // 点了个落空的地方：撤销"确认删除"的挂起态（挂太久会变成下一次误删）。没挂起就
+  // 什么都不用做——别再标脏重绘一遍（这一屏重绘要重排整张行表）。
+  if (st.noteDetailDelArm) { st.noteDetailDelArm = false; st.dirty = 1; }
 }
 
 // ── 笔记编辑器 ──────────────────────────────────────────────────────────
@@ -7522,7 +8046,9 @@ static void handleNoteEdit(int key) {
     st.notePendingText.clear();
     st.noteEditIdx = -1;
     st.vkVisible = false;
-    st.mode = RdMode::Reading;
+    // 什么都没改，回详情页不必作废折行缓存。来源决定回哪儿（见 rdNoteCommit）。
+    st.mode = st.noteEditBackToDetail ? RdMode::NoteDetail : RdMode::Reading;
+    st.noteEditBackToDetail = false;
     st.fullRefresh = true;
     st.dirty = 1;
     return;
@@ -7690,8 +8216,8 @@ static void handleShelfSearch(int key) {
 }
 
 // ── 笔记搜索 ────────────────────────────────────────────────────────────
-// 匹配原文、笔记正文、书名三处（用户记不住自己搜的是哪一段）。命中直接给笔记下标，
-// 打开就复用笔记列表那套 rdGotoNote（跳回书里的位置）。
+// 匹配原文、笔记正文、书名三处（用户记不住自己搜的是哪一段）。命中给的是笔记下标，
+// 打开走笔记详情页（跳回书里只是详情页里的一个动作，见 rdOpenNoteDetail）。
 static std::vector<int> rdNotesHits() {
   std::vector<int> out;
   const std::string q = rdLower(st.notesQuery);
@@ -7710,8 +8236,9 @@ static void rdNotesSearchOpen() {
   auto hits = rdNotesHits();
   if (hits.empty()) return;
   const int h = clampI(st.searchSel, 0, static_cast<int>(hits.size()) - 1);
-  st.notesSel = hits[h];   // 笔记列表的选中项也跟着走
-  rdGotoNote(hits[h]);
+  // fromSearch = true：详情页的「上一条/下一条」要走这条命中序列（不然翻到一条
+  // 根本不匹配关键字的笔记），Esc 也是回搜索页（查询词和选中项都留着）。
+  rdOpenNoteDetail(hits[h], true);
 }
 
 static void renderNotesSearch() {
@@ -7746,7 +8273,7 @@ static void renderNotesSearch() {
   if (st.vkVisible) drawVk();
   else {
     drawRdImeBar();   // 搜索框在打拼音：编码行 + 候选行
-    drawFooter("↑↓ 选择  Enter 跳转  Esc 取消");
+    drawFooter("↑↓ 选择  Enter 查看  Esc 取消");
   }
   rdDrawVkIcon();
 }
@@ -7755,6 +8282,9 @@ static void handleNotesSearch(int key) {
   if (key == 0x1B || key == KEY_LONG_CONFIRM || key == KEY_BACK) {
     IME::getInstance().cancelComposition();
     st.vkVisible = false;
+    // 列表的行光标跟到当前选中那条上：从搜索退回列表时不会停在别处。
+    const auto hits = rdNotesHits();
+    if (!hits.empty()) rdNoteRowSyncToNote(hits[clampI(st.searchSel, 0, static_cast<int>(hits.size()) - 1)]);
     st.mode = RdMode::Notes;
     st.fullRefresh = true;
     st.dirty = 1;
@@ -8013,6 +8543,7 @@ void screen_reader_init() {
   loadBookmarks();
   loadRecent();
   loadNotes();
+  rdNoteLoadFold();   // 笔记列表的展开状态（存在 settings 里，不随「清理缓存」丢）
   // 阅读统计：一开机读一次。统计文件在 SD 根（和 reader_progress.txt/reader_notes.txt
   // 放一起），时钟没同步时只有总时长、没有日桶（见 reading_stats.cpp 的 clockValid）。
   ReadingStats::load();
@@ -8308,7 +8839,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 菜单/书签/笔记…）保持原来的单步上下语义。
   if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
     if (st.mode != RdMode::Toc && st.mode != RdMode::Browser && st.mode != RdMode::Dictionary
-        && !st.pickOpen)
+        && st.mode != RdMode::NoteDetail && !st.pickOpen)
       key = (key == KEY_PAGE_UP) ? KEY_UP : KEY_DOWN;
   }
 
@@ -8359,6 +8890,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     case RdMode::RefreshTest: handleRefreshTest(key); break;
     case RdMode::Settings: handleSettingsTab(key); break;
     case RdMode::Notes: handleNotes(key); break;
+    case RdMode::NoteDetail: handleNoteDetail(key); break;
     case RdMode::NoteEdit: handleNoteEdit(key); break;
     case RdMode::Stats: handleStatsTab(key); break;
     case RdMode::StatsBook: handleStatsBook(key); break;
