@@ -20,6 +20,7 @@
 #include "reader_refresh_bridge.h"  // 白底纪律记账 / 自检页自推屏（同样只有裸声明）
 #include "ui_render.h"   // ui_render_drain：进阅读器前等在飞的 UI 推屏收尾
 #include "ui_helpers.h"  // drawIMEUI / imeBarPanelH：实体键盘打字时的输入法条（见 drawRdImeBar）
+#include "usb_msc.h"     // U盘模式：SD 卡整卡经 TinyUSB MSC 暴露给电脑
 
 #include <algorithm>  // std::sort（导出标注按时序排）
 #include <cmath>  // 阅读档案的雷达图（cos/sin）
@@ -3491,7 +3492,7 @@ enum class MenuAct {
   Toc, Font, FontFamily, LineSpacing, ParaSpacing, Indent, Align, Margin, Image, ImageDither, ReadingLine, Night,
   Orient,
   ToggleBookmark, Bookmarks, Footnotes, FootnoteBack, Percent, Qr, LayoutMenu,
-  Dict, DictDl, ResDl, Weread, Wifi, Opds, NetShare, KeyMap, StatusBar, About, RefreshTest, Standby,
+  Dict, DictDl, ResDl, Weread, Wifi, Opds, NetShare, KeyMap, StatusBar, About, RefreshTest, Standby, UsbDrive,
   ClockFace, ShelfStyle, RefreshStrategy, FullEvery, TurnAnim, StyleSource, EmbeddedFont, AutoStandby,
   ToShelf, Back
 };
@@ -6178,6 +6179,70 @@ static void handleToc(int key) {
   }
 }
 
+// 「U 盘模式」退出按钮的几何（绘制与命中测试共用，保证同一套坐标）。
+struct UsbDriveBtn { int x, y, w, h; };
+static UsbDriveBtn usbDriveBtn() {
+  const int h = uiLineHeight() + 16;  // 触控目标高一点
+  const int w = 360;                  // 居中、够宽好点
+  const int y = statusTop() - h - 24; // 贴近底部、在页脚线上方
+  return { (g_rd.getScreenWidth() - w) / 2, y, w, h };
+}
+
+// 「U 盘模式」全屏静态页。blocked=false 是进入前的正常提示；blocked=true 是用户点了
+// 退出但主机仍占用、被 usb_msc_run 拒绝后刷新的"请先安全弹出"警告。
+static void drawUsbDrivePage(bool blocked) {
+  g_rd.clearScreen();
+  int top = drawTitle("U盘模式");
+  const char *lines[4];
+  int n = 0;
+  if (blocked) {
+    lines[n++] = "电脑仍在使用 U 盘，尚未安全弹出";
+    lines[n++] = "请先在电脑上「安全弹出」后再点退出";
+  } else {
+    lines[n++] = "本机 SD 卡已作为 U 盘挂载到电脑";
+    lines[n++] = "电脑会直接读写整张 SD 卡";
+    lines[n++] = "退出前请先在电脑上「安全弹出」并确认未在写卡";
+  }
+  const UsbDriveBtn b = usbDriveBtn();
+  const int lineH = uiLineHeight() + 8;
+  const int bodyBot = b.y - 20;   // 正文排到按钮上沿上方
+  const int blockH = n * lineH;
+  int y = top + (bodyBot - top - blockH) / 2;
+  for (int i = 0; i < n; i++) {
+    drawCenteredLine(y, lines[i]);
+    y += lineH;
+  }
+
+  // 退出按钮：黑底白字，居中。
+  g_rd.fillRect(b.x, b.y, b.w, b.h, true);
+  const char *btnLabel = "退出 U 盘模式";
+  const int tw = g_rd.getTextWidth(uiFontId(), btnLabel);
+  drawLineText(b.x + (b.w - tw) / 2, b.y + (b.h - uiLineHeight()) / 2, btnLabel, false);
+  g_rd.displayBuffer(HalDisplay::FULL_REFRESH);
+}
+
+// 点按是否命中"退出"按钮。
+static bool usbDriveExitHit(int x, int y) {
+  const UsbDriveBtn b = usbDriveBtn();
+  return x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h;
+}
+
+// 退出判定：只认点中"退出"按钮；触摸屏异常时电源键/返回键兜底（其它按键一律忽略，
+// 避免误触任意键就撕下 MSC）。
+static bool usbDriveShouldExit(int key) {
+  if (key == '\n') {
+    int x, y;
+    if (input_tap_xy(&x, &y)) return usbDriveExitHit(x, y);
+    return false;
+  }
+  return key == KEY_POWER || key == KEY_BACK;
+}
+
+// usb_msc_run 拒绝退出时回调：重画一屏"请先安全弹出"警告（方向在进入等待前已固定横屏）。
+static void usbDriveBlockedHint() {
+  drawUsbDrivePage(true);
+}
+
 static void doMenuAction(MenuAct act) {
   switch (act) {
     case MenuAct::Toc:
@@ -6447,6 +6512,17 @@ static void doMenuAction(MenuAct act) {
       st.fullRefresh = true;
       st.dirty = 1;
       break;
+    case MenuAct::UsbDrive:
+      // U 盘模式：先画提示页，再把阅读器整个退掉（释放所有 SD 文件句柄）；写作模式若
+      // 为竖屏，exit 会恢复成竖屏，所以这里再拉回横屏，让触摸映射/绘制/按钮命中在
+      // 整个等待期间都是同一套 1216×684 坐标。usb_msc_run() 卸载 SD、接管 USB，阻塞到
+      // 点中"退出"按钮且主机已安全弹出（主机仍占用时只刷警告、不退出），最后重进阅读器。
+      drawUsbDrivePage(false);
+      screen_reader_exit();
+      board_force_landscape();
+      usb_msc_run(usbDriveShouldExit, usbDriveBlockedHint);
+      screen_reader_init();
+      break;
     case MenuAct::ToShelf:
       gotoBookshelf();
       break;
@@ -6547,6 +6623,7 @@ static std::vector<MenuItem> settingsItems() {
   m.push_back({std::string("自动待机: ") + autoStandbyLabel(g_settings.autoStandbyMinutes()),
                MenuAct::AutoStandby});
   m.push_back({"待机时钟", MenuAct::Standby});
+  m.push_back({"U盘模式", MenuAct::UsbDrive});
   m.push_back({"屏幕自检", MenuAct::RefreshTest});
   m.push_back({"关于本机", MenuAct::About});
   return m;

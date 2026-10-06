@@ -1,0 +1,5 @@
+## U盘模式：TinyUSB Mass Storage Class，把 SD 卡整卡暴露给电脑当 U 盘。
+## / U-disk mode: expose the whole SD card to the host as a USB mass-storage device.
+dependencies:
+  espressif/esp_tinyusb:
+    version: "^2.0.1~1"

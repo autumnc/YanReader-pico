@@ -67,6 +67,7 @@ idf_component_register(SRCS
     "pcf85063.cpp"
     "chinese_almanac.cpp"
     "standby_clock.cpp"
+    "usb_msc.cpp"          # U盘模式：TinyUSB MSC 把 SD 卡整卡暴露给电脑
     "boot_splash.cpp"
     "json_parser.cpp"
     "json_utils.cpp"
@@ -115,6 +116,9 @@ idf_component_register(SRCS
         read_pico_pmu
         epdiy
         cst836u
+        esp_tinyusb
+        sdmmc
+        esp_driver_sdmmc
         e0470_epaper_waveform
         e0470_page_turn
         esp_hid
