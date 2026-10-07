@@ -322,7 +322,18 @@ size_t HalFile::write(const void* buf, size_t count) {
 }
 size_t HalFile::write(uint8_t b) {
   if (!impl || !impl->fp) return 0;
-  return fputc(b, impl->fp) == EOF ? 0 : 1;
+  // 必须是 fwrite，不能是 fputc —— picolibc 的 stdio 两条写路径对"缓冲区正好写满"处理不一致，
+  // 混用会把 stdio 缓冲区写越界一个字节：
+  //   fwrite：只在循环还要继续时才 flush，所以"这一笔正好填满 128 字节"会带着 len == size
+  //           返回（留到下一次 fwrite 入口才 flush，那时是安全的）；
+  //   __bufio_put（fputc/putc/fputs/fprintf 走的路径）：先写后判 ——
+  //           `buf[len++] = c; if (len >= size) flush;`
+  // 于是"fwrite 刚好填满 + 紧接着 fputc"会写 buf[128]，越过 128 字节的堆块一个字节，踩坏
+  // 相邻堆块头。整本重新缓存到"生成图书"那步随机崩溃重启，就是这个。
+  // 本机只有微信读书的 nav.part 会混用两条路径（writeLiteral 走 fwrite、writeXmlText 逐字节
+  // 走 fputc，两者交替），也只有"本机已有这本书"时字节数才对得上（新书对不齐就不触发）。
+  // 1 字节写并入 fwrite 后，一个 HalFile 只剩一条写路径。
+  return fwrite(&b, 1, 1, impl->fp);
 }
 
 bool HalFile::rename(const char* newPath) {

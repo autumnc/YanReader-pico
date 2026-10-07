@@ -21,7 +21,6 @@
 #include <cstring>
 #include <string>
 
-#include <esp_heap_caps.h>  // 诊断用：阶段边界全堆完整性检查（定位后删除）
 
 #include "../../../src/util/BookCacheUtils.h"
 #include "../../../src/util/TimeUtils.h"
@@ -76,16 +75,6 @@ void logMemory([[maybe_unused]] const char* phase) {
 void logJobComplete() {
   LOG_INF("WR", "job complete");
   logMemory("job complete");
-}
-
-// ── 诊断（定位后删除）────────────────────────────────────────────────────
-// 整本缓存偶发 TLSF 堆损坏：打包阶段 central.part 路径变乱码，随后 free 断言复位。
-// 越界写可能潜伏很久才被撞上，所以在阶段边界主动走一遍全堆完整性检查：
-// 第一次报出来的位置 = 写坏它的那个阶段。
-void checkHeapIntegrity(const char* where) {
-  if (!heap_caps_check_integrity_all(true)) {
-    LOG_ERR("WR", "HEAP CORRUPT first seen at: %s", where);
-  }
 }
 
 struct ResponseSink {
@@ -3484,7 +3473,6 @@ Error Operation::convertCoverSource(bool& converted) {
 }
 
 Operation::Event Operation::downloadNextImage() {
-  checkHeapIntegrity("download images");  // 诊断
   WeReadStore::ImageWorkRecord selected;
   uint32_t selectedIndex = 0;
   bool found = false;
@@ -4210,7 +4198,6 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
       return Event::ChapterComplete;
 
     case Phase::PrepareImages: {
-      checkHeapIntegrity("prepare images (after chapters)");  // 诊断
       if (options_.imagePolicy == WeReadStore::ImagePolicy::Exclude) {
         bookSession_.reset();
         progressStage_ = ProgressStage::Packaging;
@@ -4242,7 +4229,6 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
       return downloadNextImage();
 
     case Phase::PackageBook: {
-      checkHeapIntegrity("package start");  // 诊断
       bookSession_.reset();
       logMemory("package start");
       const unsigned long packageStartedAt = millis();
