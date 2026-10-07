@@ -4,8 +4,10 @@
  *
  * 错相揭页引擎实现（移植自 wegooo-cell/read-pico-reader）。
  * 16 带、每像素走完一整条相位梯子；差分只算一次，每拍只换对应相位的 1K LUT。
- * 梯子由调用方给（见 e0470_page_turn_ex）：默认表 GL16 37 相（精度高、~0.73s），
- * 跟随表 DU 8 相（正文页用，~0.29s）。
+ * 梯子由调用方给（见 e0470_page_turn_ex）：正文页用 8 灰阶表 30 相（~1.21s）、
+ * 图片页用默认表 GL16 37 相（~1.15s），**两张都是灰阶梯** —— 揭页的"波"是灰阶渐变，
+ * 落在眼睛里比黑白两级顺得多。跟随表 DU 8 相（黑白硬切、~0.29s）只给触摸笔迹，
+ * 不进揭页。
  */
 
 #include "e0470_page_turn.h"
@@ -48,23 +50,67 @@ void epd_clear_phase_luts(void) __attribute__((weak));
 //
 // 于是 stride 是"在相带数"与"总拍数"之间的唯一旋钮：
 //   在相带数 = ceil(phases/stride)，脏宽度 = 在相带数/bands；喂数要在这段时间里把
-//   这么多像素推完（整屏喂完约 10.7ms，一整帧约 7ms，所以脏宽度超过 ~65% 就追不上）。
-//   总拍数   = (bands-1)*stride + phases，而每拍至少一整帧扫描（~7ms），所以拍数就是墙钟时间。
+//   这么多像素推完（整屏喂完约 10.7ms，所以脏宽度超过 ~65% 就追不上）。
+//   总拍数   = (bands-1)*stride + phases，而每拍至少一整帧扫描，所以拍数就是墙钟时间。
 // 把"脏宽 ≤ 65%"这条约束代进去就只剩一个变量：stride ≥ phases/10.4（TURN_BANDS=16），
 //   总拍数 = 15·stride + phases ≈ (15/10.4 + 1)·phases ≈ 2.5·phases。
 //   **所以真正的调速杠杆是梯子的相数，不是 stride** —— stride 只是把"波"摊到那条
 //   约束线上，调大调小都换不回墙钟时间（大 stride = 拍数多但每拍干净，小 stride 反过来）。
-//   短梯（跟随表 DU，8 相）总拍数 ≈ 20、长梯（默认表 GL16，37 相）≈ 95，差 4.7 倍。
-//   见头文件 e0470_page_turn_ex()：正文页用短梯，图片页用长梯。
-// 两种梯子各记一份 stride：它们对喂数的要求差 4 倍多，共用一份会让短梯的一次失败
-// 把长梯也一起拖慢。只往大里调（见下面出错分支），一次失败换回整段会话的稳定，
-// 避免这一帧好下一帧坏地抖。
-#define TURN_BAND_STRIDE 4         // 长梯默认：脏宽 10/16 = 62%（65% 线内留一点给 UI/WiFi）
-#define TURN_BAND_STRIDE_SAFE 6    // 长梯退守：39%
-#define TURN_BAND_STRIDE_SHORT 2   // 短梯默认：脏宽 4/16 = 25%，拍数 15*2+8 = 38 → ~0.29s
-#define TURN_BAND_STRIDE_SHORT_SAFE 4  // 短梯退守：2/16
+//
+// 2026-10-07 上机实测正面验了一遍：GL16 @stride6 = 127 拍 × 7.46ms/拍 = 947ms 扫描，
+// 8 灰阶 @stride5 = 105 拍 × 7.46ms/拍 = 783ms —— **每拍扫描时长是波形族/脏宽的属性，
+// 不归 stride 管**（两者都 ≈7.46ms/拍），拍数 × 单拍扫描在 stride 之间基本守恒。
+// 所以灰色揭页在这块屏上就是 **~0.9–1.0s 的地板**，换梯子只值 10~20%，换不来 2×。
+//
+// 因此 2026-10-07 起**只留一条揭页梯**：默认表 GL16（37 相、16 灰阶）。原先还有一条
+// 给正文页的 8 灰阶短梯（30 相 @stride5 = 105 拍，快 179ms），连判据一起删了 ——
+// 那条判据是调用方的"变化千分比 < 300‰"，实测是个硬币：同一章普通正文页连续测出
+// 217/257/272/291/333/353/354‰，**300 正好切在分布正中间**，于是同一章里一半的页走
+// 一条梯、另一半走另一条。为 179ms 留着它会误判、还让图片页有落到 8 级灰（出带状）的
+// 风险，不划算；GL16 对所有页都对，两档也只差 179ms。
+//
+// 下面这条踩坑记录仍然有效，**别把 stride 调回 4**：
+//   · GL16 @stride4（脏宽 62%）：图片页连过 2 次、第三次 err=1024，正文页也 err=1024；
+//   · 一挂，stride 就被锁到 6（44%，127 拍）并拖累整段会话剩下的每一页。
+// 实测四档：
+//   · 跟随 DU（8 相，黑白两级）@2   38 拍  → ~0.29s（只给笔迹）
+//   · GL16（37 相）@6              127 拍 → ~1.06s（44% 脏宽，连过 14 次 + 另一场 6 次）
+//   · 8 灰阶（30 相）@5            105 拍 → ~0.88s ← 已删，判据认不出它
+//   · GL16（37 相）@4               97 拍 → ~1.15s ← **擦边，别用**（上面那条）
+// 注意 127 拍的实测墙钟是 1056ms，比"127 × 7.46ms"多 ~110ms：引擎的拍长下限是 7.5ms，
+// 而个别拍的扫描会冲到 8.2ms，于是自适应把下限抬到 ~8.0ms —— 下限成了约束，不是扫描。
+//
+// **默认值一律取实测稳过的那一档**，宁可慢一点也不要闪：只往大里调（见下面出错分支），
+// 一次失败换回整段会话的稳定，避免这一帧好下一帧坏地抖。
+#define TURN_BAND_STRIDE 6            // GL16：ceil(37/6)=7 → 脏宽 44%，拍数 127
+#define TURN_BAND_STRIDE_SAFE 8       // GL16 退守：ceil(37/8)=5 → 31%，拍数 157
+#define TURN_BAND_STRIDE_SHORT 2      // 跟随 DU（只给笔迹）：ceil(8/2)=4 → 25%，拍数 38
+#define TURN_BAND_STRIDE_SHORT_SAFE 4
 static int s_stride_long = TURN_BAND_STRIDE;
 static int s_stride_short = TURN_BAND_STRIDE_SHORT;
+
+// 本引擎认识的两张相位梯子。stride 的退守值（喂数跟不上时只往大里调）和日志名字
+// 都跟梯子绑在一起，免得下面出错分支再写一遍三目。
+typedef struct {
+    const EpdWaveform* waveform;
+    int* stride;
+    int stride_safe;
+    const char* name;
+} turn_ladder_t;
+
+// 跟随 DU 是给触摸笔迹跟手的（FAST 扫描、黑白两级），**不进揭页**：它比灰阶梯快约 4 倍，
+// 但只有黑白两级、看着是"跳"不是"淌"。揭页只有一条梯：默认表 GL16（37 相 @stride6
+// = 127 拍 ≈ 1.06s，16 灰阶）。
+static const turn_ladder_t kLadderShort = {
+    &E0470_FOLLOW_WAVEFORM, &s_stride_short, TURN_BAND_STRIDE_SHORT_SAFE, "跟随DU"};
+static const turn_ladder_t kLadderLong = {
+    &E0470_WAVEFORM, &s_stride_long, TURN_BAND_STRIDE_SAFE, "GL16"};
+
+/// 认不出的一律当 GL16 长梯：它的 stride 最保守，最不容易喂数跟不上。
+static const turn_ladder_t* ladder_for(const EpdWaveform* waveform) {
+    if (waveform == kLadderShort.waveform) return &kLadderShort;
+    return &kLadderLong;
+}
 
 // ---- 本地"空"波形：1 相、全 0 表 -------------------------------------------------
 // 错相揭页每拍只要**一相**扫描（相位由 epd_set_*_phase_luts 逐行/逐带选），波形本身
@@ -351,9 +397,9 @@ static enum EpdDrawError turn_impl(
         return EPD_DRAW_NO_PHASES_AVAILABLE;
     }
 
-    // 短梯 / 长梯各一份 stride（见 TURN_BAND_STRIDE 的说明）。
-    const bool short_ladder = (waveform == &E0470_FOLLOW_WAVEFORM);
-    int* const stride_slot = short_ladder ? &s_stride_short : &s_stride_long;
+    // 梯子决定 stride 与退守值（见 TURN_BAND_STRIDE 的说明）。
+    const turn_ladder_t* const ladder = ladder_for(waveform);
+    int* const stride_slot = ladder->stride;
 
     const int bands = TURN_BANDS;
     const int stride = *stride_slot;
@@ -473,10 +519,10 @@ static enum EpdDrawError turn_impl(
             // 喂数跟不上时面板会报空行队列不够。把 stride 调大（脏带更窄）就稳了
             // （见 TURN_BAND_STRIDE 的说明）：只往大里调，一次失败换回整段会话的稳定。
             // 这一次的收尾交给调用方 —— 它会退回本档位该走的普通刷新，屏幕照样拿到新页面。
-            const int fallback = short_ladder ? TURN_BAND_STRIDE_SHORT_SAFE : TURN_BAND_STRIDE_SAFE;
+            const int fallback = ladder->stride_safe;
             if ((err & EPD_DRAW_EMPTY_LINE_QUEUE) != 0 && *stride_slot < fallback) {
                 ESP_LOGW(TAG, "喂数跟不上（%s stride=%d），退回 %d",
-                         short_ladder ? "短梯" : "长梯", *stride_slot, fallback);
+                         ladder->name, *stride_slot, fallback);
                 *stride_slot = fallback;
             }
             break;
@@ -493,7 +539,7 @@ static enum EpdDrawError turn_impl(
         "dir=%s 梯=%s(%d相) stride=%d ticks=%d/%d gen=%d ms draw=%d ms scan_avg=%d us "
         "scan_max=%d us tick=%d us wall=%d ms err=%d",
         e0470_turn_dir_name(dir),
-        short_ladder ? "跟随DU" : "GL16",
+        ladder->name,
         nphase,
         stride,
         ticks_ran,

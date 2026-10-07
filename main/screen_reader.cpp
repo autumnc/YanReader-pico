@@ -5149,6 +5149,11 @@ static void rdPinShimFb() {
 
 void renderCurrent() {
   rdPinShimFb();
+  // 一帧分两段计时：**重画**（排版命中 + 字形栅格化 + 绘制，到推屏调用为止）与
+  // **推屏**（面板扫描；挂了揭页动画时就是那段动画的墙钟）。翻页那一帧收尾会打一行
+  // 拆开的耗时 —— 用户读到的"按下去卡一下"是前者，"动画顺不顺"是后者，混在一个
+  // 总数里就没法判断该往哪边使劲。
+  const int64_t tDrawStartUs = esp_timer_get_time();
   // 虚拟键盘增量帧：这一拍只有键盘面板变了，上半屏一个像素都不用重画
   // （帧缓冲里留着的就是上一帧的内容，本来也该是它）。见 s_vk_incr_ok。
   const bool vkIncr = s_vk_incr_ok && st.vkVisible && !st.fullRefresh &&
@@ -5378,16 +5383,23 @@ void renderCurrent() {
   // 前者动画替不掉清残影，后者本来就不是"翻一页"。
   const int turn = pendingTurn;
   s_pendingTurn = 0;
+  // 本帧有没有真的挂上揭页动画（收尾那行耗时日志要用）。
+  bool turnAnim = false;
   if (turn != 0 && pageTurnAnimOn() &&
       (m == HalDisplay::HALF_REFRESH || m == HalDisplay::GRAY8_TEXT_REFRESH)) {
-    // 梯子：正文页用短梯（跟随表 DU 8 相），图片页用长梯（默认表 GL16 37 相）。
-    // 判据和上面选档位用的是同一个变化量——≥300‰ 就是"有图/版式巨变"，短梯只有黑白
-    // 两级会把图压成硬边。短梯其实比它替掉的那次 GL16 局刷还快（38 拍 × 7ms 扫描
-    // ≈ 0.27s，而 GL16 局刷是 37 相 × 11.09ms 帧周期 ≈ 0.41s），所以动画不欠速度；
-    // 长梯（97 拍 ≈ 0.68s）才是"为了不出带状宁可慢一点"的那一档。
-    const bool textLike = (frameChange >= 0 && frameChange < 300);
-    reader_hint_page_turn(turnDirFor(turn), textLike ? 1 : 0);
+    // 揭页只有一条梯：默认表 GL16（37 相、16 级灰，@stride6 = 127 拍 ≈ 1.06s）。
+    // 曾经按这个 `frameChange` 再分出一条正文短梯（8 灰阶 30 相，快 179ms），
+    // 2026-10-07 删了：那个判据实测是个硬币（同一章正文页连续落在 217~354‰，300 正好
+    // 切在中间，同一章里一半的页走一条梯），而灰色揭页本来就有 ~0.9s 的地板，换梯子
+    // 买不到多少 —— 为 179ms 留个会误判、还让图片页可能落到 8 级灰出带状的判据不划算。
+    // 见 e0470_page_turn_ex() 的注释。
+    // 留着的这条是灰阶梯，这是刻意的：以前正文页走跟随表 DU（8 相、只有黑白两级），
+    // 快约 4 倍（0.29s），但看着是"啪一下硬切"而不是灰阶流淌 —— 快 ≠ 顺。跟随表是给
+    // 触摸笔迹跟手用的。
+    reader_hint_page_turn(turnDirFor(turn));
+    turnAnim = true;
   }
+  const int64_t tPushStartUs = esp_timer_get_time();   // 上面都算"重画"，下面都算"推屏"
   bool rtPresented = false;   // 本帧是自检页的自推屏（下面收尾要再置一次 dirty，见尾注）
   if (st.rtPending >= 0) {
     // 灰阶自检页（renderRefreshTest）的 Enter：这一帧的画已经画好了，但推屏要用它选的
@@ -5407,6 +5419,7 @@ void renderCurrent() {
     if (m == HalDisplay::FULL_REFRESH) ui_render_reader_vk_settle_forget();
     g_rd.displayBuffer(m);
   }
+  const int64_t tPushEndUs = esp_timer_get_time();
   // 白底参考帧纪律：**推屏之后**记下"面板上现在是不是中灰"（语义是面板现状，放在
   // 渲染入口记会让同一页的下一帧被自己置位 → 每帧白闪）。下一次走差分档的推屏会先
   // GC16 铺白再画（消费方在 display.c，只对差分档生效），这笔账随即清掉。
@@ -5416,6 +5429,28 @@ void renderCurrent() {
   // 自检页自推的那一帧：再画一次把刚测出的耗时显示出来（那一帧内容只差一行小字，
   // 差分刷很便宜）。放在 st.dirty = 0 之后，否则会被上面那行清掉。
   if (rtPresented) st.dirty = 1;
+  // 翻页那一帧把两段拆开记（见函数开头的计时说明）。只记翻页帧：菜单/列表那些帧
+  // 一帧一次会把日志淹掉，而这条要回答的问题只在翻页上。动画内部的账（相数、每拍
+  // 扫描耗时、墙钟）由 e0470_page_turn 自己打：`dir=… 梯=… ticks=… wall=…`。
+  // 判据是"用户按了翻页"（turn != 0），不是"动画挂上了" —— 换章那一帧动画会被跳过、
+  // 走的是一次全刷，那种帧的耗时同样要知道。
+  // 变化量也打出来：它决定档位（≥300‰ 走"局刷"而非"8灰阶正文刷"，也就是下面有没有
+  // 揭页动画），而 `自适应` 档之外它不打日志，曾经一整场会话每页都被判成"图片页"却
+  // 无从看出 —— 翻页这事上它是因，得记。它**不再**决定用哪条梯子（只剩一条了）。
+  if (turn != 0) {
+    const int renderMs = (int)((tPushStartUs - tDrawStartUs) / 1000);
+    const int pushMs = (int)((tPushEndUs - tPushStartUs) / 1000);
+    // 档位也用名字打（"无动画"那一支尤其要看得出它是不是掉到了全刷）。
+    const char *modeName = m == HalDisplay::FULL_REFRESH           ? "全刷"
+                           : m == HalDisplay::GRAY8_REFRESH        ? "全刷8灰阶"
+                           : m == HalDisplay::GRAY8_TEXT_REFRESH   ? "8灰阶正文刷"
+                           : m == HalDisplay::FAST_REFRESH         ? "极速"
+                           : m == HalDisplay::STATUS_REFRESH       ? "过渡屏"
+                                                                   : "局刷";
+    ESP_LOGI(TAG, "翻页耗时: 变化 %d‰ + 重画 %d ms + 推屏 %d ms = %d ms（%s，%s）", frameChange,
+             renderMs, pushMs, renderMs + pushMs, modeName,
+             turnAnim ? "揭页·GL16 37相" : "无动画");
+  }
   // 这一帧已经推出去了，用户正盯着新页看 —— 正是把排版余量补回来的空档。
   rdPrebuildAhead();
 }

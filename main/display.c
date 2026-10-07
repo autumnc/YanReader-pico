@@ -420,19 +420,22 @@ enum EpdDrawError update_display_gray8_status(EpdiyHighlevelState* hl) {
 // 阅读器翻页前用 reader_hint_page_turn() 放一个方向进来，这里**消费一次**：只有紧随
 // 其后的这一次刷新会走动画。做成一次性而不是"设了就一直有效"，是因为这个提示放在
 // 文件级静态里、阅读器那边又可能因为换章/图片页跳过这一帧 —— 留着不放就会在无关的
-// 一帧上突然放一段揭页动画。取走即清，语义最直白。第二个参数 fast 选梯子（见下）。
+// 一帧上突然放一段揭页动画。取走即清，语义最直白。
 static int s_turn_dir = -1;  // -1 = 无；否则是 e0470_turn_dir_t
-// 这一次要不要用短梯（跟随表 DU 8 相，~0.29s）。正文页翻页置 1：正文字形非黑即白，
-// 8 级粗梯够用，比 GL16 的 37 相快一倍多；图片页/版式大变仍走长梯（16 灰阶）。
-static int s_turn_fast = 0;
+
+// 揭页只有一条梯：默认表 GL16（37 相、16 级灰，@stride6 = 127 拍 ≈ 1.06s）。它比原来
+// "正文页走黑白 DU 短梯"（0.29s）慢得多，是有意换观感的：黑白两级在整屏翻页时看着是
+// "啪一下硬切"，灰阶梯才是"淌过去"。曾经还想按"变化千分比 < 300‰"给正文页再分一条
+// 8 灰阶短梯（快 179ms），2026-10-07 删了 —— 那个判据实测是个硬币（见
+// e0470_page_turn_ex() 的注释），而且灰色揭页本来就有 ~0.9s 的地板，换梯子买不到多少。
+
 
 // 揭页失败时要退回安全时钟，而它的定义在下面（跟 guard_draw_result 在一起）。
 // 这里先声明一次；C 的暂定定义 + 后面的带初值定义是合法的。
 static int s_pclk_mhz;
 
-void reader_hint_page_turn(int dir, int fast) {
+void reader_hint_page_turn(int dir) {
     s_turn_dir = dir;
-    s_turn_fast = fast;
 }
 
 void reader_release_page_turn(void) {
@@ -455,12 +458,12 @@ static EpdRect logical_full_screen(void) {
 // 交给调用方回退到本档位本来该走的普通刷新，那样屏幕既能拿到新页面，
 // 又能顺带把欠载交给 guard_draw_result 统一处理。基准也还是干净的 ——
 // e0470 只在成功时 copy_front_to_back，highlevel.c 的回写同样只在成功后发生。
-static enum EpdDrawError update_display_page_turn(EpdiyHighlevelState* hl, e0470_turn_dir_t dir, int fast) {
-    // 梯子选哪条只影响相数（= 墙钟），扫描档位两条都要快的：揭页每拍一屏，喂数本来就
-    // 是瓶颈，所以一律 FAST 档。预填行数仍受队列容量限制：32 行队列下总槽位
-    // 2*(32-1)=62，取 44/56 都在安全线内。
-    const EpdWaveform* wf = fast ? &E0470_FOLLOW_WAVEFORM : &E0470_WAVEFORM;
-    const int mode = fast ? MODE_DU : MODE_GL16;
+static enum EpdDrawError update_display_page_turn(EpdiyHighlevelState* hl, e0470_turn_dir_t dir) {
+    // 揭页只有一条梯（默认表 GL16，见 s_turn_dir 上方）。扫描档位必须用快的：揭页每拍
+    // 一屏，喂数本来就是瓶颈，所以一律 FAST 档。预填行数仍受队列容量限制：32 行队列下
+    // 总槽位 2*(32-1)=62，取 44/56 都在安全线内。
+    const EpdWaveform* wf = &E0470_WAVEFORM;
+    const int mode = MODE_GL16;
     read_pico_epd_use_scan(READ_PICO_EPD_SCAN_FAST);
     epd_lcd_set_prefill_lines(s_bulk_io ? 56 : 44);
     present_begin();
@@ -473,9 +476,11 @@ static enum EpdDrawError update_display_page_turn(EpdiyHighlevelState* hl, e0470
     rails_keepalive();
     if (result == EPD_DRAW_SUCCESS) {
         // 每个变化像素都完整走了一遍相位梯子，等价于整屏软刷，记进残影预算，否则翻页
-        // 动画会把"攒够几次升 GC16"的节拍拉长。短梯（DU 8 相）没有 GL16 那种来回
-        // 扫的大摆动，压残影能力弱，所以按两次算，逼它早点升 GC16 清账。
-        s_soft_refreshes += (fast ? 2 : 1);
+        // 动画会把"攒够几次升 GC16"的节拍拉长。它是 GL16 的整条相位梯（37 相、16 级灰），
+        // 来回扫的摆动与它替掉的那次差分正文刷同量级，所以和普通差分刷一样按 **1** 算。
+        // 以前正文页走的是跟随表 DU（8 相、黑白两级），没有那种大摆动、压残影明显更弱，
+        // 才特别按 2 算逼它早升 GC16 —— 换灰阶梯后那个理由不成立了。
+        ++s_soft_refreshes;
         return result;
     }
     ESP_LOGW(TAG, "错相揭页未完成 (%d)，本次回退普通刷新", (int)result);
@@ -507,7 +512,6 @@ enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
          kind == DISPLAY_KIND_STATUS)) {
         ESP_LOGI(TAG, "gray panel -> from-white full refresh (reset reference, keep content)");
         s_turn_dir = -1;
-        s_turn_fast = 0;
         result = update_display_from_white(hl);
         guard_draw_result(hl, result);
         return result;
@@ -518,11 +522,9 @@ enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
     //   FULL/GRAY8 是整屏全像素清账，动画替代它们反而清不掉残影；FAST 是用户显式
     //   选了"极速"或实体键盘打字帧，再掺 1.1s 的动画就违背了那个选择。
     const int turn = s_turn_dir;
-    const int turnFast = s_turn_fast;
     s_turn_dir = -1;
-    s_turn_fast = 0;
     if (turn >= 0 && (kind == DISPLAY_KIND_HALF || kind == DISPLAY_KIND_GRAY8_TEXT)) {
-        result = update_display_page_turn(hl, (e0470_turn_dir_t)turn, turnFast);
+        result = update_display_page_turn(hl, (e0470_turn_dir_t)turn);
         if (result == EPD_DRAW_SUCCESS) return result;
         // 失败就落到下面走这一档本来该走的普通刷新。
     }
