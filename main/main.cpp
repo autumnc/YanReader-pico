@@ -298,6 +298,17 @@ static void enterLightSleep(void) {
     // 墨水屏断电(双稳态保留画面)
     epd_poweroff();
 
+    // 面板下电之后，把总线引脚（D0~D15 / XCL / XLE / XSTL / SPV / CKV）显式拉到低电平并
+    // hold 住，整个浅睡期间都保持这个电平。理由见 epd_lcd_bus_park 的注释：面板断了电，
+    // 而总线上还挂着最后一帧的残余电平，睡一晚就是给源极线一个漂移的偏置，底色的不均匀
+    // 的灰多半有这个成分。唤醒时 display_bus_unpark() 把接线接回去（在下面 epd_poweron
+    // 之前，第一次刷新要用总线）。
+    //
+    // 走 display_bus_park 而不是直接 epd_lcd_bus_park：同一件事 display.c 的空闲下电
+    // 那一拍也要做（放下机器 8 秒后 HV 轨下电，画面在屏上挂很久的那种空闲），两边共用
+    // 一份"收过线没有"的状态 —— 混着直接调 epd_* 会让下一次推屏漏掉接回来那一步。
+    display_bus_park();
+
     // 电源键唤醒：PMU 事件拉低 FCA9555 INT#(GPIO41)，浅睡唤醒。
     gpio_config_t wcfg = {
         .pin_bit_mask = 1ULL << READ_PICO_IOE_INT_GPIO,
@@ -367,6 +378,10 @@ static void enterLightSleep(void) {
     // 才进队列 → 不拦的话就是"在待机画面按一下叫醒，回来发现模式被转了"。登记一次，
     // 让它把紧接着的那个抬手事件吞掉（input.cpp 里有时间窗）。
     if (key_wake) input_note_key_wake();
+
+    // 先把 sleeping 期间锁住的那些总线脚解回来、接线重建（display_bus_park 的逆操作），
+    // 再上电清屏 —— epd_clear 就要用总线了。
+    display_bus_unpark();
 
     // 面板重新上电 + 清屏；ui_restore_snapshot 用 from-white 重绘恢复原画面。
     epd_poweron();

@@ -43,6 +43,15 @@ void display_init(void);
 void rails_keepalive(void);
 void rails_idle_check(int64_t now_ms);
 
+/// 面板总线收线 / 接线回来。面板下电后总线脚还挂着最后一帧的残余电平，会给断电源极线
+/// 一个漂移偏置（"放着不动自己发灰发花"）。**每次下电都要收**：本文件的空闲下电路径
+/// 自己会调它，main.cpp 的浅睡前也调 —— 两处走同一份状态，混着调 epd_lcd_bus_* 会让
+/// 下一次推屏漏掉"接回来"那一步（屏上直接是花屏）。
+/// / Park/unpark the panel bus. Parked while the panel is unpowered; present_begin()
+/// unparks. Any power-off site must call park through here so the pair stays balanced.
+void display_bus_park(void);
+void display_bus_unpark(void);
+
 /// 全设备夜间反色开关。反色的实施点在 display.c 的推屏处（front/back 成对取反），
 /// **不在** HalDisplay —— 后者只覆盖阅读器一族，其余界面由渲染任务直呼本文件，
 /// 从那里走（见 display.c 顶部说明）。由 board_set_night() 统一转发。

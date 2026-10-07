@@ -71,10 +71,41 @@ void display_init(void) {
     if (s_rail_mtx == NULL) s_rail_mtx = xSemaphoreCreateMutex();
 }
 
-// 推屏开始：拿锁 + 上电。与 rails_keepalive()（放锁）严格成对。
-// / Present begin: take the lock then power on. Strictly paired with rails_keepalive().
+// ── 面板总线收线：**下电这一拍**也要做，不只是浅睡前 ──────────────────────
+// 面板断了电之后，总线脚仍挂在 LCD/RMT 输出上、带着最后一帧的残余电平，就是给已经断电的
+// 源极线一个缓慢漂移的偏置 —— 面板上的残余电荷因此越来越不均匀。用户侧看到的是
+// "这一页放着不动，过一会儿底色自己发灰、发花，全刷一遍才好"，并且"有时有、有时没有"
+// （取决于挂住前最后一次刷是整屏 GC16 还是差分、挂了多久、温度）。原话在 epdiy 的
+// epd_lcd_bus_park 注释里。
+//
+// 浅睡那条路一直有这一手（main.cpp 的 enterLightSleep → epd_lcd_bus_park），而
+// **空闲下电这条一直没有** —— 但空闲下电才是常态：放下机器超过 RAILS_IDLE_TIMEOUT_MS
+// （8 秒）而还没到自动待机档的所有时间都算，夜里更是整段挂着。所以下电时就收线，
+// 下一次推屏之前（present_begin）再接线回来。
+// / Park the panel bus on the idle rail-drop as well, not only before light sleep:
+// after power-off the bus pins still carry the last frame's levels and slowly bias the
+// unpowered source lines, which is what leaves a screen sitting idle graying out.
+// Present begins by unparking, so the pair is always balanced inside one present.
+static bool s_bus_parked;
+
+void display_bus_park(void) {
+    if (s_bus_parked) return;
+    epd_lcd_bus_park();
+    s_bus_parked = true;
+    ESP_LOGI(TAG, "panel bus parked (rails off)");
+}
+
+void display_bus_unpark(void) {
+    if (!s_bus_parked) return;
+    epd_lcd_bus_unpark();
+    s_bus_parked = false;
+}
+
+// 推屏开始：拿锁 + 接回总线 + 上电。与 rails_keepalive()（放锁）严格成对。
+// / Present begin: take the lock, unpark the bus, then power on. Paired with rails_keepalive().
 static void present_begin(void) {
     if (s_rail_mtx) xSemaphoreTake(s_rail_mtx, portMAX_DELAY);
+    display_bus_unpark();   // 空闲下电时收过的线，推屏前先接回来（见 display_bus_park）
     epd_poweron();
 }
 
@@ -91,6 +122,7 @@ void rails_idle_check(int64_t now_ms) {
     if (rails_deadline_ms != 0 && now_ms >= rails_deadline_ms) {
         rails_deadline_ms = 0;
         epd_poweroff();
+        display_bus_park();   // 下电即收线：不然总线带着最后一帧的残余电平给源极线加偏置
     }
     xSemaphoreGive(s_rail_mtx);
 }
