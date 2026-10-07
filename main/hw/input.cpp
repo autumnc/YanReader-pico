@@ -612,11 +612,32 @@ int input_poll() {
     }
 
     cst836u_touch_t touch = {};
-    if (cst836u_read(g_hw.touch, &touch) != ESP_OK) return 0;
-
-    update_key_held(&touch);
-    int key = poll_touch_gesture(&touch);
-    if (key != 0) return key;
+    if (cst836u_read(g_hw.touch, &touch) != ESP_OK) {
+        // 触摸读失败**不能**吞掉别的输入源。电源键走 PMU、晃动走 SC7A20H，是两个完全
+        // 独立的器件；触摸控制器一条 I2C 读失败没有任何理由让它们一起失灵。原来这里
+        // 直接 `return 0`（本函数最下面的电源键与 shake_poll 全都轮不到），症状就是
+        // 2026-10-07 那次"一直在晃屏也激发不出全刷、一直在操作屏幕不理"，而主循环心跳
+        // 照常 —— 主循环活着、输入死了，病因就在这一行。
+        // **不调 update_key_held()**：拿不到"当前按下状态"就不该改账。把它当"手指抬了"
+        // 会凭空合成一次抬起，误触发长按/点按；失败期间静默、恢复后自然用新的一拍校正。
+        // 失败时 poll_touch_gesture() 也不调，所以 s_held[] 停在旧值也不会吐出任何键。
+        // 限速记一行：cst836u 的读失败路径（cst836u.c:188/195）本身一行日志都不打，
+        // 不在这里记就只能靠猜 —— 这正是这个 bug 能藏住的原因。
+        static int64_t s_touch_fail_log_us = 0;
+        static uint32_t s_touch_fail_n = 0;
+        s_touch_fail_n++;
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - s_touch_fail_log_us > 3000000) {
+            ESP_LOGW(TAG, "触摸读失败 %u 次/3s → 本拍跳过手势，电源键/晃动照常",
+                     (unsigned)s_touch_fail_n);
+            s_touch_fail_log_us = now_us;
+            s_touch_fail_n = 0;
+        }
+    } else {
+        update_key_held(&touch);
+        int key = poll_touch_gesture(&touch);
+        if (key != 0) return key;
+    }
 
     // 电源键：短按 → 写作/阅读模式切换；长按满 8s → 关机预警（见 poll_pmu_key）。
     const int pk = poll_pmu_key();
