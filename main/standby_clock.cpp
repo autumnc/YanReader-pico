@@ -637,6 +637,26 @@ static void drawOffNotice() {
 }
 
 // ── 对外接口 ──────────────────────────────────────────────────────────────
+
+// 待机画面的"清底"：同一页连着推两遍整屏 GC16。
+//
+// 待机画面要在屏上挂很久（一晚到几天），"底色自己变灰、变得不均匀"是这一档的常见病。
+// 不是供电不稳 —— 面板这会儿已经 epd_poweroff()，双稳态自己撑住画面，电压掉只会让
+// **刷新**失败，不会让一幅静止的画慢慢糊开。真正的机制是残余电荷/粒子弛豫：面板断电后
+// 粒子朝残余电荷的方向慢慢舒展，原来就深的低灰区糊得最明显。
+//
+// GC16 的波形表里 15→15 是**全驱动**（15 帧全部动作，见 waveform 表的 gc16.h），不是
+// 保持 —— 所以连推两遍不是白推：第一遍把上一屏的残影清掉、把粒子都送到目标位，第二遍
+// 从"已经到位"的状态再推一遍，等于给要挂很久的那一页留一个更贴轨的起点。代价是多一次
+// 整屏刷新（约 0.4s），发生在下电之前，用户只多看到闪一下。
+//
+// 第二遍走的是 post_last_frame(JOB_FULL) 那条路（第一遍交完帧 s_taken 已经归 -1），
+// 推的仍是当前缓冲里的待机画面，不重绘、也不动 keep_frame 留的那份快照。
+static void standbyFillRefresh() {
+    ui_full_refresh_now();
+    ui_full_refresh_now();
+}
+
 void standbyClockDraw(StandbyFace face) {
     if (!g_u8g2) return;
 
@@ -652,7 +672,7 @@ void standbyClockDraw(StandbyFace face) {
         ttf_set_role(TTF_ROLE_CONTENT);   // 本页走内容面（正文那一路的字体）
         drawOffNotice();
         ttf_set_role(prev_role);
-        ui_full_refresh_now();
+        standbyFillRefresh();
         return;
     }
 
@@ -668,7 +688,7 @@ void standbyClockDraw(StandbyFace face) {
     else
         drawClockFace(lt, valid);
 
-    ui_full_refresh_now();  // 整屏 GC16；不更新快照，唤醒后据此恢复
+    standbyFillRefresh();   // 整屏 GC16 ×2（清底，见上）；不更新快照，唤醒后据此恢复
 }
 
 // ── 关机页 ────────────────────────────────────────────────────────────────
@@ -689,6 +709,10 @@ void standbyShutdownDraw() {
     drawCenteredPx(top + ttf_ascender_px(pxTitle), pxTitle, "已关机", 0, 15);
     drawCenteredPx(top + pxTitle + gap + ttf_ascender_px(pxSub), pxSub, "长按电源键约 1 秒开机", 0, 15);
     ttf_set_role(prev_role);
+    // 这里**刻意只刷一遍**（不像待机画面那样清两遍底）：这一页的时间窗只有约 2s
+    // （PMU 满 10s 直接拉 EN 硬断电），多一次整屏 GC16 要吃掉 0.4s，宁可用一帧换余量。
+    // 这一页确实也挂得久（挂到下次开机），若日后证明"关机久了也发灰"，再把它挪进
+    // standbyFillRefresh 那套双刷里也不难 —— 只是得先量准这页刷一遍的真耗时。
     ui_full_refresh_now();   // 整屏 GC16，推完才返回（ui_render_full_refresh 是同步的）
 }
 
