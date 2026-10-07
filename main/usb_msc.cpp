@@ -24,6 +24,12 @@
 #include "tinyusb_default_config.h"
 #include "tinyusb_msc.h"
 
+// 退出时要把共用的 FSLS PHY 拨回 USB-Serial-JTAG（见下面步骤 5 的说明）。
+#include "soc/soc_caps.h"
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+#include "hal/usb_serial_jtag_ll.h"
+#endif
+
 static const char *TAG = "usb_msc";
 
 // 主机对介质的占用状态。esp_tinyusb 已经强实现 start_stop_cb（弹出时把卡挂回 APP），
@@ -145,7 +151,8 @@ static void wait_sd_remounted(void) {
     }
 }
 
-esp_err_t usb_msc_run(usb_msc_should_exit_cb_t should_exit, usb_msc_blocked_cb_t on_blocked) {
+esp_err_t usb_msc_run(usb_msc_should_exit_cb_t should_exit, usb_msc_blocked_cb_t on_blocked,
+                      usb_msc_exiting_cb_t on_exiting) {
     // 每次进入都从"主机未占用"起算：上一轮退出若走的是拔线（不产生 PREVENT/ALLOW
     // 或 START STOP UNIT，s_host_hold 不会被清），残留的 true 会让本轮一上来就拒退。
     s_host_hold = false;
@@ -219,6 +226,9 @@ esp_err_t usb_msc_run(usb_msc_should_exit_cb_t should_exit, usb_msc_blocked_cb_t
             continue;
         }
         ESP_LOGI(TAG, "exit accepted, tearing down");
+        // 卸载+重挂要一会儿（秒级），先让上层把"正在退出…"画上去：否则屏上还停着
+        // "退出 U 盘模式"那一页，用户看不出已经退出了，会反复点。
+        if (on_exiting) on_exiting();
         break;
     }
 
@@ -226,6 +236,22 @@ esp_err_t usb_msc_run(usb_msc_should_exit_cb_t should_exit, usb_msc_blocked_cb_t
     //    最后收裸卡。顺序不能反：先删存储时 TinyUSB 任务还在跑，主机的读写会在半路撞上
     //    已关闭的介质，卸载时挂死甚至写坏卡。esp_tinyusb 示例统一先 driver_uninstall。
     tinyusb_driver_uninstall();
+
+    // 5b. 把 FSLS PHY 交还给 USB-Serial-JTAG（否则退出 U 盘后串口/刷机口消失）。
+    //
+    // ESP32-S3 只有一路 FSLS PHY（SOC_USB_FSLS_PHY_NUM==1），USB-Serial-JTAG 与 USB-OTG
+    // 靠 RTCCNTL.usb_conf 的 mux 二选一：sw_hw_usb_phy_sel=1（软件控制）时
+    // sw_usb_phy_sel=0 → PHY 给 USJ，=1 → PHY 给 OTG。
+    // 装 OTG 时 usb_wrap_ll_phy_enable_external(false) 把 mux 拨到 OTG 侧；而卸载时
+    // usb_del_phy() 只清 pad 的上下拉覆盖、phy_uninstall() 只关 OTG wrap 的时钟，
+    // **没有任何一步把 mux 拨回来** —— 于是 USJ 侧从此没有 PHY，PC 上的串口（也是刷机口）
+    // 一直到复位为止都不再出现。这里照 usb_serial_jtag_driver_install() 的做法补上两步，
+    // 把 PHY 与 pad 重新交给 USJ（USJ 驱动本身一直装着，不必也不能重装）。
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+    usb_serial_jtag_ll_phy_enable_external(false);  // PHY 路由回 USJ
+    usb_serial_jtag_ll_phy_enable_pad(true);        // 打开 PHY 的 D+/D- pad
+#endif
+
     tinyusb_msc_delete_storage(handle);
     storage_teardown_sdmmc(&card);
 

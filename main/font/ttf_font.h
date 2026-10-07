@@ -86,7 +86,14 @@ esp_err_t ttf_font_open_alt(const char* path);
 esp_err_t ttf_font_open_logo(void);
 void ttf_font_close_alt(void);
 bool ttf_font_alt_ready(void);
-/// 控制任务独占传字体时切内置并暂停 SD 打开；停服后解除，保留字体设置。/ Switch to built-in and suspend SD opens on the owner task for font transfer; resume after stop without changing settings.
+/// 「SD 上的字体文件在接下来这段时间不可用」：true = 内容面切内建、关掉次字面、并拒绝
+/// 任何按路径重开；false = 解除禁令（**恢复用户字体要由调用方自己按设置重开**，这里
+/// 不替它记路径，见 screen_reader.cpp 的 applyUserContentFont()）。
+///
+/// 两个用途，本质是同一件事 —— 别让字体面攥着一条已经失效的 SD 句柄：
+///   1) 控制任务独占传字体（整卡在写）；
+///   2) U 盘模式：SD 整卡交给电脑（usb_msc_run 会卸载再重挂），前后必须各调一次，
+///      否则退出后 fatfs 实例换了新挂载，旧的 fd 仍在，整机掉字。
 esp_err_t ttf_font_suspend_sd(bool suspend);
 /// 内容面**就是**内置字体（= 用户没选外置字体）。此时内置面根本不会被单独加载
 /// （ttf_set_role(UI) 会直接映射到内容面），一切与"只有一份字体"时完全一致。

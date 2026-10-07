@@ -6427,6 +6427,17 @@ static void usbDriveBlockedHint() {
   drawUsbDrivePage(true);
 }
 
+// usb_msc_run 接受退出时回调：卸载 MSC + 重挂 SD 的那几秒画这件事本身。
+// 不画按钮 —— 这一页出现就意味着退出已经定了，再画一个"退出"按钮只会让人以为没退成。
+// 这一帧由 screen_reader_init() 的首帧接上（它那一帧走整屏全刷）。
+static void usbDriveExitingHint() {
+  g_rd.clearScreen();
+  const int top = drawTitle("U盘模式");
+  drawCenteredLine(top + (statusTop() - top) / 2 - uiLineHeight(), "正在退出 U 盘模式…");
+  drawCenteredLine(top + (statusTop() - top) / 2 + 8, "正在重新挂载 SD 卡，请稍候");
+  g_rd.displayBuffer(HalDisplay::FULL_REFRESH);
+}
+
 static void doMenuAction(MenuAct act) {
   switch (act) {
     case MenuAct::Toc:
@@ -6678,14 +6689,32 @@ static void doMenuAction(MenuAct act) {
       st.dirty = 1;
       break;
     case MenuAct::UsbDrive:
-      // U 盘模式：先画提示页，再把阅读器整个退掉（释放所有 SD 文件句柄）；写作模式若
-      // 为竖屏，exit 会恢复成竖屏，所以这里再拉回横屏，让触摸映射/绘制/按钮命中在
-      // 整个等待期间都是同一套 1216×684 坐标。usb_msc_run() 卸载 SD、接管 USB，阻塞到
-      // 点中"退出"按钮且主机已安全弹出（主机仍占用时只刷警告、不退出），最后重进阅读器。
+      // U 盘模式：先画提示页，再把阅读器整个退掉（释放所有 SD 文件句柄）。
+      // **退出后必须把 epd 旋转与 g_rd 方向一起钉回阅读方向**（applyReaderOrientation），
+      // 不能只拨 epd（board_restore_orientation 恢复的是全局方向，可能是另一种）。
+      // 理由：这一页的页面几何、退出按钮命中框全取自 g_rd 与那几个排版基准，而触摸坐标
+      // 取自 epd_get_rotation()。两者不一致时就是"点了没反应"——竖屏下 g_rd 仍按
+      // 684×1216 几何算按钮（y 能到 ~1136），点按坐标却按横屏映射（y ≤ 684），
+      // 两个矩形永远碰不上，按钮完全点不动；横屏下两者一致，所以只有竖屏用户会踩到。
+      // usb_msc_run() 卸载 SD、接管 USB，阻塞到点中"退出"按钮且主机已安全弹出
+      // （主机仍占用时只刷警告、不退出），最后重进阅读器。三个回调各管一屏：
+      // 命中判定 / 主机未弹出警告 / 退出已定的"正在退出…"，后两屏也画在同一套方向里。
       drawUsbDrivePage(false);
       screen_reader_exit();
-      board_force_landscape();
-      usb_msc_run(usbDriveShouldExit, usbDriveBlockedHint);
+      // SD 整卡马上要交给电脑：**把字体面从 SD 上收回来**（内容面切内建、关掉次字面）。
+      // 不收的话 ttf 会一直攥着指向"即将被卸载的那个 FATFS 实例"的 fd：主机接管卡之后
+      // 画那几页（警告页/"正在退出…"）仍会走这条死句柄 —— 读失败就是掉字，而更糟的是
+      // 设备与主机同时摸一张卡。重挂之后更是雪上加霜：applyUserContentFont() 因为
+      // "路径没变"短路掉、根本不重开，于是退出 U 盘后整机（含阅读页）一直掉字。
+      // 挂起期间 ttf 一律不碰 SD，那几页改用内建字面画（字形齐全）。
+      ttf_font_suspend_sd(true);
+      applyReaderOrientation();
+      usb_msc_run(usbDriveShouldExit, usbDriveBlockedHint, usbDriveExitingHint);
+      // SD 已重挂：解禁并按设置重开用户字体（此刻内容面还是内建，所以这一次是真开，
+      // 不会被 applyUserContentFont 的"同路径"短路挡掉）。书内字面/次字面由下面的
+      // init 重开（openEpub 按 st 里记的路径重装）。
+      ttf_font_suspend_sd(false);
+      applyUserContentFont();
       screen_reader_init();
       break;
     case MenuAct::ToShelf:
