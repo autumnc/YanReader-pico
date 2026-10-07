@@ -442,6 +442,13 @@ void reader_release_page_turn(void) {
     e0470_page_turn_release();
 }
 
+// 揭页动画期间的补采回调（阅读器注册 input_tick，见 reader_page_turn.h）。
+// 在这里转一道手：阅读器不能 include e0470_page_turn.h（那会拖进 epdiy.h），
+// 跟 reader_hint_page_turn 同一个理由。
+void reader_page_turn_set_tick_hook(void (*hook)(void)) {
+    e0470_page_turn_set_tick_hook(hook);
+}
+
 // 逻辑全屏矩形。错相揭页的 area 参数是逻辑坐标，而 epd_full_screen() 给的是**物理**
 // 尺寸（epdiy 的 rotation 只存枚举、不换宽高），两者在竖屏下不同，所以这里显式用
 // epd_rotated_*() 拿逻辑尺寸。

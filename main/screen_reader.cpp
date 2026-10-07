@@ -8990,6 +8990,12 @@ void screen_reader_init() {
   // g_rd.begin() 之后 frameBuffer 才有效，立刻把 u8g2 shim 也钉上去（理由见 rdPinShimFb）。
   rdPinShimFb();
 
+  // 揭页动画期间每 8 拍补采一次输入。动画 ≈1.06s 是这一段同步阻塞里最长的一截，
+  // 期间没人读触摸控制器 —— 而点按必须"按下"与"抬手"各被采到一次，整段落在动画里的
+  // 点按一点痕迹都不留（用户侧："点了要等一会儿才翻页，这期间怎么点都一样"）。
+  // 回调在推屏那个任务里跑（就是本任务），cst836u 的约束满足。
+  reader_page_turn_set_tick_hook(&input_tick);
+
   // UI 字体（菜单/书架/词典）跟随写作模式共享字号；正文字体 5 档独立。
   // 像素高 ≈ 字号 * 2.1：22pt→46 / 20pt→42 / 18pt→38。阅读器的整套界面版式都从
   // uiLineHeight() 派（footerH/statusTop/coverTop/drawTitle），所以这一个值定了全缩放。

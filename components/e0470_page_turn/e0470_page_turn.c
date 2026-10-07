@@ -156,6 +156,18 @@ static int s_lut_n;
 // 抖动（WiFi/UI 抢核）不该让后面每一次翻页都跟着变慢。
 static int s_tick_us = E0470_TURN_DEFAULT_TICK_US;
 
+// 拍循环里的可选回调（e0470_page_turn_set_tick_hook）。用途只有一个：整段揭页动画
+// 1.06s 是主循环里的一段同步阻塞，期间没人读触摸控制器 —— 而"点按"要求"按下"和"抬手"
+// 各被采到一次，整段落在动画里的点按一点痕迹都不留（用户侧："点了要等一会儿才翻页，
+// 这期间怎么点都一样"）。调用方（阅读器）在这里按节拍补采一次输入。
+// 回调**只允许**在调用本引擎的那个任务里做它该做的事（cst836u 只能从主循环那个任务
+// 读），引擎自己不认识输入层，也不该认识。
+static void (*s_tick_hook)(void);
+
+void e0470_page_turn_set_tick_hook(void (*hook)(void)) {
+    s_tick_hook = hook;
+}
+
 void e0470_page_turn_release(void) {
     heap_caps_free(s_lut);
     s_lut = NULL;
@@ -530,6 +542,12 @@ static enum EpdDrawError turn_impl(
         if (tick_target > 0 && used < tick_target) {
             esp_rom_delay_us((uint32_t)(tick_target - used));
         }
+        // 每 8 拍（≈60ms，127 拍里 16 次）给调用方一次补采输入的机会，见 s_tick_hook 的说明。
+        // 节拍取 60ms：一次人手点按的按住时长通常 ≥80ms，任何 ≥60ms 的按住都必然被采到
+        // 一次。**放在补足拍长之后**：这一拍的空档（目标 7.5ms 与单拍扫描 ~7ms 之差）正好
+        // 吃掉这点开销，动画墙钟基本不动（16 次 × ~0.5ms ≈ 8ms/翻页），也不进 used 的
+        // 自适应 —— 否则那点开销会被 tick_target 抬 0.2ms 传给后面每一拍。
+        if (s_tick_hook != NULL && (tick & 7) == 0) s_tick_hook();
     }
 
     // 扫描失败时屏幕可能停在中间相位，保留旧帧基准给调用方恢复。

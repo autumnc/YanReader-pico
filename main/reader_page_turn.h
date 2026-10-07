@@ -30,6 +30,14 @@ void reader_hint_page_turn(int dir);
 /// include e0470_page_turn.h（那会拖进 epdiy.h，见文件头的说明）。
 void reader_release_page_turn(void);
 
+/// 注册"揭页动画期间每 8 拍（≈60ms）调一次"的回调 —— 阅读器在这里注册 input_tick()。
+/// 理由（2026-10-07 用户报的"点了要等一会儿才翻页、这期间怎么点都一样"）：一次翻页里
+/// 重画(292~742ms) + 揭页动画(~1060ms) + 预热(126~321ms) 三段都是同步阻塞，
+/// 中间只有两个采样点，而点按必须"按下"与"抬手"各被采到一次 —— 整段落在里面的点按
+/// 一点痕迹都不留。动画是其中最大的一段，这里就是它的采样点。
+/// 回调跑在调用推屏的那个任务里（阅读器整条绘制+推屏都在主循环那个任务，core0）。
+void reader_page_turn_set_tick_hook(void (*hook)(void));
+
 #ifdef __cplusplus
 }
 #endif

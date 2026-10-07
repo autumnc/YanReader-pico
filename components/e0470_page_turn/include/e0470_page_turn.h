@@ -44,6 +44,15 @@ const char* e0470_turn_dir_name(e0470_turn_dir_t dir);
 /// 每拍目标时长（下限，实际以单拍扫描耗时为准）。调小更跟手，但拍间可能追不上扫描。
 void e0470_page_turn_set_tick_us(int us);
 int e0470_page_turn_tick_us(void);
+
+/// 揭页动画期间的可选"补采"回调：拍循环里每 8 拍（≈60ms，GL16 的 127 拍里 16 次）调一次。
+/// 用途只有"长阻塞段补采输入"这一件事（见 main/hw/input.h 的 input_tick）：
+/// 整段动画 ≈1.06s 是主循环里的一段同步阻塞，期间没人读触摸控制器，而点按要求
+/// "按下"和"抬手"各被采到一次 —— 整段落在动画里的点按一点痕迹都不留。
+/// 节拍 60ms 的依据：一次人手点按的按住时长通常 ≥80ms，任何 ≥60ms 的按住都必然被采到。
+/// 开销 16 次 × ~0.5ms ≈ 8ms/翻页，且落在每拍的补足空档里（见 .c 里的落点说明）。
+/// 回调跑在**调用本引擎的那个任务**里；传 NULL 取消。引擎不关心它做什么。
+void e0470_page_turn_set_tick_hook(void (*hook)(void));
 /// 离开阅读时释放按需分配的 37KiB 相位表（PSRAM）。
 void e0470_page_turn_release(void);
 
