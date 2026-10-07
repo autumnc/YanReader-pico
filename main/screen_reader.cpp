@@ -1533,6 +1533,9 @@ static const int kPrebuildAhead = 5;
 // 自然失效，所以不用显式清。
 static std::string s_rdSbTriedPath;
 
+// 定义在 rdWarmPageText 之后（那边才凑齐整页预取的机件）。
+static void rdWarmAheadGlyphs();
+
 static void rdPrebuildAhead() {
   if (st.mode != RdMode::Reading) return;
   // （1）待机整屏封面：表盘是「书籍封面」时它总要生成，但开书那一趟被门控跳过了
@@ -1547,6 +1550,10 @@ static void rdPrebuildAhead() {
       rdBuildStandbyCoverForOpenBook();
     }
   }
+  // （2）下一页的整页字形：与上面的排版余量同一个道理 —— 把"翻页那一拍要付的钱"提前。
+  // 放在这里（而不是下面 bookKind==0 那段里）是因为 TXT 也要暖，而下面那条分支把
+  // 非 EPUB 全都早退了。它自己判 mode/bookKind 并带去重键，重复调是空操作。
+  rdWarmAheadGlyphs();
   if (st.bookKind != 0 || !st.section) return;
   // 挂起的弹注排在最前面：它要的是**锚点那一页**，可能远在几十页之外（注文常整块压在
   // 章末），比"领先读者 kPrebuildAhead 页"要紧得多。它自己带预算，也在里面把结果弹出来。
@@ -1942,6 +1949,85 @@ static void rdWarmPageText(const RdPageText &pt) {
   rdWarmStrings(TTF_ROLE_CONTENT_ALT, alt);
   rdWarmStrings(TTF_ROLE_CONTENT, main);  // 最后把角色留在内容面，跟改之前一致
 }
+
+// 收集 TXT 第 p 页的行。切行规则与 renderTxtPage 是**同一份**，抽出来是为了让空闲
+// 帧能对"下一页"用完全一样的切法预热 —— 两边一旦不一致，暖的就是另一页的字。
+static void txtPageSegs(int p, std::vector<std::string> &segs) {
+  segs.clear();
+  const std::string &t = st.txtUtf8;
+  if (p < 0) return;
+  const int lpp = linesPerPage();
+  const size_t base = static_cast<size_t>(p) * static_cast<size_t>(lpp);
+  segs.reserve(static_cast<size_t>(lpp));
+  for (int ln = 0; ln < lpp; ln++) {
+    size_t li = base + ln;
+    if (li >= st.txtLineStarts.size()) break;
+    size_t ls = st.txtLineStarts[li];
+    size_t le = (li + 1 < st.txtLineStarts.size()) ? st.txtLineStarts[li + 1] : t.size();
+    if (le > t.size()) le = t.size();
+    if (ls >= le) { segs.emplace_back(); continue; }
+    std::string seg = t.substr(ls, le - ls);
+    if (!seg.empty() && seg.back() == '\n') seg.pop_back();
+    segs.push_back(std::move(seg));
+  }
+}
+
+// ── 空闲帧把"下一页"的整页字形先栅格化进缓存 ────────────────────────────────
+// 翻页那一帧的**重画**实测 900~1240ms（同日四次：1240/1023/1018/900），而重画的构成是
+// 「排版命中 + 字形栅格化 + 绘制」：排版早就被 rdPrebuildAhead 提前跑在读者前面 5 页了，
+// 剩下的大头是**新一页的新字**——内容面字形缓存 3MB（ttf_font.c 的 TTF_CACHE_LIMIT）
+// 大致只装得下一页的量，所以每次翻页都在付一遍冷字形的栅格化。
+// 这里用**现成的整页预取**（rdWarmPageText → ttf_warm_text_px，已经在缓存里的字自己跳过）
+// 把它挪到"读者盯着上一页看"的空档里；翻页那一拍的重画就只剩把已缓存的位图贴进帧缓冲。
+//
+// 只往前暖**同一节内**的下一页：跨节/末页那一翻要 openSpine，会改 st —— 那是翻页那一拍
+// 的活，空闲帧偷做等于替用户翻页。跨章那一翻本来就带一次整屏全刷，快不了也不该假装快。
+// 一本书 + 一页 + 一档排版只做一次（键里带字号/行距/边距/缩进，改设置自然重暖一次）。
+static std::string s_warmKey;
+
+static void rdWarmAheadGlyphs() {
+  if (st.mode != RdMode::Reading) return;
+  if (st.bookKind != 0 && st.bookKind != 1) return;   // XTC 是整页位图，没有字形
+  const int fontId = BODY_FONT_ID_BASE + st.fontLevel;
+
+  std::string key = st.bookPath + "#" + std::to_string(st.bookKind) + "#" +
+                    std::to_string(st.fontLevel) + "#" +
+                    std::to_string(static_cast<int>(st.lineSpacing * 100)) + "#" +
+                    std::to_string(st.marginIdx) + "#" + std::to_string(st.indentMode);
+
+  const int64_t t0 = esp_timer_get_time();
+  if (st.bookKind == 0) {
+    if (!st.section) return;
+    const int np = st.page + 1;
+    if (np >= static_cast<int>(st.section->pageCount)) return;
+    key += "#" + std::to_string(st.spineIndex) + ":" + std::to_string(np);
+    if (key == s_warmKey) return;
+    auto page = st.section->loadPage(np);
+    if (!page) return;
+    rdWarmPageText(rdBuildPageText(*page, fontId, bodyMargin(), RD_BODY_TOP));
+  } else {
+    const int np = st.txtPage + 1;
+    if (np >= totalPages()) return;
+    key += "#-1:" + std::to_string(np);
+    if (key == s_warmKey) return;
+    std::vector<std::string> segs;
+    txtPageSegs(np, segs);
+    size_t total = 0;
+    for (const auto &s : segs) total += s.size();
+    std::string all;
+    if (total > 0) {
+      all.reserve(total + 8);
+      for (const auto &s : segs) all += s;
+    }
+    rdWarmStrings(TTF_ROLE_CONTENT, all);   // TXT 没有样式，只有内容面
+  }
+  s_warmKey = key;
+  // 这一行就是判断本方案成不成立的地方：它若接近重画那 900~1240ms，说明冷字形确实是大头；
+  // 若只有几十毫秒，说明钱不在字形上，得回去重新定位（别照着一厢情愿往下改）。
+  ESP_LOGI(TAG, "预热 下一页 字形 %d ms（重画基线 900~1240 ms）",
+           static_cast<int>((esp_timer_get_time() - t0) / 1000));
+}
+
 
 // 词序列 → 展示文本。中日韩之间不加空格（原文本来就没有），拉丁词之间补一个空格。
 static bool rdAsciiWordChar(char c) {
@@ -2467,31 +2553,19 @@ static void renderEpubPage() {
 
 static void renderTxtPage() {
   g_rd.clearScreen();
-  const std::string &t = st.txtUtf8;
   int fontId = BODY_FONT_ID_BASE + st.fontLevel;
   int lh = static_cast<int>(g_rd.getLineHeight(fontId) * st.lineSpacing + 0.5f);
-  int lpp = linesPerPage();
   int tp = totalPages();
   if (st.txtPage >= tp) st.txtPage = tp - 1;
   if (st.txtPage < 0) st.txtPage = 0;
-  size_t base = static_cast<size_t>(st.txtPage) * lpp;
   int y = RD_BODY_TOP;
   int asc = g_rd.getFontAscenderSize(fontId);
   std::vector<std::string> segs;   // 同时留一份给"文字地图"（长按选词用）
-  segs.reserve(static_cast<size_t>(lpp));
   // 1) 先切好这一页的行（不画）。原文是边切边画，但整页预取必须先把整页的字收齐，
   //    所以这里拆成"收集 → 预取 → 绘制"三步，绘制结果与原顺序逐像素一致。
-  for (int ln = 0; ln < lpp; ln++) {
-    size_t li = base + ln;
-    if (li >= st.txtLineStarts.size()) break;
-    size_t ls = st.txtLineStarts[li];
-    size_t le = (li + 1 < st.txtLineStarts.size()) ? st.txtLineStarts[li + 1] : t.size();
-    if (le > t.size()) le = t.size();
-    if (ls >= le) { segs.emplace_back(); continue; }
-    std::string seg = t.substr(ls, le - ls);
-    if (!seg.empty() && seg.back() == '\n') seg.pop_back();
-    segs.push_back(std::move(seg));
-  }
+  //    切行搬去了 txtPageSegs：空闲帧对"下一页"的预热要用完全一样的切法，
+  //    两份一旦分家，暖的就是另一页的字（脚本上看不出来，只有手感会变）。
+  txtPageSegs(st.txtPage, segs);
   // 2) 整页预取（TXT 是按行切的，没有词表，直接把行拼起来）。
   {
     size_t total = 0;
@@ -5399,6 +5473,13 @@ void renderCurrent() {
     reader_hint_page_turn(turnDirFor(turn));
     turnAnim = true;
   }
+  // 推屏前补采一次输入：阅读器整条绘制 + 推屏都在主循环那个任务里同步跑，上面这截
+  // "重画"实测 571~1344ms，期间主循环一次触摸都不采，落在里面的点按整个丢掉（用户侧
+  // 就是"点了没反应"）。补采到的键暂存，下一次 input_poll() 取走。**只补这一次**：
+  // 下面 displayBuffer 内部的揭页动画（127 拍 ≈ 1s）不再插钩子——那是通用组件，为它开
+  // 一个回调口不值得，而且动画期间本来就该看动画。cst836u 不是线程安全的，这里就是
+  // 它允许被调的那个任务（阅读器不绕 core1，见 screen_reader_init 的说明）。
+  input_tick();
   const int64_t tPushStartUs = esp_timer_get_time();   // 上面都算"重画"，下面都算"推屏"
   bool rtPresented = false;   // 本帧是自检页的自推屏（下面收尾要再置一次 dirty，见尾注）
   if (st.rtPending >= 0) {
