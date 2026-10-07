@@ -425,6 +425,13 @@ static const char *kAlignLabels[4] = {"两端", "左", "居中", "书籍样式"}
 // 阅读线（正文行间引导线）的四种线型。0 就是关，菜单标签直接用它。
 // 新加的「实线」排在末位，是为了让老设置里存着的 0/1/2 含义不变。
 static const char *kReadingLineNames[4] = {"无", "虚线", "点线", "实线"};
+// 下面这几档的标签同时被「排版设定」的列表行和它的弹出层用（rdPickFill），所以只留
+// 这一份：两处若各写一套，改档位时容易只改一处（列表说"强制"、弹层说"取消"）。
+static const char *kIndentLabels[3] = {"自动", "强制", "取消"};
+static const char *kMarginLabels[3] = {"窄", "标准", "宽"};
+static const char *kImageScalingLabels[2] = {"最近邻", "双线性"};   // 下标 = st.imageBilinear
+static const char *kOrientNames[2] = {"竖屏", "横屏"};              // 下标 = 0 竖 / 1 横
+static const char *kOrientKeys[2] = {"portrait", "landscape"};
 
 // ── 样式解析：书籍内嵌 / 强制指定（设置 → 样式解析）────────────────────────
 // 书籍内嵌（默认）= 按书里 CSS 排：对齐、缩进、字号都听书的（用户在这三项上的
@@ -2359,6 +2366,24 @@ static void rdDrawReadingLines(int fontId) {
   }
 }
 
+// 正文墨色作用域（排版设定里的「字重」「对比度」）。这两档只作用于**书的正文**，
+// 所以做成"进正文前打开、画完关掉"的栈上对象：界面外壳（菜单/状态栏/标签栏/目录/
+// 笔记/词典）都画在作用域之外，观感一分不变。
+//
+// 为什么必须显式加作用域、而不是按"角色是 CONTENT 就算正文"：没装外置字体时
+// uiFontId() 返回的就是 CONTENT_UI_FONT_ID，界面外壳也画在内容面、角色也是 CONTENT
+// （见 uiFontId 的说明），按角色判会把菜单一起改了。
+//
+// 用栈上对象而不是首尾两次调用：正文路径中途有早退（页面没读出来、TXT 页越界），
+// RAII 保证无论如何都会收尾（忘了 end 就会把墨色状态漏给后面的界面绘制）。
+struct RdBodyInkScope {
+  RdBodyInkScope() {
+    ttf_body_ink_begin(kFontWeights[clampI(st.fontWeight, 0, kFontWeightCount - 1)],
+                       kContrastGammas[clampI(st.contrast, 0, kContrastCount - 1)]);
+  }
+  ~RdBodyInkScope() { ttf_body_ink_end(); }
+};
+
 static void renderEpubPage() {
   g_rd.clearScreen();
   const int fontId = BODY_FONT_ID_BASE + st.fontLevel;
@@ -2391,7 +2416,12 @@ static void renderEpubPage() {
         st.pageLinks.push_back({std::string(lk.href), lk.x + bodyMargin(), lk.y + RD_BODY_TOP, lk.width, lk.height});
       }
       rdWarmPageText(g_pageText);
-      page->render(g_rd, fontId, bodyMargin(), RD_BODY_TOP);
+      {
+        // 正文墨色（字重/对比度）只在这里打开：这一行是 EPUB 正文的唯一出口，
+        // 状态栏/阅读线/标注叠加层都画在作用域外，观感不受影响（见 RdBodyInkScope）。
+        RdBodyInkScope ink;
+        page->render(g_rd, fontId, bodyMargin(), RD_BODY_TOP);
+      }
       // 图片解码缓存(.pxc 像素)在 RAM 里的那份副本：整页渲染期间留着，好让同一页
       // 的多趟绘制不再读 SD；这一页画完就还回去。它最大 96KB PSRAM，跨页持有没意义。
       ImageBlock::releaseRenderCache();
@@ -2442,9 +2472,13 @@ static void renderTxtPage() {
     rdWarmStrings(TTF_ROLE_CONTENT, all);  // TXT 没有样式，只有内容面
   }
   // 3) 画。y 的推进与收集循环一一对应（每个 seg 一行，含空行）。
-  for (const auto &seg : segs) {
-    if (!seg.empty()) g_rd.drawText(fontId, bodyMargin(), y + asc, seg.c_str(), true);
-    y += lh;
+  {
+    // 正文墨色（字重/对比度）：TXT 的正文就是这一圈 drawText，与 EPUB 同一条作用域规则。
+    RdBodyInkScope ink;
+    for (const auto &seg : segs) {
+      if (!seg.empty()) g_rd.drawText(fontId, bodyMargin(), y + asc, seg.c_str(), true);
+      y += lh;
+    }
   }
   g_pageText = rdBuildPageTextTxt(segs, fontId, bodyMargin(), RD_BODY_TOP, lh);
   rdDrawReadingLines(fontId);  // 与 EPUB 同一条阅读线（TXT 的 y 推进就是标称行距）
@@ -3551,7 +3585,7 @@ static DitherMode ditherModeOf(int idx) {
 
 // ── 阅读菜单：动作 + 动态条目 ───────────────────────────────────────────
 enum class MenuAct {
-  Toc, Font, FontFamily, LineSpacing, ParaSpacing, Indent, Align, Margin, Image, ImageDither, ReadingLine, Night,
+  Toc, Font, FontFamily, FontWeight, Contrast, LineSpacing, ParaSpacing, Indent, Align, Margin, Image, ImageDither, ReadingLine, Night,
   Orient,
   ToggleBookmark, Bookmarks, Footnotes, FootnoteBack, Percent, Qr, LayoutMenu,
   Dict, DictDl, ResDl, Weread, Wifi, Opds, NetShare, KeyMap, StatusBar, About, RefreshTest, Standby, UsbDrive,
@@ -3762,6 +3796,12 @@ static std::vector<MenuItem> layoutMenuItems() {
   m.push_back({st.bookFontLocal.empty() ? std::string("字体: ") + ttf_font_display_name()
                                         : std::string("字体: 书内嵌"),
                MenuAct::FontFamily});
+  // 字重/对比度：只改正文墨色，不改步进与度量（见 ttf_font.h 的 ttf_body_ink_*），
+  // 所以这两项**不重排**——不像字号/行距那样要 reopenBook。
+  m.push_back({std::string("字重: ") + kFontWeightLabels[clampI(st.fontWeight, 0, kFontWeightCount - 1)],
+               MenuAct::FontWeight});
+  m.push_back({std::string("对比度: ") + kContrastLabels[clampI(st.contrast, 0, kContrastCount - 1)],
+               MenuAct::Contrast});
   snprintf(buf, sizeof(buf), "行距: %.1f", st.lineSpacing);
   m.push_back({buf, MenuAct::LineSpacing});
   m.push_back({std::string("段距: ") + kParaSpacingLabels[clampI(st.paraSpacing, 0, 5)], MenuAct::ParaSpacing});
@@ -3772,11 +3812,11 @@ static std::vector<MenuItem> layoutMenuItems() {
   // "标着随书、按下去却真改了"。
   const bool embedded = styleEmbedded() && st.bookKind == 0;
   m.push_back({std::string("缩进: ") +
-                   (embedded ? "随书" : (st.indentMode == 0 ? "自动" : st.indentMode == 1 ? "强制" : "取消")),
+                   (embedded ? "随书" : kIndentLabels[clampI(st.indentMode, 0, 2)]),
                MenuAct::Indent});
   m.push_back({std::string("对齐: ") + (embedded ? "随书" : kAlignLabels[clampI(st.alignMode, 0, 3)]), MenuAct::Align});
-  m.push_back({std::string("边距: ") + (st.marginIdx == 0 ? "窄" : st.marginIdx == 1 ? "标准" : "宽"), MenuAct::Margin});
-  m.push_back({std::string("图片: ") + (st.imageBilinear ? "双线性" : "最近邻"), MenuAct::Image});
+  m.push_back({std::string("边距: ") + kMarginLabels[clampI(st.marginIdx, 0, 2)], MenuAct::Margin});
+  m.push_back({std::string("图片: ") + kImageScalingLabels[st.imageBilinear ? 1 : 0], MenuAct::Image});
   m.push_back({std::string("图片抖动: ") + kRdDitherNames[clampI(st.imageDither, 0, kRdDitherCount - 1)],
                MenuAct::ImageDither});
   m.push_back({std::string("阅读线: ") + kReadingLineNames[clampI(st.readingLine, 0, 3)], MenuAct::ReadingLine});
@@ -6369,53 +6409,38 @@ static void doMenuAction(MenuAct act) {
       openRdPick(static_cast<int>(MenuAct::FontFamily));
       break;
     }
-    case MenuAct::LineSpacing:
-      st.lineSpacing = kLineSpacings[(spacingIdx() + 1) % 5];
-      g_settings.setString("reader_line_spacing", std::to_string(st.lineSpacing));
-      reopenBook();
-      st.fullRefresh = true;
+    case MenuAct::FontWeight:
+      openRdPick(static_cast<int>(MenuAct::FontWeight));
       break;
+    case MenuAct::Contrast:
+      openRdPick(static_cast<int>(MenuAct::Contrast));
+      break;
+    // ── 排版设定里的轮换条目：全部改成弹出式选择 ──────────────────────────
+    // 与设置标签那批（ShelfStyle…AutoStandby）同一套：openRdPick 弹层 + applyRdPick 落定。
+    // 原来每项按一次换一格，5 档的行距要按 4 次才知道有哪些档、现在在第几档。
+    case MenuAct::LineSpacing:
     case MenuAct::ParaSpacing:
-      st.paraSpacing = (st.paraSpacing + 1) % 6;
-      g_settings.setString("reader_para_spacing", std::to_string(st.paraSpacing));
-      reopenBook();  // EPUB 要让 Section 按新档位重排；TXT 要重扫分页表
-      st.fullRefresh = true;
+    case MenuAct::Margin:
+    case MenuAct::Image:
+    case MenuAct::ReadingLine:
+      openRdPick(static_cast<int>(act));
       break;
     case MenuAct::Indent:
       // 内嵌模式下缩进由书里的 CSS 说了算，这一档按下无效；标签上已经写着"随书"，
-      // 值保留着，切回「强制指定」立刻按它生效。
-      if (styleEmbedded() && st.bookKind == 0) break;
-      st.indentMode = (st.indentMode + 1) % 3;
-      g_settings.setString("reader_indent", std::to_string(st.indentMode));
-      reopenBook();
-      st.fullRefresh = true;
+      // 值保留着，切回「强制指定」立刻按它生效。给弹层没有意义（档位是"随书"，
+      // 不在用户可选的表里），直说不比展开一张按哪个都没用的表差。
+      if (styleEmbedded() && st.bookKind == 0) {
+        rdShowFloat("缩进随书", "设置 → 样式解析 → 强制指定 后可调", 2500);
+        break;
+      }
+      openRdPick(static_cast<int>(MenuAct::Indent));
       break;
     case MenuAct::Align:
-      if (styleEmbedded() && st.bookKind == 0) break;   // 同理：对齐也随书
-      st.alignMode = (st.alignMode + 1) % 4;
-      g_settings.setString("reader_align", std::to_string(st.alignMode));
-      reopenBook();
-      st.fullRefresh = true;
-      break;
-    case MenuAct::Margin:
-      st.marginIdx = (st.marginIdx + 1) % 3;
-      g_settings.setString("reader_margin", std::to_string(st.marginIdx));
-      reopenBook();
-      st.fullRefresh = true;
-      break;
-    case MenuAct::Image:
-      st.imageBilinear = !st.imageBilinear;
-      ImageBlock::setBilinearScaling(st.imageBilinear);
-      g_settings.setString("reader_image_scaling", std::to_string(st.imageBilinear ? 1 : 0));
-      reopenBook();
-      st.fullRefresh = true;
-      break;
-    case MenuAct::ReadingLine:
-      // 无 → 虚线 → 点线 → 无。只是绘制层的叠加，不动版式：重排一次反而会丢掉
-      // 当前页（reopenBook 回到本节开头），所以这里只重画当前页。
-      st.readingLine = (clampI(st.readingLine, 0, 3) + 1) % 4;
-      g_settings.setString("reader_reading_line", std::to_string(st.readingLine));
-      st.fullRefresh = true;
+      if (styleEmbedded() && st.bookKind == 0) {
+        rdShowFloat("对齐随书", "设置 → 样式解析 → 强制指定 后可调", 2500);
+        break;
+      }
+      openRdPick(static_cast<int>(MenuAct::Align));
       break;
     case MenuAct::Night:  // 菜单项已移除（夜间在 主界面设置）；保留分支供旧路径兜底
       st.night = !g_settings.nightMode();
@@ -6424,11 +6449,7 @@ static void doMenuAction(MenuAct act) {
       st.fullRefresh = true;
       break;
     case MenuAct::Orient:
-      st.orientation = (st.orientation == "portrait") ? "landscape" : "portrait";
-      g_settings.setString("reader_orientation", st.orientation);
-      applyReaderOrientation();
-      reopenBook();
-      st.fullRefresh = true;
+      openRdPick(static_cast<int>(MenuAct::Orient));
       break;
     case MenuAct::ToggleBookmark:
       toggleBookmark();
@@ -6936,6 +6957,15 @@ static void rdPickFill(int act) {
         }
       }
       break;
+    case MenuAct::FontWeight:
+      // 值的字面量就是档位下标（与 Font 的写法一致，落定后 applyRdPick 只做 atoi）。
+      st.pickTitle = "字重";
+      for (int i = 0; i < kFontWeightCount; i++) add(kFontWeightLabels[i], std::to_string(i));
+      break;
+    case MenuAct::Contrast:
+      st.pickTitle = "对比度";
+      for (int i = 0; i < kContrastCount; i++) add(kContrastLabels[i], std::to_string(i));
+      break;
     case MenuAct::ShelfStyle:
       st.pickTitle = "书架风格";
       for (int i = 0; i < kShelfStyleCount; i++) add(kShelfStyleNames[i], kShelfStyleKeys[i]);
@@ -6977,6 +7007,45 @@ static void rdPickFill(int act) {
       st.pickTitle = "自动待机";
       for (int i = 0; i < kAutoStandbyCount; i++) add(kAutoStandbyLabels[i], kAutoStandbyValues[i]);
       break;
+    // ── 排版设定（阅读页菜单 → 排版设定）────────────────────────────────────
+    // 值一律是**档位下标**（上面 Font/FontWeight 的惯例），applyRdPick 只做一次 atoi。
+    case MenuAct::LineSpacing:
+      // 标签与列表行同一个写法（"%.1f"）：弹层里挑的那一档，回到列表行上是同一个数。
+      st.pickTitle = "行距";
+      for (int i = 0; i < 5; i++) {
+        char b[16];
+        snprintf(b, sizeof(b), "%.1f", kLineSpacings[i]);
+        add(b, std::to_string(i));
+      }
+      break;
+    case MenuAct::ParaSpacing:
+      st.pickTitle = "段距";
+      for (int i = 0; i < 6; i++) add(kParaSpacingLabels[i], std::to_string(i));
+      break;
+    case MenuAct::Indent:
+      st.pickTitle = "缩进";
+      for (int i = 0; i < 3; i++) add(kIndentLabels[i], std::to_string(i));
+      break;
+    case MenuAct::Align:
+      st.pickTitle = "对齐";
+      for (int i = 0; i < 4; i++) add(kAlignLabels[i], std::to_string(i));
+      break;
+    case MenuAct::Margin:
+      st.pickTitle = "边距";
+      for (int i = 0; i < 3; i++) add(kMarginLabels[i], std::to_string(i));
+      break;
+    case MenuAct::Image:
+      st.pickTitle = "图片缩放";
+      for (int i = 0; i < 2; i++) add(kImageScalingLabels[i], std::to_string(i));
+      break;
+    case MenuAct::ReadingLine:
+      st.pickTitle = "阅读线";
+      for (int i = 0; i < 4; i++) add(kReadingLineNames[i], std::to_string(i));
+      break;
+    case MenuAct::Orient:
+      st.pickTitle = "阅读器方向";
+      for (int i = 0; i < 2; i++) add(kOrientNames[i], kOrientKeys[i]);
+      break;
     default:
       st.pickTitle.clear();
       break;
@@ -6987,6 +7056,8 @@ static void rdPickFill(int act) {
 static std::string rdPickCurValue(int act) {
   switch (static_cast<MenuAct>(act)) {
     case MenuAct::Font: return std::to_string(st.fontLevel);
+    case MenuAct::FontWeight: return std::to_string(clampI(st.fontWeight, 0, kFontWeightCount - 1));
+    case MenuAct::Contrast: return std::to_string(clampI(st.contrast, 0, kContrastCount - 1));
     case MenuAct::FontFamily: {
       // 用户**设置里**选的那个字体（持久化的那份），不是 ttf_font_path()：后者读的是
       // 内容面，正在读的书有内嵌字体时它返回的是书里的字体文件，扫出来的 SD 字体一个都
@@ -7009,6 +7080,17 @@ static std::string rdPickCurValue(int act) {
     case MenuAct::ClockFace:
       return standbyFaceKey(standbyFaceFromKey(g_settings.getString("clock_face").c_str()));
     case MenuAct::AutoStandby: return std::to_string(g_settings.autoStandbyMinutes());
+    // 排版设定这批：**取 st. 里的实时值**（不是 g_settings，两者在 applyRdPick 里一起写，
+    // 但 st. 才是这一屏正在生效的那份）。行距要经过 spacingIdx() 吸附 ——
+    // st.lineSpacing 是浮点（老设置里有 1.15 这种历史上的非档位值），直接比字符串会落空。
+    case MenuAct::LineSpacing: return std::to_string(spacingIdx());
+    case MenuAct::ParaSpacing: return std::to_string(clampI(st.paraSpacing, 0, 5));
+    case MenuAct::Indent: return std::to_string(clampI(st.indentMode, 0, 2));
+    case MenuAct::Align: return std::to_string(clampI(st.alignMode, 0, 3));
+    case MenuAct::Margin: return std::to_string(clampI(st.marginIdx, 0, 2));
+    case MenuAct::Image: return st.imageBilinear ? "1" : "0";
+    case MenuAct::ReadingLine: return std::to_string(clampI(st.readingLine, 0, 3));
+    case MenuAct::Orient: return st.orientation;
     default: return "";
   }
 }
@@ -7106,6 +7188,82 @@ static void applyRdPick(int act, const std::string &value) {
       st.dirty = 1;
       break;
     }
+    case MenuAct::FontWeight:
+      // 同 ImageDither：**不 reopenBook**。字重只改字形怎么栅格化与怎么调墨，步进与度量
+      // 一个字节没动（见 ttf_font.h 的 ttf_body_ink_*），所以 section 排版缓存全部照旧有效，
+      // 重排纯属浪费 —— 下一帧重画就够了。
+      st.fontWeight = clampI(atoi(value.c_str()), 0, kFontWeightCount - 1);
+      g_settings.setString("reader_font_weight", std::to_string(st.fontWeight));
+      rdShowFloat(std::string("字重: ") + kFontWeightLabels[st.fontWeight],
+                  "只改正文墨色，不重排", 1500);
+      st.fullRefresh = true;
+      st.dirty = 1;
+      break;
+    case MenuAct::Contrast:
+      // 同 FontWeight：只换一张覆盖率查找表（画的时候逐像素查），字形缓存都不必动。
+      st.contrast = clampI(atoi(value.c_str()), 0, kContrastCount - 1);
+      g_settings.setString("reader_contrast", std::to_string(st.contrast));
+      rdShowFloat(std::string("对比度: ") + kContrastLabels[st.contrast],
+                  "只改正文墨色，不重排", 1500);
+      st.fullRefresh = true;
+      st.dirty = 1;
+      break;
+    // ── 排版设定这批：收尾照搬原来 doMenuAction 循环版，只是"一次跳到目标档" ────
+    // 值 = 档位下标（rdPickFill 灌的就是它）。
+    case MenuAct::LineSpacing:
+      st.lineSpacing = kLineSpacings[clampI(atoi(value.c_str()), 0, 4)];
+      g_settings.setString("reader_line_spacing", std::to_string(st.lineSpacing));
+      reopenBook();
+      st.fullRefresh = true;
+      break;
+    case MenuAct::ParaSpacing:
+      // 档位变了要重排：EPUB 让 Section 按新档位重排，TXT 要重扫分页表。
+      st.paraSpacing = clampI(atoi(value.c_str()), 0, 5);
+      g_settings.setString("reader_para_spacing", std::to_string(st.paraSpacing));
+      reopenBook();
+      st.fullRefresh = true;
+      break;
+    case MenuAct::Indent:
+      st.indentMode = clampI(atoi(value.c_str()), 0, 2);
+      g_settings.setString("reader_indent", std::to_string(st.indentMode));
+      reopenBook();
+      st.fullRefresh = true;
+      break;
+    case MenuAct::Align:
+      st.alignMode = clampI(atoi(value.c_str()), 0, 3);
+      g_settings.setString("reader_align", std::to_string(st.alignMode));
+      reopenBook();
+      st.fullRefresh = true;
+      break;
+    case MenuAct::Margin:
+      st.marginIdx = clampI(atoi(value.c_str()), 0, 2);
+      g_settings.setString("reader_margin", std::to_string(st.marginIdx));
+      reopenBook();
+      st.fullRefresh = true;
+      break;
+    case MenuAct::Image:
+      st.imageBilinear = (atoi(value.c_str()) != 0);
+      ImageBlock::setBilinearScaling(st.imageBilinear);
+      g_settings.setString("reader_image_scaling", std::to_string(st.imageBilinear ? 1 : 0));
+      reopenBook();
+      st.fullRefresh = true;
+      break;
+    case MenuAct::ReadingLine:
+      // 只是绘制层的叠加，不动版式：重排一次反而会丢掉当前页（reopenBook 回到本节
+      // 开头），所以这里只重画当前页 —— 与原来循环版一字不差。
+      st.readingLine = clampI(atoi(value.c_str()), 0, 3);
+      g_settings.setString("reader_reading_line", std::to_string(st.readingLine));
+      st.fullRefresh = true;
+      break;
+    case MenuAct::Orient:
+      // 方向不是"当前这本书"的属性：值存全局设置，落定后同时拨 epd 旋转与渲染器方向
+      // 标志（applyReaderOrientation），页面几何全变所以还要重排。
+      st.orientation = (value == "portrait") ? "portrait" : "landscape";
+      g_settings.setString("reader_orientation", st.orientation);
+      applyReaderOrientation();
+      reopenBook();
+      st.fullRefresh = true;
+      break;
     case MenuAct::FullEvery:
       // 计数从改动这一刻重新开始。
       g_settings.setString("reader_full_every", value);
@@ -8533,6 +8691,10 @@ void screen_reader_init() {
   st.indentMode = clampI(atoi(g_settings.getString("reader_indent", "0").c_str()), 0, 2);
   st.alignMode = clampI(atoi(g_settings.getString("reader_align", "0").c_str()), 0, 3);
   st.marginIdx = clampI(atoi(g_settings.getString("reader_margin", "1").c_str()), 0, 2);
+  // 正文墨色：默认档 = 字重 +1(不加粗) + 标准对比度(gamma 0.6)，也就是这套旋钮
+  // 出现之前的观感，老用户升级后一切照旧（见 kFontWeights 的说明）。
+  st.fontWeight = clampI(atoi(g_settings.getString("reader_font_weight", "0").c_str()), 0, kFontWeightCount - 1);
+  st.contrast = clampI(atoi(g_settings.getString("reader_contrast", "2").c_str()), 0, kContrastCount - 1);
   st.readingLine = clampI(atoi(g_settings.getString("reader_reading_line", "0").c_str()), 0, 3);
   st.imageBilinear = g_settings.getString("reader_image_scaling", "1") != "0";
   ImageBlock::setBilinearScaling(st.imageBilinear);

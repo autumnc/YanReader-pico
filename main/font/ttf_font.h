@@ -152,6 +152,23 @@ int ttf_char_advance_px(int role, int pixel_height, uint32_t codepoint);
 void ttf_set_weight(int wght);
 int ttf_get_weight(void);
 
+/// 正文墨色（排版设定里的「字重」与「对比度」）。**只在正文渲染期间打开**：调用方画书页
+/// 正文的前后 begin/end 一次（见 screen_reader.cpp 的 RdBodyInkScope）。画在作用域之外的
+/// 界面外壳（菜单/状态栏/列表/词典）仍旧按默认墨色画，所以调它不会把本机界面一起改了。
+///
+/// dw    = CSS 字重增量（**只加粗**，0..+200 左右；0 = 原样）。字体自带 wght 轴
+///         （fvar/gvar）时走**真实变体**；没有（内置字体、普通静态字体）就**合成**：
+///         按 em 比例膨胀笔画（r = px·dw/12800 = δ/2，与 KOReader/crengine 的
+///         FT_Outline_Embolden 同口径）。**不做变细**：stb 没有轮廓腐蚀的公开 API，
+///         硬做只会把细笔画啃掉。
+/// gamma = 覆盖率的曲线 cover' = 255·(cover/255)^gamma，默认 0.6（= TTF_COVER_GAMMA）：
+///         小 → 抗锯齿边缘更深（柔、墨重）；大 → 更浅（锐、干净）。
+///
+/// 两者都**不改步进与度量**（见 ttf_font.c 里 cp_advance 那段说明）：改它们绝不重排正文，
+/// 也不会让"量的"与"画的"分家。
+void ttf_body_ink_begin(int dw, float gamma);
+void ttf_body_ink_end(void);
+
 void ttf_font_cache_clear(void);
 
 #ifdef __cplusplus

@@ -83,6 +83,28 @@ inline constexpr const char *kParaSpacingLabels[6] = {"关", "0.5x", "0.75x", "1
 inline constexpr int kMargins[3] = {20, 30, 45};
 inline constexpr int kDefaultMarginIdx = 1;
 
+// 字重：**只往粗的一边走**。0 档 = 不加粗（今天的观感，也是默认档），加粗档 +1…+9
+// 一档 20（CSS 字重增量 20…180），一共 10 档。
+// 不做变细：stb 没有轮廓腐蚀的公开 API，硬做只会啃掉细笔画，观感是"字发虚"而不是"变细"。
+// 一档 20 而不是 KOReader 的 ±100 一档：那样一按就跳一大截，这里要的是每档只差一点、
+// 由用户自己微调到顺手的那档。
+//
+// 0 档是**真的一个字节都不加**（合成半径 0，走单采样那条原路），所以老用户升级后默认
+// 观感分毫不动；装了自带 wght 轴的字体也一样（0 不进"改字面字重"那一段）。加粗从 +1
+// 起，+1/+2 在外号下还很轻，越往后笔画外扩越明显。
+inline constexpr int kFontWeights[10] = {0, 20, 40, 60, 80, 100, 120, 140, 160, 180};
+inline constexpr const char *kFontWeightLabels[10] = {"0", "+1", "+2", "+3", "+4",
+                                                      "+5", "+6", "+7", "+8", "+9"};
+inline constexpr int kFontWeightCount = 10;
+inline constexpr int kDefaultFontWeightIdx = 0;  // 0 = 不加粗 = 今天的观感
+
+// 对比度：抗锯齿覆盖率的 gamma。标准档 = TTF_COVER_GAMMA(0.6) = 今天的观感；
+// 小 → 边缘更深（柔、墨重），大 → 更浅（锐、干净）。
+inline constexpr float kContrastGammas[5] = {0.45f, 0.52f, 0.6f, 0.78f, 1.0f};
+inline constexpr const char *kContrastLabels[5] = {"低", "偏低", "标准", "偏高", "高"};
+inline constexpr int kContrastCount = 5;
+inline constexpr int kDefaultContrastIdx = 2;
+
 inline constexpr int MARGIN = 30;    // 正文/列表左右边距
 inline constexpr int RD_TOP_INSET = 28;    // 顶部留白(标题起始)，原 8，整体下移 20px
 inline constexpr int RD_BODY_TOP = 50;     // 正文起始，原 MARGIN(30)，整体下移 20px
@@ -353,6 +375,10 @@ struct RdState {
   int indentMode = 0;  // 0 自动 1 强制 2 取消
   int alignMode = 0;   // 0 两端 1 左 2 居中 3 书籍样式（跟随 CSS text-align）
   int marginIdx = kDefaultMarginIdx;        // 边距档位
+  // 正文墨色：字重（kFontWeights 的下标）与对比度（kContrastGammas 的下标）。
+  // 两者都**不改步进与度量**，所以改档只重画、不重排（见 ttf_font.h 的 ttf_body_ink_*）。
+  int fontWeight = kDefaultFontWeightIdx;
+  int contrast = kDefaultContrastIdx;
   int readingLine = 0;                      // 阅读线：0 无 1 虚线 2 点线 3 实线（正文行间引导线）
   bool imageBilinear = true;                // 图片缩放：true 双线性 false 最近邻
   // 图片抖动档：0 有序 1 行扩散 2 关。存 int 而不是 DitherMode，这个头就不必

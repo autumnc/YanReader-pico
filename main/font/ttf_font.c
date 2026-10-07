@@ -174,6 +174,9 @@ typedef struct glyph_entry {
     uint32_t codepoint;
     uint8_t size;
     uint16_t weight;
+    // 这张位图是"合成加粗多少"栅出来的（见 synth_dw_now）。缓存键的一部分：同一码点同一
+    // 字号在"正文粗/外壳标准"两种作用域下是两张不同的位图，必须分开存。
+    int16_t synth_dw;
     int16_t width;
     int16_t height;
     int16_t left;
@@ -423,6 +426,31 @@ extern const uint8_t yanos_logo_ttf_start[] asm("_binary_yanos_logo_ttf_start");
 extern const uint8_t yanos_logo_ttf_end[] asm("_binary_yanos_logo_ttf_end");
 static bool sd_suspended; // 字体传输期间仅允许内置字体。/ Only built-in fonts while transferring font files.
 static ttf_work_t* work;
+
+/* ---- 正文墨色：排版设定里的「字重」「对比度」---------------------------------
+ * 这两个旋钮**只作用于书的正文**，所以做成"作用域"而不是常驻状态：调用方在画正文的前后
+ * begin/end 一次（见 screen_reader.cpp 的 RdBodyInkScope），界面外壳画在作用域之外。
+ *
+ *   对比度 = 覆盖率曲线 gamma。作用在**已缓存**的字形位图上（mix_ink 逐像素查表），
+ *            所以改它不必碰字形缓存 —— 与 KOReader 把 gamma 放在 cr_correct_gamma_buf
+ *            的位置一致（那边也是"栅格化时算一次、之后一直用"）。
+ *   字重   = 有 wght 轴的面走真实变体（作用域内临时改 f_current_weight，end 时还原）；
+ *            没有轴的面走合成（见 synth_dw_now/rasterize_glyph）。字形缓存的键里带上
+ *            合成量，所以改档自然命中新位图，不必清缓存。
+ * 两者都**不改步进与度量**（见 cp_advance 那段说明）：改它们绝不重排正文。
+ */
+static bool s_body_on;                        // 正文墨色作用域是否打开
+static int s_body_dw;                         // 字重增量（CSS 字重单位，只增不减）
+static float s_body_gamma = TTF_COVER_GAMMA;  // 对比度（覆盖率 gamma）
+static int s_body_saved_w[TTF_ROLE_COUNT];    // 真实变体：进作用域时备份的字重
+static bool s_body_saved_ok[TTF_ROLE_COUNT];
+
+// 本面此刻该用多少"合成"加粗量。有 wght 轴的面由真实变体负责，这里恒 0 —— 否则会叠成
+// 双倍粗（真实变体已经是 Medium/Bold 了，再膨胀一遍就过了）。
+static int synth_dw_now(void) {
+    if (!s_body_on || gvar_ready) return 0;
+    return s_body_dw;
+}
 
 // 选定字面，返回原字面(配 face_leave 还原)。给"进某面做一件固定的事再回来"用
 // (加载/卸载/清缓存)。铁律 1：s_cur 只在这里和 ttf_set_role 里被写。
@@ -1999,7 +2027,8 @@ static glyph_entry_t* cache_lookup(uint32_t codepoint, int size) {
     unsigned bucket = cache_bucket(codepoint, size);
     for (glyph_entry_t* entry = cache_buckets[bucket]; entry != NULL; entry = entry->hash_next) {
         if (entry->codepoint == codepoint && entry->size == (uint8_t)size
-            && entry->weight == (uint16_t)current_weight) {
+            && entry->weight == (uint16_t)current_weight
+            && entry->synth_dw == (int16_t)synth_dw_now()) {
             lru_touch(entry);
             return entry;
         }
@@ -2043,13 +2072,115 @@ static int fallback_role_for(uint32_t cp) {
     return -1;
 }
 
+/* ---- 合成加粗 / Synthetic emboldening ------------------------------------
+ * 内置字体（Noto Sans CJK SC Regular）只有 400 一份、没有 fvar/gvar，用户装的静态字体
+ * 多半也没有 —— 这些面只能靠"按 em 比例膨胀笔画"来假装更粗，口径与 KOReader/crengine
+ * 的 FT_Outline_Embolden 一致：字形总宽增加 δ = em·Δw/6400，每边各让 δ/2。
+ *
+ * stb 的公开 API 没有 FT_Outline_Embolden 的对应物（那是对**轮廓**做几何外扩），所以
+ * 做法是把同一字形按亚像素偏移栅 5 张（中心 + 上下左右各 r），逐点取最大值 —— 覆盖率的
+ * 逐点 max 正是几何并集：笔画外扩 r，边缘照样带抗锯齿。并集框比原框大约 ⌈r⌉/边，left/top
+ * 跟着往外挪，正好等价于 crengine 用 _synth_weight_half_strength 做的重心补偿：字形在
+ * 自己的步进格子里居中，不掉墨、也不改步进。
+ *
+ * r 上限 2px（再大也会吃掉相邻字的字身，而面板只有 16 级灰）；小于 0.08px 按 0 处理
+ * （那是量化噪声，不值得为它多栅 4 张 —— 排档第一档 +20 就落在这条线以下，正文各号都
+ * 画成原样，正好当"不加粗"使）。**只有加粗这一个方向**：stb 没有轮廓腐蚀的公开 API，
+ * "取最小"会把细笔画整条抹掉，那是"字发虚"不是"变细"，所以排版设定干脆不提供细档。
+ */
+#define TTF_SYNTH_DW_PER_PX 12800.0f   // 每 1px 半径对应的字重增量（= 6400×2，即 δ/2）
+#define TTF_SYNTH_R_MAX 2.0f
+#define TTF_SYNTH_R_MIN 0.08f
+
+// 5 个采样点的亚像素偏移（r = 0 时只用中心那一个）。stb 的 shift 是**画布像素**单位
+// （见 GetGlyphBitmapBoxSubpixel 里的 x0*scale_x + shift_x），正是这里要的。
+static void synth_offsets(float r, float* ox, float* oy) {
+    ox[0] = 0.0f;  oy[0] = 0.0f;
+    ox[1] = r;     oy[1] = 0.0f;
+    ox[2] = -r;    oy[2] = 0.0f;
+    ox[3] = 0.0f;  oy[3] = r;
+    ox[4] = 0.0f;  oy[4] = -r;
+}
+
+// 复用的临时位图（一张采样的覆盖图）。只增长不释放：与 f_touch_blocks 同一套内存策略 ——
+// 加粗档是用户常开的状态，每个字形两次 malloc/free 没必要；它也不属于任何字面。
+static uint8_t* s_synth_scratch;
+static size_t s_synth_cap;
+
+// 把 ns 张采样并进 dst（dst 是并集框尺寸 w×h、原点在 (dst_x0,dst_y0) 的那块，**进来时已清 0**）。
+// 失败（scratch 分配不出来）返回 false，调用方退回单采样 —— 宁可不加粗，也不能画不出字。
+static bool synth_merge(int gid, float scale, const float* ox, const float* oy, int ns,
+                        uint8_t* dst, int w, int h, int dst_x0, int dst_y0) {
+    const size_t need = (size_t)(w + 2) * (size_t)(h + 2);   // 单张的框 ≤ 并集框 + 1px/边
+    if (s_synth_cap < need) {
+        uint8_t* p = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (p == NULL) return false;
+        if (s_synth_scratch != NULL) heap_caps_free(s_synth_scratch);
+        s_synth_scratch = p;
+        s_synth_cap = need;
+    }
+    for (int i = 0; i < ns; i++) {
+        int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+        stbtt_GetGlyphBitmapBoxSubpixel(
+            &font_info, gid, scale, scale, ox[i], oy[i], &bx0, &by0, &bx1, &by1
+        );
+        const int sw = bx1 - bx0;
+        const int sh = by1 - by0;
+        if (sw <= 0 || sh <= 0) continue;                     // 这一张没墨（空格之类）
+        if ((size_t)sw * (size_t)sh > s_synth_cap) continue;
+        stbtt_MakeGlyphBitmapSubpixel(
+            &font_info, s_synth_scratch, sw, sh, sw, scale, scale, ox[i], oy[i], gid
+        );
+        const int dx = bx0 - dst_x0;
+        const int dy = by0 - dst_y0;
+        for (int y = 0; y < sh; y++) {
+            const int ty = dy + y;
+            if (ty < 0 || ty >= h) continue;
+            const uint8_t* srow = s_synth_scratch + (size_t)y * (size_t)sw;
+            uint8_t* drow = dst + (size_t)ty * (size_t)w;
+            for (int x = 0; x < sw; x++) {
+                const int tx = dx + x;
+                if (tx >= 0 && tx < w && srow[x] > drow[tx]) drow[tx] = srow[x];
+            }
+        }
+    }
+    return true;
+}
+
 static glyph_entry_t* rasterize_glyph(uint32_t codepoint, int pixel_height) {
     int gid = stbtt_FindGlyphIndex(&font_info, (int)codepoint);
     if (!pack_glyph_tree(gid)) return NULL;
 
     float scale = font_scale_px(pixel_height);
+
+    // 本张位图要多少合成加粗（0 = 原样，默认档就是它）。
+    const int synth_dw = synth_dw_now();
+    float r = 0.0f;
+    if (synth_dw > 0) {
+        r = (float)pixel_height * (float)synth_dw / TTF_SYNTH_DW_PER_PX;
+        if (r > TTF_SYNTH_R_MAX) r = TTF_SYNTH_R_MAX;
+        if (r < TTF_SYNTH_R_MIN) r = 0.0f;
+    }
+    const int ns = (r > 0.0f) ? 5 : 1;
+    float ox[5], oy[5];
+    synth_offsets(r, ox, oy);
+
+    // 框取 5 张采样的并集；r = 0 时就是原框，与加这个功能之前逐值一致。
     int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    stbtt_GetGlyphBitmapBox(&font_info, gid, scale, scale, &x0, &y0, &x1, &y1);
+    for (int i = 0; i < ns; i++) {
+        int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+        stbtt_GetGlyphBitmapBoxSubpixel(
+            &font_info, gid, scale, scale, ox[i], oy[i], &bx0, &by0, &bx1, &by1
+        );
+        if (i == 0) {
+            x0 = bx0; y0 = by0; x1 = bx1; y1 = by1;
+        } else {
+            if (bx0 < x0) x0 = bx0;
+            if (by0 < y0) y0 = by0;
+            if (bx1 > x1) x1 = bx1;
+            if (by1 > y1) y1 = by1;
+        }
+    }
 
     int width = x1 - x0;
     int height = y1 - y0;
@@ -2072,9 +2203,33 @@ static glyph_entry_t* rasterize_glyph(uint32_t codepoint, int pixel_height) {
             heap_caps_free(entry);
             return NULL;
         }
-        stbtt_MakeGlyphBitmap(
-            &font_info, entry->bitmap, width, height, width, scale, scale, gid
-        );
+        if (ns == 1) {
+            stbtt_MakeGlyphBitmap(
+                &font_info, entry->bitmap, width, height, width, scale, scale, gid
+            );
+        } else {
+            // max 合并要求底子是 0；兜底路径也靠这一记清零（它只写自己那块子矩形）。
+            memset(entry->bitmap, 0, bitmap_bytes);
+            if (!synth_merge(
+                    gid, scale, ox, oy, ns, entry->bitmap, width, height, x0, y0
+                )) {
+                // 兜底：scratch 分配不出来时不加粗也得把字画出来。单采样那张的框比并集框
+                // 小一点，得写进它在并集框里的位置，不能直接铺满整块（那样会挪位）。
+                int ux0 = 0, uy0 = 0, ux1 = 0, uy1 = 0;
+                stbtt_GetGlyphBitmapBox(
+                    &font_info, gid, scale, scale, &ux0, &uy0, &ux1, &uy1
+                );
+                const int uw = ux1 - ux0;
+                const int uh = uy1 - uy0;
+                if (uw > 0 && uh > 0) {
+                    uint8_t* dst = entry->bitmap + (size_t)(uy0 - y0) * (size_t)width
+                                   + (size_t)(ux0 - x0);
+                    stbtt_MakeGlyphBitmap(
+                        &font_info, dst, uw, uh, width, scale, scale, gid
+                    );
+                }
+            }
+        }
     }
 
     int advance = 0;
@@ -2084,6 +2239,7 @@ static glyph_entry_t* rasterize_glyph(uint32_t codepoint, int pixel_height) {
     entry->codepoint = codepoint;
     entry->size = (uint8_t)pixel_height;
     entry->weight = (uint16_t)current_weight;
+    entry->synth_dw = (int16_t)synth_dw;
     entry->width = (int16_t)width;
     entry->height = (int16_t)height;
     entry->left = (int16_t)x0;
@@ -2609,25 +2765,86 @@ int ttf_char_advance_px(int role, int pixel_height, uint32_t codepoint) {
     return width;
 }
 
-// 线性抗锯齿的中间灰在这块屏上偏亮。按 TTF_COVER_GAMMA 抬覆盖率，半透明边缘更深。
-static uint8_t s_cover[256];
+// 线性抗锯齿的中间灰在这块屏上偏亮。按 gamma 抬覆盖率，半透明边缘更深。
+//
+// **两张表**：base 给界面外壳（γ = TTF_COVER_GAMMA，就是本功能出现之前的固定观感），
+// body 给书的正文（排版设定里的「对比度」）。s_cover_cur 指向当下该用哪张，只有这里和
+// ttf_body_ink_begin/end 会写它。
+static uint8_t s_cover_base[256];
+static uint8_t s_cover_body[256];
+static uint8_t* s_cover_cur = s_cover_base;
+static float s_body_lut_gamma = -1.0f;  // 当前 body 表是按哪个 gamma 建的（-1 = 还没建）
+
+// 建一张覆盖率表：cover' = 255·(cover/255)^gamma。256 次 powf，只在设置真的变了之后的
+// 第一帧发生一次。
+static void build_cover(uint8_t* tbl, float gamma) {
+    for (int i = 0; i < 256; i++) {
+        float t = (float)i / 255.f;
+        int n = (int)(255.f * powf(t, gamma) + 0.5f);
+        if (n < 0) n = 0;
+        if (n > 255) n = 255;
+        tbl[i] = (uint8_t)n;
+    }
+}
 
 /* ---- 绘制 / Draw ---- */
 static void ttf_cover_lut_init(void) {
     static bool ready;
     if (ready) return;
-    for (int i = 0; i < 256; i++) {
-        float t = (float)i / 255.f;
-        int v = (int)(255.f * powf(t, TTF_COVER_GAMMA) + 0.5f);
-        if (v < 0) v = 0;
-        if (v > 255) v = 255;
-        s_cover[i] = (uint8_t)v;
-    }
+    build_cover(s_cover_base, TTF_COVER_GAMMA);
+    build_cover(s_cover_body, TTF_COVER_GAMMA);
+    s_body_lut_gamma = TTF_COVER_GAMMA;
     ready = true;
 }
 
 static uint8_t mix_ink(uint8_t alpha, uint8_t fg, uint8_t bg) {
-    return (uint8_t)(bg + s_cover[alpha] * ((int)fg - (int)bg) / 255);
+    return (uint8_t)(bg + s_cover_cur[alpha] * ((int)fg - (int)bg) / 255);
+}
+
+void ttf_body_ink_begin(int dw, float gamma) {
+    ttf_cover_lut_init();
+    if (gamma < 0.15f) gamma = 0.15f;
+    if (gamma > 4.0f) gamma = 4.0f;
+
+    // 只有 gamma 一个旋钮要进表（字重走的是字形本身：合成加粗在 rasterize_glyph 里
+    // 把位图膨胀一圈，真变体在下面改字面字重，都不碰覆盖率曲线）。
+    if (gamma != s_body_lut_gamma) {
+        build_cover(s_cover_body, gamma);
+        s_body_lut_gamma = gamma;
+    }
+
+    s_body_on = true;
+    s_body_dw = dw;
+    s_body_gamma = gamma;
+    s_cover_cur = s_cover_body;
+
+    // 真实变体：只对**自己有 wght 轴**的面做（有轴就用字体里的 Medium/Bold，比合成准得多；
+    // 没有轴的面交给合成，见 synth_dw_now）。形状是相对各面自己的默认值偏移，与 KOReader
+    // 的 font_base_weight 同口径：+100 = Medium(500)、+300 = Bold(700)。
+    // 记下原值，end 时还原 —— 外壳与正文常常同一个面，不还原就把菜单也一起改了。
+    for (int role = 0; role < TTF_ROLE_COUNT; role++) {
+        s_body_saved_ok[role] = false;
+        if (dw == 0) continue;
+        ttf_face_t* prev = face_enter(role);
+        if (font_ready && gvar_ready) {
+            s_body_saved_w[role] = current_weight;
+            s_body_saved_ok[role] = true;
+            current_weight = clamp_weight(wght_def + dw);
+        }
+        face_leave(prev);
+    }
+}
+
+void ttf_body_ink_end(void) {
+    s_body_on = false;
+    s_cover_cur = s_cover_base;
+    for (int role = 0; role < TTF_ROLE_COUNT; role++) {
+        if (!s_body_saved_ok[role]) continue;
+        s_body_saved_ok[role] = false;
+        ttf_face_t* prev = face_enter(role);
+        current_weight = s_body_saved_w[role];
+        face_leave(prev);
+    }
 }
 
 void ttf_draw_text(
