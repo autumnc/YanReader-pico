@@ -1937,6 +1937,7 @@ bool Operation::active() const {
     case Phase::FetchCover:
     case Phase::ConvertCover:
     case Phase::PrepareDownload:
+    case Phase::PrepareDownloadCover:
     case Phase::FetchToc:
     case Phase::PrepareProgressSync:
     case Phase::FetchProgress:
@@ -2085,7 +2086,9 @@ bool Operation::begin(const Kind kind, const WeReadStore::ShelfRecord* book, con
       return false;
     }
     book_ = WeReadStore::bookRecord(*book);
-    if (kind == Kind::Detail && book->coverUrl[0]) {
+    // 详情（Detail）与整本缓存（Download）都要这条封面地址：整本缓存的第一步
+    // PrepareDownloadCover 就靠它去抓 epub 要嵌的那张封面源图（见那里的注释）。
+    if ((kind == Kind::Detail || kind == Kind::Download) && book->coverUrl[0]) {
       if (!shelfCoverUrl_) {
         shelfCoverUrl_ = makeUniqueNoThrow<char[]>(kUrlSize);
         if (!shelfCoverUrl_) {
@@ -3837,9 +3840,18 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
         case CoverWorkResult::Pending:
           return Event::None;
         case CoverWorkResult::Complete:
-          phase_ = Phase::ConvertCover;
+          // 整本缓存：源图到手就够了（epub 嵌的就是它），接着走下载链，不做缩略图转换。
+          // 见 PrepareDownloadCover 的注释。
+          phase_ = kind_ == Kind::Download ? Phase::FetchToc : Phase::ConvertCover;
           return Event::None;
         case CoverWorkResult::Skipped:
+          if (kind_ == Kind::Download) {
+            // 抓不到（重试耗尽/服务器不给）就当没有封面，书照缓存 —— 不能在这里收工，
+            // 整本缓存的任务还没开始下正文。
+            logMemory("download cover skipped");
+            phase_ = Phase::FetchToc;
+            return Event::None;
+          }
           phase_ = Phase::Complete;
           logMemory("cover skipped");
           logJobComplete();
@@ -3861,8 +3873,57 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
 
     case Phase::PrepareDownload: {
       if (!preparePaths()) return fail(Error::SdCard);
-      LOG_INF("WR", "download cache mode: refresh=%u", static_cast<unsigned>(Storage.exists(outputPath_.c_str())));
-      phase_ = Phase::FetchToc;
+      // 补封面这一趟必须沿用**当初缓存这本书时**的图片口径（记在 options.bin 里）：
+      // 按 Exclude 缓存的书卡上没有图片文件，若按调用方默认的 Embed 走，prepareImageWork
+      // 会把每一张图都判成"缺"→ 一个补封面任务变成几百张图的下载。
+      if (options_.coverOnly) {
+        WeReadStore::BookOptions saved;
+        if (WeReadStore::loadBookOptions(bookDir_, saved) && validImagePolicy(saved.imagePolicy)) {
+          options_.imagePolicy = saved.imagePolicy;
+        }
+      }
+      LOG_INF("WR", "download cache mode: refresh=%u coverOnly=%u",
+              static_cast<unsigned>(Storage.exists(outputPath_.c_str())), static_cast<unsigned>(options_.coverOnly));
+      phase_ = Phase::PrepareDownloadCover;
+      return Event::None;
+    }
+
+    // 整本缓存的封面。在此之前这条链一个封面步骤都没有（封面只挂在详情/书架同步两个
+    // job 上），于是 cover.source.jpg|png 从没下过；打包时 packageBook 的 findCoverSource
+    // 找不到源图，OPF 里那对 `<item id="cover-image">` 就没图可塞 —— 缓存出来的 epub
+    // 没有封面，就是这里缺的。
+    //
+    // 只抓「源图」，不做详情那条链的 ConvertCover：要嵌进 epub 的正是源图本身
+    // （见 packageBook 的封面嵌入），而转换产物 cover.v2.bmp 是微读书架那一路用的缩略图，
+    // 与本机阅读无关（本机封面在打开本书时从 epub 生成）。顺带避开一个坑：
+    // convertCoverSource 一旦解不开图会把**源图一起删掉**，那 epub 的封面也跟着没了。
+    case Phase::PrepareDownloadCover: {
+      std::string sourcePath;
+      const WeReadProtocol::ImageType existingSource = findCoverSource(bookDir_, sourcePath);
+      if (options_.coverOnly) {
+        // 「重新获取封面」要的就是重抓：老源图在卡上（老固件下的那张）必须先清掉，否则下面
+        // requestImage 见到文件已在就直接 Complete，一个字节都不会重下 —— 点了等于没点。
+        // jpg/png **两个名字都删**：findCoverSource 优先认 png，只删这次要下的那个后缀，
+        // 上一轮的 png 会被原样打包进 epub，封面还是老的那张。
+        for (const WeReadProtocol::ImageType type :
+             {WeReadProtocol::ImageType::Png, WeReadProtocol::ImageType::Jpeg}) {
+          const std::string stale = bookDir_ + "/" + coverSourceName(type);
+          if (Storage.exists(stale.c_str())) Storage.remove(stale.c_str());
+        }
+      } else if (existingSource != WeReadProtocol::ImageType::None) {
+        phase_ = Phase::FetchToc;  // 源图已在（重新缓存）：不重复下载
+        return Event::None;
+      }
+      coverType_ = selectCoverUrl("", shelfCoverUrl_ ? shelfCoverUrl_.get() : "", url_, sizeof(url_));
+      if (coverType_ == WeReadProtocol::ImageType::None || !url_[0]) {
+        // 书架记录里没有封面地址也不是错误：照旧把书缓存出来，只是没有封面。
+        phase_ = Phase::FetchToc;
+        return Event::None;
+      }
+      coverAttempts_ = 0;
+      coverRedirects_ = 0;
+      coverState_ = WeReadStore::ImageWorkState::Pending;
+      phase_ = Phase::FetchCover;
       return Event::None;
     }
 
@@ -3874,7 +3935,11 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
       }
       if (error != Error::Ok) return handleRequestError(error, Phase::FetchToc);
       requestSucceeded();
-      phase_ = (kind_ == Kind::ProgressSync || (kind_ == Kind::Download && strncmp(book_.bookId, "MP_WXS_", 7) != 0))
+      // 「只补封面」直接跳到 OpenToc：进度同步（取远端进度 → 决定方向 → 上报）是给**新书**
+      // 落地初读位置用的，对一本已经读完/读到一半的书只会白白多几个请求，还可能把用户
+      // 现在的位置改掉 —— 用户只想补张封面，不该动进度。
+      phase_ = (kind_ == Kind::ProgressSync ||
+                (kind_ == Kind::Download && !options_.coverOnly && strncmp(book_.bookId, "MP_WXS_", 7) != 0))
                    ? Phase::FetchProgress
                    : Phase::OpenToc;
       return Event::None;
@@ -4045,8 +4110,14 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
       chapterResponseAttempts_ = 0;
       HalFile imageIndex;
       uint32_t imageCount = 0;
-      if (reuseChapterFile(Storage.exists(outputPath_.c_str()),
-                           Storage.exists(WeReadStore::chapterPath(bookDir_, chapterIndex_).c_str())) &&
+      const bool chapterOnCard = Storage.exists(WeReadStore::chapterPath(bookDir_, chapterIndex_).c_str());
+      // 「只补封面」：卡上的正文正是要留下的东西，所以不走 reuseChapterFile 那条"整本重缓存
+      // 就把每一章重下一遍"的规则。图片索引开得出来才算真的可复用（下面的 AdvanceChapter
+      // 靠它列图），开不出就老老实实重取这一章 —— 那是半截缓存，顺手补上。
+      const bool reuse = options_.coverOnly
+                             ? chapterOnCard
+                             : reuseChapterFile(Storage.exists(outputPath_.c_str()), chapterOnCard);
+      if (reuse &&
           WeReadStore::openImageIndex(WeReadStore::imageIndexPath(bookDir_, chapterIndex_), imageIndex, imageCount)) {
         phase_ = Phase::AdvanceChapter;
         return Event::None;

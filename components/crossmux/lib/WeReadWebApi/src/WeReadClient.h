@@ -37,6 +37,15 @@ struct DownloadOptions {
 
   WeReadStore::ImagePolicy imagePolicy = WeReadStore::ImagePolicy::Embed;
   ChapterScope chapterScope = ChapterScope::WholeBook;
+  // 「只补封面」：给**已经缓存过**的书补一次封面（老版本缓存出来的书没有封面，见
+  // PrepareDownloadCover 的注释）。走的是同一条整本缓存链，只改三处：
+  //   · 章节文件已在卡上就直接用（不重下正文 —— 这是"补封面"配得上的代价）；
+  //   · 封面源图**强制重抓**（用户点这一项就是要"重新获取"）；
+  //   · 跳过进度同步（那是给新书取初读位置用的，对已缓存的书只会白白多几个请求）。
+  // 其余（重扫图片索引 → 打包 → 原子替换 epub）都复用整本缓存那套。
+  // / Cover-only refresh: reuses the whole-book pipeline but keeps on-card chapters,
+  // force-refetches the cover source, and skips the progress-sync steps.
+  bool coverOnly = false;
 };
 
 enum class LocalOffsetBasis : uint8_t {
@@ -166,6 +175,7 @@ class Operation {
     FetchCover,
     ConvertCover,
     PrepareDownload,
+    PrepareDownloadCover,
     FetchToc,
     PrepareProgressSync,
     FetchProgress,
@@ -256,6 +266,11 @@ class Operation {
   }
   static constexpr bool reuseChapterFile(const bool refreshingBook, const bool chapterExists) {
     return !refreshingBook && chapterExists;
+  }
+  // options.bin 是卡上文件，反序列化出来的 imagePolicy 不保证是枚举里的值（旧版本/坏块）。
+  // 只认 Embed/Exclude 两个已知口径，其余一律当作"没读到"，让调用方保留自己的默认。
+  static constexpr bool validImagePolicy(const WeReadStore::ImagePolicy policy) {
+    return policy == WeReadStore::ImagePolicy::Embed || policy == WeReadStore::ImagePolicy::Exclude;
   }
   static constexpr bool imageAttemptPending(const uint8_t attempts) { return attempts < 2; }
   static constexpr bool imageRedirectAllowed(const uint8_t redirects) { return redirects < kMaxImageRedirects; }

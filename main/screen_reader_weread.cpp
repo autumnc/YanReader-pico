@@ -53,9 +53,11 @@ static const char *weErrorText(WeReadClient::Error e) {
   return "未知错误";
 }
 
-static const char *weStageName(WeReadClient::Operation::ProgressStage s) {
+static const char *weStageName(WeReadClient::Operation::ProgressStage s, bool coverOnly) {
   switch (s) {
-    case WeReadClient::Operation::ProgressStage::Chapters: return "缓存章节";
+    // 补封面这一趟里"章节"那一程只是把卡上的正文核对一遍（缺的才补），一个字都没下，
+    // 照整本缓存的字面写"缓存章节"是骗人的。
+    case WeReadClient::Operation::ProgressStage::Chapters: return coverOnly ? "核对章节" : "缓存章节";
     case WeReadClient::Operation::ProgressStage::Preparing: return "整理资源";
     case WeReadClient::Operation::ProgressStage::Images: return "下载图片";
     case WeReadClient::Operation::ProgressStage::Packaging: return "生成图书";
@@ -108,8 +110,12 @@ static void weBeginJob(int kind, const WeReadStore::ShelfRecord *book) {
   WeReadClient::DownloadOptions options;
   options.imagePolicy = WeReadStore::ImagePolicy::Embed;
   options.chapterScope = WeReadClient::DownloadOptions::ChapterScope::WholeBook;
-  const WeReadClient::Operation::Kind k =
-      (kind == 1) ? WeReadClient::Operation::Kind::Download : WeReadClient::Operation::Kind::Sync;
+  // kind 2 = 「重新获取封面」：走同一条整本缓存链，只是留着卡上的正文、强制重抓封面源图、
+  // 跳过进度同步（见 DownloadOptions::coverOnly）。
+  options.coverOnly = (kind == 2);
+  const WeReadClient::Operation::Kind k = (kind == 1 || kind == 2)
+                                              ? WeReadClient::Operation::Kind::Download
+                                              : WeReadClient::Operation::Kind::Sync;
   st.weKind = kind;
   st.weStatus.clear();
   st.weJobTitle = book ? book->title : "";
@@ -155,6 +161,14 @@ void weDrive() {
           st.weStatus = "缓存完成，但打不开这本书";
           st.mode = RdMode::Weread;
         }
+      } else if (st.weKind == 2) {
+        // 封面重抓：epub 已在原地原子替换（新的封面图嵌在里头了），但本机那几张封面产物
+        // 还停在老封面上（生成端都是"文件在就跳过"，光换 epub 没用）——全部删掉重建。
+        // 这一步要解一遍 zip + 缩放出两张图（秒级），进度屏就停在最后一帧，随后回书目菜单。
+        const std::string path = st.weOp->finalPath();
+        if (!path.empty()) rdRebuildBookCoverArtifacts(path, 0);
+        st.weStatus = "封面已更新";
+        st.mode = RdMode::WereadMenu;
       } else {
         weLoadShelf();
         st.weStatus.clear();
@@ -165,23 +179,23 @@ void weDrive() {
       break;
     case WeReadClient::Operation::Event::Cancelled:
       st.weStatus = "已取消";
-      st.mode = (st.weKind == 1) ? RdMode::WereadMenu : RdMode::Weread;
+      st.mode = (st.weKind == 1 || st.weKind == 2) ? RdMode::WereadMenu : RdMode::Weread;
       st.fullRefresh = true;
       st.dirty = 1;
       break;
     case WeReadClient::Operation::Event::Failed:
       st.weStatus = weErrorText(st.weOp->error());
-      st.mode = (st.weKind == 1) ? RdMode::WereadMenu : RdMode::Weread;
+      st.mode = (st.weKind == 1 || st.weKind == 2) ? RdMode::WereadMenu : RdMode::Weread;
       st.fullRefresh = true;
       st.dirty = 1;
       break;
     case WeReadClient::Operation::Event::DetailReady:
     case WeReadClient::Operation::Event::ChapterRangeReady:
     case WeReadClient::Operation::Event::ChapterComplete:
-      st.dirty = 1;   // 进度画面刷新
+      weMarkDirtyIfProgressChanged();   // 进度画面刷新（内容变了才推，见上）
       break;
     case WeReadClient::Operation::Event::None:
-      if (st.mode == RdMode::WereadDl && st.weOp->active()) st.dirty = 1;
+      if (st.mode == RdMode::WereadDl && st.weOp->active()) weMarkDirtyIfProgressChanged();
       break;
   }
 }
@@ -193,12 +207,14 @@ static int weBookIndex() {
   return (st.weSel >= 0 && st.weSel < static_cast<int>(st.weShelf.size())) ? st.weSel : -1;
 }
 
-// 书目菜单：本地已有缓存就给"打开/重新缓存/删除"，否则只有"缓存整本并阅读"。
+// 书目菜单：本地已有缓存就给"打开/重新获取封面/重新缓存/删除"，否则只有"缓存整本并阅读"。
+// 「重新获取封面」对**已缓存**的书一律给（不去探测它到底有没有封面）：老固件缓存出来的
+// 书可能压根没下过封面，这正是这一项要补的场景；有封面的书再抓一次也无非重下一张图。
 static std::vector<std::string> weMenuItems() {
   const int idx = weBookIndex();
   bool cached = false;
   if (idx >= 0) cached = Storage.exists(WeReadStore::finalBookPath(st.weShelf[idx]).c_str());
-  if (cached) return {"打开本书", "重新缓存", "删除本地缓存", "取消"};
+  if (cached) return {"打开本书", "重新获取封面", "重新缓存", "删除本地缓存", "取消"};
   return {"缓存整本并阅读", "取消"};
 }
 
@@ -336,7 +352,8 @@ void renderWereadMenu() {
 void renderWereadDl() {
   g_rd.clearScreen();
   const int w = g_rd.getScreenWidth();
-  const int top = drawTitle("微信读书 缓存图书");
+  const bool coverOnly = (st.weKind == 2);
+  const int top = drawTitle(coverOnly ? "微信读书 更新封面" : "微信读书 缓存图书");
   std::string title = st.weJobTitle.empty() ? "正在准备" : st.weJobTitle;
   title = g_rd.truncatedText(uiFontId(), title.c_str(), w - 2 * MARGIN, EpdFontFamily::REGULAR);
   drawLineText(MARGIN, top + 8, title.c_str(), true);
@@ -346,7 +363,7 @@ void renderWereadDl() {
   if (st.weOp) {
     done = st.weOp->progressCompleted();
     total = st.weOp->progressTotal();
-    stage = weStageName(st.weOp->progressStage());
+    stage = weStageName(st.weOp->progressStage(), coverOnly);
   }
   int y = top + 8 + uiLineHeight() + 16;
   g_rd.drawText(uiFontId(), MARGIN, y + uiAsc(), stage, true);
@@ -458,6 +475,17 @@ void handleWereadMenu(int key) {
   if (label == "打开本书") {
     if (openBook(finalPath, 0)) { st.mode = RdMode::Reading; st.fullRefresh = true; st.dirty = 1; }
     else { st.weStatus = "打不开已缓存的书"; st.dirty = 1; }
+    return;
+  }
+  // 重新获取封面：卡上有正文，所以很快（不重下正文，只重抓封面源图 + 重打包 epub）。
+  // 它也走进度屏——重打包是秒级的事，没有进度画面用户会以为没反应。
+  if (label == "重新获取封面") {
+    weBeginJob(2, &b);
+    if (st.weKind == 2 && st.weStatus.empty()) {
+      st.mode = RdMode::WereadDl;
+      st.fullRefresh = true;
+      st.dirty = 1;
+    }
     return;
   }
   if (label == "删除本地缓存") {

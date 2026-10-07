@@ -1050,6 +1050,7 @@ void readerStandbyCoverLayout(StandbyCoverLayout &out) {
 
 // 打开书后即时生成封面（用已加载对象，避免二次解压）。
 static void rdCoverThumbForget(const std::string &bmpPath);  // 定义在封面缩放那一段
+
 static void generateCoverForOpenedBook() {
   // 顺手清掉几代老封面：改名之后它们再也不会被读到，留着白占卡（每本一两百 KB，
   // 几百本就是几十 MB）。删失败也无所谓，下次打开再试。
@@ -1069,6 +1070,36 @@ static void generateCoverForOpenedBook() {
   // 待机整屏封面**故意不在这里做**：它跟"把这本书打开"没有半点关系，纯粹是待机表盘
   // 的素材，而做它要"解原图 + 缩放 + 写盘"（实测 ~3.0s，开书路径上第三大的一块）。
   // 两个补做的时机见 rdBuildStandbyCoverForOpenBook 的头注释。
+}
+
+// 书的 epub 在卡上被**原地换掉**之后（微信读书的「重新获取封面」），把这本书的封面
+// 产物全部作废重建。三处都得管，缺一处就"用户点了重新获取、屏幕上还是老封面"：
+//   · cover_v2.bmp —— 书架格子用的那张缩略图；
+//   · standby_v4.bmp —— 待机「书籍封面」表盘那张（没有它表盘会退回用上面那张，糊一圈）；
+//   · 内存缩略图缓存 —— 路径对得上就直接拿旧的画，不认盘上的新图。
+// 生成端（generateCoverBmp / generateStandbyCoverBmp）都是"文件在就跳过"，所以**必须先删**。
+// kind 只支持 0(epub)：微读缓存出来的都是 epub，TXT/XTC 没有"重抓封面"这条路。
+void rdRebuildBookCoverArtifacts(const std::string &path, int kind) {
+  if (path.empty() || kind != 0 || !Storage.exists(path.c_str())) return;
+  const std::string cover = coverBmpPathFor(path, kind);
+  const std::string standby = standbyCoverPathFor(path, kind);
+  if (Storage.exists(cover.c_str())) Storage.remove(cover.c_str());
+  if (Storage.exists(standby.c_str())) Storage.remove(standby.c_str());
+  rdCoverThumbForget(cover);
+
+  // 用 make_shared 而不是栈对象：与 openEpub/空闲预建同一个用法，避免把几百字节的
+  // 句柄摊在主任务栈上。解封面要 unzip 一遍目录，出作用域就放掉。
+  auto epub = std::make_shared<Epub>(path, CACHE_DIR);
+  if (!epub->load()) {
+    ESP_LOGW(TAG, "重取封面: %s 打不开，封面产物保持为空", path.c_str());
+    return;
+  }
+  (void)epub->generateCoverBmp();
+  StandbyCoverLayout lay{};
+  readerStandbyCoverLayout(lay);
+  const bool sb = epub->generateStandbyCoverBmp(standby, lay.boxW, lay.boxH);
+  ESP_LOGI(TAG, "重取封面: %s 书架图=%d 待机图=%d", path.c_str(),
+           (int)Storage.exists(cover.c_str()), (int)sb);
 }
 
 // 待机封面（「书籍封面」表盘 1:1 上屏的那张，尺寸 = readerStandbyCoverLayout 的框）。
