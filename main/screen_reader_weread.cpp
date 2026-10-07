@@ -230,6 +230,9 @@ static ListView weShelfListView() {
   lv.itemH = weItemH();
   lv.count = static_cast<int>(st.weShelf.size());
   lv.rows = std::max(1, (statusTop() - lv.top) / lv.itemH);
+  // 上下滑 = 整页翻（一屏行数）：微读书架动辄几十本，"一格一格挪"走不动。
+  // 单步留给方向键/BLE 键盘的 KEY_UP/DOWN，与目录/本地书架同一套口径。
+  lv.page = lv.rows;
   lv.sel = st.weSel;
   listViewCenter(lv);
   return lv;

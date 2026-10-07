@@ -9025,14 +9025,15 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
 
   // 触摸上下滑的翻页键（KEY_PAGE_UP/DOWN，主循环不再替阅读模式回退成单步）：
   // 目录和**书架**认它——目录几千章、书架一屏四本（横屏十二本），"一格一格选"或
-  // "一行一行挪"都走不动，上下滑要整页翻。**词典**也认它：释义正文常常整屏放不下，
-  // 上下滑要按屏滚（handleDict 收原键）。**弹层**（字号/字体/书架风格…）同样认它：
-  // 档位表常有十几项（SD 上字体越多越长），一格一格挪根本走不动 —— 弹层是模态的，
-  // 这个键只会喂给 handleSettingPicker，不会漏进下面的翻页动作。其余子界面（正文/
-  // 菜单/书签/笔记…）保持原来的单步上下语义。
+  // "一行一行挪"都走不动，上下滑要整页翻。**微读书架**也是长列表（一屏五六本），
+  // 同理认它，步长 = 一屏行数（weShelfListView 里 page = rows）。**词典**也认它：
+  // 释义正文常常整屏放不下，上下滑要按屏滚（handleDict 收原键）。**弹层**（字号/字体/
+  // 书架风格…）同样认它：档位表常有十几项（SD 上字体越多越长），一格一格挪根本走不动
+  // —— 弹层是模态的，这个键只会喂给 handleSettingPicker，不会漏进下面的翻页动作。
+  // 其余子界面（正文/菜单/书签/笔记…）保持原来的单步上下语义。
   if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
     if (st.mode != RdMode::Toc && st.mode != RdMode::Browser && st.mode != RdMode::Dictionary
-        && st.mode != RdMode::NoteDetail && !st.pickOpen)
+        && st.mode != RdMode::Weread && st.mode != RdMode::NoteDetail && !st.pickOpen)
       key = (key == KEY_PAGE_UP) ? KEY_UP : KEY_DOWN;
   }
 
