@@ -93,31 +93,27 @@ void repairSafeWriteFile(const std::string &path) {
     if (fileExists(tmp)) remove(tmp.c_str());
 }
 
-bool safeWriteFile(const std::string &path, const std::string &content) {
+// 原子写的两半，两个写入口（整份内容 / 流式）共用，免得备份-改名的先后次序在两处走样。
+// 打开 <path>.tmp 供写入：建目录 → 清掉上次残留的 .tmp / 从 .bak 回滚 → 以 "w" 打开。
+// 失败返回 NULL，且此时不留下 .tmp。tmp/bak 是出参，供后面的 commitTmpFile 使用。
+static FILE *openTmpForWrite(const std::string &path, std::string &tmp, std::string &bak) {
     size_t slash = path.rfind('/');
     if (slash != std::string::npos && slash > 0) {
-        if (!ensureDirPath(path.substr(0, slash))) return false;
+        if (!ensureDirPath(path.substr(0, slash))) return nullptr;
     }
-
-    std::string tmp = path + ".tmp";
-    std::string bak = path + ".bak";
+    tmp = path + ".tmp";
+    bak = path + ".bak";
     repairSafeWriteFile(path);
     remove(tmp.c_str());
 
     FILE *f = fopen(tmp.c_str(), "w");
-    if (!f) {
-        ESP_LOGE(TAG, "open tmp failed: %s errno=%d", tmp.c_str(), errno);
-        return false;
-    }
-    size_t written = fwrite(content.data(), 1, content.size(), f);
-    bool ok = (written == content.size()) && flushAndClose(f);
-    if (!ok) {
-        ESP_LOGE(TAG, "write tmp failed: %s (written=%u/%u) errno=%d",
-                 tmp.c_str(), (unsigned)written, (unsigned)content.size(), errno);
-        remove(tmp.c_str());
-        return false;
-    }
+    if (!f) ESP_LOGE(TAG, "open tmp failed: %s errno=%d", tmp.c_str(), errno);
+    return f;
+}
 
+// 把写好的 .tmp 提交成正式文件：原文件先退到 .bak，再把 .tmp 改名过来；任一步失败都把
+// .bak 改回去、删掉 .tmp，返回 false（盘上仍是上一份完整内容，不是半份新的）。
+static bool commitTmpFile(const std::string &path, const std::string &tmp, const std::string &bak) {
     remove(bak.c_str());
     bool hadOriginal = fileExists(path);
     if (hadOriginal && rename(path.c_str(), bak.c_str()) != 0) {
@@ -135,4 +131,37 @@ bool safeWriteFile(const std::string &path, const std::string &content) {
 
     if (hadOriginal) remove(bak.c_str());
     return true;
+}
+
+bool safeWriteFile(const std::string &path, const std::string &content) {
+    std::string tmp, bak;
+    FILE *f = openTmpForWrite(path, tmp, bak);
+    if (!f) return false;
+    const size_t written = fwrite(content.data(), 1, content.size(), f);
+    bool ok = (written == content.size()) && flushAndClose(f);
+    if (!ok) {
+        ESP_LOGE(TAG, "write tmp failed: %s (written=%u/%u) errno=%d",
+                 tmp.c_str(), (unsigned)written, (unsigned)content.size(), errno);
+        remove(tmp.c_str());
+        return false;
+    }
+    return commitTmpFile(path, tmp, bak);
+}
+
+bool safeWriteFileStream(const std::string &path,
+                         bool (*writeChunk)(FILE *tmp, void *ctx),
+                         void *ctx) {
+    std::string tmp, bak;
+    FILE *f = openTmpForWrite(path, tmp, bak);
+    if (!f) return false;
+    // 回调自己中止（false）与短写/fsync 失败同等对待：都删 tmp 回滚，绝不提交半份内容。
+    bool ok = writeChunk != nullptr && writeChunk(f, ctx);
+    if (ok) ok = flushAndClose(f);
+    else fclose(f);
+    if (!ok) {
+        ESP_LOGE(TAG, "stream write tmp failed: %s errno=%d", tmp.c_str(), errno);
+        remove(tmp.c_str());
+        return false;
+    }
+    return commitTmpFile(path, tmp, bak);
 }

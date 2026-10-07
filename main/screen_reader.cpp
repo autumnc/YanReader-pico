@@ -2578,21 +2578,47 @@ static std::string rdNoteUnescape(const std::string &s) {
   return o;
 }
 
-static void saveNotes() {
-  HalFile f;
-  if (!Storage.openFileForWrite(TAG, kNotesPath, f)) return;
+// saveNotes 的逐行写：一行一条，字段顺序与 loadNotes 的解析一一对应。
+// 单独拆出来是为了走 safeWriteFileStream —— 见 saveNotes 的注释（这张表**无大小上界**）。
+static bool rdWriteNotesChunk(FILE *f, void *ctx) {
+  (void)ctx;
   for (const auto &n : st.notes) {
     std::string line = rdNoteEscape(n.path) + RD_NOTE_SEP + rdNoteEscape(n.book) + RD_NOTE_SEP +
                        std::to_string(n.spine) + RD_NOTE_SEP + std::to_string(n.page) + RD_NOTE_SEP +
                        std::to_string(static_cast<long long>(n.time)) + RD_NOTE_SEP +
                        rdNoteEscape(n.text) + RD_NOTE_SEP + rdNoteEscape(n.note) + "\n";
-    f.write(reinterpret_cast<const uint8_t *>(line.data()), line.size());
+    if (fwrite(line.data(), 1, line.size(), f) != line.size()) return false;
   }
-  f.close();
+  return true;
+}
+
+static void saveNotes() {
+  // 原子写（.tmp → fsync → rename，带 .bak 回滚，见 safe_file.cpp）。
+  // 原来直接 openFileForWrite 写正式文件，而这是一张**整表重写**的表（每加/改/删一条标注
+  // 都重写整张）：写到一半掉电/复位丢的是**全部**笔记，不是这一条。原子写之后最坏丢最后
+  // 一次改动。用流式版本而不是 safeWriteFile：这张表没有大小上界，拼成一整份 std::string
+  // 会在 -fno-exceptions 下因分配失败直接 abort()。
+  const int64_t t0 = esp_timer_get_time();
+  if (!safeWriteFileStream(kNotesPath, rdWriteNotesChunk, nullptr)) {
+    // 不致命：盘上还是上一份完整的表，下次改标注会重试。仍要出声 —— 写失败通常是卡的问题，
+    // 而"笔记不见了"这个症状很容易被当成阅读器自己的 bug。
+    ESP_LOGW(TAG, "阅读笔记落盘失败 %s（保留上一份，下次改动重试）", kNotesPath);
+    return;
+  }
+  const int64_t us = esp_timer_get_time() - t0;
+  if (us > 200000) {
+    ESP_LOGW(TAG, "阅读笔记落盘偏慢: %lldms (%u 条)", (long long)(us / 1000),
+              (unsigned)st.notes.size());
+  }
 }
 
 static void loadNotes() {
   st.notes.clear();
+  // 读侧也走一遍修复：原子写有一个真实窗口 —— rename(path→bak) 之后、rename(tmp→path)
+  // 之前掉电，正式文件是**不在**的，只剩 .bak 和 .tmp。不在这里 repair，读起来就像
+  // "笔记全没了"。（loadProgress 那条路是 readWholeFile 内部自带 repair，这里手搓读，
+  // 得自己来。）
+  repairSafeWriteFile(kNotesPath);
   HalFile f;
   if (!Storage.openFileForRead(TAG, kNotesPath, f)) return;
   std::string all;
