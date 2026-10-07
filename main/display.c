@@ -342,7 +342,38 @@ enum EpdDrawError update_display_gray8_text(EpdiyHighlevelState* hl) {
     return result;
 }
 
-// 与 HalDisplay::RefreshMode 的枚举序一一对应（HalDisplay.h 里就是这五个，
+// 过渡屏（微读缓存进度 / 词典下载 / "正在连接 WiFi… N 秒"）专用：与 gray8_text 是
+// **同一条刷法**（同一张 30 相 8 灰阶表、同样整屏差分、白推一帧所以不闪），区别只在
+// 不记账、也不升级。
+//
+// 为什么单开一档：这些屏是"内容几乎不变、按秒重画一次"的过渡画面。按正文那样记账的话，
+// 每 APP_GC16_EVERY 次推进就替它升一次整屏 GC16 —— 用户看到的正是"缓存图书时隔几秒
+// 闪一下"（这本书缓存要好几分钟，一秒一次推进，14 次 ≈ 5 秒一次全刷）。而且这些推进
+// 本来也不推进残影（整屏只有一小段进度条和几个数字在变），却把共享预算吃掉了，挤掉
+// 正文翻页该得到的清账机会。
+// 灰底由离场那一下清：这些屏的每条出口（缓存完成/失败/取消、连接成功/失败）都会回到
+// 上一级界面，而那是"进新界面首帧"→ st.fullRefresh → 整屏 GC16（见 weDrive 与
+// handleWifi / readerWifiConnect 的各条分支）。所以这里不必再替它记这笔账。
+// / Transition-screen pass (WeRead cache progress, dictionary download, "connecting to
+// WiFi… N s"): the same 30-phase 8-gray differential as gray8_text, but it neither
+// counts toward the ghost budget nor promotes to GC16. These screens repaint once a
+// second with almost unchanged content; counting them produced the "flashes every few
+// seconds while caching" report and ate the shared budget text pages need. The gray
+// floor is cleared when the screen is left, which always happens through a
+// full-refresh first frame.
+enum EpdDrawError update_display_gray8_status(EpdiyHighlevelState* hl) {
+    use_scan_for(&E0470_GRAY8_TEXT_WAVEFORM, MODE_GL16);
+    present_begin();
+    epd_hl_waveform(hl, &E0470_GRAY8_TEXT_WAVEFORM);
+    night_enter(hl);
+    enum EpdDrawError result = epd_hl_update_screen_full(hl, MODE_GL16, 25);
+    night_leave(hl);
+    epd_hl_waveform(hl, &E0470_WAVEFORM);
+    rails_keepalive();
+    return result;
+}
+
+// 与 HalDisplay::RefreshMode 的枚举序一一对应（HalDisplay.h 里就是这六个，
 // 顺序不能改，crossmux 侧直接把枚举值当 int 传进来）。
 // Mirrors HalDisplay::RefreshMode — order matters, the crossmux side passes the
 // enum value straight through as an int.
@@ -351,6 +382,7 @@ enum EpdDrawError update_display_gray8_text(EpdiyHighlevelState* hl) {
 #define DISPLAY_KIND_FAST 2
 #define DISPLAY_KIND_GRAY8 3
 #define DISPLAY_KIND_GRAY8_TEXT 4
+#define DISPLAY_KIND_STATUS 5
 
 // ── 错相揭页（翻页动画）────────────────────────────────────────────────
 // 阅读器翻页前用 reader_hint_page_turn() 放一个方向进来，这里**消费一次**：只有紧随
@@ -439,7 +471,8 @@ enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
     // 灰底 + 出图。出图后 back_fb == front_fb，下面那条差分刷和揭页动画都成了空
     // 差分（走了也白走），所以这里清掉揭页方向后直接返回。
     if (display_take_white_exit() &&
-        (kind == DISPLAY_KIND_HALF || kind == DISPLAY_KIND_FAST || kind == DISPLAY_KIND_GRAY8_TEXT)) {
+        (kind == DISPLAY_KIND_HALF || kind == DISPLAY_KIND_FAST || kind == DISPLAY_KIND_GRAY8_TEXT ||
+         kind == DISPLAY_KIND_STATUS)) {
         ESP_LOGI(TAG, "gray panel -> from-white full refresh (reset reference, keep content)");
         s_turn_dir = -1;
         s_turn_fast = 0;
@@ -462,7 +495,7 @@ enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
         // 失败就落到下面走这一档本来该走的普通刷新。
     }
     switch (kind) {
-        // 这三档**不能直接 return**：它们自己都不调 guard_draw_result，直接返回就绕过了
+        // 这几档**不能直接 return**：它们自己都不调 guard_draw_result，直接返回就绕过了
         // 欠载兜底 —— 一旦线队列供数不足（GRAY8_TEXT 正是阅读器正文翻页的默认档），
         // PCLK 不会退回安全值、也不做"清屏 + from-white 重推"，它自己又不会恢复，
         // 于是之后每一帧继续欠载，屏幕长期花屏/半页。赋给 result 落到底下统一处理。
@@ -474,6 +507,10 @@ enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
             break;
         case DISPLAY_KIND_GRAY8_TEXT:
             result = update_display_gray8_text(hl);
+            break;
+        // 过渡屏（进度条 / "正在连接…"）：同一条 8 灰阶差分路，不记账也不升级。
+        case DISPLAY_KIND_STATUS:
+            result = update_display_gray8_status(hl);
             break;
         default: {
             // HALF(局刷 GL16) / FAST(极速 DU)：差分刷，走 hl_update —— GL16 会被

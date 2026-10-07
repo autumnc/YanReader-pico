@@ -86,8 +86,33 @@ static void weLoadShelf() {
   st.weSel = clampI(st.weSel, 0, std::max(0, static_cast<int>(st.weShelf.size()) - 1));
 }
 
-// 起一个新任务（登录/书架同步 kind=0，整本缓存 kind=1）。
+// 进度画面的"内容变了吗"快照（stage/done/total 就是 renderWereadDl 画的全部东西）。
+// 只有内容真的变了才标脏重推：原来 Event::None 分支每拍都置 dirty，于是每个空闲拍都
+// 推一次屏 —— 一次整屏差分推屏是阻塞的（~300ms），一本书缓存几分钟，这些推屏既拖慢
+// 缓存，又在攒残影预算（攒够就升一次整屏 GC16，见 rdSelfTickingProgress 的注释）。
+static int s_weLastStage = -1;
+static uint32_t s_weLastDone = 0, s_weLastTotal = 0;
+static bool s_weLastValid = false;
+
+static void weProgressForget() { s_weLastValid = false; }
+
+// 内容变了才标脏。任务不在/已结束时也作废快照，免得下一个任务的第一拍被上一次的值挡住。
+static void weMarkDirtyIfProgressChanged() {
+  if (!st.weOp) { weProgressForget(); return; }
+  const int stage = static_cast<int>(st.weOp->progressStage());
+  const uint32_t done = st.weOp->progressCompleted();
+  const uint32_t total = st.weOp->progressTotal();
+  if (s_weLastValid && stage == s_weLastStage && done == s_weLastDone && total == s_weLastTotal) return;
+  s_weLastStage = stage;
+  s_weLastDone = done;
+  s_weLastTotal = total;
+  s_weLastValid = true;
+  st.dirty = 1;
+}
+
+// 起一个新任务（登录/书架同步 kind=0，整本缓存 kind=1，只补封面 kind=2）。
 static void weBeginJob(int kind, const WeReadStore::ShelfRecord *book) {
+  weProgressForget();
   if (!st.weOp) st.weOp = weMakeOperation();
   if (!st.weOp) { st.weStatus = "内存不足，无法启动"; return; }
   // 没联网就先用设置里的 SSID/密码连一次（与词典下载同一条路子）。微读这边所有请求
@@ -376,7 +401,11 @@ void renderWereadDl() {
   const int barW = w - 2 * MARGIN;
   const int barH = uiLineHeight();
   g_rd.drawRect(MARGIN, y, barW, barH, true);
-  const int pct = (total > 0) ? static_cast<int>((static_cast<uint64_t>(done) * 100) / total) : 0;
+  // 夹在 100：done 与 total 不是同一本账（progressCompleted_ 每下一片/每缓一张图都加，
+  // total 按记录数算，重试还会再加），done > total 时 pct 会超 100 —— 不夹的话进度条
+  // 画到框外（下面那行百分比也会是 "132%" 这种）。
+  int pct = (total > 0) ? static_cast<int>((static_cast<uint64_t>(done) * 100) / total) : 0;
+  if (pct > 100) pct = 100;
   g_rd.fillRect(MARGIN + 1, y + 1, (barW - 2) * pct / 100, barH - 2, true);
   y += barH + 8;
   char buf[64];

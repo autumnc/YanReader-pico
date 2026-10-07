@@ -17,7 +17,10 @@ class HalDisplay {
     HALF_REFRESH,  // GL16
     FAST_REFRESH,  // DU
     GRAY8_REFRESH,     // 30 相 8 灰阶 GC16 全刷：比 FULL 快，残影一样清净（清账档）
-    GRAY8_TEXT_REFRESH // 30 相 8 灰阶 GL16 差分：不闪、比 HALF 每屏快约 80ms（正文档）
+    GRAY8_TEXT_REFRESH, // 30 相 8 灰阶 GL16 差分：不闪、比 HALF 每屏快约 80ms（正文档）
+    STATUS_REFRESH     // 同 GRAY8_TEXT 的刷法，但**不计入残影预算**：过渡屏（缓存进度 /
+                       // 词典下载 / "正在连接…"）按秒重画，记账会每 14 次升一次整屏
+                       // GC16 —— 那就是"缓存时隔几秒闪一下"。见 display.c
   };
 
   void begin(bool seamless = false);

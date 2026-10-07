@@ -5074,6 +5074,30 @@ static int fullRefreshEvery() {
 // 自上次全刷以来推过的阅读页数（只数阅读页翻页，菜单/列表不算）。
 static int s_pagesSinceFull = 0;
 
+// ── 会自己按秒重画的进度画面 ────────────────────────────────────────────
+// 微读整本缓存 / 词典下载 / 资源下载：这三屏在阻塞请求之间由自己的 tick 反复重画
+// （微读每拍一次、词典每 5% 一次），而它们**不能走 HALF(局刷)** —— display 侧有一条
+// "GL16 恒全像素"的规矩（hl_update 里 full = full || MODE_GL16），整屏 GL16 会被升级成
+// 整屏全像素驱动（含白推一帧），于是每重画一次就整屏闪一下。缓存一本书要好几分钟、
+// 每秒重画一次，用户侧就是"缓存时每秒闪一下"。
+//
+// 8 灰阶正文刷是同一条差分路（30 相 8-Gray 表）：不变的白像素不驱动 → 不闪（进度屏是
+// 纯黑白内容，没有真中灰，8 灰阶完全够）。
+//
+// 但它走的是**过渡屏那一档**（HalDisplay::STATUS_REFRESH，display.c 里与正文刷同一条
+// 刷法，只是不记账、也不升级）。原来它和正文翻页共用一个残影预算，于是每 APP_GC16_EVERY
+// 次推进就升一次整屏 GC16 —— 缓存一本书要好几分钟、进度一秒变一次，用户侧就是"缓存时
+// 隔几秒闪一下"。这些推进本来也不推进残影（整屏只有一小段进度条和几个数字在变），
+// 却把正文翻页该得的清账机会吃掉了。灰底由离场那一下清：这三屏的每条出口（完成/失败/
+// 取消）都回上一级界面，那是"进新界面首帧"→ st.fullRefresh → 整屏 GC16。
+//
+// WiFi 连接的阻塞等待（readerWifiConnect）也归这一类：屏幕上是"正在连接… N 秒"的浮层，
+// 与那三屏同样是"几秒重画一次、内容几乎不变"，同样不能走 GL16 全像素（每重画一次闪一屏）。
+static bool rdSelfTickingProgress() {
+  if (st.wifiBusy) return true;
+  return st.mode == RdMode::WereadDl || st.mode == RdMode::DictDl || st.mode == RdMode::ResDl;
+}
+
 // ── 换章检测（强制全刷，与策略无关）─────────────────────────────────────
 // EPUB 每个 spine 项就是一个章节文件，所以 spine 变了就是换章。换章时整屏内容全换、
 // 上一章的残影最脏，这里记下上一次推屏时的章节，翻页/跳目录/跳脚注/跳书签只要跨了章，
@@ -5325,6 +5349,8 @@ void renderCurrent() {
           break;
       }
     }
+  } else if (rdSelfTickingProgress()) {
+    m = HalDisplay::STATUS_REFRESH;
   } else {
     m = physTyping ? HalDisplay::FAST_REFRESH : HalDisplay::HALF_REFRESH;
   }

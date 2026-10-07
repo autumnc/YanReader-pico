@@ -77,6 +77,13 @@ enum EpdDrawError update_display_gray8(EpdiyHighlevelState* hl);
 /// tick. Unchanged white is not driven (no flash) and it is ~80 ms faster per
 /// screen than the default 37-phase GL16. Used for text page turns.
 enum EpdDrawError update_display_gray8_text(EpdiyHighlevelState* hl);
+/// 过渡屏刷（微读缓存进度 / 词典下载 / "正在连接 WiFi… N 秒"）：与 gray8_text 同一条
+/// 30 相 8 灰阶差分路（不闪），但不记账、不升级 —— 这些屏按秒重画且内容几乎不变，
+/// 记账只会每 APP_GC16_EVERY 次替它升一次整屏 GC16（"缓存时隔几秒闪一下"），还把共享
+/// 预算从正文翻页那里吃掉。灰底由离场那一下（进下一界面的首帧全刷）清。
+/// / Transition-screen pass: same 30-phase 8-gray differential as gray8_text (no flash)
+/// but it neither counts toward the ghost budget nor promotes to GC16.
+enum EpdDrawError update_display_gray8_status(EpdiyHighlevelState* hl);
 /// 阅读模式的统一推屏出口。kind 就是 HalDisplay::RefreshMode 的枚举序
 /// (FULL/HALF/FAST/GRAY8/GRAY8_TEXT)。存在的理由：crossmux 的
 /// HalDisplay::displayBuffer() 把 HALF/FAST 直接交给 epd_hl_update_screen()，
