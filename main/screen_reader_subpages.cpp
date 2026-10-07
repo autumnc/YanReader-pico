@@ -200,16 +200,15 @@ void handleWifi(int key) {
       rdVkWantShow();
       st.dirty = 1;
     } else if (st.wifiField == 2) {
-      // 连接（阻塞式，最多 10s，与写作模式设置页一致）
+      // 连接（阻塞式，最多 10s，与写作模式设置页一致）。进度反馈在 readerWifiConnect
+      // 里：它先推"正在连接…"浮层，再让它每 ~250ms 回调重画一次秒数 —— 原来的写法
+      // 只设了 wifiBusy 就进阻塞段，那一帧根本没推上去（渲染在主循环里，而这里还没
+      // 返回），用户看到的就是"点了连接，屏幕一直不动"。
       if (st.wifiSsidEdit.empty()) { st.wifiStatus = "SSID 为空"; st.dirty = 1; return; }
       g_settings.setWifiSsid(st.wifiSsidEdit);
       g_settings.setWifiPassword(st.wifiPassEdit);
-      st.wifiBusy = true;
-      st.fullRefresh = true;
-      st.dirty = 1;
       g_wifi.begin();
-      bool ok = g_wifi.connect(st.wifiSsidEdit.c_str(), st.wifiPassEdit.c_str());
-      st.wifiBusy = false;
+      const bool ok = readerWifiConnect(st.wifiSsidEdit.c_str(), st.wifiPassEdit.c_str());
       // 失败时把 reason 码翻成人话贴出来：最常见的是"密码错"与"找不到该 SSID"，两者
       // 的处理办法完全不同，笼统写"检查 SSID/密码"帮不上忙。
       st.wifiStatus = ok ? ("已连接  IP " + g_wifi.getIp())
@@ -480,6 +479,35 @@ static int dictDlRowCount() {
   return static_cast<int>(st.dictCat.items.size()) + 1;  // 末行 = 重新获取清单
 }
 
+// ── 阻塞式连接 + 进度反馈 ────────────────────────────────────────────────
+// connect() 最长阻塞 10 秒，这 10 秒里界面完全不动 —— 用户会以为死机（"点了连接
+// 没反应"）。这里先推一帧"正在连接…"浮层，再让 WifiManager 每 ~250ms 回调一次，
+// 每次把浮层里的秒数改掉重推。刷新走过渡屏那一档（不闪，见 rdSelfTickingProgress）。
+// 返回前清掉浮层，调用方接着设自己的状态文字（结果那一帧由主循环画）。
+static void wifiConnectTick(void *, unsigned elapsedMs) {
+  char buf[48];
+  snprintf(buf, sizeof(buf), "正在连接… %u 秒", (elapsedMs + 999) / 1000);
+  st.busyMsg = buf;
+  st.dirty = 1;
+  renderCurrent();
+}
+
+bool readerWifiConnect(const char *ssid, const char *pass) {
+  // 第一帧得自己推：第一次回调要等一个 250ms 段，而且这之前屏上什么都没有。
+  // 走整屏全刷 —— 它是新出现的一层浮层，屏上内容确实换了。
+  st.busyMsg = "正在连接…";
+  st.busySub = "最多 10 秒";
+  st.wifiBusy = true;
+  st.fullRefresh = true;
+  st.dirty = 1;
+  renderCurrent();
+  const bool ok = g_wifi.connect(ssid, pass, wifiConnectTick, nullptr);
+  st.wifiBusy = false;
+  st.busyMsg.clear();
+  st.busySub.clear();
+  return ok;
+}
+
 // 确保 WiFi 已连（未连则按设置里的 SSID/密码连一次）。
 bool readerEnsureWifi(std::string &err) {
   if (g_wifi.isConnected()) return true;
@@ -490,7 +518,7 @@ bool readerEnsureWifi(std::string &err) {
     return false;
   }
   g_wifi.begin();
-  if (!g_wifi.connect(ssid.c_str(), pass.c_str())) {
+  if (!readerWifiConnect(ssid.c_str(), pass.c_str())) {
     err = "WiFi 连接失败";
     return false;
   }

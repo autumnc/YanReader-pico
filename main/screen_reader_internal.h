@@ -621,6 +621,9 @@ ListView flatMenuListView(int count, int sel, int top = coverTop());
 // 动作：打开一本书 / 确保联网 / 重扫书架 / 整屏重绘
 bool openBook(const std::string &path, int kind);
 bool readerEnsureWifi(std::string &err);
+// 阻塞式连接 + 屏上"正在连接… N 秒"进度反馈（连接最长 10 秒，不给反馈用户会以为死机）。
+// 所有"先连 WiFi 再干活"的路径都该走它，不要直接调 g_wifi.connect()。
+bool readerWifiConnect(const char *ssid, const char *pass);
 void scanBooks();
 void renderCurrent();
 

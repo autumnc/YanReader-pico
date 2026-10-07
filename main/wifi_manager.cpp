@@ -2,6 +2,7 @@
 #include <cstring>
 #include <vector>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <esp_netif.h>
@@ -127,7 +128,7 @@ bool WifiManager::begin() {
     return true;
 }
 
-bool WifiManager::connect(const char *ssid, const char *password) {
+bool WifiManager::connect(const char *ssid, const char *password, ConnectProgress progress, void *ctx) {
     if (!ssid || !*ssid) return false;
     // 先抑制自动重连：esp_wifi_start() 会触发 STA_START，若此处 auto_reconnect
     // 已为 true，处理器会用旧配置抢先连接，导致下方的 set_config 报
@@ -195,11 +196,20 @@ bool WifiManager::connect(const char *ssid, const char *password) {
         return false;
     }
 
-    // Wait for connection (10s timeout)
+    // Wait for connection (10s timeout)。分成 250ms 的小段等：段与段之间调一次
+    // progress，调用方才有机会把"正在连接… N 秒"画到屏上（否则这 10 秒里界面完全
+    // 冻住）。事件组的位是"读时才清"，回调里重画屏（几百毫秒）期间就算连上了，
+    // 位也还在，下一段 wait 立刻取到 —— 不会漏醒。
     if (s_wifi_event) {
-        EventBits_t bits = xEventGroupWaitBits(s_wifi_event, WIFI_CONNECTED_BIT,
-                                                pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
-        if (bits & WIFI_CONNECTED_BIT) return true;
+        const int64_t waitStartUs = esp_timer_get_time();
+        for (;;) {
+            const EventBits_t bits = xEventGroupWaitBits(s_wifi_event, WIFI_CONNECTED_BIT,
+                                                         pdTRUE, pdFALSE, pdMS_TO_TICKS(250));
+            if (bits & WIFI_CONNECTED_BIT) return true;
+            const int64_t elapsedMs = (esp_timer_get_time() - waitStartUs) / 1000;
+            if (elapsedMs >= 10000) break;
+            if (progress) progress(ctx, static_cast<unsigned>(elapsedMs));
+        }
     }
     // 失败：先停掉后台重连循环，再扫一遍给出可操作的结论。
     s_auto_reconnect = false;
