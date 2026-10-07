@@ -9,12 +9,21 @@
 
 namespace {
 
+// elementTick：可选。整页渲染是主循环里的一整段同步阻塞（阅读器实测"重画" 292~742ms），
+// 期间没人读触摸控制器 —— 而"点按"要求"按下"和"抬手"各被采到一次，整段落在里面的点按
+// 一点痕迹都不留（用户侧："点了要等一会儿才翻页，这期间怎么点都一样"）。所以让调用方把
+// 自己的补采回调传进来，每 2 个元素（正文页就是每两行）调一次。
+// 回调跑在**调用方的任务**里：它只能做那个任务里能做的事（阅读器的 cst836u 只能从主循环
+// 那个任务读）。本库不认识输入层，也不该认识。传 nullptr（默认）时一圈下来一次都不调。
 template <typename Predicate>
 void renderFilteredPageElements(const std::vector<std::unique_ptr<PageElement>>& elements, GfxRenderer& renderer,
-                                const int fontId, const int xOffset, const int yOffset, Predicate&& predicate) {
+                                const int fontId, const int xOffset, const int yOffset, Predicate&& predicate,
+                                void (*elementTick)() = nullptr) {
+  int n = 0;
   for (const auto& element : elements) {
     if (predicate(*element)) {
       element->render(renderer, fontId, xOffset, yOffset);
+      if (elementTick != nullptr && (++n & 1) == 0) elementTick();
     }
   }
 }
@@ -166,8 +175,10 @@ std::unique_ptr<PageHorizontalRule> PageHorizontalRule::deserialize(HalFile& fil
   return rule;
 }
 
-void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {
-  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, [](const PageElement&) { return true; });
+void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                  void (*elementTick)()) const {
+  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, [](const PageElement&) { return true; },
+                             elementTick);
 }
 
 void Page::renderImages(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {

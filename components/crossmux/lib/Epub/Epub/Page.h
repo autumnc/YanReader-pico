@@ -93,7 +93,11 @@ class Page {
 
   bool addLink(const char* href, int16_t x, int16_t y, int16_t width, int16_t height);
 
-  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
+  /// elementTick：可选，每渲染 2 个元素（正文页 = 每两行）调一次 —— 给"长阻塞段补采输入"用。
+  /// 整页渲染是调用方任务里的一整段同步阻塞（阅读器实测 292~742ms），期间没人采输入，
+  /// 落在里面的点按会被整个丢掉。回调在调用方的任务里跑，只该做那个任务里能做的事。
+  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset,
+              void (*elementTick)() = nullptr) const;
   void renderImages(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
   void renderWithImagePlaceholders(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
   void extractImagesNeedingDecode();

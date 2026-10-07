@@ -146,6 +146,16 @@ void ttf_draw_text_px_bw(
 /// 纯优化：内建字体/已整表映射时直接返回，不分配任何内存。
 void ttf_warm_text_px(int pixel_height, const char* text);
 
+/// 把整段文本用到的字形**现在就栅格化**进字形缓存。与 ttf_warm_text_px 的分工：
+/// 那个只把字形块读进块缓存（IO），这个是把它真正解析成位图（CPU）。两个都得做，
+/// 之后绘制才只剩"查表 + 贴位图"——翻页那一拍的重画就是这么被搬到上一页的空档里的。
+///
+/// 缓存按（码点、像素高、字重、合成加粗）判同，**已缓存的自己跳过**，所以重复调用
+/// 只是多几次查表；也因此必须在与绘制**同一套字重**下调用（见 ttf_body_ink_begin）。
+/// 缺字替补跟在绘制路径里完全一样（走 get_glyph）。
+/// 纯优化：字体没开、文本为空时直接返回。
+void ttf_raster_text_px(int pixel_height, const char* text);
+
 void ttf_measure_line(int size, const char* text, int* above, int* below);
 void ttf_measure_line_px(int pixel_height, const char* text, int* above, int* below);
 int ttf_text_width_px(int pixel_height, const char* text);

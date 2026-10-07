@@ -2724,6 +2724,22 @@ void ttf_warm_text_px(int pixel_height, const char* text) {
     warm_text_io(pixel_height, text);
 }
 
+void ttf_raster_text_px(int pixel_height, const char* text) {
+    if (!font_ready || text == NULL) return;
+    pixel_height = clamp_px(pixel_height);
+    const char* cursor = text;
+    // 不做去重表：同一个码点第二次进来就是一次 cache_lookup 命中，比维护去重表便宜，
+    // 也不会跟 warm_text_io 抢 warm_cps 那张暂存（阅读器整页预热里两个函数挨着调）。
+    while (*cursor != '\0') {
+        uint32_t cp = decode_utf8(&cursor);
+        if (cp == 0) break;
+        // get_glyph 先查缓存、命中直接返回（同码点/像素高/字重/合成加粗），缺字替补也
+        // 在里面 —— 这里不另做一套判定，图的就是"与绘制路径逐一对齐"。
+        // 返回的指针不持有：缓存是 LRU，指针跨条目失效是设计内的（调用方一律"取到就画"）。
+        (void)get_glyph(cp, pixel_height);
+    }
+}
+
 void ttf_measure_line(int size, const char* text, int* above, int* below) {
     ttf_measure_line_px(size_to_px(size), text, above, below);
 }
