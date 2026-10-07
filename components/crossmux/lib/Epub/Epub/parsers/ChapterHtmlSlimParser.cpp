@@ -308,18 +308,27 @@ void ChapterHtmlSlimParser::applyVerticalAlignToEntry(StyleStackEntry& entry, co
   }
 }
 
-// 这条 CSS 是不是把文字交给了**次家族**（书内 CSS 的第二个字面）。阅读器没开次字面
-// 时 altFontFamilyHash() 是 0，而 0 不是任何家族名的哈希，所以恒为 false：关闭态下
-// 与"没有这条路径"逐像素等价。
-bool ChapterHtmlSlimParser::isAltFamily(const CssStyle& css) const {
+// 这条 CSS 把文字交给了**哪个家族面**（书内 CSS 的第二 / 第三家族）。阅读器没开某个
+// 家族面时它的哈希是 0，而 0 不是任何家族名的哈希、也不能等于 css.fontFamilyHash()
+// （hash 非 0 才登记），所以恒不命中：关闭态下与"没有这条路径"逐像素等价。
+//
+// 判定顺序 = 优先级：同一段同时命中两个哈希（书里两个家族名指到同一个哈希时会这样）
+// 时归**次家族**。两个哈希相等本来就该由调用方去重（见 Epub::resolveEmbeddedFonts
+// 的挑选规则），这里只是兜底，保证"每个词只带一位"。
+EpdFontFamily::Style ChapterHtmlSlimParser::familyBitOf(const CssStyle& css) const {
+  if (!css.hasFontFamily()) return EpdFontFamily::REGULAR;
   const uint32_t altFamily = renderer.altFontFamilyHash();
-  return altFamily != 0 && css.hasFontFamily() && css.fontFamilyHash == altFamily;
+  if (altFamily != 0 && css.fontFamilyHash == altFamily) return EpdFontFamily::ALT_FONT;
+  const uint32_t alt2Family = renderer.alt2FontFamilyHash();
+  if (alt2Family != 0 && css.fontFamilyHash == alt2Family) return EpdFontFamily::ALT2_FONT;
+  return EpdFontFamily::REGULAR;
 }
 
-void ChapterHtmlSlimParser::applyAltFontToEntry(StyleStackEntry& entry, const CssStyle& css) {
-  if (isAltFamily(css)) {
-    entry.hasAltFont = true;
-    entry.altFont = true;
+void ChapterHtmlSlimParser::applyFamilyBitToEntry(StyleStackEntry& entry, const CssStyle& css) {
+  const EpdFontFamily::Style bit = familyBitOf(css);
+  if (bit != EpdFontFamily::REGULAR) {
+    entry.hasFamilyBit = true;
+    entry.familyBit = bit;
   }
 }
 
@@ -341,7 +350,7 @@ void ChapterHtmlSlimParser::pushTableTextStyleEntry(const CssStyle& cssStyle) {
   }
   applyTextDecorationToEntry(entry, cssStyle);
   applyDirectionToEntry(entry, cssStyle);
-  applyAltFontToEntry(entry, cssStyle);
+  applyFamilyBitToEntry(entry, cssStyle);
   entry.setsParagraphDirection = true;
   if (cssStyle.hasTextAlign()) {
     entry.hasTextAlign = true;
@@ -366,7 +375,7 @@ void ChapterHtmlSlimParser::pushDecorationStyleEntry(const CssTextDecoration def
     entry.italic = cssStyle.fontStyle == CssFontStyle::Italic;
   }
   applyDirectionToEntry(entry, cssStyle);
-  applyAltFontToEntry(entry, cssStyle);
+  applyFamilyBitToEntry(entry, cssStyle);
   inlineStyleStack.push_back(entry);
   updateEffectiveInlineStyle();
 }
@@ -391,8 +400,8 @@ void ChapterHtmlSlimParser::updateEffectiveInlineStyle() {
   effectiveTextAlign = currentCssStyle.textAlign;
   effectiveSup = false;
   effectiveSub = false;
-  // 次家族：跟 bold 同一个来源（当前块的 CSS），比的是一个哈希。
-  effectiveAltFont = isAltFamily(currentCssStyle);
+  // 家族面：跟 bold 同一个来源（当前块的 CSS），比的是家族哈希。
+  effectiveFamily = familyBitOf(currentCssStyle);
 
   // Apply inline style stack in order
   for (const auto& entry : inlineStyleStack) {
@@ -427,8 +436,8 @@ void ChapterHtmlSlimParser::updateEffectiveInlineStyle() {
       effectiveSub = entry.sub;
       if (entry.sub) effectiveSup = false;
     }
-    if (entry.hasAltFont) {
-      effectiveAltFont = entry.altFont;
+    if (entry.hasFamilyBit) {
+      effectiveFamily = entry.familyBit;
     }
   }
 
@@ -548,10 +557,9 @@ void ChapterHtmlSlimParser::flushPartWordBuffer() {
   } else if (effectiveSub) {
     fontStyle = static_cast<EpdFontFamily::Style>(fontStyle | EpdFontFamily::SUB);
   }
-  // 次字面：只换画哪个字面，不动字号也不加装饰，所以跟上面几位正交。
-  if (effectiveAltFont) {
-    fontStyle = static_cast<EpdFontFamily::Style>(fontStyle | EpdFontFamily::ALT_FONT);
-  }
+  // 家族面：只换画哪个字面，不动字号也不加装饰，所以跟上面几位正交。effectiveFamily
+  // 本身就是那一位（0 / ALT_FONT / ALT2_FONT），"或"进去即可，不必再判。
+  fontStyle = static_cast<EpdFontFamily::Style>(fontStyle | effectiveFamily);
 
   // flush the buffer
   partWordBuffer[partWordBufferIndex] = '\0';
@@ -1120,9 +1128,12 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
   // 同样不继承，靠 inlineStyleStack 逐层传），但家族漏了这一条，容器式的多字体书
   // 就完全不生效（祖堂集恰好把 family 写在 <span> 上，走行内那一支，但 <div class="jiazhu">
   // 这种写法在中文 EPUB 里同样常见）。所以照 direction 的办法补一条：
-  // 只有"这一层确实开着次字面"时才继承，别的家族继承下来也画不出区别。
-  if (!cssStyle.hasFontFamily() && self->effectiveAltFont) {
-    cssStyle.fontFamilyHash = self->renderer.altFontFamilyHash();
+  // 只继承**当前生效的那个家族**（哪一位生效就抄哪个哈希），别的家族继承下来也画不出
+  // 区别。抄哈希而不是抄"位"，是因为下游认的是哈希（familyBitOf 再比一次）。
+  if (!cssStyle.hasFontFamily() && self->effectiveFamily != EpdFontFamily::REGULAR) {
+    cssStyle.fontFamilyHash = (self->effectiveFamily == EpdFontFamily::ALT2_FONT)
+                                  ? self->renderer.alt2FontFamilyHash()
+                                  : self->renderer.altFontFamilyHash();
     cssStyle.defined.fontFamily = 1;
   }
 
@@ -2078,11 +2089,12 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     // Handle span and other inline elements for CSS styling.
     const bool inheritedTableTextAlign = self->tableDepth >= 1 && cssStyle.hasTextAlign();
     // 家族切换几乎只出现在行内（祖堂集：<span class="zhu"> 的仿宋注文），所以这一支
-    // 必须认 font-family，否则次字面永远不会被打开。只在"这个家族确实有字面"时才推
+    // 必须认 font-family，否则家族字面永远不会被打开。只在"这个家族确实有字面"时才推
     // 一层栈 —— 别的家族（kt/ls/…）落到内容面，跟没写一样，不值得为它切断词缓冲。
-    const bool altFontHere = self->isAltFamily(cssStyle);
+    const EpdFontFamily::Style familyBitHere = self->familyBitOf(cssStyle);
     if (cssStyle.hasFontWeight() || cssStyle.hasFontStyle() || cssStyle.hasTextDecoration() ||
-        cssStyle.hasDirection() || cssStyle.hasVerticalAlign() || inheritedTableTextAlign || altFontHere) {
+        cssStyle.hasDirection() || cssStyle.hasVerticalAlign() || inheritedTableTextAlign ||
+        familyBitHere != EpdFontFamily::REGULAR) {
       // Flush buffer before style change so preceding text gets current style
       if (self->partWordBufferIndex > 0) {
         self->flushPartWordBuffer();
@@ -2107,9 +2119,9 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         entry.textAlign = cssStyle.textAlign;
       }
       applyVerticalAlignToEntry(entry, cssStyle);
-      if (altFontHere) {
-        entry.hasAltFont = true;
-        entry.altFont = true;
+      if (familyBitHere != EpdFontFamily::REGULAR) {
+        entry.hasFamilyBit = true;
+        entry.familyBit = familyBitHere;
       }
       self->inlineStyleStack.push_back(entry);
       self->updateEffectiveInlineStyle();

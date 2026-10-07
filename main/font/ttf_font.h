@@ -40,9 +40,12 @@ extern "C" {
 //           （见 font_renderer.h 的 g_font）。没装外置字体时它等于内置字体。
 // UI      = 恒为内置 builtin.ttf。保留它是为了两件事：内置/用户字体并存的回退面
 //           （见下）与"必须固定用内置字体"的少数界面（虚拟键盘）。
-// CONTENT_ALT = 书内 CSS 里**第二个家族**的字面（祖堂集：正文宋体 st、注文/引文仿宋 fs）。
-// 它和 CONTENT 同侧（画的都是书里的字），只是另带一份字面与字形缓存；没打开时
-// ttf_set_role(CONTENT_ALT) 静默退回 CONTENT，所以不必到处判空。
+// CONTENT_ALT  = 书内 CSS 里**第二个家族**的字面（祖堂集：正文宋体 st、注文/引文仿宋 fs）。
+// CONTENT_ALT2 = **第三个家族**的字面（同一本书里再指一个家族时的那一份）。
+// 它俩和 CONTENT 同侧（画的都是书里的字），只是各带一份字面与字形缓存；没打开时
+// ttf_set_role(CONTENT_ALT/ALT2) 静默退回 CONTENT，所以不必到处判空。
+// 家族在书里一般不超三个（正文 + 注文 + 引文），所以只留两槽；CSS 指名第四个家族时
+// 它落回 CONTENT（见 Epub::resolveEmbeddedFonts 的挑选规则）。
 // 绘制前必须选面：ttf_set_role() 只改一个指针，O(1)。见 ttf_font.c 中 s_cur 的说明。
 // **缺字自动替补**：某个面画不出一个码点时，绘制/度量会自动去别的面取那个字形
 // （正文面 ↔ 内置面互补，见 fallback_role_for），所以调用方不必为"用户的字体没这个
@@ -50,7 +53,8 @@ extern "C" {
 #define TTF_ROLE_CONTENT 0
 #define TTF_ROLE_UI      1
 #define TTF_ROLE_CONTENT_ALT 2
-#define TTF_ROLE_COUNT   3
+#define TTF_ROLE_CONTENT_ALT2 3
+#define TTF_ROLE_COUNT   4
 
 #define TTF_FONT_MAX 24
 #define TTF_FONT_NAME_MAX 64
@@ -77,6 +81,9 @@ esp_err_t ttf_font_open_builtin(void);
 /// 关闭即把它占的 PSRAM（IO 块缓存 + 字形缓存 + loca）全部还回去 —— 换书/退出阅读
 /// 必须调，否则上一本书的仿宋会一直占着 ~1MB。
 esp_err_t ttf_font_open_alt(const char* path);
+/// 同上的**第三家族**槽（书内 CSS 指了第三个家族）。两槽同尺寸、同字形缓存上限，
+/// 也就同代价；一本两家族的书不会碰这一面（open 失败/没调 = 关机状态）。
+esp_err_t ttf_font_open_alt2(const char* path);
 /// 把**内嵌的 Yan Reader 标志字体**（Noto Serif CJK SC 子集，仅标志用字）装进次字面
 /// (CONTENT_ALT)，供开机动画使用。装不上不是错误 —— 调用方退化为清屏即可。
 ///
@@ -86,6 +93,8 @@ esp_err_t ttf_font_open_alt(const char* path);
 esp_err_t ttf_font_open_logo(void);
 void ttf_font_close_alt(void);
 bool ttf_font_alt_ready(void);
+void ttf_font_close_alt2(void);
+bool ttf_font_alt2_ready(void);
 /// 「SD 上的字体文件在接下来这段时间不可用」：true = 内容面切内建、关掉次字面、并拒绝
 /// 任何按路径重开；false = 解除禁令（**恢复用户字体要由调用方自己按设置重开**，这里
 /// 不替它记路径，见 screen_reader.cpp 的 applyUserContentFont()）。

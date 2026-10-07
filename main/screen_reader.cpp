@@ -453,22 +453,28 @@ static int styleSource() {
 }
 static bool styleEmbedded() { return styleSource() == 0; }
 
-// ── 内嵌字体：随书 / 关闭（设置 → 内嵌字体）────────────────────────────────
-// 随书（默认）= 书里 @font-face 标了、并且被 body/html 规则点名的字体，读这本书时
-//   装到内容面；换书/退出自动还原用户字体。关闭 = 永远用用户字体（老行为）。
-// 只认"整本书一个家族"这一层：按元素混排要同时驻留多个字体面（每面一套字形缓存
-// 加 128+32KB io 缓冲），而字体面是全局单例、不能嵌套，先不做。
-static const char *kEmbFontKeys[] = {"on", "off"};
-static const char *kEmbFontNames[] = {"随书", "关闭"};
-static const int kEmbFontCount = 2;
+// ── 内嵌字体：随书 / 替换主字体 / 关闭（设置 → 内嵌字体）──────────────────
+// 引擎最多认三份字面（EmbeddedFontSet{primary, alt, alt2}，见 Epub.h）：primary 画正文，
+// alt / alt2 画样式表里另指了家族的段落（祖堂集：正文宋体 st、注文/引文仿宋 fs）。
+// 三档就是"这些字面各装不装"：
+//   随书（默认）= 三份都装到书里对应的字体面；换书/退出自动还原用户字体。
+//   替换主字体 = 书里的 primary **不抠也不装**，内容面留给用户全局字体（等于"用我的
+//     字体替换书里的主字体"），书里的家族字面照旧装 —— 那本书的注文/引文还是书里的字面。
+//   关闭 = 书里的概不装（老行为：全用用户字体）。
+// 档位都是全局设置，与书的家族数无关：一本书只有一个家族时只装那一份。
+// 键是字符串，老设备存的 "on"/"off" 原样有效，不需要迁移。
+static const char *kEmbFontKeys[] = {"on", "replace", "off"};
+static const char *kEmbFontNames[] = {"随书", "替换主字体", "关闭"};
+static const int kEmbFontCount = 3;
+// 档位下标，与上面两张表同序。别把 "off" 的下标写死成 1。
+enum { kEmbFollow = 0, kEmbReplacePrimary = 1, kEmbOff = 2 };
 static int embeddedFontMode() {
   const std::string k = g_settings.getString("reader_embedded_font", "on");
   for (int i = 0; i < kEmbFontCount; i++) {
     if (k == kEmbFontKeys[i]) return i;
   }
-  return 0;  // 随书
+  return kEmbFollow;
 }
-static bool embeddedFontEnabled() { return embeddedFontMode() == 0; }
 
 // 版式缓存键用的字面身份。FNV-1a 而不是 std::hash：后者不保证跨版本稳定，
 // 换了实现就会把一整批 .bin 白白判废。
@@ -500,40 +506,70 @@ static void applyUserContentFont() {
   }
 }
 
-// ── 次字面（书内 CSS 的第二个家族）────────────────────────────────────────
-// 祖堂集：正文家族 st(宋体)，注文/引文家族 fs(仿宋)。次字面是**独立**于内容面的一份
-// 字面：装不上不影响正文，只是那些段落照旧用正文字面画。它占 PSRAM（一份 CJK 字面
+// ── 家族字面（书内 CSS 的第二个 / 第三个家族）────────────────────────────
+// 祖堂集：正文家族 st(宋体)，注文/引文家族 fs(仿宋)。家族字面是**独立**于内容面的一份
+// 字面：装不上不影响正文，只是那些段落照旧用正文字面画。每份占 PSRAM（一份 CJK 字面
 // 常驻 ~1MB），所以换书/退出阅读必须连同内容面一起还回去 —— 见 releaseBookFonts()。
 //
 // 装载成功后把家族名哈希灌进 g_rd：排版期 ChapterHtmlSlimParser 拿它跟每个元素算出来的
-// CSS 家族哈希比，相等就给这个词打 EpdFontFamily::ALT_FONT，绘制时切到次字面。
-// 没装成则灌 0（0 不是任何家族名的哈希）—— 恒不相等，整本书一个字都不走这条路。
-static void loadAltEmbeddedFont(const Epub::EmbeddedFont &alt) {
-  ttf_font_close_alt();
-  st.bookFontAltLocal.clear();
-  g_rd.setAltFontFamilyHash(0);
-  st.bookFontAltTag = 0;
-  if (alt.itemHref.empty()) return;  // 这本书只有一个家族（绝大多数书）
-  const std::string local = st.epub ? st.epub->extractEmbeddedFont(alt, "book_alt.ttf") : std::string();
-  if (local.empty() || ttf_font_open_alt(local.c_str()) != 0) {
-    ESP_LOGW(TAG, "次家族装载失败，注文/引文回落正文字面: %s",
+// CSS 家族哈希比，相等就给这个词打 EpdFontFamily::ALT_FONT / ALT2_FONT，绘制时切到
+// 对应的家族字面。没装成则灌 0（0 不是任何家族名的哈希）—— 恒不相等，整本书一个字都
+// 不走这条路。
+//
+// 两个槽（次字面 / 第三家族）除了角色号、落盘文件名、哈希灌哪个以外完全一样，所以走同一
+// 个实现 —— 免得哪天只给其中一个补了修补。second=false 就是次字面。
+static void loadBookAltFace(const Epub::EmbeddedFont &alt, std::string &localOut, uint32_t &tagOut,
+                            bool second) {
+  const char *label = second ? "第三家族" : "次家族";
+  if (second) {
+    ttf_font_close_alt2();
+    g_rd.setAlt2FontFamilyHash(0);
+  } else {
+    ttf_font_close_alt();
+    g_rd.setAltFontFamilyHash(0);
+  }
+  localOut.clear();
+  tagOut = 0;
+  if (alt.itemHref.empty()) return;  // 这本书没有那么多家族（绝大多数书）
+  // 落盘名必须**每档不同**：两份字面是两个不同的字体文件，同名会互相覆盖。
+  const char *fileName = second ? "book_alt2.ttf" : "book_alt.ttf";
+  const std::string local = st.epub ? st.epub->extractEmbeddedFont(alt, fileName) : std::string();
+  const bool opened =
+      !local.empty() && (second ? ttf_font_open_alt2(local.c_str()) : ttf_font_open_alt(local.c_str())) == 0;
+  if (!opened) {
+    ESP_LOGW(TAG, "%s装载失败，注文/引文回落正文字面: %s", label,
              local.empty() ? alt.itemHref.c_str() : local.c_str());
     return;
   }
-  st.bookFontAltLocal = local;
+  localOut = local;
   // 这里只需要一个"变没变"的指纹：哈希本身跟着家族名走，家族名没变就没必要重排。
-  st.bookFontAltTag = fontTagFor(local, alt.size);
-  g_rd.setAltFontFamilyHash(CssParser::fontFamilyHash(alt.family));
-  ESP_LOGI(TAG, "次家族: '%s' → %s", alt.family.c_str(), local.c_str());
+  tagOut = fontTagFor(local, alt.size);
+  if (second) {
+    g_rd.setAlt2FontFamilyHash(CssParser::fontFamilyHash(alt.family));
+  } else {
+    g_rd.setAltFontFamilyHash(CssParser::fontFamilyHash(alt.family));
+  }
+  ESP_LOGI(TAG, "%s: '%s' → %s", label, alt.family.c_str(), local.c_str());
 }
 
-// 内容面 + 次字面一起还回去。任何清 st.bookFontLocal 的地方都必须走这里，否则次字面
-// 那份 ~1MB 会一直挂在 PSRAM 上（换一本书才发现，且表现为"内存莫名其妙少了 1MB"）。
+static void loadAltEmbeddedFont(const Epub::EmbeddedFont &alt) {
+  loadBookAltFace(alt, st.bookFontAltLocal, st.bookFontAltTag, /*second=*/false);
+}
+static void loadAlt2EmbeddedFont(const Epub::EmbeddedFont &alt2) {
+  loadBookAltFace(alt2, st.bookFontAlt2Local, st.bookFontAlt2Tag, /*second=*/true);
+}
+
+// 内容面 + 两个家族字面一起还回去。任何清 st.bookFontLocal 的地方都必须走这里，否则
+// 那两份各 ~1MB 会一直挂在 PSRAM 上（换一本书才发现，且表现为"内存莫名其妙少了 1MB"）。
 static void releaseBookFonts() {
   ttf_font_close_alt();
+  ttf_font_close_alt2();
   st.bookFontAltLocal.clear();
   st.bookFontAltTag = 0;
+  st.bookFontAlt2Local.clear();
+  st.bookFontAlt2Tag = 0;
   g_rd.setAltFontFamilyHash(0);
+  g_rd.setAlt2FontFamilyHash(0);
 }
 
 static ReaderRenderSpec makeSpec() {
@@ -541,9 +577,13 @@ static ReaderRenderSpec makeSpec() {
   int w = g_rd.getScreenWidth();
   spec.fontId = BODY_FONT_ID_BASE + st.fontLevel;
   // fontId 只挑字号，挑不出字面：换字面（用户字体 ↔ 书内字体）后 fontId 可能一字不变，
-  // 不带上 fontTag 就会拿另一套字面排出来的旧 .bin 直接显示。次字面同理：它的哈希
-  // 只在装了次字面时才非零，装/不装会改变每个词的 ALT_FONT 位，也就改变版式。
-  spec.fontTag = st.bookFontTag ^ st.bookFontAltTag;
+  // 不带上 fontTag 就会拿另一套字面排出来的旧 .bin 直接显示。家族字面同理：它们的哈希
+  // 只在装了那一面时才非零，装/不装会改变每个词的 ALT_FONT / ALT2_FONT 位，也就改变版式。
+  // 注意 fontTag 里**不含用户字体的身份**（0 就表示"用户/内建字体"）：关闭档与
+  // 替换主字体档在书没有家族面时都是 0，那是刻意的 —— 两种情形都全用用户字体排版，
+  // 逐像素等价。代价是"换了用户字体文件"在键上完全看不出来，所以改用户字体必须走
+  // reopenBook()（它开头的 rdAheadClear 作废掉 RAM 里那一页）。
+  spec.fontTag = st.bookFontTag ^ st.bookFontAltTag ^ st.bookFontAlt2Tag;
   spec.lineCompression = st.lineSpacing;
   spec.extraParagraphSpacing = static_cast<uint8_t>(clampI(st.paraSpacing, 0, 5));
   // 内嵌模式下让对齐/缩进也随书（引擎的 None/Auto 就是"不覆盖书籍样式"）；
@@ -690,28 +730,49 @@ static bool openEpub(const std::string &path) {
   // 书内嵌字体：装到内容面。reopenBook() 会重入这里（改字号/行距/边距都走它），
   // 那时内容面已经装着这本书的字面，st.bookFontLocal 非空即为"同一本书、字面已就位"，
   // 不能再解压+重读一遍 SD（大字体一次几百毫秒）；换书时 openBook() 会先清空它。
+  // 「替换主字体」档下 bookFontLocal **恒为空**（primary 故意不装），于是这一段每次
+  // reopenBook 都会走进来 —— 该档下真正需要判"已就位"的是次字面（见下面的判据）。
   if (st.bookFontLocal.empty()) {
     bool loaded = false;
-    if (embeddedFontEnabled()) {
-      const Epub::EmbeddedFontSet fonts = epub->resolveEmbeddedFonts();
-      const Epub::EmbeddedFont &font = fonts.primary;
-      const std::string local = font.itemHref.empty() ? std::string() : epub->extractEmbeddedFont(font);
-      if (!local.empty() && ttf_font_open(local.c_str()) == 0) {
-        st.bookFontLocal = local;
-        st.bookFontTag = fontTagFor(local, font.size);
-        loaded = true;
-        ESP_LOGI(TAG, "内嵌字体: '%s' → %s", font.family.c_str(), local.c_str());
-      } else if (!font.itemHref.empty()) {
-        ESP_LOGW(TAG, "内嵌字体装载失败，回落用户字体: %s",
-                 local.empty() ? font.itemHref.c_str() : local.c_str());
-      } else {
-        // 空 itemHref = 这本书没有我们认得的正文家族（或者声明的字体根本不在归档里）。
-        // 这条路以前完全静默，"内嵌字体没生效"就只能靠猜，所以补一行 INFO。
-        ESP_LOGI(TAG, "内嵌字体: 本书没有可用的正文家族声明，用用户字体");
-      }
-      loadAltEmbeddedFont(fonts.alt);
-    } else {
+    const int emb = embeddedFontMode();
+    if (emb == kEmbOff) {
       ESP_LOGI(TAG, "内嵌字体: 设置=关闭，用用户字体");
+    } else {
+      const Epub::EmbeddedFontSet fonts = epub->resolveEmbeddedFonts();
+      if (emb == kEmbFollow) {
+        const Epub::EmbeddedFont &font = fonts.primary;
+        const std::string local = font.itemHref.empty() ? std::string() : epub->extractEmbeddedFont(font);
+        if (!local.empty() && ttf_font_open(local.c_str()) == 0) {
+          st.bookFontLocal = local;
+          st.bookFontTag = fontTagFor(local, font.size);
+          loaded = true;
+          ESP_LOGI(TAG, "内嵌字体: '%s' → %s", font.family.c_str(), local.c_str());
+        } else if (!font.itemHref.empty()) {
+          ESP_LOGW(TAG, "内嵌字体装载失败，回落用户字体: %s",
+                   local.empty() ? font.itemHref.c_str() : local.c_str());
+        } else {
+          // 空 itemHref = 这本书没有我们认得的正文家族（或者声明的字体根本不在归档里）。
+          // 这条路以前完全静默，"内嵌字体没生效"就只能靠猜，所以补一行 INFO。
+          ESP_LOGI(TAG, "内嵌字体: 本书没有可用的正文家族声明，用用户字体");
+        }
+      } else {
+        // 替换主字体：primary **不抠也不装** —— 省一次几 MB 的 zip 解压/落盘与一份常驻
+        // 字面，内容面留给用户全局字体（下面的 applyUserContentFont）。bookFontLocal /
+        // bookFontTag 故意保持空/0：它们是"内容面 = 本书字面"的判据，外壳字体(uiFontId)、
+        // 菜单标签、字体选择器的拦阻都据此正确地让位给用户字体。书里的 alt 照旧装 ——
+        // 那本书的注文/引文仍然用书里的字面画。
+        ESP_LOGI(TAG, "内嵌字体: 替换主字体，正文用用户字体（书内 '%s' 不装载）",
+                 fonts.primary.family.c_str());
+        applyUserContentFont();   // 正文是必需的那一面，先装它
+        loaded = true;            // 收尾那次 applyUserContentFont 不必再来（它本来也会短路）
+      }
+      // 家族字面只在"还没就位"时装。替换档下这一段会被 reopenBook() 反复走进来，不判就位
+      // 的话每改一次字号都要把它从 SD 重读一遍（几百 ms + 该面字形缓存全丢）；
+      // primary 抠不出来/装不上（bookFontLocal 保持为空）时，随书档的每一次重排也一样。
+      // bookFontAltLocal 非空 ⇔ 那一面此刻装着这本书的家族 —— releaseBookFonts() 与
+      // loadBookAltFace() 的失败路径都会清它，所以它当判据是准的。
+      if (st.bookFontAltLocal.empty()) loadAltEmbeddedFont(fonts.alt);
+      if (st.bookFontAlt2Local.empty()) loadAlt2EmbeddedFont(fonts.alt2);
     }
     // 没有内嵌字体（绝大多数书）、装载失败、或用户在设置里关掉了：内容面必须是
     // 用户字体。这一支也是"上一本书的内嵌字体"唯一的还原点。
@@ -1606,12 +1667,12 @@ static void rdPrebuildAhead() {
 //   3) 只补**还没有 book.bin** 的书；已有缓存的书开起来本来就快（热开 3.4s），
 //      重建它纯属浪费 SD 寿命。
 //
-// 字体这一步是**只解压不装载**：ttf_font_open 会占用全局的内容面/次字面，那是"正在
+// 字体这一步是**只解压不装载**：ttf_font_open 会占用全局的内容面/家族字面，那是"正在
 // 读的那本书"的东西，后台不能碰（换了字面，正在看的那一页下次重排就变样了）。
 // extractEmbeddedFont 只落文件，开书时那段 zip 读取和早退判断就全变成了 stat 命中。
 // 这也是原先计划的 ②「内嵌字体懒加载」真正的落点：**懒加载本身不能做** ——
-// makeSpec 的 fontTag 里带着次字面指纹、ChapterHtmlSlimParser 又按 altFontFamilyHash
-// 给每个词打 ALT_FONT 位，装不装次字面直接改变换行；把"解压"提前则完全等价、且安全。
+// makeSpec 的 fontTag 里带着家族字面指纹、ChapterHtmlSlimParser 又按家族哈希
+// 给每个词打 ALT_FONT/ALT2_FONT 位，装不装那面直接改变换行；把"解压"提前则完全等价、且安全。
 //
 // 反过来说，这条路的**代价**：这几秒在书架上是真占 CPU/SD 的，所以规矩 1、2 必须守。
 // 停手多久才算"用户不在跟前，可以开工"。这两个值是拿第一次上机日志校出来的：
@@ -1623,13 +1684,18 @@ static void rdPrebuildAhead() {
 static const int64_t kShelfIdleUs = 8 * 1000 * 1000;
 static const int64_t kShelfIdleColdUs = 30 * 1000 * 1000;
 
-// 这本书有没有内嵌正文字体？读 <cache>/book_font.txt（v4：`v4\n<href>\n<size>\n<family>\n…`，
-// 主 href 是空行即"没有"），见 Epub::resolveEmbeddedFonts。判不出来（文件不在、版本旧）
+// 这本书有没有内嵌正文字体？读 <cache>/book_font.txt（`v6\n<href>\n<size>\n<family>\n…`，
+// 主 href 是空行即"没有"），见 Epub::resolveEmbeddedFonts。判不出来（文件不在、版本不认得）
 // 一律返回 false = 当成"有"：保守，宁可不预建，也不排一份规格必然对不上、开书即作废的 .bin。
 static bool bookHasNoEmbeddedFont(const std::string &cacheDir) {
   bool ok = false;
   const std::string cached = Storage.readFile((cacheDir + "/book_font.txt").c_str(), &ok);
-  if (!ok || cached.rfind("v4\n", 0) != 0) return false;
+  if (!ok) return false;
+  // v4/v5/v6 的**前三个字段**（主 href / size / family）含义一致，这里只看主 href 那一行，
+  // 所以三个版本都认 —— 不认旧版本的话，升级后每本老书在第一次被打开（缓存被重写成 v6）之前
+  // 都会被当成"有内嵌字体"，②首章预建对整柜书静默停摆。v7 真再来的时候再一起看。
+  if (cached.rfind("v6\n", 0) != 0 && cached.rfind("v5\n", 0) != 0 && cached.rfind("v4\n", 0) != 0)
+    return false;
   const size_t nl = cached.find('\n', 3);
   return nl != std::string::npos && nl == 3;   // 主 href 是空行
 }
@@ -1685,13 +1751,18 @@ static void rdShelfIdlePrebuild() {
     auto epub = std::make_shared<Epub>(path, CACHE_DIR);
     if (epub->load()) {
       if (needMeta) {
-        // resolveEmbeddedFonts 会把结论写进 <cache>/book_font.txt（v4），开书时直接读它，
+        // resolveEmbeddedFonts 会把结论写进 <cache>/book_font.txt（v6），开书时直接读它，
         // 不用再解一遍 OPF 里的 @font-face。
         const Epub::EmbeddedFontSet fonts = epub->resolveEmbeddedFonts();
-        if (!fonts.primary.itemHref.empty()) (void)epub->extractEmbeddedFont(fonts.primary);
-        // 次字面的落盘名必须和 loadAltEmbeddedFont 里的一致（book_alt.ttf），否则这里
-        // 抠出来的那份开书时用不上，等于白做。
+        // 替换主字体档下 primary 永远不会被装载，抠出来（几 MB 的 zip 解压 + SD 写）
+        // 纯属白费。但 resolveEmbeddedFonts() 必须照跑：<cache>/book_font.txt(v6) 是它
+        // 写的，那才是省开书时间的大头。家族字面两个档都要抠。
+        if (embeddedFontMode() == kEmbFollow && !fonts.primary.itemHref.empty())
+          (void)epub->extractEmbeddedFont(fonts.primary);
+        // 家族字面的落盘名必须和 loadBookAltFace 里的一致（book_alt.ttf / book_alt2.ttf），
+        // 否则这里抠出来的那份开书时用不上，等于白做。
         if (!fonts.alt.itemHref.empty()) (void)epub->extractEmbeddedFont(fonts.alt, "book_alt.ttf");
+        if (!fonts.alt2.itemHref.empty()) (void)epub->extractEmbeddedFont(fonts.alt2, "book_alt2.ttf");
         (void)epub->generateCoverBmp();
       } else {
         // 只补首章排版。顺序与 openSpine 一致：字号梯子必须在 startBuild 之前灌，
@@ -1889,7 +1960,7 @@ static RdPageText rdBuildPageText(const Page &page, int fontId, int xOffset, int
     for (uint16_t i = 0; i < blk->wordCount(); i++) {
       RdWordHit wh;
       wh.x = xOffset + el->xPos + blk->wordXpos(i);
-      wh.style = static_cast<uint8_t>(blk->wordStyle(i));
+      wh.style = static_cast<uint16_t>(blk->wordStyle(i));
       wh.y = baseY;
       wh.text = blk->wordText(i);
       // 宽度也按这一行的字体量：渲染用的就是它，用正文号量会让标题行的命中框横向也对不上。
@@ -2004,21 +2075,30 @@ static bool rdWarmStrings(int role, const std::string &all, bool yieldToKey) {
 // 据它决定要不要记下"这页暖过了" —— 让位收手的那种没做完，下个空闲帧要重来。
 static bool rdWarmPageText(const RdPageText &pt, bool yieldToKey) {
   if (!pt.valid) return true;
-  // 按字面分两拨：一页里正文（内容面）和注文/引文（次字面）混排是常态，
+  // 按字面分拨：一页里正文（内容面）和注文/引文（家族字面）混排是常态，
   // 而 ttf_warm_text_px 只作用于"当前字面"，混在一起喂等于拿内容面的 loca/glyf
-  // 基址去读次字面该用的字形块 —— 白读一遍，那些注文还是一个冷字形一次 SD 读。
-  // 次字面没打开时 ttf_set_role 会静默退回内容面，所以不必在这儿判空。
-  std::string main, alt;
+  // 基址去读家族字面该用的字形块 —— 白读一遍，那些注文还是一个冷字形一次 SD 读。
+  // 哪一面没打开时 ttf_set_role 会静默退回内容面，所以不必在这儿判空。
+  // 家族面先暖、内容面最后暖：收手（yieldToKey）时留下的角色就是内容面 —— 调用方与
+  // 翻页那一帧都按"内容面"接着画，多暖一遍都没暖完的家族面不影响正确性。
+  std::string main, alt, alt2;
   for (const auto &w : pt.words) {
     if (w.text.empty()) continue;
-    if ((w.style & EpdFontFamily::ALT_FONT) != 0) {
+    const uint16_t bits = static_cast<uint16_t>(w.style);
+    if ((bits & EpdFontFamily::ALT2_FONT) != 0) {
+      alt2 += w.text;
+    } else if ((bits & EpdFontFamily::ALT_FONT) != 0) {
       alt += w.text;
     } else {
       main += w.text;
     }
   }
-  if (!rdWarmStrings(TTF_ROLE_CONTENT_ALT, alt, yieldToKey)) {
+  if (!rdWarmStrings(TTF_ROLE_CONTENT_ALT2, alt2, yieldToKey)) {
     ttf_set_role(TTF_ROLE_CONTENT);   // 中途收手也要把角色留在内容面（跟改之前一致）
+    return false;
+  }
+  if (!rdWarmStrings(TTF_ROLE_CONTENT_ALT, alt, yieldToKey)) {
+    ttf_set_role(TTF_ROLE_CONTENT);
     return false;
   }
   if (!rdWarmStrings(TTF_ROLE_CONTENT, main, yieldToKey)) return false;  // 同上，角色已在内容面
@@ -7932,9 +8012,9 @@ static void applyRdPick(int act, const std::string &value) {
       st.fullRefresh = true;
       break;
     case MenuAct::EmbeddedFont:
-      // 随书 ↔ 关闭。关掉时当前这本书立刻换回用户字体，打开时立刻换成书里的
-      // （reopenBook 走 openEpub → 重新解析/解压/装载，所以在这里先把已装载的
-      // 书内字体作废，否则 openEpub 会认为"字面已就位"而跳过）。
+      // 随书 / 替换主字体 / 关闭三档共用这一支（与 value 无关）：切到哪一档都让当前
+      // 这本书立刻按新档重装字面。先作废已装载的书内字面 —— reopenBook 走 openEpub
+      // → 重新解析/解压/装载，不作废的话 openEpub 会认为"字面已就位"而跳过。
       g_settings.setString("reader_embedded_font", value);
       releaseBookFonts();  // 次字面同理：openEpub 会按新设置重装（关了就没有）
       st.bookFontLocal.clear();

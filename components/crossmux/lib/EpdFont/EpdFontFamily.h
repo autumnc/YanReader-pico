@@ -32,6 +32,11 @@ class EpdFontFamily {
     // 按波浪画（见 TextBlock::render 的 tracker）。来自 CSS 的
     // `text-decoration: duokan-wavyline` / `text-decoration-style: wavy` / border-image。
     WAVY_UNDERLINE = 256,
+    // 同 ALT_FONT，但指书内 CSS 的**第三个家族**。与 ALT_FONT 是**互斥的选择**而不是
+    // 叠加：解析器每段只会置其中一个（见 ChapterHtmlSlimParser 的 effectiveFamily），
+    // 两个都置时 GfxRenderer 按 ALT2 优先。家族数上限就到三个 —— 再多也没处放，
+    // 第四个家族落回正文字面（见 Epub::resolveEmbeddedFonts 的挑选规则）。
+    ALT2_FONT = 512,
   };
   static constexpr uint16_t TEXT_DECORATION_MASK = static_cast<uint16_t>(UNDERLINE | STRIKETHROUGH | WAVY_UNDERLINE);
 

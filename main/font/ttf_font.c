@@ -345,11 +345,13 @@ static void face_defaults(ttf_face_t* f, int role) {
     f->f_wght_def = TTF_WGHT_DEF;
     f->f_wght_max = TTF_WGHT_MAX;
     f->f_current_weight = TTF_WGHT_DEF;
+    // 两个"书内家族"槽同待遇（都是零星出现的注文/引文，量比正文小）。
+    const bool is_book_alt = (role == TTF_ROLE_CONTENT_ALT || role == TTF_ROLE_CONTENT_ALT2);
     f->f_cache_limit = (role == TTF_ROLE_UI)     ? TTF_UI_CACHE_LIMIT
-                       : (role == TTF_ROLE_CONTENT_ALT) ? TTF_ALT_CACHE_LIMIT
-                                                        : TTF_CACHE_LIMIT;
-    f->f_io_slots = (role == TTF_ROLE_CONTENT_ALT) ? TTF_ALT_IO_SLOTS : TTF_IO_SLOTS;
-    f->f_io_run_max = (role == TTF_ROLE_CONTENT_ALT) ? TTF_ALT_IO_RUN_MAX : TTF_IO_RUN_MAX;
+                       : is_book_alt             ? TTF_ALT_CACHE_LIMIT
+                                                 : TTF_CACHE_LIMIT;
+    f->f_io_slots   = is_book_alt ? TTF_ALT_IO_SLOTS   : TTF_IO_SLOTS;
+    f->f_io_run_max = is_book_alt ? TTF_ALT_IO_RUN_MAX : TTF_IO_RUN_MAX;
 }
 
 static ttf_face_t s_faces[TTF_ROLE_COUNT];
@@ -2050,19 +2052,24 @@ static bool face_has_cp(int role, uint32_t cp) {
 }
 
 // 替补顺序：**与当前面互补的那一面优先**。
-//   当前是正文面(内容/次字面) → 内置面：它覆盖最全(7717 字，ASCII 全在)。
-//   当前是内置面(界面外壳)   → 内容面：用户装的字体 CJK 覆盖通常比内置子集更宽。
-//   当前是次字面(书内 CSS 第二个家族) → 先内容面：同一本书、同一套观感。
+//   当前是正文面(CONTENT)          → 内置面：它覆盖最全(7717 字，ASCII 全在)。
+//   当前是内置面(界面外壳)         → 内容面：用户装的字体 CJK 覆盖通常比内置子集更宽。
+//   当前是书内某个家族面(ALT/ALT2) → 先内容面、再**另一个家族面**：同一本书、同一套观感；
+//                                    最后才轮到内置面（覆盖最全，兜底）。
+// 未打开的面 face_has_cp 立刻返回 false，所以给两家族的书多带一列、多试一个家族面不花时间。
 // 返回角色；-1 = 谁都没有(调用方照旧画 .notdef)。
 static int fallback_role_for(uint32_t cp) {
+    // 行 = 当前面，列 = 依次尝试的替补面，-1 表示到此为止。**四个角色各一行**，
+    // TTF_ROLE_COUNT 变了这里必须跟着变（列数=角色数）。
     static const int8_t kOrder[TTF_ROLE_COUNT][TTF_ROLE_COUNT] = {
-        /* CONTENT     */ {TTF_ROLE_UI, -1, -1},
-        /* UI          */ {TTF_ROLE_CONTENT, -1, -1},
-        /* CONTENT_ALT */ {TTF_ROLE_CONTENT, TTF_ROLE_UI, -1},
+        /* CONTENT      */ {TTF_ROLE_UI, -1, -1, -1},
+        /* UI           */ {TTF_ROLE_CONTENT, -1, -1, -1},
+        /* CONTENT_ALT  */ {TTF_ROLE_CONTENT, TTF_ROLE_CONTENT_ALT2, TTF_ROLE_UI, -1},
+        /* CONTENT_ALT2 */ {TTF_ROLE_CONTENT, TTF_ROLE_CONTENT_ALT, TTF_ROLE_UI, -1},
     };
-    const int cur = (s_cur == &s_faces[TTF_ROLE_UI])            ? TTF_ROLE_UI
-                    : (s_cur == &s_faces[TTF_ROLE_CONTENT_ALT]) ? TTF_ROLE_CONTENT_ALT
-                                                                : TTF_ROLE_CONTENT;
+    // 用指针差算下标，别再写比较链 —— 加面时漏一行的表现是"替补悄悄串到别的面"，
+    // 那种 bug 在屏上只是偶尔一个错字形，很难查。
+    const int cur = (int)(s_cur - s_faces);
     for (int i = 0; i < TTF_ROLE_COUNT; i++) {
         const int role = kOrder[cur][i];
         if (role < 0) break;
@@ -2602,28 +2609,42 @@ esp_err_t ttf_font_open(const char* path) {
     return e;
 }
 
-/* ---- 次字面：书内 CSS 的第二个家族 ---- */
-bool ttf_font_alt_ready(void) { return s_faces[TTF_ROLE_CONTENT_ALT].f_font_ready; }
-
-esp_err_t ttf_font_open_alt(const char* path) {
-    ttf_face_t* prev = face_enter(TTF_ROLE_CONTENT_ALT);
+/* ---- 书内家族面：CSS 的第二 / 第三个家族 --------------------------------
+ * 两槽行为完全一样（同尺寸、同字形缓存上限、同失败语义），只有角色号不同，所以走同一
+ * 对辅助函数 —— 免得哪天只给其中一个补了修补，另一个还带着老毛病。
+ */
+static esp_err_t book_alt_open(int role, const char* path) {
+    ttf_face_t* prev = face_enter(role);
     esp_err_t e = face_open(path);
     face_leave(prev);
     if (e != ESP_OK) {
-        // 次字面打不开**不是错误**：正文照旧，只是那些注文/引文落回主字面渲染。
-        // 这里退到"没开"，ttf_set_role(ALT) 随后会自动走内容面。
-        face_enter(TTF_ROLE_CONTENT_ALT);
+        // 家族面打不开**不是错误**：正文照旧，只是那些注文/引文落回主字面渲染。
+        // 这里退到"没开"，ttf_set_role(该面) 随后会自动走内容面。
+        face_enter(role);
         face_unload();
         face_leave(prev);
     }
     return e;
 }
 
-void ttf_font_close_alt(void) {
-    ttf_face_t* prev = face_enter(TTF_ROLE_CONTENT_ALT);
+static void book_alt_close(int role) {
+    ttf_face_t* prev = face_enter(role);
     face_unload();
     face_leave(prev);
 }
+
+bool ttf_font_alt_ready(void) { return s_faces[TTF_ROLE_CONTENT_ALT].f_font_ready; }
+bool ttf_font_alt2_ready(void) { return s_faces[TTF_ROLE_CONTENT_ALT2].f_font_ready; }
+
+esp_err_t ttf_font_open_alt(const char* path) {
+    return book_alt_open(TTF_ROLE_CONTENT_ALT, path);
+}
+esp_err_t ttf_font_open_alt2(const char* path) {
+    return book_alt_open(TTF_ROLE_CONTENT_ALT2, path);
+}
+
+void ttf_font_close_alt(void) { book_alt_close(TTF_ROLE_CONTENT_ALT); }
+void ttf_font_close_alt2(void) { book_alt_close(TTF_ROLE_CONTENT_ALT2); }
 
 esp_err_t ttf_font_open_logo(void) {
     ttf_face_t* prev = face_enter(TTF_ROLE_CONTENT_ALT);
@@ -2651,16 +2672,14 @@ esp_err_t ttf_font_open_logo(void) {
 }
 
 int ttf_get_role(void) {
-    if (s_cur == &s_faces[TTF_ROLE_UI]) return TTF_ROLE_UI;
-    if (s_cur == &s_faces[TTF_ROLE_CONTENT_ALT]) return TTF_ROLE_CONTENT_ALT;
-    return TTF_ROLE_CONTENT;
+    // s_cur 恒指向 s_faces 里的一员（只由 face_enter/ttf_set_role 写），所以下标就是答案。
+    return (int)(s_cur - s_faces);
 }
 
 void ttf_set_role(int role) {
-    // 次字面：没打开就静默用内容面（绘制层不必到处判"本书有没有次字体"）。
-    if (role == TTF_ROLE_CONTENT_ALT) {
-        s_cur = s_faces[TTF_ROLE_CONTENT_ALT].f_font_ready ? &s_faces[TTF_ROLE_CONTENT_ALT]
-                                                           : &s_faces[TTF_ROLE_CONTENT];
+    // 书内家族面：没打开就静默用内容面（绘制层不必到处判"本书有没有这个家族"）。
+    if (role == TTF_ROLE_CONTENT_ALT || role == TTF_ROLE_CONTENT_ALT2) {
+        s_cur = s_faces[role].f_font_ready ? &s_faces[role] : &s_faces[TTF_ROLE_CONTENT];
         return;
     }
     // 内容面就是内置字体时，UI 面与它完全等价 —— 直接用内容面，不必另开一份。
@@ -2687,12 +2706,10 @@ void ttf_set_role(int role) {
 
 esp_err_t ttf_font_init(void) {
     // BSS 清零后 font_fd/-1、font_file_pos/UINT32_MAX、packed_root/-1、current_weight
-    // 这几项"零不是对的值"，两面都要先过一遍默认值。用 cache_limit 非 0 当"已初始化"
+    // 这几项"零不是对的值"，每个面都要先过一遍默认值。用 cache_limit 非 0 当"已初始化"
     // 的探针 —— begin() 会被调两次(UI 面与内容面各一次)，第二次不能把字体状态抹掉。
     if (s_faces[TTF_ROLE_CONTENT].f_cache_limit == 0) {
-        face_defaults(&s_faces[TTF_ROLE_CONTENT], TTF_ROLE_CONTENT);
-        face_defaults(&s_faces[TTF_ROLE_UI], TTF_ROLE_UI);
-        face_defaults(&s_faces[TTF_ROLE_CONTENT_ALT], TTF_ROLE_CONTENT_ALT);
+        for (int role = 0; role < TTF_ROLE_COUNT; role++) face_defaults(&s_faces[role], role);
     }
 
     // 1) 内容面先装。try_map_table 以 heap_caps_get_largest_free_block() 为门槛：

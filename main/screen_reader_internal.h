@@ -235,14 +235,23 @@ struct RdState {
   // 书内嵌字体：非空 = 内容面此刻装的是从当前这本书里解出来的字体（指向缓存目录里的
   // 落盘副本）。bookFontTag 跟着它进版式缓存键（见 ReaderRenderSpec::fontTag）；
   // 0 表示内容面是用户/内建字体。两者都在 openBook() 里换书时清掉。
+  // **空 ≠ 这本书没装任何内嵌字体**：「内嵌字体=替换主字体」档下正文故意不装书里的
+  // primary，这里就恒为空而次字面（下面那个）正装着。它是"内容面是不是本书字面"的判据，
+  // 不是"这本书有没有内嵌字体"的判据。
   std::string bookFontLocal;
   uint32_t bookFontTag = 0;
-  // 书内 CSS 的**次家族**（祖堂集：正文宋体、注文/引文仿宋）。跟 bookFontLocal 同生共死：
-  // 换书/退出阅读/SD 挂起时一起关（次字面一份就占 ~1MB PSRAM，留着就是漏）。
-  // 空 = 这本书没有可用的第二个家族，此时 g_rd 的次家族哈希是 0，排版不会给任何词
-  // 打 ALT_FONT，绘制完全等价于次字面没打开。
+  // 书内 CSS 的**家族字面**：次家族（祖堂集：正文宋体、注文/引文仿宋）与第三家族
+  // （同一本书再指一个家族时的那份）。跟 bookFontLocal 同生共死：换书/退出阅读/SD 挂起
+  // 时一起关（每份就占 ~1MB PSRAM，留着就是漏）。
+  // **非空 = 那一面此刻装着的正是这本书的那个家族** —— openEpub() 拿它当"已就位"
+  // 的判据（替换主字体档下那段字体会被每次 reopenBook() 重入，不判就位就要重读 SD）。
+  // 空 = 没装成（这本书没有那么多家族 / 解压或打开失败），此时 g_rd 里对应的家族哈希是 0，
+  // 排版不会给任何词打 ALT_FONT / ALT2_FONT，绘制完全等价于那一面没打开。
+  // 两槽互不依赖：只有次家族的书写常（也应当）把 alt2 留空。
   std::string bookFontAltLocal;
   uint32_t bookFontAltTag = 0;
+  std::string bookFontAlt2Local;
+  uint32_t bookFontAlt2Tag = 0;
 
   // txt
   std::string txtUtf8;
@@ -745,7 +754,10 @@ void prepareQr();
 // 采集时必须和 Page::render 用同一套 xOffset/yOffset/字重，否则高亮会画歪。
 struct RdWordHit {
   int x = 0, w = 0, y = 0;   // 像素：起点、宽、基线
-  uint8_t style = 0;
+  // 与 EpdFontFamily::Style 同宽（uint16_t）。**别收窄成 uint8_t**：ALT_FONT(128) 塞得进，
+  // 但 WAVY_UNDERLINE(256) / ALT2_FONT(512) 会被砍 —— 后果是 rdWarmPageText 永远读不到
+  // ALT2 位（第三家族的字形从不预热），命中框宽度也会按错的面量。
+  uint16_t style = 0;
   std::string text;
 };
 

@@ -99,6 +99,9 @@ class GfxRenderer {
   int8_t cssFontLadder_[5] = {0, 0, 0, 0, 0};
   // 书内 CSS 的次家族名哈希（见 setAltFontFamilyHash）。0 = 不启用。
   uint32_t altFontFamilyHash_ = 0;
+  // 第三家族名哈希，同上的另一份（见 setAlt2FontFamilyHash）。0 = 不启用。
+  // 两个哈希必须不同才有意义：相等时同一个家族会先被次家族认领（见解析器的判定顺序）。
+  uint32_t alt2FontFamilyHash_ = 0;
   // Mutable because ensureSdCardFontReady() is const (called from layout code
   // that holds a const GfxRenderer&) but triggers SD card reads and heap
   // allocation inside the SdCardFont objects. Same pragmatic compromise as
@@ -225,12 +228,16 @@ class GfxRenderer {
   /// 原样返回 baseFontId。
   [[nodiscard]] int cssFontId(int baseFontId, float scale) const;
 
-  // ---- 书内 CSS 的次家族（font-family 的第二个字面）----
+  // ---- 书内 CSS 的家族字面（font-family 的第二 / 第三个）----
   // CssStyle 里存的是家族名哈希，排版时拿它跟这里比：相等就给这个词打 ALT_FONT，
   // 绘制时 GfxRenderer 把 ttf 角色切到次字面。0 = 未启用（没开书/书里只有一个家族），
   // 此时任何家族哈希都不相等 → 全部走正文字面，与旧行为逐像素一致。
   void setAltFontFamilyHash(uint32_t hash) { altFontFamilyHash_ = hash; }
   [[nodiscard]] uint32_t altFontFamilyHash() const { return altFontFamilyHash_; }
+  // 同上的第三个家族：相等就给这个词打 ALT2_FONT，绘制时切到第三个家族面。
+  // 一族一个哈希、各管一位，互不含糊；两个哈希相等时次家族先认领（解析器按序判定）。
+  void setAlt2FontFamilyHash(uint32_t hash) { alt2FontFamilyHash_ = hash; }
+  [[nodiscard]] uint32_t alt2FontFamilyHash() const { return alt2FontFamilyHash_; }
 
   void registerSdCardFont(int fontId, SdCardFont* font) { sdCardFonts_[fontId] = font; }
   void unregisterSdCardFont(int fontId) { removeFont(fontId); }

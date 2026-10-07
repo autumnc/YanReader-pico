@@ -46,12 +46,14 @@ class Epub {
     size_t size = 0;       // inflated size of the font file, 0 when itemHref is empty
   };
 
-  // 一本书最多认两份字面：primary 画正文，alt 画样式表里另指了一个家族的段落
-  // （祖堂集：正文宋体 st，注文/引文仿宋 fs）。设备上同时只养得起这两份，
-  // 第三个及以后的家族照旧落到 primary —— 也就是"只认一个家族"的旧行为。
+  // 一本书最多认三份字面：primary 画正文，alt / alt2 画样式表里另指了家族的段落
+  // （祖堂集：正文宋体 st，注文/引文仿宋 fs）。每份都是一整套字面 + 自己的字形缓存
+  // （设备上每份净增几十 KB 常驻 + ≤384KB 按需字形位图，见 ttf_font.h 的角色说明），
+  // 所以到第三份为止；第四个及以后的家族照旧落到 primary。
   struct EmbeddedFontSet {
     EmbeddedFont primary;
     EmbeddedFont alt;
+    EmbeddedFont alt2;
   };
 
   explicit Epub(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)) {
@@ -112,19 +114,22 @@ class Epub {
   // ignored here: a decorative face used for captions or a TOC must not be applied
   // to the whole book.
   //
-  // alt: the second face, taken from exactly those ignored per-element rules — the
-  // family referenced most often by them, minus headings and other one-off bits
-  // (see isDecorativeFamilySelector). 祖堂集 is the case that motivated it: body
-  // 宋体, annotations/quotes 仿宋. Rendering it means a per-word face switch
-  // (EpdFontFamily::ALT_FONT), not a second layout engine, so only this one extra
-  // family can be honoured; a third falls back to primary.
+  // alt / alt2: the next faces, taken from the per-element rules the body tiers ignore
+  // — the families referenced most often by them, minus the genuinely one-off bits
+  // (sup/sub/rt, toc, captions; see isNegligibleFamilySelector). Headings (h1..h6) ARE
+  // counted: a typical book is exactly body + notes/quotes + headings, which fills all
+  // three slots. 祖堂集 is the case that motivated alt: body 宋体, annotations/quotes
+  // 仿宋; the heading family fills alt2 the same way. Rendering one means a per-word face switch
+  // (EpdFontFamily::ALT_FONT / ALT2_FONT), not another layout engine, so exactly two
+  // extra families can be honoured; a fourth falls back to primary. The two are
+  // always distinct families resolving to distinct files (see the ranking below).
   // (not const: a cache miss populates cssFiles from the ZIP, same as load() does)
   EmbeddedFontSet resolveEmbeddedFonts();
   // Copy the resolved font out of the ZIP into the book's cache dir and return the
   // path on SD, or an empty string on failure (the caller keeps the user's font).
-  // fileName distinguishes the two faces: primary and alt must land in different
-  // files (they are different fonts) and both must be length-stable across opens
-  // so the re-extract short-circuit works for each.
+  // fileName distinguishes the faces: primary/alt/alt2 must land in different files
+  // (they are different fonts) and each must be length-stable across opens so the
+  // re-extract short-circuit works for each.
   std::string extractEmbeddedFont(const EmbeddedFont& font, const char* fileName = "book.ttf") const;
 
   size_t getBookSize() const;

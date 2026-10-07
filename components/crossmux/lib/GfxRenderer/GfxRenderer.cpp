@@ -51,12 +51,17 @@ void ttf_set_role(int role);
 #define TTF_ROLE_CONTENT 0
 #define TTF_ROLE_UI      1
 #define TTF_ROLE_CONTENT_ALT 2
+#define TTF_ROLE_CONTENT_ALT2 3
 // fontId → 字面角色。阅读器约定：0 = UI(chrome)，1..5 = 正文。
-// 正文词的 ALT_FONT 位 = "这一段用书内 CSS 的第二个家族"（祖堂集的仿宋注文），
-// 切到次字面；次字面没打开时 ttf_set_role 自己退回内容面，所以这里不用判空。
+// 正文词的 ALT_FONT / ALT2_FONT 位 = "这一段用书内 CSS 的第二个 / 第三个家族"
+// （祖堂集的仿宋注文），切到对应的家族面；那一面没打开时 ttf_set_role 自己退回
+// 内容面，所以这里不用判空。两个位不会同时置（解析器只置其中一个，见
+// ChapterHtmlSlimParser 的 effectiveFamily），真同时置了也是 ALT2 优先。
 inline int ttfRoleForFontId(int fontId, EpdFontFamily::Style style = EpdFontFamily::REGULAR) {
   if (fontId == 0) return TTF_ROLE_UI;
-  if ((style & EpdFontFamily::ALT_FONT) != 0) return TTF_ROLE_CONTENT_ALT;
+  const uint16_t s = (uint16_t)style;
+  if ((s & EpdFontFamily::ALT2_FONT) != 0) return TTF_ROLE_CONTENT_ALT2;
+  if ((s & EpdFontFamily::ALT_FONT) != 0) return TTF_ROLE_CONTENT_ALT;
   return TTF_ROLE_CONTENT;
 }
 

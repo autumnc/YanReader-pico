@@ -205,9 +205,12 @@ void TextBlock::render(const GfxRenderer& renderer, const int fallbackFontId, co
   // 基线上方 ascender/5（与上游那条线的相对关系一致），上标下标按半号缩。
   //
   // 下划线离基线的间隙**随字号走**而不是写死：汉字底部本来就压在基线上，原来固定 2px 看着
-  // 就是"贴着字画"。但也不能一路用正文的数值 —— 脚注那种半号字吃同样的 4px 会飘起来。
-  // 正文 ascender≈40 → 4px；半号字自动收到 2px。
-  const int underlineDropPx = ascender / 10 < 2 ? 2 : ascender / 10;
+  // 就是"贴着字画"。但也不能一路用正文的数值 —— 脚注那种半号字吃同样的间距会飘起来。
+  // 正文 ascender≈40 → 6px；半号字自动收到 3px。
+  // 这个比值是**书名线/专名线共同的下移量**（波浪线以它为波峰、实线以它为线心），调它 = 两条
+  // 线一起上下走。4px（ascender/10）时线几乎贴着汉字底部，所以抬到 6px —— 再要更松就继续减小
+  // 除数。
+  const int underlineDropPx = ascender / 6 < 2 ? 2 : ascender / 6;
   const auto decorationY = [&](EpdFontFamily::Style deco, EpdFontFamily::Style wordStyle, int wordY) {
     const bool decoHalf = (wordStyle & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0;
     const int decoAsc = decoHalf ? ascender / 2 : ascender;

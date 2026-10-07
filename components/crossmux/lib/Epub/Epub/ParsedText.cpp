@@ -650,8 +650,10 @@ void ParsedText::setRubyGroupAt(size_t startIndex, size_t count, const std::stri
       rubyTexts.resize(words.size());
     }
     rubyTexts[idx] = "";
+    // 用 uint16_t 而不是 uint8_t：Style 已经加宽到 16 位，收窄会把 WAVY_UNDERLINE(256) /
+    // ALT2_FONT(512) 砍掉 —— 组注音的跟随词若同时带家族位，就是"这一个词换回正文字面"。
     wordStyles[idx] =
-        static_cast<EpdFontFamily::Style>(static_cast<uint8_t>(wordStyles[idx]) | EpdFontFamily::RUBY_CONTINUE);
+        static_cast<EpdFontFamily::Style>(static_cast<uint16_t>(wordStyles[idx]) | EpdFontFamily::RUBY_CONTINUE);
     wordContinues[idx] = true;       // Prevent page breaker from splitting the Group Ruby!
     wordNoSpaceBefore[idx] = false;  // Ensure allowsBreak returns false!
   }

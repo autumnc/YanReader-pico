@@ -116,10 +116,14 @@ class ChapterHtmlSlimParser {
     CssTextAlign textAlign = CssTextAlign::Left;
     bool hasSup = false, sup = false;
     bool hasSub = false, sub = false;
-    // 次家族（EpdFontFamily::ALT_FONT）。跟 bold/italic 不同，它不来自标签本身，
-    // 而来自这一层的 CSS：解析器先把家族哈希跟 GfxRenderer 里的次家族哈希比一比，
-    // 相等才置位。这样 <span class="zhu"> 这类**行内**家族切换也能一路传到词上。
-    bool hasAltFont = false, altFont = false;
+    // 家族字面（EpdFontFamily::ALT_FONT / ALT2_FONT）。跟 bold/italic 不同，它不来自
+    // 标签本身，而来自这一层的 CSS：解析器把这一层的家族哈希跟 GfxRenderer 里登记的
+    // 家族哈希比一比，命中哪个就记哪一位。这样 <span class="zhu"> 这类**行内**家族切换
+    // 也能一路传到词上。
+    // ★ 存的是一枚**选择**（0 / ALT_FONT / ALT2_FONT）而不是两个独立的布尔：两层家族
+    // 嵌套时（外层注文家族、内层引文家族）两个布尔会同时为真，那就没法决定画哪个面。
+    bool hasFamilyBit = false;
+    EpdFontFamily::Style familyBit = EpdFontFamily::REGULAR;
   };
   std::vector<StyleStackEntry> inlineStyleStack;
   std::vector<BlockStyle> blockStyleStack;  // accumulated block styles from open ancestor elements
@@ -133,9 +137,9 @@ class ChapterHtmlSlimParser {
   CssTextAlign effectiveTextAlign = CssTextAlign::Left;
   bool effectiveSup = false;
   bool effectiveSub = false;
-  // 这一处的字用次字面画（书内 CSS 的第二个家族）。判据只有一个：当前生效的 CSS
-  // 家族哈希 == GfxRenderer::altFontFamilyHash()，见 updateEffectiveInlineStyle。
-  bool effectiveAltFont = false;
+  // 这一处的字用哪个家族面画（0 / ALT_FONT / ALT2_FONT）。判据只有一个：当前生效的
+  // CSS 家族哈希命中了 GfxRenderer 里登记的哪个家族哈希，见 familyBitOf()。
+  EpdFontFamily::Style effectiveFamily = EpdFontFamily::REGULAR;
   static constexpr size_t MAX_GRID_TABLE_COLUMNS = 4;
   static constexpr size_t MAX_GRID_TABLE_CELL_WORDS = 32;
   static constexpr size_t MAX_GRID_TABLE_CELL_BYTES = 512;
@@ -260,9 +264,9 @@ class ChapterHtmlSlimParser {
   static void applyDirectionToEntry(StyleStackEntry& entry, const CssStyle& css);
   static void applyTextDecorationToEntry(StyleStackEntry& entry, const CssStyle& css);
   static void applyVerticalAlignToEntry(StyleStackEntry& entry, const CssStyle& css);
-  /// 这条 CSS 是不是把文字交给了书内 CSS 的第二个家族（次字面）。见 .cpp。
-  [[nodiscard]] bool isAltFamily(const CssStyle& css) const;
-  void applyAltFontToEntry(StyleStackEntry& entry, const CssStyle& css);
+  /// 这条 CSS 把文字交给了书内 CSS 的哪个家族面（0 / ALT_FONT / ALT2_FONT），见 .cpp。
+  [[nodiscard]] EpdFontFamily::Style familyBitOf(const CssStyle& css) const;
+  void applyFamilyBitToEntry(StyleStackEntry& entry, const CssStyle& css);
   void pushTableTextStyleEntry(const CssStyle& cssStyle);
   void pushDecorationStyleEntry(CssTextDecoration defaultDecoration, const CssStyle& cssStyle);
   void emitHorizontalRule(const BlockStyle& blockStyle);

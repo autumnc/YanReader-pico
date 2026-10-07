@@ -239,29 +239,38 @@ struct CssFontCandidates {
   // flattens these and takes the first family that really resolves to a file.
   std::vector<std::vector<std::string>> tierFamilies[3];
 
-  // 次家族候选：非正文三层的规则（.class / p.class / span.x …）里第一个家族名，以及它
-  // 被引用了多少次。阅读器只养得起一个额外的字面，选谁就是"哪个家族在样式表里被用得
+  // 家族字面候选：非正文三层的规则（.class / p.class / span.x / h1..h6 …）里第一个家族名，
+  // 以及它被引用了多少次。阅读器养得起两个额外的字面，选谁就是"哪个家族在样式表里被用得
   // 最多"（祖堂集：正文 st，注文/引文 fs，fs 被 .jiazhu/.zhu/.author/.quote/.quoteright
-  // 五条规则引用，压过 .kt 的四条）。**标题和行间注（h1..h6 / sup / sub / rt）不计**：
-  // 那是一次性的短串，为它们多养一份字面（一份 CJK 字体常驻就是 1MB 上下）不划算，
-  // 而真正值得多留一份字面的注文、引文、题名一律是段落正文。
+  // 五条规则引用，压过 .kt 的四条）。
+  // **标题（h1..h6）算候选**：一本典型的书就是"正文 / 注文·引文 / 标题"三份字面，正好占满
+  // 三个槽；把标题排除掉的话，三槽的书永远只用得上两槽，而标题会以其正文字体画出来 ——
+  // 那正是"第 3 槽看起来没生效"的成因而非取舍。标题在每章都出现，不是一次性短串。
+  // 仍然排除的是**真正**的零碎（sup/sub/rt、toc、图注），见 isNegligibleFamilySelector。
+  // 按引用次数排下来取前两名（去掉正文家族）就是 alt / alt2。
   std::vector<std::pair<std::string, int>> altFamilies;
 };
 
-// 这条规则的家族值不值得为它多养一份字面（次家族候选）。排除三类：
-//   1 标题 h1..h6、2 行间注/上标 sup/sub/rt、3 导航与图注（toc / image-subtitle / maintitle）
-// —— 都是一次性短串或成不了气候的零碎，而一份 CJK 字面常驻就是 1MB 上下。
-// 取反之后剩下的就是段落正文类（注文、引文、题名、说明文字），那才是第二个字面该去的地方。
+// 这条规则的家族要不要**排除**在候选之外。只剩两类零碎：
+//   1 行间注/上标 sup/sub/rt、2 导航与图注（toc / image-subtitle / maintitle）
+// —— 都是一次性短串或成不了气候的零碎，而一份 CJK 字面常驻就是 1MB 上下，为它们多养一份
+// 不划算。**标题（h1..h6）不在其列**：它每章都出现，且是"三字体"书的第三份，值得一个槽。
+// 取反之后剩下的就是段落正文 + 标题类，那才是第二/第三个字面该去的地方。
 // The caller passes an already lower-cased selector.
-bool isDecorativeFamilySelector(const std::string& selector) {
-  for (const char* heading : {"h1", "h2", "h3", "h4", "h5", "h6"}) {
-    if (selectorMentionsElement(selector, heading)) return true;
-  }
+bool isNegligibleFamilySelector(const std::string& selector) {
   for (const char* tiny : {"sup", "sub", "rt"}) {
     if (selectorHasBareElement(selector, tiny)) return true;
   }
   return selector.find("toc") != std::string::npos || selector.find("image-sub") != std::string::npos ||
          selector.find("image-main") != std::string::npos;
+}
+
+// 家族名 / 文件名的小集合查询（几个元素，线性扫比 set 便宜且不分配）。
+bool containsName(const std::vector<std::string>& haystack, const std::string& needle) {
+  for (const std::string& have : haystack) {
+    if (have == needle) return true;
+  }
+  return false;
 }
 
 // Count one reference to `family`, keeping first-appearance order (the tie-break).
@@ -320,7 +329,7 @@ void scanCssRules(const std::string& css, const size_t begin, const size_t end, 
         // nothing to record either way
       } else if (tier >= 0) {
         out->tierFamilies[tier].push_back(families);
-      } else if (!isDecorativeFamilySelector(selector)) {
+      } else if (!isNegligibleFamilySelector(selector)) {
         tallyAltFamily(out, families.front());
       }
     }
@@ -1200,8 +1209,8 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
 
   // Ask the per-book cache first. This runs on every open and the answer is stable
   // for a given file, so the common cases — no font at all, or one already resolved
-  // — must not pay for a ZIP enumeration. Format (v4):
-  //   <href>\n<size>\n<family>\n  ×2  (primary, then alt)
+  // — must not pay for a ZIP enumeration. Format (v6):
+  //   <href>\n<size>\n<family>\n  ×3  (primary, then alt, then alt2)
   // with an empty primary href meaning the book ships no usable body font.
   // v1 -> v2: the selector tiers below changed which books resolve at all, so every
   // cached "none" from v1 is suspect and must be re-scanned (the entry is rewritten
@@ -1210,11 +1219,17 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
   // books whose CSS references a differently-cased path (e.g. ../Fonts/ vs the
   // archive's OEBPS/fonts/) now resolve — every cached "none" from v2 is likewise
   // suspect. Bump this whenever the matching rules change.
-  // v3 -> v4: 多出一个次家族（见 isDecorativeFamilySelector/tallyAltFamily）。
+  // v3 -> v4: 多出一个次家族（见 isNegligibleFamilySelector/tallyAltFamily）。
+  // v4 -> v5: 再多一个家族槽（alt2）。**必须 bump**：v4 的缓存里没有第三家族这一份，
+  // 接受了它就等于给三家族的书永久少装一份（缓存不会自己失效）。代价是每本书多扫一次
+  // 样式表，之后一直命中 v5。
+  // v5 -> v6: 标题家族（h1..h6）从"排除"改成"算候选"。**必须 bump**：v5 的缓存里
+  // 三槽的书往往只有主 + 次两份（标题那一份没被选中），接受了就永久少一份 ——
+  // 而 v5 与 v6 的**文件格式完全相同**（都是 3×3 行），光看内容分不出来，只能靠版本号。
   {
     bool cacheOk = false;
     const std::string cached = Storage.readFile(cacheFile.c_str(), &cacheOk);
-    if (cacheOk && cached.rfind("v4\n", 0) == 0) {
+    if (cacheOk && cached.rfind("v6\n", 0) == 0) {
       std::vector<std::string> lines;
       for (size_t start = 3; start <= cached.size();) {
         size_t nl = cached.find('\n', start);
@@ -1223,15 +1238,19 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
         if (nl == cached.size()) break;
         start = nl + 1;
       }
-      if (lines.size() >= 6) {
+      if (lines.size() >= 9) {
         font.itemHref = lines[0];
         font.size = static_cast<size_t>(strtoul(lines[1].c_str(), nullptr, 10));
         font.family = lines[2];
         set.alt.itemHref = lines[3];
         set.alt.size = static_cast<size_t>(strtoul(lines[4].c_str(), nullptr, 10));
         set.alt.family = lines[5];
-        LOG_DBG("EBP", "Embedded body font (cached): %s%s%s", font.itemHref.empty() ? "none" : font.itemHref.c_str(),
-                set.alt.itemHref.empty() ? "" : " + alt ", set.alt.itemHref.c_str());
+        set.alt2.itemHref = lines[6];
+        set.alt2.size = static_cast<size_t>(strtoul(lines[7].c_str(), nullptr, 10));
+        set.alt2.family = lines[8];
+        LOG_DBG("EBP", "Embedded body font (cached): %s%s%s%s%s", font.itemHref.empty() ? "none" : font.itemHref.c_str(),
+                set.alt.itemHref.empty() ? "" : " + alt ", set.alt.itemHref.c_str(),
+                set.alt2.itemHref.empty() ? "" : " + alt2 ", set.alt2.itemHref.c_str());
         return set;
       }
     }
@@ -1303,34 +1322,46 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
     if (matched) break;
   }
 
-  // 次家族：候选按引用次数降序（同数保持先出现的在前），跳过正文家族、跳过解不出文件的、
-  // 跳过跟正文指向同一个文件的 —— 同一份字面装两遍只是白占一份 PSRAM。
+  // 家族字面：候选按引用次数降序（同数保持先出现的在前），跳过正文家族、跳过解不出文件的、
+  // 跳过跟已选字面指向同一个文件的 —— 同一份字面装两遍只是白占一份 PSRAM。
+  // 同一个循环跑两遍 = 第二 / 第三个家族：第一遍选出 alt，把它的家族名与文件也记进
+  // "已占用"，第二遍就只能挑到**另一个**家族了（一般就是引用次数第二多的那个）。
   std::vector<std::pair<std::string, int>> ranked = candidates.altFamilies;
   std::stable_sort(ranked.begin(), ranked.end(),
                    [](const std::pair<std::string, int>& a, const std::pair<std::string, int>& b) {
                      return a.second > b.second;
                    });
-  for (const auto& entry : ranked) {
-    if (entry.first == font.family) continue;  // 就是正文字面
-    const CssFontFace* face = nullptr;
-    for (const CssFontFace& candidate : candidates.faces) {
-      if (candidate.family == entry.first) {
-        face = &candidate;
-        break;
+  std::vector<std::string> takenFamilies{font.family};
+  std::vector<std::string> takenFiles;
+  if (!font.itemHref.empty()) takenFiles.push_back(font.itemHref);
+  int altIndex = 0;
+  for (EmbeddedFont* slot : {&set.alt, &set.alt2}) {
+    ++altIndex;
+    for (const auto& entry : ranked) {
+      if (containsName(takenFamilies, entry.first)) continue;  // 正文/已选中的家族
+      const CssFontFace* face = nullptr;
+      for (const CssFontFace& candidate : candidates.faces) {
+        if (candidate.family == entry.first) {
+          face = &candidate;
+          break;
+        }
       }
+      if (!face) continue;  // 只有家族名、没有 @font-face
+      std::string url;
+      if (!pickFontUrl(face->src, &url)) continue;
+      std::string href = resolveFontHref(face->cssHref, url);
+      size_t size = 0;
+      if (href.empty() || containsName(takenFiles, href) || !getItemSize(href, &size) || size == 0) continue;
+      slot->itemHref = std::move(href);
+      slot->size = size;
+      slot->family = face->family;
+      takenFamilies.push_back(slot->family);
+      takenFiles.push_back(slot->itemHref);
+      LOG_INF("EBP", "第%u家族 '%s' → %s (%u refs, %u bytes)", static_cast<unsigned>(altIndex + 1),
+              slot->family.c_str(), slot->itemHref.c_str(), static_cast<unsigned>(entry.second),
+              static_cast<unsigned>(slot->size));
+      break;
     }
-    if (!face) continue;  // 只有家族名、没有 @font-face
-    std::string url;
-    if (!pickFontUrl(face->src, &url)) continue;
-    std::string href = resolveFontHref(face->cssHref, url);
-    size_t size = 0;
-    if (href.empty() || href == font.itemHref || !getItemSize(href, &size) || size == 0) continue;
-    set.alt.itemHref = std::move(href);
-    set.alt.size = size;
-    set.alt.family = face->family;
-    LOG_INF("EBP", "次家族 '%s' → %s (%u refs, %u bytes)", set.alt.family.c_str(), set.alt.itemHref.c_str(),
-            static_cast<unsigned>(entry.second), static_cast<unsigned>(set.alt.size));
-    break;
   }
 
   if (font.itemHref.empty()) {
@@ -1342,8 +1373,11 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
   if (set.alt.itemHref.empty()) {
     LOG_DBG("EBP", "Embedded alt font: none");
   }
+  if (set.alt2.itemHref.empty()) {
+    LOG_DBG("EBP", "Embedded alt2 font: none");
+  }
 
-  std::string cacheContent = "v4\n";
+  std::string cacheContent = "v6\n";
   const auto appendFont = [&cacheContent](const EmbeddedFont& f) {
     cacheContent += f.itemHref;
     cacheContent += '\n';
@@ -1354,6 +1388,7 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
   };
   appendFont(font);
   appendFont(set.alt);
+  appendFont(set.alt2);
   Storage.writeFile(cacheFile.c_str(), cacheContent);
   return set;
 }

@@ -370,7 +370,7 @@ gfx/ font/                 # u8g2 shim + 图标字体 + ttf_font（stb_truetype�
 
 | 增强 | 做了什么 | 触到的引擎文件 |
 |---|---|---|
-| **字体栈换芯** | 上游是 `EpdFont` + `SdCardFont` + `FontDecompressor` 那一套**预烘焙/压缩位图字体**；整套换成 `main/font/ttf_font`（stb_truetype，**运行时栅格化**），才撑得起任意 SD 字体、书内嵌字体、CJK 扩展区 B。角色分家（内容面 / UI 面 / 内容备选面）与共享格子模型也在这一层 | 删 `lib/EpdFont/{EpdFont,SdCardFont*,FontDecompressor*}`；保留并改写 `EpdFontFamily`、`EpdFontData` |
+| **字体栈换芯** | 上游是 `EpdFont` + `SdCardFont` + `FontDecompressor` 那一套**预烘焙/压缩位图字体**；整套换成 `main/font/ttf_font`（stb_truetype，**运行时栅格化**），才撑得起任意 SD 字体、书内嵌字体、CJK 扩展区 B。角色分家（内容面 / UI 面 / 内容备选面 ×2，即正文 + 书内另两个家族）与共享格子模型也在这一层 | 删 `lib/EpdFont/{EpdFont,SdCardFont*,FontDecompressor*}`；保留并改写 `EpdFontFamily`、`EpdFontData` |
 | **书内嵌字体（EPUB `@font-face`）** | 扫书自己的 CSS 找正文字体 → 从 zip 里解出字体文件落缓存（`book_font.txt`），阅读时把内容面换成它，退出/换书还原用户全局字体。上游完全没有这条链路 | `Epub/Epub.cpp`（`resolveEmbeddedFont` / `extractEmbeddedFont` / `resolveFontHref`）、`css/CssParser.*`（家族名哈希归一） |
 | **古籍专名线 / 书名线** | `border-bottom` 实线 = 专名线、波浪（`wavy` / 多看私有 `duokan-wavyline` / `border-image` / 虚点线）= 书名线；给 span 画线而不打扰块级元素。为此 **`EpdFontFamily::Style` 从 `uint8_t` 加宽到 `uint16_t`**、TextBlock 的 tracker 从 2 条变 3 条（实线下划线遇波浪让位）、新增 `GfxRenderer::drawWavyLine` | `css/CssParser.*`、`css/CssStyle.h`、`EpdFont/EpdFontFamily.h`、`GfxRenderer/GfxRenderer.*`、`Epub/blocks/TextBlock.cpp`、`Epub/Section.cpp` |
 | **脚注回引识别** | `localAnchorOf()` 原来只认裸 `#anchor`，calibre 转的书每条内链都带文件名（`part0008.html#m7`）→ 判成跨文件 → 注文页塞满"指回正文的假脚注"、正文/注释角色颠倒。改成认「本章文件名#锚点」 | `Epub/parsers/ChapterHtmlSlimParser.cpp` |

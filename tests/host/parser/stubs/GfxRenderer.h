@@ -45,6 +45,8 @@ class GfxRenderer {
   int cssFontId(int baseFontId, float) const { return baseFontId; }
   uint32_t altFontFamilyHash() const { return 0; }
   void setAltFontFamilyHash(uint32_t) {}
+  uint32_t alt2FontFamilyHash() const { return 0; }
+  void setAlt2FontFamilyHash(uint32_t) {}
   int getSpaceAdvance(int, uint32_t, uint32_t, EpdFontFamily::Style) const { return 4; }
   bool isSdCardFont(int) const { return false; }
   void ensureSdCardFontReady(int, const std::deque<std::string>&, bool, uint8_t) const {}
