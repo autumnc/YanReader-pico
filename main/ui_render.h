@@ -79,6 +79,13 @@ void ui_render_set_local_only(bool enable);
 // render_present 的作业队列，只能把同一套差分/波形判据重走一遍——实现在 ui_render.cpp。
 void reader_vk_present(int panel_top, int cand_h);
 
+// 阅读器**列表/菜单帧**（书架、目录、书签、设置…凡不是正文页的那些）的区域推屏。
+// 矩形由本帧 front_fb 与 back_fb 的差分包围盒定（不需要渲染函数申报区域），因此滚动
+// 列表不再整屏全像素驱动、也不吃那份共享残影预算（见 ui_render.cpp 的实现说明）。
+// 调用方（screen_reader.cpp 的推屏收尾）判两件事才走这里：档位是 HALF、且不是
+// RdMode::Reading；另外面板留着中灰时不走（reader_white_exit_pending）。
+void reader_list_present(void);
+
 // 阅读器虚拟键盘的"清残影欠账"：**口径与编辑器那套一一对齐**（设置项 ime_clean，
 // 见 ui_render.cpp 里 reader_vk_present 上面那张表）。快档（上屏刷法=快）欠下的正文那块
 // （跟随 DU 推的、发灰又带残影的）在停手 IME_CLEAN_PAUSE_US 之后由阅读器自己的帧循环

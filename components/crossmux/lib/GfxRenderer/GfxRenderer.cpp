@@ -182,7 +182,18 @@ void GfxRenderer::invertScreen() const {
   for (uint32_t i = 0; i < frameBufferSize; ++i) fb[i] = static_cast<uint8_t>(~fb[i]);
   display.displayBuffer(HalDisplay::FULL_REFRESH);
 }
-void GfxRenderer::clearScreen(uint8_t color) const { display.clearScreen(color); }
+void GfxRenderer::clearScreen(uint8_t color) const {
+  // 绘制目标被 setFrameBuffer 换走时（阅读器的空闲帧预渲染，见 screen_reader.cpp 的
+  // rdPrerenderNextPage），要清的必须是**这一块**：display.clearScreen 清的永远是 display
+  // 自己那块上屏缓冲（它不看 frameBuffer 指向谁），照旧调就会把面板正显示的那一帧擦白，
+  // 而这一趟真正要画的备用缓冲一个字节都没清 —— 画出来是一页叠着上一趟的垃圾。
+  // 指针没被换走（相等）时走原路：display 那条是整块缓冲 memset，与这里逐字节等价。
+  if (frameBuffer != nullptr && frameBuffer != display.getFrameBuffer()) {
+    memset(frameBuffer, color ? 0xFF : 0x00, frameBufferSize);
+    return;
+  }
+  display.clearScreen(color);
+}
 
 void GfxRenderer::getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const {
   *outTop = VIEWABLE_MARGIN_TOP;

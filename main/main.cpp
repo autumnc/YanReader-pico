@@ -427,6 +427,64 @@ static void checkLightSleep(AppState state) {
     }
 }
 
+// ── SD 热插拔（运行中拔卡/插卡）─────────────────────────────────────────
+// 开机那次等待（app_main 里）只覆盖"开机时没插卡"。运行中拔卡此前没人管：所有读写各自
+// 报错、各界面各自提示，但没有一处**知道"卡没了"**；更麻烦的是插回来之后驱动那边
+// media_invalidated 一直挂着，read_pico_sd_get_info 会一直回放旧错误 —— 不主动 remount
+// 就永远读不回来（与"开机没卡"是同一个陷阱，见 read_pico_sd.c 的 observe_media_locked）。
+//
+// 每 500ms 问一次驱动（get_info 内部顺手把 CD 观察记回驱动：拔卡即置 media_invalidated），
+// 只认两个状态迁移，每个迁移**每次插拔只做一次**（否则一张坏卡会 500ms 挂一次、日志刷屏）：
+//   卡在（且已挂载）→ 说卡丢了：日志 + 让阅读器收尾（退出当前书、清空书架列表 —— 那些
+//                    句柄已经随卡作废，继续读只会一路报错）。
+//   说卡丢了 → 卡又在了：remount。这才是驱动要的时机（消费者先关句柄 —— 有书开着时
+//                    阅读器那一拍已经先把它关掉了），挂上之后再让阅读器重扫书架。
+// 阅读器那两个钩子只在"当前界面就是阅读器"时调：卡不在时别的界面（编辑器/WiFi…）各自
+// 报错就够，而那两个钩子会当场渲染，调错界面就把人家正在看的画面盖掉了。
+static void sdHotplugTick(AppState state) {
+    static int64_t s_next_us = 0;
+    static bool s_saw_lost = false;      // 上一次轮询时卡是"不在 / 没挂上"
+    static bool s_tried_remount = false; // 本次"卡回来"已经试过挂载了吗
+    const int64_t now = esp_timer_get_time();
+    if (now < s_next_us) return;
+    s_next_us = now + 500 * 1000;
+
+    read_pico_sd_info_t info = {};
+    read_pico_sd_get_info(&info);
+    // 第一拍只记状态、不动作：开机就没插卡时 present/mounted 一直是假，若把这一拍也当成
+    // "刚刚丢失"，每次无卡开机都会白打一行「SD 卡丢失」并让阅读器去收一个从未开过的尾。
+    // 过渡只认**观察到变化**，不认"我开机第一次看就是这样"。
+    static bool s_seeded = false;
+    if (!s_seeded) {
+        s_seeded = true;
+        s_saw_lost = !(info.present && info.mounted);
+        return;
+    }
+    if (info.present && info.mounted) {
+        if (s_saw_lost) {
+            s_saw_lost = false;
+            s_tried_remount = false;
+            ESP_LOGI(TAG, "SD 卡已恢复（已挂载）");
+            if (state == APP_READER) screen_reader_on_sd_ready();
+        }
+        return;
+    }
+
+    if (!s_saw_lost) {
+        s_saw_lost = true;
+        s_tried_remount = false;
+        ESP_LOGW(TAG, "SD 卡丢失: present=%d needs_format=%d err=%s", (int)info.present,
+                 (int)info.needs_format, esp_err_to_name(info.error));
+        if (state == APP_READER) screen_reader_on_sd_lost(!info.present);
+    } else if (info.present && !s_tried_remount) {
+        // 卡回来了但还没挂上：这一次插入只试一次（重新挂载会重走 40/20/10MHz 那条梯子，
+        // 一张坏卡每 500ms 重试一次没有意义，还会把日志刷满）。
+        s_tried_remount = true;
+        const esp_err_t err = read_pico_sd_remount();
+        ESP_LOGW(TAG, "SD 卡回来，重新挂载: %s", esp_err_to_name(err));
+    }
+}
+
 // ── 每屏的 handle（Screen 表的实现，见 main/ui/screen.h）────────────────
 // 这一批函数是**从主循环那个 switch 里原样搬出来的 case 体**：`break` 换成
 // `return 下一个界面`，`currentState` 换成局部 `next`，其余一字未改——包括各屏自己
@@ -1097,6 +1155,9 @@ extern "C" void app_main() {
 
     while (currentState != APP_QUIT) {
         checkLightSleep(currentState);
+        // 运行中拔卡/插卡（见 sdHotplugTick）：每 500ms 自己掐一次表，插在 checkLightSleep
+        // 后面是因为它俩都是"这一拍先问一遍外部世界"的活，且都不该被下面的按键分发影响。
+        sdHotplugTick(currentState);
 
         int key = g_bt.readKey();
         g_key_from_ble = (key != 0);

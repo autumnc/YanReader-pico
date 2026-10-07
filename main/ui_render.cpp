@@ -863,6 +863,73 @@ void reader_vk_present(int panel_top, int cand_h) {
     done("正文+候选局刷", update_display_area_with(hl, &E0470_GRAY8_TEXT_WAVEFORM, MODE_GL16, r), r);
 }
 
+// ── 阅读器列表/菜单帧的局部推屏 ────────────────────────────────────────────
+//
+// 书架、目录、书签、笔记、设置那些界面一帧只动一小块：滚动的列表、跟着重画的
+// 标题/页脚、走动的选中条。以前一律整屏 HALF 推过去，代价两笔 ——
+//   1. 整屏 GL16 撞上 display.c「GL16 恒全像素」那条规则（hl_update 第一行），
+//      一次滚动就是一次整屏全像素驱动，每个像素都过一遍 LUT；
+//   2. 它记进**共享**残影预算（APP_GC16_EVERY，见 display.c 的 hl_update）——
+//      于是连滚十几下就升一次整屏 GC16，用户侧正是"连按十几下整屏黑白闪一下"
+//      （社区固件 rc55 也是为这条改的）。
+//
+// 改成只驱动本帧的**差分包围盒**：矩形拿 front_fb 与 back_fb 比出来
+// （diff_bounding_rect，与上面 reader_vk_present 同一个——那边是这套做法的第一个
+// 用户，实测好用），凡是这一帧改过的地方都在里面。好处是不需要任何渲染函数自己
+// 申报区域，也就没有"某个界面忘了申报 → 那块永远是旧像素"这种错法：区域按定义
+// 就是"这一帧到底改了哪儿"，不是"我以为我改了哪儿"。
+//
+// 区域刷**不进**共享预算（hl_update 只在 area == NULL 时记账）：这正是要的，滚动
+// 不该吃掉翻页该得的清账机会。代价是这块地方得自己有人清，所以这里带自己的小预算：
+// 攒够 LIST_GC16_EVERY 次区域刷，用一次**区域** GC16 把它坐实。为什么清残影必须是
+// GC16 而不是 GL16，见 display.c update_display_area_clean 上面那段实测（白→白在
+// GL16 表里是全保持，压不掉"现在白、上一拍也白"的墨痕）。与输入法那两行的
+// ime_clean_tick 是同一条规矩、同一个原语，区别只是**不推迟**：滚动本来就是一格一格
+// 看的，插一帧黑白摆动比打字中间插一帧好受得多，没有"停手"这个概念可等。
+//
+// 只给列表/菜单帧：正文翻页的整屏差分是残影预算的主来源，把它收窄等于把那套账拆了
+// （判据在调用方 screen_reader.cpp，顺带也在那里挡掉面板还留着中灰的帧）。
+// 自己的旋钮，刻意**不**复用 APP_GC16_EVERY：那个档有个 0 = 关闭的语义，跟着它走会
+// 变成"关掉自动清残影 → 每一帧列表都当场清一次"（0 次就满足 >= 0）。数取 14 与它一致，
+// 只是"同样的手感"，不是同一份账。
+#define LIST_GC16_EVERY 14
+static int s_list_n = 0;                  // 自上次坐实以来的区域刷次数
+static EpdRect s_list_dirty = {0, 0, 0, 0};
+static bool s_list_dirty_any = false;
+
+void reader_list_present(void) {
+    EpdiyHighlevelState *hl = board_hl();
+    if (!hl) return;
+    // 差分基准是 epdiy 的 back_fb："上一次真正驱动到面板上的内容"。阅读器直画 front_fb，
+    // 所以差异就是 front_fb vs back_fb（同 reader_vk_present）。
+    EpdRect d = diff_bounding_rect(hl->front_fb, hl->back_fb);
+    if (d.width <= 0 || d.height <= 0) return;   // 无变化：墨水屏双稳态，不刷
+    // 坐实那一拍的矩形要盖住**自上次坐实以来驱动过的所有像素**（残影长在那儿），
+    // 所以累计的是并集、不是本帧这一个矩形——选中条从列表底走到顶时两者差得最明显，
+    // 只清当前这一格会把一路走过留下的墨痕全漏掉。
+    s_list_dirty = s_list_dirty_any ? rect_union(s_list_dirty, d) : d;
+    s_list_dirty_any = true;
+    const int64_t t0 = esp_timer_get_time();
+    if (++s_list_n >= LIST_GC16_EVERY) {
+        s_list_n = 0;
+        const EpdRect r = s_list_dirty;
+        s_list_dirty = EpdRect{0, 0, 0, 0};
+        s_list_dirty_any = false;
+        guard_draw_result(hl, update_display_area_clean(hl, r));
+        // 每条路都打一行：区域 → 几十毫秒，整屏 → 几百毫秒。这是"连滚十几下还闪不闪"
+        // 的唯一现场证据（帧数/矩形对不上时，先看这条日志选了哪条路、矩形多大）。
+        ESP_LOGI(TAG, "列表帧: 区域坐实 %d,%d %dx%d 刷屏 %lldms", r.x, r.y, r.width, r.height,
+                 (long long)((esp_timer_get_time() - t0) / 1000));
+        return;
+    }
+    // 波形/模式与整屏那条 HALF 路**完全一致**（display.c 默认档：E0470_WAVEFORM +
+    // MODE_GL16），只是把驱动范围收窄 —— 画质不该因为收窄而变，变的只有"闪多大"。
+    guard_draw_result(hl, update_display_area_with(hl, &E0470_WAVEFORM, MODE_GL16, d));
+    ESP_LOGI(TAG, "列表帧: 区域差分 %d,%d %dx%d 刷屏 %lldms (%d/%d)", d.x, d.y, d.width,
+             d.height, (long long)((esp_timer_get_time() - t0) / 1000), s_list_n,
+             LIST_GC16_EVERY);
+}
+
 // 立即整屏 GC16（长按全刷 / 休眠提示）。
 static void full_refresh_now(uint8_t *cur, int rel_idx) {
     if (!cur) return;

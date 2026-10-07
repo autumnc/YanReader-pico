@@ -91,3 +91,16 @@ bool readerSetStandbyImage(const std::string &srcPath, std::string &err);
 // readerStandbyPump 是**取件**：由主循环每拍调一次（16KB 栈的主任务），有待办才干活。
 void readerRequestStandbyImage(const std::string &srcPath);
 void readerStandbyPump();
+
+// ── SD 热插拔（运行中拔卡/插卡）的两条收尾 ───────────────────────────────
+// 判断"卡还在不在"只有 main 侧一处轮询（main.cpp 的 sdHotplugTick），但画面得由
+// 阅读器自己收 —— 卡最常是在这里被拔掉的，而那时正文页正指着一堆失效的文件句柄。
+// 两个函数都**自己当场渲染**，且**只在当前界面就是阅读器时**才允许被调（否则会把
+// 用户正在看的别的界面盖掉）。
+//
+// on_sd_lost：卡掉了。有书开着就先按"回书架"收尾、再释放书对象（留着就是留一堆
+// 通向已经不存在的卡的句柄），清空书架列表，提示一条；card_absent=false 表示"卡在
+// 但文件系统没挂上"（提示语不同）。返回 true = 当时确实关掉了一本书。
+// on_sd_ready：卡回来了且已挂载。重扫书架并把结果提示出来。
+bool screen_reader_on_sd_lost(bool card_absent);
+void screen_reader_on_sd_ready();

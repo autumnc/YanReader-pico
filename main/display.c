@@ -308,6 +308,12 @@ void reader_set_gray_panel(int on) {
     display_hold_white_exit(on != 0);
 }
 
+// 只看不取：列表帧的收窄判据要问一句"这笔白底账还欠着吗"。欠着就老老实实走整屏那条路
+// （from-white 重锚必须整屏），别用区域刷把这次重锚挤掉。
+int reader_white_exit_pending(void) {
+    return s_white_exit ? 1 : 0;
+}
+
 enum EpdDrawError update_display_full(EpdiyHighlevelState* hl) {
     use_scan_for(&E0470_WAVEFORM, MODE_GC16);
     present_begin();
@@ -642,6 +648,11 @@ int reader_refresh_test_present(int which) {
     // 这一屏是自检页自己推上去的，推完还要照常把"面板上现在是灰"记上（(b) 的白底纪律）。
     return ms;
 }
+
+// 见 reader_refresh_bridge.h：把 epdiy 那个「前导保持相跳过」的收益露出来。
+// 开关本身由板级 bring-up 打开（read_pico_init 里的 epd_set_leading_skip(true)），
+// 本仓库不动它 —— 这里只读数。
+int reader_leading_skip(void) { return epd_last_leading_skip(); }
 
 // ── 清一块区域的残影（输入法那两行）────────────────────────────────────────
 //
