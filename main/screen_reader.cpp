@@ -74,6 +74,7 @@
 // 漂移已经发生了：照抄的 ttf_font_open 返回 int，真头返回 esp_err_t。
 #include "font/ttf_font.h"
 #include "wifi_manager.h"
+#include "flomo_api.h"  // 笔记详情页「发 Flomo」（与「应用 → Flomo」共用同一套接口）
 #include "opds_client.h"
 #include "dictionary_store.h"
 #include "ble_keymap.h"
@@ -7948,26 +7949,100 @@ static void rdOpenNoteDetail(int idx, bool fromSearch) {
   st.dirty = 1;
 }
 
+// 标签随状态变：没写过注释的是"写"，写过的是"改"；删除按下的那一趟变"确认删除"。
+static const char *rdNoteDetailBtnLabel(int i) {
+  const bool hasNote = st.noteDetailIdx >= 0 &&
+                       st.noteDetailIdx < static_cast<int>(st.notes.size()) &&
+                       !st.notes[st.noteDetailIdx].note.empty();
+  switch (i) {
+    case 0: return "‹ 上一条";
+    case 1: return "跳转原文";
+    case 2: return hasNote ? "改注释" : "写注释";
+    case 3: return "发 Flomo";
+    case 4: return st.noteDetailDelArm ? "确认删除" : "删除";
+    default: return "下一条 ›";
+  }
+}
+
 // ── 详情页动作条 ────────────────────────────────────────────────────────
-// 列数按屏宽自适应：横屏 5 列 1 行，竖屏 3 列 2 行。竖屏 684px 下 5 格一排只剩 137px，
-// 装不下 4 个汉字（22pt 就是 184px）；3 列 2 行时最宽的那格 184 < 228 才富余。
-// 绘制与命中必须共用下面这两个几何函数（同 ui/list_view.h 那条纪律）。
-static constexpr int kNoteDetailBtns = 5;
-static int rdNoteDetailBarCols() { return (g_rd.getScreenWidth() >= 900) ? kNoteDetailBtns : 3; }
+// 按钮宽度按**标签实测宽度**分（不是等分格子）：六颗按钮在三档界面字号 × 横竖屏六种
+// 组合下，等分格子总有一种塞不下 —— 22pt 横屏六等分每格只有 176px，而「跳转原文」
+// 本身就有 184px。规则：量出每个标签的宽度（左右各留 kNoteDetailBtnPad），加起来一行
+// 放得下就一行（横屏放得下，省下的一行全给正文），否则两行；行内按宽度比例铺满整行。
+// 实测六种组合都是横屏一行、竖屏 3+3 两行，行内缩放系数 ≥ 1，也就是没有一处要截断。
+// 绘制与命中共用下面这几份数据（同 ui/list_view.h 那条纪律）。
+static constexpr int kNoteDetailBtns = 6;
+static constexpr int kNoteDetailBtnPad = 10;   // 标签左右各留的空白，含在按钮宽度里
+static int s_ndBtnX[kNoteDetailBtns];
+static int s_ndBtnW[kNoteDetailBtns];
+static int s_ndBtnRow[kNoteDetailBtns];
+static int s_ndBarRows = 1;
+// 版式只跟屏宽与界面字号有关，量一次就够：重画一帧要问六次几何，每次都能量六遍太亏。
+static int s_ndLayW = -1, s_ndLayPx = -1;
+
+// 量宽用的标签：**删除键按最宽的「确认删除」量**（它按下那一刻会变宽）。不这么钉住的话，
+// 按下删除整条动作条会重排、六颗按钮全都挪位置。
+static const char *rdNoteDetailBtnLabelWide(int i) {
+  return (i == 4) ? "确认删除" : rdNoteDetailBtnLabel(i);
+}
+
+static void rdNoteDetailLayout() {
+  const int w = g_rd.getScreenWidth();
+  const int px = uiLineHeight();
+  if (s_ndLayW == w && s_ndLayPx == px) return;
+  s_ndLayW = w;
+  s_ndLayPx = px;
+
+  const int availW = w - 2 * MARGIN;
+  int cw[kNoteDetailBtns];
+  int total = 0;
+  for (int i = 0; i < kNoteDetailBtns; i++) {
+    cw[i] = g_rd.getTextWidth(uiFontId(), rdNoteDetailBtnLabelWide(i)) + 2 * kNoteDetailBtnPad;
+    total += cw[i];
+  }
+  s_ndBarRows = (total <= availW) ? 1 : 2;
+  // 两行时在**累计宽度最接近一半**处切（不是按个数平半）：宽标签多的那半少放一颗，
+  // 两行宽度才相当，不会一行挤一行空。切点夹在 [1, n-1]，别切出空行。
+  int split = kNoteDetailBtns;
+  if (s_ndBarRows == 2) {
+    int acc = 0, best = 1 << 30;
+    for (int i = 0; i + 1 < kNoteDetailBtns; i++) {
+      acc += cw[i];
+      const int d = 2 * acc - total;
+      const int diff = (d < 0) ? -d : d;
+      if (diff < best) { best = diff; split = i + 1; }
+    }
+  }
+  int i = 0;
+  for (int r = 0; r < s_ndBarRows; r++) {
+    const int end = (r == 0) ? split : kNoteDetailBtns;
+    int rowSum = 0;
+    for (int k = i; k < end; k++) rowSum += cw[k];
+    int x = MARGIN;
+    for (int k = i; k < end; k++) {
+      const int bw = (rowSum > 0) ? cw[k] * availW / rowSum : 0;
+      s_ndBtnX[k] = x;
+      s_ndBtnW[k] = bw;
+      s_ndBtnRow[k] = r;
+      x += bw;
+    }
+    if (end > i) s_ndBtnW[end - 1] += MARGIN + availW - x;   // 取整余下的几像素给行尾那颗
+    i = end;
+  }
+}
+
 static int rdNoteDetailBtnH() { return uiLineHeight() + 14; }
 static int rdNoteDetailBarH() {
-  const int cols = rdNoteDetailBarCols();
-  const int rows = (kNoteDetailBtns + cols - 1) / cols;
-  return rows * rdNoteDetailBtnH() + 8;
+  rdNoteDetailLayout();
+  return s_ndBarRows * rdNoteDetailBtnH() + 8;
 }
 // 动作条排在提示行**上方**，不顶掉它 —— 提示行是这一屏唯一写着"怎么翻页/怎么返回"的地方。
 static int rdNoteDetailBarTop() { return statusTop() - 4 - rdNoteDetailBarH(); }
 static void rdNoteDetailBtnRect(int i, int *bx, int *by, int *bw, int *bh) {
-  const int cols = rdNoteDetailBarCols();
-  const int colW = (g_rd.getScreenWidth() - 2 * MARGIN) / cols;
-  *bx = MARGIN + (i % cols) * colW;
-  *by = rdNoteDetailBarTop() + 4 + (i / cols) * rdNoteDetailBtnH();
-  *bw = colW - 6;
+  rdNoteDetailLayout();
+  *bx = s_ndBtnX[i];
+  *by = rdNoteDetailBarTop() + 4 + s_ndBtnRow[i] * rdNoteDetailBtnH();
+  *bw = s_ndBtnW[i] - 6;   // 留出格间缝
   *bh = rdNoteDetailBtnH() - 6;
 }
 static int rdNoteDetailBarHit(int x, int y) {   // -1 = 没命中（与绘制同源）
@@ -7978,19 +8053,6 @@ static int rdNoteDetailBarHit(int x, int y) {   // -1 = 没命中（与绘制同
   }
   return -1;
 }
-// 标签随状态变：没写过注释的是"写"，写过的是"改"；删除按下的那一趟变"确认删除"。
-static const char *rdNoteDetailBtnLabel(int i) {
-  const bool hasNote = st.noteDetailIdx >= 0 &&
-                       st.noteDetailIdx < static_cast<int>(st.notes.size()) &&
-                       !st.notes[st.noteDetailIdx].note.empty();
-  switch (i) {
-    case 0: return "‹ 上一条";
-    case 1: return "跳转原文";
-    case 2: return hasNote ? "改注释" : "写注释";
-    case 3: return st.noteDetailDelArm ? "确认删除" : "删除";
-    default: return "下一条 ›";
-  }
-}
 static void renderNoteDetailBar() {
   const int w = g_rd.getScreenWidth();
   const int top = rdNoteDetailBarTop();
@@ -7998,7 +8060,7 @@ static void renderNoteDetailBar() {
   for (int i = 0; i < kNoteDetailBtns; i++) {
     int bx, by, bw, bh;
     rdNoteDetailBtnRect(i, &bx, &by, &bw, &bh);
-    const bool arming = (i == 3 && st.noteDetailDelArm);   // 确认删除那一下反白
+    const bool arming = (i == 4 && st.noteDetailDelArm);   // 确认删除那一下反白
     if (arming) g_rd.fillRect(bx, by, bw, bh, true);
     else g_rd.drawRect(bx, by, bw, bh, true);
     const std::string s = fitWidth(rdNoteDetailBtnLabel(i), bw - 10);
@@ -8093,6 +8155,79 @@ static void rdNoteDetailDelete() {
   rdShowFloat("已删除笔记", "", 2000);
   st.fullRefresh = true;
   st.dirty = 1;
+}
+
+// 「发 Flomo」：把这一条（标注原文 + 自己的注释）发到 Flomo，打上 #读书笔记/书名 标签。
+// 阻塞式 —— 连 WiFi 最多 10 秒，之后登录、建 memo 各一次请求；期间走"正在…"浮层
+// （rdShowBusy 先整屏画一帧再进阻塞段，e-ink 上不动的屏幕看着就是死机）。
+// 走的是「应用 → Flomo」那套 FlomoApi（与 Flomo 标签页共用同一份登录信息）。
+static void rdNoteDetailSendFlomo() {
+  const int idx = st.noteDetailIdx;
+  if (idx < 0 || idx >= static_cast<int>(st.notes.size())) return;
+  const RdState::RdNote &n = st.notes[idx];
+  const std::string title = rdExportBookTitle(n.path);
+
+  // 收尾一律走它：把"正在…"那一帧用全刷盖掉（局部刷盖不干净会留残影），再挂浮层提示。
+  auto done = [](const std::string &msg, const std::string &sub, int ms) {
+    rdShowFloat(msg, sub, ms);
+    st.fullRefresh = true;
+    st.dirty = 1;
+  };
+
+  // 标签里不能有空白：服务端解析到空格就断（"#读书笔记/三体 1"只有前半截算标签，后面
+  // 那截会散成正文），所以书名里的空白一律抹掉。
+  std::string tag = "读书笔记/" + title;
+  tag.erase(std::remove_if(tag.begin(), tag.end(),
+                           [](unsigned char c) {
+                             return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+                           }),
+            tag.end());
+
+  // 内容：位置行 + 原文（原样，可能多段）+ 注释 + 标签。**别在行首写 "#"**（除了标签
+  // 那一行）—— Flomo 会把任何 #xxx 当标签；"- " 开头的行会被它转成列表项，这个跟着
+  // 原文自己的写法走，不用管。
+  std::string text = "《" + title + "》 第 " + std::to_string(n.page + 1) + " 页 · 第 " +
+                     std::to_string(n.spine + 1) + " 章\n\n";
+  if (!n.text.empty()) text += n.text + "\n\n";
+  if (!n.note.empty()) text += "**笔记**：" + n.note + "\n\n";
+  text += "#" + tag;
+
+  std::string email = g_settings.flomoEmail();
+  std::string pass = g_settings.flomoPassword();
+  std::string token = g_settings.flomoToken();
+  if (token.empty() && (email.empty() || pass.empty())) {
+    done("未配置 Flomo 账号", "先到设置里填邮箱和密码", 3000);
+    return;
+  }
+
+  if (!g_wifi.isConnected()) {
+    rdShowBusy("正在连接 WiFi…", "");
+    std::string werr;
+    if (!readerEnsureWifi(werr)) { done("发送失败", werr, 4000); return; }
+  }
+  if (token.empty()) {
+    rdShowBusy("正在登录 Flomo…", "");
+    const ApiResult r = FlomoApi::login(email, pass);
+    if (!r.ok) { done("登录失败", r.message, 4000); return; }
+    token = r.data["access_token"].asString();
+    if (token.empty()) { done("登录失败", "服务端没返回令牌", 4000); return; }
+    g_settings.setFlomoToken(token);
+  }
+
+  rdShowBusy("正在发送…", "");
+  FlomoApi api(token);
+  const ApiResult r = api.createMemo(text);
+  if (!r.ok) {
+    // 令牌过期是最常见的一类失败：清掉缓存令牌，下次点这颗按钮就会重新登录
+    // （不清的话每次都拿同一个死令牌去撞同一堵墙）。
+    if (r.message.find("HTTP 401") != std::string::npos ||
+        r.message.find("登录") != std::string::npos) {
+      g_settings.setFlomoToken("");
+    }
+    done("发送失败", r.message, 4000);
+    return;
+  }
+  done("已发送到 Flomo", "《" + title + "》", 2500);
 }
 
 static void renderNoteDetail() {
@@ -8216,7 +8351,8 @@ static void handleNoteDetail(int key) {
       case 0: rdNoteDetailStep(-1); return;
       case 1: rdGotoNote(st.noteDetailIdx); return;   // 内部已把 mode 置回正文
       case 2: rdNoteDetailEdit(); return;
-      case 3:
+      case 3: rdNoteDetailSendFlomo(); return;
+      case 4:
         if (!st.noteDetailDelArm) {   // 二次确认：第一次按只把按钮改成"确认删除"
           st.noteDetailDelArm = true;
           rdShowFloat("再点一次「确认删除」", "", 3000);
@@ -8225,7 +8361,7 @@ static void handleNoteDetail(int key) {
         }
         rdNoteDetailDelete();
         return;
-      case 4: rdNoteDetailStep(+1); return;
+      case 5: rdNoteDetailStep(+1); return;
       default: break;
     }
     st.noteDetailDelArm = false;
