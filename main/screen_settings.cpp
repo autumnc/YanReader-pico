@@ -13,6 +13,8 @@
 #include "pcf85063.h"
 #include "standby_clock.h"
 #include "quick_edit.h"
+#include "settings_backup.h"   // 通用分类末尾的「备份设置与记录 / 从备份恢复」
+#include "read_pico_sd.h"      // 卡在不在（恢复前的提示要分开说）
 #include "typing_click.h"
 #include "ui_helpers.h"
 #include "input.h"
@@ -25,6 +27,7 @@
 #include <set>
 #include <vector>
 #include <esp_timer.h>
+#include <esp_system.h>   // esp_restart：「从备份恢复」换完文件后重启
 #include <esp_sntp.h>
 #include <esp_log.h>
 #include <sys/stat.h>
@@ -66,6 +69,12 @@ static const SettingField SETTINGS_FIELDS[] = {
     {"_clock_face", "待机表盘", false, true, CAT_GEN},
     {"_clock_preview", "预览待机表盘", false, true, CAT_GEN},
     {"_bt_manage", "蓝牙设备管理", false, true, CAT_GEN},
+    // 配置与阅读记录备份/恢复（settings_backup.cpp）。放「通用」这一类的末尾：它管的
+    // 东西跨模式（写作的设置键 + 阅读的位置/笔记/统计 + 编辑器的版本历史），不属于
+    // 任何单一分类。恢复之后要重启才生效 —— 文件换掉了，内存里那份设置缓存和各模块
+    // 从设置派生的状态却还停在旧值上，重启是唯一不用逐模块追的地方。
+    {"_cfg_backup", "备份设置与记录", false, true, CAT_GEN},
+    {"_cfg_restore", "从备份恢复", false, true, CAT_GEN},
     // ── 显示与版式 ──
     {"_font", "字体", false, true, CAT_DISPLAY},
     {"night_mode", "夜间模式", false, false, CAT_DISPLAY},
@@ -260,6 +269,9 @@ static int kbLayoutIndex(const char *k) {
 // UI 序号(跳过隐藏行)→ SETTINGS_FIELDS 真实下标;越界返回最后一个可见行
 // 当前所在分类(顶层分类列表/子菜单共用)。定义在字段过滤之前，供 fieldAt 等使用。
 static int s_cat = CAT_GEN;
+// 「从备份恢复」的二次确认。恢复是不可逆的覆盖，第一次点只是把这句话打出来，
+// 离开这一屏（screen_settings_init）就作废 —— 免得下一次进来第一下就恢复。
+static bool s_cfgRestoreConfirm = false;
 
 // 该字段当前是否出现在列表里：属于当前分类，且未被模式条件隐藏。
 static bool fieldShown(int idx) {
@@ -1092,6 +1104,7 @@ static void drawSettingsCategories() {
 // ── Screen entry points ──────────────────────────────────────────────────
 void screen_settings_init() {
     s_cat = CAT_GEN;
+    s_cfgRestoreConfirm = false;   // 进这一屏就作废上一次没确认完的恢复
     g_settingsState.selection = g_settingsState.scroll = 0;
     g_settingsState.editing = false;
     g_settingsState.editBuffer.clear();
@@ -1738,6 +1751,50 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                 ctx.nextState = APP_BT_MANAGE;
                 return APP_BT_MANAGE;
             }
+            if (strcmp(f.key, "_cfg_backup") == 0) {
+                const esp_err_t err = settings_backup_save();
+                ui_show_message_centered(
+                    err == ESP_OK ? "已备份到 TF 卡 settings_backup/"
+                    : err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
+                                                   : "备份失败，请检查卡剩余空间");
+                vTaskDelay(pdMS_TO_TICKS(1800));
+                return APP_SETTINGS;
+            }
+            if (strcmp(f.key, "_cfg_restore") == 0) {
+                if (!settings_backup_exists()) {
+                    // 卡不在和"卡在、但没有备份"是两件事，给的话得分开 —— 前者让用户去
+                    // 插卡，后者去备份。
+                    read_pico_sd_info_t sd = {};
+                    const bool card = (read_pico_sd_get_info(&sd) == ESP_OK && sd.mounted);
+                    ui_show_message_centered(card ? "TF 卡上没有备份"
+                                                  : "未识别到 TF 卡，请插卡后重试");
+                    vTaskDelay(pdMS_TO_TICKS(1800));
+                    return APP_SETTINGS;
+                }
+                // 覆盖当前设置是不可逆的（恢复**不删**备份里没有的文件，但被覆盖的那些
+                // 旧值就没了），所以再点一次才动手。
+                if (!s_cfgRestoreConfirm) {
+                    s_cfgRestoreConfirm = true;
+                    ui_show_message_centered("恢复会覆盖当前设置，请再点一次确认");
+                    vTaskDelay(pdMS_TO_TICKS(1800));
+                    return APP_SETTINGS;
+                }
+                s_cfgRestoreConfirm = false;
+                const esp_err_t err = settings_backup_restore();
+                if (err != ESP_OK) {
+                    ui_show_message_centered(
+                        err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
+                                                     : "备份不可用，恢复未执行");
+                    vTaskDelay(pdMS_TO_TICKS(1800));
+                    return APP_SETTINGS;
+                }
+                // 文件换掉了，内存里那份设置缓存（settings_manager.cpp 的 s_cache）和
+                // 各模块从设置派生的状态还都是旧值 —— 重启一次让它们从头读。
+                ui_show_message_centered("已恢复，正在重启…");
+                vTaskDelay(pdMS_TO_TICKS(1500));
+                esp_restart();
+                return APP_SETTINGS;
+            }
             if (strcmp(f.key, "_polish_prompt") == 0) {
                 ctx.nextState = APP_POLISH_PROMPT;
                 return APP_POLISH_PROMPT;
@@ -1818,6 +1875,12 @@ static void drawBrowseListBody() {
                          standbyFaceLabel(standbyFaceFromKey(g_settings.getString("clock_face").c_str())));
             } else if (strcmp(f.key, "_clock_preview") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s", f.label);
+            } else if (strcmp(f.key, "_cfg_backup") == 0 ||
+                       strcmp(f.key, "_cfg_restore") == 0) {
+                // 带出"卡上那份是什么时候的"，不然两个按钮一模一样，分不清有没有备份。
+                const std::string stamp = settings_backup_stamp();
+                snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
+                         stamp.empty() ? "无备份" : stamp.c_str());
             } else if (strcmp(f.key, "_vertical_ref_line_style") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          VERTICAL_REF_LINE_STYLE_OPTS[verticalRefLineStyleIndex(g_settings.verticalReferenceLineStyle().c_str())].label);

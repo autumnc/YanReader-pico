@@ -57,6 +57,7 @@ idf_component_register(SRCS
     "bt_keyboard.cpp"
     "journal_storage.cpp"
     "settings_manager.cpp"
+    "settings_backup.cpp"  # 配置+阅读记录备份/恢复到 TF 卡（设置·通用 分类里的两项）
     "wifi_manager.cpp"
     "webdav_client.cpp"
     "opds_client.cpp"
