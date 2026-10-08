@@ -182,6 +182,86 @@ static const std::vector<MdLineInfo>& getHistoryMdInfo(bool mdOn) {
     return g_history.cachedMdInfo;
 }
 
+struct ViewerLoadArg {
+    std::string filename;
+};
+
+static AppAsyncJob s_viewerLoadJob;
+static SemaphoreHandle_t s_viewerLoadMutex = nullptr;
+static std::string s_viewerLoadContent;
+
+static void viewerLoadLock() {
+    if (!s_viewerLoadMutex) s_viewerLoadMutex = xSemaphoreCreateMutex();
+    if (s_viewerLoadMutex) xSemaphoreTake(s_viewerLoadMutex, portMAX_DELAY);
+}
+
+static void viewerLoadUnlock() {
+    if (s_viewerLoadMutex) xSemaphoreGive(s_viewerLoadMutex);
+}
+
+static void loadViewerText(const std::string &content) {
+    g_viewer.lines.clear();
+    size_t pos = 0;
+    while (pos < content.length()) {
+        size_t nl = content.find('\n', pos);
+        g_viewer.lines.push_back((nl == std::string::npos) ? content.substr(pos) : content.substr(pos, nl - pos));
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    if (g_viewer.lines.empty()) g_viewer.lines.push_back("");
+    g_viewer.scroll = 0;
+    g_viewer.vrowsDirty = true;
+    g_viewer.mdInfoDirty = true;
+}
+
+static void viewerLoadTask(void *arg) {
+    ViewerLoadArg *job = static_cast<ViewerLoadArg *>(arg);
+    std::string content;
+    if (job && !s_viewerLoadJob.cancelled()) {
+        content = g_journal.readEntry(job->filename);
+    }
+    viewerLoadLock();
+    s_viewerLoadContent = content;
+    viewerLoadUnlock();
+    delete job;
+    s_viewerLoadJob.finish(s_viewerLoadJob.cancelled() ? "已取消" : "");
+    vTaskDelete(nullptr);
+}
+
+static void startViewerLoad(const std::string &filename) {
+    viewerLoadLock();
+    s_viewerLoadContent.clear();
+    viewerLoadUnlock();
+    s_viewerLoadJob.begin("日记详情", "正在读取...");
+    auto *arg = new ViewerLoadArg{filename};
+    if (!s_viewerLoadJob.start(viewerLoadTask, "viewer_load", 6144, arg)) {
+        delete arg;
+        s_viewerLoadJob.failToStart("任务启动失败");
+    }
+}
+
+static bool handleViewerLoad(int key, ScreenContext &ctx) {
+    const AppAsyncState state = s_viewerLoadJob.state();
+    if (state == AppAsyncState::Idle) return false;
+    if (state == AppAsyncState::Running) {
+        if (!s_viewerLoadJob.drawn) {
+            ui_feedback_titled_message(s_viewerLoadJob.title().c_str(),
+                                       s_viewerLoadJob.busy().c_str(), 0);
+            s_viewerLoadJob.drawn = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(60));
+        return true;
+    }
+    std::string content;
+    viewerLoadLock();
+    content = s_viewerLoadContent;
+    viewerLoadUnlock();
+    const bool cancelled = s_viewerLoadJob.cancelled();
+    s_viewerLoadJob.reset();
+    if (!cancelled) loadViewerText(content);
+    return cancelled;
+}
+
 static bool editorVertical() {
     return g_settings.editorOrientation() == "vertical";
 }
@@ -838,18 +918,12 @@ void screen_viewer_init(const std::string &filename) {
     if (filename.length() >= 15)
         g_viewer.dateStr = filename.substr(0,10) + " " + filename.substr(11,2) + ":" + filename.substr(13,2);
     else g_viewer.dateStr = filename;
-    std::string content = g_journal.readEntry(filename);
-    if (content.empty()) return;
-    size_t pos = 0;
-    while (pos < content.length()) {
-        size_t nl = content.find('\n', pos);
-        g_viewer.lines.push_back((nl == std::string::npos) ? content.substr(pos) : content.substr(pos, nl - pos));
-        if (nl == std::string::npos) break;
-        pos = nl + 1;
-    }
+    startViewerLoad(filename);
 }
 
 AppState screen_viewer_handle(int key, ScreenContext &ctx) {
+    if (handleViewerLoad(key, ctx)) return ctx.nextState == APP_BROWSER ? APP_BROWSER : APP_VIEWER;
+
     // 删除确认：确认期间只认"删除/取消"两组键，别的键**吞掉**（不落到底下的翻页/快捷键，
     // 否则确认框还开着、内容却翻页了）。点按（'\n'）算确认——与列表屏、flomo 笔记、
     // 历史版本那几处删除确认同一套规矩。

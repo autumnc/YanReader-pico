@@ -150,17 +150,39 @@ static int inspHelpVis() {
     return v < 1 ? 1 : v;
 }
 
+static ListView inspListView() {
+    ListView lv;
+    lv.sel = g.sel;
+    lv.first = g.scroll;
+    lv.count = (int)g.itemCount;
+    lv.rows = inspListVis();
+    lv.top = FONT_H + 8 + LINE_SPACING - FONT_H - 2;
+    lv.itemH = LINE_SPACING;
+    return lv;
+}
+
+static ListView inspSearchListView() {
+    ListView lv;
+    lv.sel = g.sel;
+    lv.first = g.scroll;
+    lv.count = (int)g.searchResults.size();
+    lv.rows = inspSearchVis();
+    lv.top = FONT_H + 4 + LINE_SPACING - FONT_H - 2;
+    lv.itemH = LINE_SPACING;
+    return lv;
+}
+
 static void drawList() {
     ui_clear();
     ui_draw_text_content(4, g_font.ascent(), "灵感", false);
     u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
 
     int y = FONT_H + 8 + LINE_SPACING;
-    int vis = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
-    if (vis < 1) vis = 1;
-
-    if (g.sel < g.scroll) g.scroll = g.sel;
-    if (g.sel >= g.scroll + vis) g.scroll = g.sel - vis + 1;
+    ListView lv = inspListView();
+    listViewFollow(lv);
+    g.sel = lv.sel;
+    g.scroll = lv.first;
+    const int vis = lv.rows;
 
     for (int i = 0; i < vis && (g.scroll + i) < (int)g.itemCount; i++) {
         int idx = g.scroll + i;
@@ -273,17 +295,12 @@ static void drawSearch() {
     const bool vk = editorVkVisible();
     bool searchComposing = g.searchImeActive && g_ime.composing() && !vk;
 
-    // Search results
     int listY = sepY + LINE_SPACING;
-    // 列表底边：虚拟键盘弹着时裁到键盘面板顶边，否则照旧（候选条在时再让一让）。
-    int listMaxY = vk ? (editorVkTop() - LINE_SPACING)
-                      : (searchComposing ? imeFullscreenPanelTopY() - LINE_SPACING : SCREEN_H);
-    int vis = (listMaxY - listY + LINE_SPACING - 1) / LINE_SPACING;
-    if (vis < 1) vis = 1;
-
-    if (g.scroll < 0) g.scroll = 0;
-    if (g.sel < g.scroll) g.scroll = g.sel;
-    if (g.sel >= g.scroll + vis) g.scroll = g.sel - vis + 1;
+    ListView lv = inspSearchListView();
+    listViewFollow(lv);
+    g.sel = lv.sel;
+    g.scroll = lv.first;
+    const int vis = lv.rows;
 
     int resultCount = (int)g.searchResults.size();
     for (int i = 0; i < vis && (g.scroll + i) < resultCount; i++) {
@@ -593,18 +610,13 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
                 app_editor_request_reinit();
                 return APP_EDITOR;
             }
-        } else if (key == KEY_UP) {
-            if (g.sel > 0) g.sel--;
-        } else if (key == KEY_DOWN) {
-            if (g.sel < (int)g.searchResults.size() - 1) g.sel++;
-        } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-            // 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。
-            const int n = (int)g.searchResults.size();
-            const int step = listPageStep(n, inspSearchVis());
-            if (step > 0) {
-                g.sel += (key == KEY_PAGE_DOWN) ? step : -step;
-                if (g.sel < 0) g.sel = 0;
-                if (g.sel > n - 1) g.sel = n - 1;
+        } else if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+                   key == KEY_HOME || key == KEY_END) {
+            ListView lv = inspSearchListView();
+            if (listViewKey(lv, key)) {
+                listViewFollow(lv);
+                g.sel = lv.sel;
+                g.scroll = lv.first;
             }
         } else if (key == 0x7F || key == 0x08) {
             // 只在真的删掉一个码点后重算结果/复位选中：和原来 `if (searchCur > 0)` 等价
@@ -629,18 +641,13 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
         }
         ctx.nextState = g.returnTo;
         return g.returnTo;
-    } else if (key == KEY_UP) {
-        if (g.sel > 0) g.sel--;
-    } else if (key == KEY_DOWN) {
-        if (g.sel < (int)g.itemCount - 1) g.sel++;
-    } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-        // 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。
-        const int n = (int)g.itemCount;
-        const int step = listPageStep(n, inspListVis());
-        if (step > 0) {
-            g.sel += (key == KEY_PAGE_DOWN) ? step : -step;
-            if (g.sel < 0) g.sel = 0;
-            if (g.sel > n - 1) g.sel = n - 1;
+    } else if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+               key == KEY_HOME || key == KEY_END) {
+        ListView lv = inspListView();
+        if (listViewKey(lv, key)) {
+            listViewFollow(lv);
+            g.sel = lv.sel;
+            g.scroll = lv.first;
         }
     } else if (key == 'a' || key == 'A') {
         // Add new inspiration — open editor

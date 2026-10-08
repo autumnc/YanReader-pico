@@ -67,6 +67,26 @@ static int btHelpRows() {
     int v = (STATUS_Y - contentY) / LINE_SPACING;  // 与 drawHelp 同式
     return v < 1 ? 1 : v;
 }
+static ListView btScanListView() {
+    ListView lv;
+    lv.sel = g_btState.selection;
+    lv.first = g_btState.scroll;
+    lv.count = g_bt.deviceCount();
+    lv.rows = btScanRows();
+    lv.top = FONT_H + 8 + LINE_SPACING + (g_btState.connecting ? FONT_H : 0) - g_font.ascent();
+    lv.itemH = FONT_H;
+    return lv;
+}
+static ListView btPairedListView() {
+    ListView lv;
+    lv.sel = g_btState.selection;
+    lv.first = g_btState.scroll;
+    lv.count = g_bt.pairedDeviceCount();
+    lv.rows = btPairedRows();
+    lv.top = manageRowBase() + (g_btState.connecting ? FONT_H : 0) - g_font.ascent();
+    lv.itemH = FONT_H;
+    return lv;
+}
 static bool fabHit(int x, int y) {
     return x >= fabX() && x < fabX() + fabW() && y >= fabY() && y < fabY() + fabH();
 }
@@ -159,14 +179,11 @@ static void drawManageBase(const char *statusLeft) {
         ui_draw_text_centered(y, "暂无已配对设备"); y += FONT_H;
         ui_draw_text_centered(y, "点右下角添加"); y += FONT_H;
     } else {
-        // 底部让开浮动按钮那一条：按钮压住最后一行的话，那台设备既看不见、
-        // 长按命中的行带也和画出来的行对不上。
-        const int listBottom = fabY() - 4;
-        int visible = (listBottom - y + FONT_H - 1) / FONT_H;
-        if (visible < 1) visible = 1;
-        if (g_btState.selection < g_btState.scroll) g_btState.scroll = g_btState.selection;
-        if (g_btState.selection >= g_btState.scroll + visible)
-            g_btState.scroll = g_btState.selection - visible + 1;
+        ListView lv = btPairedListView();
+        listViewFollow(lv);
+        g_btState.selection = lv.sel;
+        g_btState.scroll = lv.first;
+        const int visible = lv.rows;
 
         for (int i = 0; i < visible && (g_btState.scroll + i) < n; i++) {
             int idx = g_btState.scroll + i;
@@ -273,10 +290,11 @@ static void drawScan() {
             ui_draw_text_centered(y, "未找到蓝牙键盘"); y += FONT_H;
             ui_draw_text_centered(y, "Esc 返回后重试");
         } else {
-            int visible = (STATUS_Y - y + FONT_H - 1) / FONT_H;
-            if (g_btState.selection < g_btState.scroll) g_btState.scroll = g_btState.selection;
-            if (g_btState.selection >= g_btState.scroll + visible)
-                g_btState.scroll = g_btState.selection - visible + 1;
+            ListView lv = btScanListView();
+            listViewFollow(lv);
+            g_btState.selection = lv.sel;
+            g_btState.scroll = lv.first;
+            const int visible = lv.rows;
 
             for (int i = 0; i < visible && (g_btState.scroll + i) < n; i++) {
                 int idx = g_btState.scroll + i;
@@ -412,18 +430,13 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
             g_btState.selection = (ci >= 0) ? ci : 0;
             g_btState.scroll = 0;
         } else if (!g_btState.scanning && !g_btState.connecting) {
-            if (key == KEY_UP) {
-                if (g_btState.selection > 0) g_btState.selection--;
-            } else if (key == KEY_DOWN) {
-                if (g_btState.selection < g_bt.deviceCount() - 1) g_btState.selection++;
-            } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-                // 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。
-                const int n = g_bt.deviceCount();
-                const int step = listPageStep(n, btScanRows());
-                if (step > 0) {
-                    g_btState.selection += (key == KEY_PAGE_DOWN) ? step : -step;
-                    if (g_btState.selection < 0) g_btState.selection = 0;
-                    if (g_btState.selection > n - 1) g_btState.selection = n - 1;
+            if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+                key == KEY_HOME || key == KEY_END) {
+                ListView lv = btScanListView();
+                if (listViewKey(lv, key)) {
+                    listViewFollow(lv);
+                    g_btState.selection = lv.sel;
+                    g_btState.scroll = lv.first;
                 }
             } else if (key == 0x0A || key == 0x0D) {
                 int n = g_bt.deviceCount();
@@ -486,10 +499,11 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
         if (input_tap_xy(&lx, &ly) && !fabHit(lx, ly)) {
             int n = g_bt.pairedDeviceCount();
             if (n > 0) {
-                const int top = manageRowBase() - g_font.ascent();
-                int r = (ly - top) / FONT_H;
-                if (ly >= top && r >= 0 && g_btState.scroll + r < n && ly < fabY() - 4) {
-                    g_btState.selection = g_btState.scroll + r;
+                ListView lv = btPairedListView();
+                listViewFollow(lv);
+                const int hit = (ly < fabY() - 4) ? listViewHitAt(lv, ly) : -1;
+                if (hit >= 0 && hit < n) {
+                    g_btState.selection = hit;
                     g_btState.menuTarget = g_btState.selection;
                     g_btState.menuSel = 0;
                     g_btState.menuOpen = true;
@@ -515,18 +529,13 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
         return APP_BT_MANAGE;
     } else if (g_btState.connecting) {
         // 连接中忽略导航键
-    } else if (key == KEY_UP) {
-        if (g_btState.selection > 0) g_btState.selection--;
-    } else if (key == KEY_DOWN) {
-        if (g_btState.selection < g_bt.pairedDeviceCount() - 1) g_btState.selection++;
-    } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-        // 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。
-        const int n = g_bt.pairedDeviceCount();
-        const int step = listPageStep(n, btPairedRows());
-        if (step > 0) {
-            g_btState.selection += (key == KEY_PAGE_DOWN) ? step : -step;
-            if (g_btState.selection < 0) g_btState.selection = 0;
-            if (g_btState.selection > n - 1) g_btState.selection = n - 1;
+    } else if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+               key == KEY_HOME || key == KEY_END) {
+        ListView lv = btPairedListView();
+        if (listViewKey(lv, key)) {
+            listViewFollow(lv);
+            g_btState.selection = lv.sel;
+            g_btState.scroll = lv.first;
         }
     } else if (key == 0x0A || key == 0x0D) {
         int n = g_bt.pairedDeviceCount();

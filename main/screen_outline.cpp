@@ -1173,6 +1173,28 @@ static int olHelpRows() {   // 帮助是固定尺寸的小浮层（与 drawHelp 
     return olVisRows(contentY, boxY + boxH - 8);
 }
 
+static ListView olListView(int sel, int first, int count, int rows, int top) {
+    ListView lv;
+    lv.sel = sel;
+    lv.first = first;
+    lv.count = count;
+    lv.rows = rows;
+    lv.top = top;
+    lv.itemH = LINE_SPACING;
+    return lv;
+}
+
+static bool olApplyListKey(int key, int &sel, int &scroll, int count, int rows, int top) {
+    if (key == 'j') key = KEY_DOWN;
+    else if (key == 'k') key = KEY_UP;
+    ListView lv = olListView(sel, scroll, count, rows, top);
+    if (!listViewKey(lv, key)) return false;
+    listViewFollow(lv);
+    sel = lv.sel;
+    scroll = lv.first;
+    return true;
+}
+
 // ── Screen entry ─────────────────────────────────────────────────────────
 void screen_outline_init() {
     mkdir(OUTLINE_DIR, 0777);
@@ -1608,19 +1630,11 @@ static bool olHandleTagMgr(int &key, AppState &out) {
     if (g.mode == M_TAG_MGR) {
         if (key == 0x1B || key == 'q' || key == 'Q') {
             g.mode = M_BROWSE;
-        } else if (key == KEY_UP || key == 'k') {
-            if (g.tagMgrSel > 0) g.tagMgrSel--;
-        } else if (key == KEY_DOWN || key == 'j') {
-            if (g.tagMgrSel < (int)g.tagList.size() - 1) g.tagMgrSel++;
-        } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-            // 触摸上下滑 = 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻。
-            const int n = (int)g.tagList.size();
-            const int step = listPageStep(n, olTagMgrRows());
-            if (step > 0) {
-                g.tagMgrSel += (key == KEY_PAGE_DOWN) ? step : -step;
-                if (g.tagMgrSel < 0) g.tagMgrSel = 0;
-                if (g.tagMgrSel > n - 1) g.tagMgrSel = n - 1;
-            }
+        } else if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+                   key == KEY_HOME || key == KEY_END || key == 'j' || key == 'k') {
+            int scroll = 0;
+            olApplyListKey(key, g.tagMgrSel, scroll, (int)g.tagList.size(), olTagMgrRows(),
+                           FONT_H + 6 + LINE_SPACING - g_font.ascent());
         } else if (key == 'a' || key == 'A') {
             g.mode = M_ADD_TAG;
             g.editBuf.clear(); g.editCur = 0;
@@ -1796,18 +1810,13 @@ static bool olHandleBookmarkMgr(int &key, AppState &out) {
         int bmCount = bmArr.isArray() ? (int)bmArr.size() : 0;
         if (key == 0x1B || key == 'q' || key == 'Q') {
             g.mode = M_BROWSE;
-        } else if (key == KEY_UP || key == 'j') {
-            if (g.bmMgrSel > 0) g.bmMgrSel--;
-        } else if (key == KEY_DOWN || key == 'k') {
-            if (g.bmMgrSel < bmCount - 1) g.bmMgrSel++;
-        } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-            // 触摸上下滑 = 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻。
-            const int step = listPageStep(bmCount, olBookmarkRows());
-            if (step > 0) {
-                g.bmMgrSel += (key == KEY_PAGE_DOWN) ? step : -step;
-                if (g.bmMgrSel < 0) g.bmMgrSel = 0;
-                if (g.bmMgrSel > bmCount - 1) g.bmMgrSel = bmCount - 1;
-            }
+        } else if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+                   key == KEY_HOME || key == KEY_END || key == 'j' || key == 'k') {
+            int scroll = 0;
+            if (key == 'j') key = KEY_UP;
+            else if (key == 'k') key = KEY_DOWN;
+            olApplyListKey(key, g.bmMgrSel, scroll, bmCount, olBookmarkRows(),
+                           FONT_H + 8 + LINE_SPACING - g_font.ascent());
         } else if (key == 0x0A || key == 0x0D) {
             // Jump to bookmarked node
             if (g.bmMgrSel >= 0 && g.bmMgrSel < bmCount && g.nodes) {
@@ -2053,21 +2062,10 @@ static bool olHandleProjects(int &key, AppState &out, ScreenContext &ctx) {
             g_ime.setActive(false);
             ctx.nextState = APP_MAIN; out = APP_MAIN; return true;
         }
-        if (key == 'j' || key == KEY_DOWN) {
-            if (g.sel < (int)g.projects.size() - 1) g.sel++;
-        }
-        if (key == 'k' || key == KEY_UP) {
-            if (g.sel > 0) g.sel--;
-        }
-        if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-            // 触摸上下滑 = 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻。
-            const int n = (int)g.projects.size();
-            const int step = listPageStep(n, olProjectRows());
-            if (step > 0) {
-                g.sel += (key == KEY_PAGE_DOWN) ? step : -step;
-                if (g.sel < 0) g.sel = 0;
-                if (g.sel > n - 1) g.sel = n - 1;
-            }
+        if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+            key == KEY_HOME || key == KEY_END || key == 'j' || key == 'k') {
+            olApplyListKey(key, g.sel, g.scroll, (int)g.projects.size(), olProjectRows(),
+                           FONT_H + 8 + LINE_SPACING + 2 - g_font.ascent());
         }
         if (key == 'n' || key == 'N') {
             g.mode = M_ADD_PROJECT;
@@ -2168,23 +2166,11 @@ static bool olHandleBrowse(int &key, AppState &out, ScreenContext &ctx) {
             }
         }
 
-        if (key == KEY_UP) {
-            if (g.sel > 0) g.sel--;
-        }
-        if (key == KEY_DOWN) {
-            int maxIdx = g.filterText.empty() ? (int)g.nodeCount : (int)g_filteredIdx.size();
-            if (g.sel < maxIdx - 1) g.sel++;
-        }
-        if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-            // 触摸上下滑 = 整页翻：一步一屏（树里是**可见行**，折叠起来更少），高亮跟着
-            // 页走；一屏放得下就没得翻（吃掉这一划）。滚动窗口由绘制按 g.sel 反推。
+        if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+            key == KEY_HOME || key == KEY_END) {
             const int n = g.filterText.empty() ? (int)g.nodeCount : (int)g_filteredIdx.size();
-            const int step = listPageStep(n, outlineListRows());
-            if (step > 0) {
-                g.sel += (key == KEY_PAGE_DOWN) ? step : -step;
-                if (g.sel < 0) g.sel = 0;
-                if (g.sel > n - 1) g.sel = n - 1;
-            }
+            olApplyListKey(key, g.sel, g.scroll, n, outlineListRows(),
+                           FONT_H + 8 + LINE_SPACING - g_font.ascent());
         }
 
         // hjkl: reorder and hierarchy
