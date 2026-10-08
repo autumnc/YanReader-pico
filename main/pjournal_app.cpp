@@ -31,6 +31,7 @@ static struct {
 } g_browser;
 static struct { std::vector<std::string> lines; int scroll = 0; std::string filename;
     std::string dateStr;
+    bool confirmDelete = false;          // 删除确认框开着（键盘 d 与浮动按钮共用）
     std::vector<VRow> cachedVrows; bool vrowsDirty = true;
     bool vrowsCachedFirstLineIndent = false;
     std::vector<MdLineInfo> cachedMdInfo; bool mdInfoDirty = true; bool mdCachedOn = false;
@@ -509,35 +510,22 @@ AppState screen_main_handle(int key, ScreenContext &ctx) {
 }
 
 // ── Browser Screen ─────────────────────────────────────────────────────
-// 浮动按钮「编辑 / 删除」：**只在没连蓝牙键盘时**浮出来。有物理键盘时 e/d 就够了；
-// 没有键盘时这一屏原本只有一个动作（点按 = 打开选中项），编辑和删除在触屏上**根本
-// 没有入口**——日记只能看，不能改也不能删。动作与键盘的 e/d 走同一条路（同一对函数），
-// 不是另写一套（见 [[edit-shared-layer]] 的"触摸与实体键盘共用同一份动作函数"）。
-static bool brwFabShown() { return !g_bt.isConnected(); }
-static int brwFabW() { return g_font.textWidth("删除") + 40; }
-static int brwFabH() { return FONT_H + 10; }
-static int brwFabY() { return STATUS_Y - brwFabH() - 8; }
-static int brwFabDelX() { return SCREEN_W - brwFabW() - 10; }
-static int brwFabEditX() { return brwFabDelX() - brwFabW() - 12; }
-
-// 命中区比按钮四周放宽 6px：e-ink 手指落点糙（与阅读模式文件浏览页的 FAB 同一套规矩）。
-// 放宽后「编辑」和「删除」的命中区正好相接、不重叠（两钮之间留了 12px 空档）。
-static bool brwFabBoxHit(int bx, int x, int y) {
-    const int pad = 6, w = brwFabW(), h = brwFabH(), by = brwFabY();
-    return x >= bx - pad && x <= bx + w + pad && y >= by - pad && y <= by + h + pad;
-}
-static bool brwFabEditHit(int x, int y) { return brwFabBoxHit(brwFabEditX(), x, y); }
-static bool brwFabDelHit(int x, int y) { return brwFabBoxHit(brwFabDelX(), x, y); }
+// 「编辑 / 删除」两个浮动按钮原来在这一屏的右下角，现在搬到了**日记详情页**
+// （APP_VIEWER，点一行进去的那一屏）——列表里点一行就是"看这一篇"，动作跟着
+// 内容走；列表本身也不必再为按钮让出底部那一条。浮动按钮那一套在下面 Viewer
+// 那一节（viewerFab*）。
+// 键盘的 e / d 两个键**照旧留在列表**：它们不占地方，主菜单的「日记」那一项就是
+// 按它们命名的（见 kMainActions 的注释），删掉反而对不上。
 
 // 列表首行的**基线**。绘制与触摸命中必须用同一个式子，否则"点哪行开哪行"会错位。
 static int brwRowBase() { return FONT_H + 8 + LINE_SPACING; }
-// 可见行数：底部要给浮动按钮让出一条——按钮压住的那一行既看不见也点不着。
+// 可见行数：整屏从首行基线排到 STATUS_Y（与历史版本那一屏同一套算法）。
+// 原来底部要给浮动按钮让出一条，按钮搬走之后这一屏和别的列表一样铺到底。
 static int brwVisibleRows() {
-    const int bottom = brwFabShown() ? brwFabY() - 4 : SCREEN_H;
-    const int visible = (bottom - brwRowBase() + LINE_SPACING - 1) / LINE_SPACING;
+    const int visible = (STATUS_Y - brwRowBase() + LINE_SPACING - 1) / LINE_SPACING;
     return visible < 1 ? 1 : visible;
 }
-// 点在第几行（-1 = 点在标题、空白或浮动按钮那一条上）。
+// 点在第几行（-1 = 点在标题或空白上）。
 static int brwRowAtY(int y) {
     const int top = brwRowBase() - FONT_H - 2;   // 行带上沿：基线往上让出一个行高
     if (y < top) return -1;
@@ -545,46 +533,43 @@ static int brwRowAtY(int y) {
     return row < brwVisibleRows() ? row : -1;
 }
 
-// 黑底白字 + 内描边（与蓝牙管理页的浮动按钮同一套样子）。
-static void brwDrawFab(int x, const char *label) {
-    const int w = brwFabW(), h = brwFabH(), y = brwFabY();
-    u8g2_SetDrawColor(g_u8g2, 0);
-    u8g2_DrawBox(g_u8g2, x, y, w, h);
-    u8g2_SetDrawColor(g_u8g2, 1);
-    u8g2_DrawFrame(g_u8g2, x + 2, y + 2, w - 4, h - 4);
-    const int tw = g_font.textWidth(label);
-    ui_draw_text(x + (w - tw) / 2, y + (h - FONT_H) / 2 + g_font.ascent(), label, true);
-    u8g2_SetDrawColor(g_u8g2, 0);
-}
-
-// 键盘 e / 浮动按钮「编辑」共用。返回 false = 文件读不出来（损坏/刚被删），留在原屏。
-static bool browserBeginEdit(ScreenContext &ctx) {
-    auto &entries = g_browser.entries;
-    if (g_browser.selection < 0 || g_browser.selection >= (int)entries.size()) return false;
-    std::string content = g_journal.readEntry(entries[g_browser.selection].filename);
+// 打开某一篇去编辑：列表的 e / 浮动按钮「编辑」、详情页的 e / 浮动按钮「编辑」都走这里
+// （returnTo = 从编辑器退出来回哪一屏：列表 or 详情页）。原来列表和详情页各写了一遍，
+// 两处只差 prevState 一个字段。
+// 返回 false = 文件读不出来（损坏/刚被删），调用方留在原屏。
+static bool beginEditEntry(const std::string &filename, AppState returnTo, ScreenContext &ctx) {
+    std::string content = g_journal.readEntry(filename);
     if (content.empty()) return false;
-    ctx.prevState = APP_BROWSER;
+    ctx.prevState = returnTo;
+    ctx.selectedEntry = filename;   // 回详情页时 viewerEnter 靠它知道是哪一篇
     ctx.editContent = extractBody(content);
-    ctx.editFilename = entries[g_browser.selection].filename;
+    ctx.editFilename = filename;
     ctx.promptText = "";
     ctx.nextState = APP_EDITOR;
     return true;
 }
 
-// 键盘 d 确认后 / 浮动按钮「删除」确认后共用。删完刷新缓存并把选中项夹回范围内。
-static void browserDeleteSelected(ScreenContext &ctx) {
-    auto &entries = g_browser.entries;
-    if (g_browser.selection < 0 || g_browser.selection >= (int)entries.size()) return;
-    const bool ok = g_journal.deleteEntry(entries[g_browser.selection].filename);
+// 删一篇（按文件名）+ 刷新列表缓存 + 把列表选中项夹回范围内。列表的 d、详情页的 d、
+// 两处的浮动按钮「删除」共用同一份。
+static void deleteEntryByFilename(const std::string &filename, ScreenContext &ctx) {
+    const bool ok = g_journal.deleteEntry(filename);
     ctx.statusMessage = ok ? "已删除" : "删除失败";
     refreshBrowserCache();
+    auto &entries = g_browser.entries;
     if (g_browser.selection >= (int)entries.size()) g_browser.selection = (int)entries.size() - 1;
     if (g_browser.selection < 0) g_browser.selection = 0;
     if (g_browser.selection < g_browser.scroll) g_browser.scroll = g_browser.selection;
 }
 
-// 整屏：标题 + 列表 +（未连蓝牙时）两个浮动按钮。确认框也在这里叠——确认期间它每帧
-// 都要跟着重画，落在别处就会漏掉某一帧的底图。
+// 键盘 d 确认后 / 浮动按钮「删除」确认后共用（列表这一屏的选中项）。
+static void browserDeleteSelected(ScreenContext &ctx) {
+    auto &entries = g_browser.entries;
+    if (g_browser.selection < 0 || g_browser.selection >= (int)entries.size()) return;
+    deleteEntryByFilename(entries[g_browser.selection].filename, ctx);
+}
+
+// 整屏：标题 + 列表（+ 键盘 d 的确认框）。确认框也在这里叠——确认期间它每帧都要跟着
+// 重画，落在别处就会漏掉某一帧的底图。
 static void drawBrowser() {
     auto &entries = g_browser.entries;
     // 与其它带标题的列表页对齐：下划线在 +4，首行基线让出一整个行高 + 8。
@@ -609,12 +594,8 @@ static void drawBrowser() {
         ui_draw_text(8, y + i * LINE_SPACING, buf, sel);
     }
 
-    // 浮动按钮画在列表之后（压住右下角，这是 FAB 的常态）。
-    if (brwFabShown()) {
-        brwDrawFab(brwFabEditX(), "编辑");
-        brwDrawFab(brwFabDelX(), "删除");
-    }
-
+    // 不再有浮动按钮：编辑/删除在详情页（点一行进去）——键盘的 d 还是在这里直接可用，
+    // 确认框照旧叠在列表上。
     if (g_browser.confirmDelete) ui_draw_confirm_dialog("删除这篇日记？", "Enter=删除", "Esc=取消");
     ui_commit();
 }
@@ -662,19 +643,11 @@ AppState screen_browser_handle(int key, ScreenContext &ctx) {
         }
     }
     if (key == 0x0A || key == 0x0D) {
-        // 触摸点按（input_tap_xy 是一次性的，只读一次）：先看右下角两个浮动按钮，
-        // 都不是就落在哪一行选哪一行，再打开——"点哪行开哪行"。
+        // 触摸点按（input_tap_xy 是一次性的，只读一次）：落在哪一行选哪一行，再打开
+        // ——"点哪行开哪行"。点行不再是"可能点到浮动按钮"的那种含糊动作了（按钮搬去了
+        // 详情页），整块列表都是行。
         int tx = 0, ty = 0;
         const bool tapped = input_tap_xy(&tx, &ty);
-        if (tapped && brwFabShown() && brwFabEditHit(tx, ty)) {
-            if (browserBeginEdit(ctx)) return APP_EDITOR;
-            return APP_BROWSER;   // 读不出来就停在这一屏（点按钮不该等于点行）
-        }
-        if (tapped && brwFabShown() && brwFabDelHit(tx, ty)) {
-            g_browser.confirmDelete = true;
-            drawBrowser();        // 底图 + 确认框，一次提交
-            return APP_BROWSER;
-        }
         if (tapped) {
             const int row = brwRowAtY(ty);
             if (row >= 0 && g_browser.scroll + row < (int)entries.size())
@@ -697,7 +670,8 @@ AppState screen_browser_handle(int key, ScreenContext &ctx) {
         return APP_BROWSER;
     }
     if (key == 'e' || key == 'E') {
-        if (browserBeginEdit(ctx)) return APP_EDITOR;
+        if (beginEditEntry(entries[g_browser.selection].filename, APP_BROWSER, ctx))
+            return APP_EDITOR;
     }
     if (key == 0x13) {
         auto content = g_journal.readEntry(entries[g_browser.selection].filename);
@@ -717,8 +691,58 @@ AppState screen_browser_handle(int key, ScreenContext &ctx) {
 }
 
 // ── Viewer Screen ──────────────────────────────────────────────────────
+// 浮动按钮「编辑 / 删除」：**只在没连蓝牙键盘时**浮出来。有物理键盘时 e/d 就够了；
+// 没有键盘时这一屏原本只有键盘动作（e编辑 h历史 f发Flomo），触屏上编辑和删除**根本
+// 没有入口**。原来这两个按钮在列表屏的右下角，现在跟着内容走：点进哪一篇，就在哪一篇
+// 上编辑/删除（见 drawBrowser 上面那段）。动作与键盘的 e/d 走同一条路（同一对函数），
+// 不是另写一套（见 [[edit-shared-layer]] 的"触摸与实体键盘共用同一份动作函数"）。
+static bool viewerFabShown() { return !g_bt.isConnected(); }
+static int viewerFabW() { return g_font.textWidth("删除") + 40; }
+static int viewerFabH() { return FONT_H + 10; }
+static int viewerFabY() { return STATUS_Y - viewerFabH() - 8; }
+static int viewerFabDelX() { return SCREEN_W - viewerFabW() - 10; }
+static int viewerFabEditX() { return viewerFabDelX() - viewerFabW() - 12; }
+
+// 命中区比按钮四周放宽 6px：e-ink 手指落点糙（与阅读模式文件浏览页的 FAB 同一套规矩）。
+// 放宽后「编辑」和「删除」的命中区正好相接、不重叠（两钮之间留了 12px 空档）。
+static bool viewerFabBoxHit(int bx, int x, int y) {
+    const int pad = 6, w = viewerFabW(), h = viewerFabH(), by = viewerFabY();
+    return x >= bx - pad && x <= bx + w + pad && y >= by - pad && y <= by + h + pad;
+}
+static bool viewerFabEditHit(int x, int y) { return viewerFabBoxHit(viewerFabEditX(), x, y); }
+static bool viewerFabDelHit(int x, int y) { return viewerFabBoxHit(viewerFabDelX(), x, y); }
+
+// 正文本该排到哪一条线为止：浮动按钮浮在那儿时，把它占的那一条让出来（正文少显示
+// 一两行），否则按钮正好压在最后两行字上。与原来列表屏 brwVisibleRows 的让法同一个道理。
+static int viewerContentMaxY() {
+    return viewerFabShown() ? viewerFabY() - 4 : STATUS_Y;
+}
+
+// 黑底白字 + 内描边（与蓝牙管理页的浮动按钮同一套样子）。
+static void viewerDrawFab(int x, const char *label) {
+    const int w = viewerFabW(), h = viewerFabH(), y = viewerFabY();
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawBox(g_u8g2, x, y, w, h);
+    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawFrame(g_u8g2, x + 2, y + 2, w - 4, h - 4);
+    const int tw = g_font.textWidth(label);
+    ui_draw_text(x + (w - tw) / 2, y + (h - FONT_H) / 2 + g_font.ascent(), label, true);
+    u8g2_SetDrawColor(g_u8g2, 0);
+}
+
+// 浮动按钮画在正文之后（压住右下角，这是 FAB 的常态），确认框再叠在最后——确认期间
+// 它每帧都要跟着重画，落在别处就会漏掉某一帧的底图。
+static void viewerDrawOverlays() {
+    if (viewerFabShown()) {
+        viewerDrawFab(viewerFabEditX(), "编辑");
+        viewerDrawFab(viewerFabDelX(), "删除");
+    }
+    if (g_viewer.confirmDelete) ui_draw_confirm_dialog("删除这篇日记？", "Enter=删除", "Esc=取消");
+}
+
 void screen_viewer_init(const std::string &filename) {
     g_viewer.filename = filename; g_viewer.scroll = 0; g_viewer.lines.clear();
+    g_viewer.confirmDelete = false;
     g_viewer.vrowsDirty = true;
     g_viewer.mdInfoDirty = true;
     if (filename.length() >= 15)
@@ -736,18 +760,44 @@ void screen_viewer_init(const std::string &filename) {
 }
 
 AppState screen_viewer_handle(int key, ScreenContext &ctx) {
+    // 删除确认：确认期间只认"删除/取消"两组键，别的键**吞掉**（不落到底下的翻页/快捷键，
+    // 否则确认框还开着、内容却翻页了）。点按（'\n'）算确认——与列表屏、flomo 笔记、
+    // 历史版本那几处删除确认同一套规矩。
+    if (g_viewer.confirmDelete) {
+        if (key == 0x0A || key == 0x0D || key == 'y' || key == 'Y') {
+            deleteEntryByFilename(g_viewer.filename, ctx);
+            g_viewer.confirmDelete = false;
+            // 删完回列表（列表的 enter 会重新扫一遍；删空了它自己会退回主菜单）。
+            ctx.nextState = APP_BROWSER;
+            return APP_BROWSER;
+        }
+        if (key == 0x1B || key == 'q' || key == 'Q' || key == 'n' || key == 'N')
+            g_viewer.confirmDelete = false;
+        // 别的一律吞掉（key 归零）——与列表屏同一个写法。
+        key = 0;
+    }
+
+    // 触摸点按（input_tap_xy 是一次性的，只读一次）：先看右下角两个浮动按钮，都不是
+    // 就当作翻页那一套（本屏点空白没有别的含义）。
+    if (key == 0x0A || key == 0x0D) {
+        int tx = 0, ty = 0;
+        const bool tapped = input_tap_xy(&tx, &ty);
+        if (tapped && viewerFabShown() && viewerFabEditHit(tx, ty)) {
+            if (beginEditEntry(g_viewer.filename, APP_VIEWER, ctx)) return APP_EDITOR;
+            key = 0;   // 读不出来就停在这一屏（点按钮不该等于翻页）
+        } else if (tapped && viewerFabShown() && viewerFabDelHit(tx, ty)) {
+            g_viewer.confirmDelete = true;
+            key = 0;
+        }
+    }
+
     if (key == 'q' || key == 'Q' || key == 0x1B) { ctx.nextState = APP_BROWSER; return APP_BROWSER; }
     if (key == 'e' || key == 'E') {
-        ctx.prevState = APP_VIEWER;
-        ctx.selectedEntry = g_viewer.filename;
-        std::string content = g_journal.readEntry(g_viewer.filename);
-        if (!content.empty()) {
-            ctx.editContent = extractBody(content);
-            ctx.editFilename = g_viewer.filename;
-            ctx.promptText = "";
-            ctx.nextState = APP_EDITOR;
-            return APP_EDITOR;
-        }
+        if (beginEditEntry(g_viewer.filename, APP_VIEWER, ctx)) return APP_EDITOR;
+    }
+    if (key == 'd' || key == 'D') {
+        // 删除一律先问一次（键盘与浮动按钮同一个确认框，见本函数开头）。
+        g_viewer.confirmDelete = true;
     }
     if (key == 'h' || key == 'H') {
         ctx.selectedEntry = g_viewer.filename;
@@ -774,7 +824,8 @@ AppState screen_viewer_handle(int key, ScreenContext &ctx) {
     // 分隔线到墨水顶边的距离，少了 ascent —— 首行的上升部会顶到标题上。日记正文前两行
     // 正好是"日期:/字数:"，看起来就是和标题糊在一起。加 ascent 换算成真基线。
     const int contentY = sepY + 12 + g_font.ascent();
-    const int contentMaxY = STATUS_Y;
+    // 底部到哪儿为止：浮动按钮浮着的时候要让出它那一条（见 viewerContentMaxY）。
+    const int contentMaxY = viewerContentMaxY();
 
     if (editorVertical()) {
         // 竖排首字墨迹顶边对齐横排首行墨迹顶边(基线-上伸部),顶部不留整行空白
@@ -812,7 +863,8 @@ AppState screen_viewer_handle(int key, ScreenContext &ctx) {
             int pctW = g_font.textWidth(pctStr);
             ui_draw_text(SCREEN_W - pctW - 4, headerY, pctStr);
         }
-        ui_draw_status("竖排阅读 e编辑 h历史", "");
+        ui_draw_status("竖排阅读 e编辑 d删除 h历史", "");
+        viewerDrawOverlays();
         ui_commit();
         return APP_VIEWER;
     }
@@ -857,6 +909,7 @@ AppState screen_viewer_handle(int key, ScreenContext &ctx) {
         }
     }
 
+    viewerDrawOverlays();
     ui_commit();
     return APP_VIEWER;
 }
