@@ -1040,6 +1040,9 @@ static void generateCoverForOpenedBook();
 // 「下一页排版结果」缓存的作废（定义在"空闲帧预热下一页"那一段）：换书/重排必须调，
 // 否则新书同页同档排版下会拿到上一本留下的一份（见 rdAheadClear 的说明）。
 static void rdAheadClear();
+// 「常驻首帧」留档的作废（定义在同一段里）：重排（换字体文件）与"卡拔了"才需要，
+// 换书不用 —— 它的版式键里带着书路径，见那边的说明。
+static void rdHoldClear();
 static void pushRecent(const std::string &path, int kind, const std::string &title);
 // 阅读位置落盘/恢复：定义在 buildToPage 之后（恢复要靠它跳页），这里先声明。
 static void rdRememberProgress(bool force);
@@ -1421,6 +1424,8 @@ static void reopenBook() {
   // 重排 = 缓存里那份排版结果是按旧版式算的，一律作废。改字号/行距/边距时键会自己变，
   // 但**换字体文件**（同书同页同字号）键一模一样而版式全变 —— 这条是它唯一的防线。
   rdAheadClear();
+  // 常驻首帧那份同理，而且是这里显式清（rdAheadClear 里不清它，见那边的说明）。
+  rdHoldClear();
   const int wantSpine = st.spineIndex;
   const int wantPage = st.page;
   const int wantTxt = st.txtPage;
@@ -2295,6 +2300,10 @@ static std::string s_preKey;
 // 作废两份留档。换书（openBook）与重排（reopenBook：改字号/行距/边距/方向/字体/样式解析）
 // 都必须调 —— 尤其是**换字体文件**：它同样会重排，而字体身份不在键里，光靠键拦不住
 // （同书同页同字号下换字体，键一模一样，版式却变了）。
+// 常驻首帧那份留档**不在这里**清：这个函数换书（openBook）也会走，而切模式回来正是
+// "换回同一本书同一页" —— 在这里清等于每次进书都把首帧丢了。留档靠的是自己的版式键
+// （书路径/档位/节:页 都在里面），换书/翻页它自己就对不上；键盖不住的那一样（换字体
+// **文件**）由 reopenBook 显式清（见那边的 rdHoldClear 调用）。
 static void rdAheadClear() {
   s_next = RdAheadPage();
   s_prev = RdAheadPage();
@@ -2474,9 +2483,138 @@ static const int kPreQuietFrames = 4;   // 空闲帧约 80ms 一拍（main.cpp i
 // 「翻页耗时」里的"重画"，值不一样就是它真在省时间；改成 0 之后不预渲染也不会画错。
 static bool rdPrerenderOn() { return g_settings.getString("reader_prerender", "1") != "0"; }
 
+// ── 常驻首帧：切模式回来那一拍，把这一页整帧贴回来 ────────────────────────
+// 上面那块 scratch 只赌"下一帧"（s_preKey 每帧重画都被清掉）。切模式是另一条路：用户在
+// 阅读页上按电源键走出去，过一会儿又走回来 —— 中间隔着另一个模式的整场绘制，回来时这一页
+// 的版式一个像素都没变，却要把"绘制"那一段从头做一遍。而且那一段**回回都是冷的**：这一趟
+// 的 Section 刚从 .bin 载入，字形缓存刚被 releaseBookFonts 清过，所以付的不只是绘制
+// （热的时候实测 205ms），是"冷排版 + 整页栅格化 + 绘制"一整套 —— 实测 319ms。
+//
+// 所以另开一块**常驻**缓冲：每帧重画阅读页之后，把那一帧的像素（正文层画完、浮层还没叠上去
+// 的那一刻，见 renderCurrent 里那处调用）连同它的派生信息一起存下来。切回来时 renderReading
+// 一进来就命中，memcpy 顶替那三段（~10ms）。
+//
+// 为什么不跟 s_preFb 合用一块：两块的生命期正好相反 —— s_preFb 隔一拍就被空闲帧覆盖，这份
+// 要活过**整个别的模式**（那段时间 s_preFb 正被拿去干别的）。代价是 416KB PSRAM 常驻。
+//
+// **每帧都存**，不做"键没变就跳过"的省事写法：版式键（rdLayoutKey）只覆盖字体/行距/边距/
+// 缩进/页，而屏幕上这一页还受一批不在键里的开关影响（阅读线、状态栏样式、标注…）。那些开关
+// 改了同样会走 renderCurrent 重画这一页 ——"重画即存"意味着存下来的永远是屏幕上那一帧；一旦
+// 按"键没变就跳过"短路，改完开关回来的就会是上一版像素。10ms 的 memcpy 换这份免疫。
+//
+// 作废：靠的是它自己的版式键（书路径/档位/节:页 都在里面），所以换书/翻页不必谁去通知；
+// 键盖不住的那一样 —— **换字体文件**（同书同页同档，键一模一样而版式全变）—— 由
+// reopenBook 显式清（rdHoldClear）。屏幕尺寸也算在判据里（换了方向那一帧不能照搬）。
+struct RdHeldFrame {
+  std::string key;
+  RdPageText text;
+  std::vector<RdState::RdLinkRect> links;
+  bool footnotes = false;
+  uint32_t offset = UINT32_MAX;
+  int frameGray = 0;
+  int w = 0, h = 0;
+};
+static RdHeldFrame s_hold;
+static uint8_t *s_holdFb = nullptr;
+static size_t s_holdFbSize = 0;
+static bool s_holdAllocTried = false;
+// 分配它之前要求的 PSRAM 余量：这块是常驻的，进了写作模式也一直在（那边正常缺 PSRAM）。
+// 只在开书后的阅读页上分配（那时 PSRAM 的账就是这块 + s_preFb 的头寸），余量不够就永久
+// 关掉这个功能 —— 少省 319ms，好过把写作模式挤爆。
+static const size_t kHoldMinFreePsram = 1500 * 1024;
+// 上一次离开阅读模式时留档是好的（screen_reader_exit 置位）。只用来把"切回来那一拍真
+// 命中了"这一句打出来 —— 否则这个功能省了多少只能从拆账数字上猜；打完就清，菜单来来回回
+// 那些正常的命中不再打日志。
+static bool s_holdArmed = false;
+
+// 作废留档。只有两处：重排（换字体文件那一路）与卡拔插 —— 换书不用，见上面的说明。
+// 缓冲不还：下次进书第一帧还要用，还回去再要回来只是把分配搬个地方。
+static void rdHoldClear() {
+  s_hold.key.clear();
+  s_hold.text = RdPageText();
+  s_hold.links.clear();
+}
+
+// 生产侧（renderCurrent 里正文层画完、浮层之前那一点调）。
+static void rdHoldCapture() {
+  if (st.mode != RdMode::Reading) return;
+  if (st.bookKind != 0 && st.bookKind != 1) return;   // 只做 EPUB/TXT 的正文页
+  if (s_imgPresentSkipped) return;                    // 图片解码被打断，帧缓冲里是半张图
+  if (st.vkVisible || st.selActive) return;           // 有跟着手在变的层
+  const size_t n = g_rd.getBufferSize();
+  if (n == 0) return;
+  if (!s_holdAllocTried) {
+    s_holdAllocTried = true;
+    const size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (freePsram < n + kHoldMinFreePsram) {
+      ESP_LOGW(TAG, "常驻首帧: PSRAM 余量不足（free %u，要 %u+%u），本功能关闭",
+               static_cast<unsigned>(freePsram), static_cast<unsigned>(n),
+               static_cast<unsigned>(kHoldMinFreePsram));
+      return;
+    }
+    s_holdFb = static_cast<uint8_t *>(heap_caps_aligned_alloc(16, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (s_holdFb == nullptr) {
+      ESP_LOGW(TAG, "常驻首帧: 缓冲 %u 字节分配失败，本功能关闭", static_cast<unsigned>(n));
+      return;
+    }
+    s_holdFbSize = n;
+    ESP_LOGI(TAG, "常驻首帧: 缓冲 %u 字节（PSRAM，剩 %u）", static_cast<unsigned>(n),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+  }
+  if (n > s_holdFbSize) return;
+  memcpy(s_holdFb, g_rd.getFrameBuffer(), n);
+  const int spine = (st.bookKind == 0) ? st.spineIndex : -1;
+  const int page = (st.bookKind == 0) ? st.page : st.txtPage;
+  s_hold.key = rdLayoutKey(spine, page);
+  s_hold.text = g_pageText;
+  s_hold.links = st.pageLinks;
+  s_hold.footnotes = st.pageInfoFootnotes;
+  s_hold.offset = st.pageInfoOffset;
+  s_hold.frameGray = st.frameGray;
+  s_hold.w = g_rd.getScreenWidth();
+  s_hold.h = g_rd.getScreenHeight();
+}
+
+// 消费侧（rdPreBlit 的第一道闸）。留档与派生信息都还在、键也对得上，就整块贴回来。
+// 与 s_preKey 不同的是**键不清**：这一页的像素对后面每一次重画都成立（开菜单回来、
+// 改完设置回来…），留着它等于让"回到这一页"的每一拍都省下绘制。真换了页/换了书，
+// 键自己就对不上；每帧的 capture 也会把留档刷成新的。
+static bool rdHoldTake() {
+  if (s_holdFb == nullptr || s_hold.key.empty()) return false;
+  if (st.bookKind != 0 && st.bookKind != 1) return false;
+  if (g_rd.getScreenWidth() != s_hold.w || g_rd.getScreenHeight() != s_hold.h) return false;
+  const int spine = (st.bookKind == 0) ? st.spineIndex : -1;
+  const int page = (st.bookKind == 0) ? st.page : st.txtPage;
+  if (s_hold.key != rdLayoutKey(spine, page)) return false;
+  const size_t n = g_rd.getBufferSize();
+  if (n == 0 || n > s_holdFbSize) return false;
+  // 派生信息只能从留档来（同 rdPreBlit 那一段，一字不差）：点链接要 st.pageLinks，
+  // 长按选词/词典要 g_pageText，菜单/书签/百分比要 st.pageInfo*。
+  g_pageText = s_hold.text;
+  if (st.bookKind == 0) {
+    st.pageLinks = s_hold.links;
+    st.pageInfoSpine = st.spineIndex;
+    st.pageInfoPage = st.page;
+    st.pageInfoFootnotes = s_hold.footnotes;
+    st.pageInfoOffset = s_hold.offset;
+  }
+  st.frameGray = s_hold.frameGray;
+  if (s_hold.frameGray) st.fullRefresh = true;
+  memcpy(g_rd.getFrameBuffer(), s_holdFb, n);
+  if (s_holdArmed) {
+    s_holdArmed = false;
+    ESP_LOGI(TAG, "常驻首帧: 命中，这一帧免排版/免栅格化/免绘制（%s）", s_hold.key.c_str());
+  }
+  s_subLayoutMs = 0;
+  s_subWarmMs = 0;
+  s_subLayoutHit = 4;   // "整帧命中常驻首帧"，见 renderCurrent 里那一行日志的 src
+  return true;
+}
+
 // 消费侧：这一帧要画的正好是 scratch 里那一帧吗？是就整块搬回来，并把留档里的派生信息
 // 装上（跳过的是**像素**，不是状态）。返回 true = 这一帧已经画好了，renderReading 直接返回。
 static bool rdPreBlit() {
+  if (rdHoldTake()) return true;
   if (s_preKey.empty() || s_preFb == nullptr) return false;
   if (st.bookKind != 0 && st.bookKind != 1) return false;
   const int spine = (st.bookKind == 0) ? st.spineIndex : -1;
@@ -6048,6 +6186,9 @@ void renderCurrent() {
     case RdMode::StatsSettings: renderStatsSettings(); break;
   }
   }  // end 常规帧（见上面 st.frameGray 那段）
+  // 常驻首帧：正文层刚画完、下面那些浮层还没叠上来，此刻帧缓冲里正是"这一页干净的样子"，
+  // 存一份下来（切模式回来那一拍 memcpy 顶替绘制，见 rdHoldCapture）。
+  rdHoldCapture();
   // 脚注弹注：盖在正文页上的一层（自己就是内容，不是提示），所以在所有别的浮层之前画。
   drawFootnotePopup();
   // 设置标签的选择弹层：也是"盖在底图上的一层"，底图由上面那个 case 画好，这里叠上去。
@@ -6328,6 +6469,7 @@ void renderCurrent() {
     const char *src = s_subLayoutHit == 1   ? "排版命中下一页留档"
                       : s_subLayoutHit == 2 ? "排版命中上一页留档"
                       : s_subLayoutHit == 3 ? "整帧命中预渲染"
+                      : s_subLayoutHit == 4 ? "整帧命中常驻首帧"
                                             : "排版现读现建";
     ESP_LOGI(TAG, "重画拆账: [%s] 翻%s页 排版 %d + 预热 %d + 绘制 %d ms（%s）",
              rdLogPage().c_str(), turn > 0 ? "下一" : "上一", s_subLayoutMs, s_subWarmMs,
@@ -10017,6 +10159,10 @@ void screen_reader_init() {
 
 void screen_reader_exit() {
   ESP_LOGI(TAG, "阅读模式退出");
+  // 常驻首帧：离场时报一句 —— 切回来那一拍能不能省下绘制全看这份留档还在不在
+  // （在 = 下一帧直接贴回来；被 rdHoldClear 清过 = 这一页得重画，见 rdHoldCapture）。
+  s_holdArmed = !s_hold.key.empty();
+  ESP_LOGI(TAG, "常驻首帧: 离场留档 %s", s_holdArmed ? s_hold.key.c_str() : "（空）");
   // 退出前强制记一次：下面马上要把书对象释放掉，之后就没得记了。同一次开机内切走
   // 再切回来靠 s_return，这次落盘是为了掉电/重启后还能接上。
   rdRememberProgress(true);
@@ -10372,8 +10518,10 @@ bool screen_reader_on_sd_lost(bool card_absent) {
     st.bookTitle.clear();
     st.bookKind = -1;
     // 邻页留档与预渲染那块 scratch 都是按"这本书的下一屏"记的，一起作废
-    // （rdAheadClear 顺手清 s_preKey）。
+    // （rdAheadClear 顺手清 s_preKey）。常驻首帧那份也清：卡拔了再插回来，同一个路径上
+    // 换没换过文件我们无从知道，不冒险（见 rdAheadClear 上面那段说明）。
     rdAheadClear();
+    rdHoldClear();
   }
   // 书架列表同样是卡的投影：卡没了，列表就是假的（点一本报一次错）。清掉，卡插回来
   // 由 on_sd_ready 重扫。书架风格/光标之类的偏好不动。
