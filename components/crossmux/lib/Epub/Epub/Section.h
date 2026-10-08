@@ -93,6 +93,11 @@ class Section {
   // forward-declared ChapterHtmlSlimParser, whose full definition is only visible in the .cpp.
   explicit Section(const std::shared_ptr<Epub>& epub, int spineIndex, GfxRenderer& renderer);
   ~Section();
+  // Load a section .bin laid out under the same spec and continue from it: pageCount
+  // becomes immediately readable (a finalized file leaves isBuildComplete() true, a
+  // partial leaves isPartial() true so the caller can startBuild() to extend it).
+  // Returns false -- leaving the Section as if freshly constructed -- when the file is
+  // missing, its version is unknown, or the render spec differs.
   bool loadSectionFile(const ReaderRenderSpec& spec);
   bool clearCache() const;
   bool createSectionFile(const ReaderRenderSpec& spec, const std::function<void()>& popupFn = nullptr);

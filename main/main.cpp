@@ -1252,7 +1252,13 @@ extern "C" void app_main() {
             // 切模式这一帧必须立刻跑一次生命周期：leave(旧) + enter(新)。放在 switch 之后
             // 也能兜住（dispatch 后面的收口还是同一对状态），但那要等本帧 dispatch 走完，
             // 中间如果 next==0 会进 scrReader 而阅读器还没 init。所以这里先同步一次。
+            const int64_t tSwitch = esp_timer_get_time();
             syncScreenLifecycle(currentState, ctx);
+            // 按下电源键（这一拍才开始处理）到新界面第一帧走完的总时长，含 leave(旧) +
+            // enter(新)。新界面是阅读器时它自己那本「开书拆账」同时打出来，两边一对就差
+            // 出 leave 那一份 —— 否则"卡这一段"永远分不清是旧界面的收尾还是新界面的开局。
+            ESP_LOGI(TAG, "切模式耗时: %lld ms (→ state %d)",
+                     (long long)((esp_timer_get_time() - tSwitch) / 1000), (int)currentState);
             key = 0;
         }
 

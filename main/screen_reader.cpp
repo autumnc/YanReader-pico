@@ -703,6 +703,35 @@ void scanBooks() {
   rdSortShelfByRecency();   // 越近读的排越前面
 }
 
+// ── 进阅读模式 / 开书的耗时拆账 ──────────────────────────────────────────
+//
+// 切模式（写作/计划 → 阅读）那一下是**同步阻塞**的：screen_reader_init() 全部跑完之前
+// 屏上一动不动，体感就是"卡一会儿"。而这一段里能花的钱太多（等在飞的推屏、装字面、
+// 扫书架、Section 重解析本章、排到上次那一页、解封面…），只靠读代码猜不出主犯。
+// 这套打点把每一段的时间报出来 —— 与翻页那条 `翻页耗时: 变化 N‰ + 重画 X ms + 推屏
+// Y ms` 同一个形状，一个账本对一次动作。
+//
+// 用法：rdTraceBegin() 起一次账，之后每个阶段边界 rdTraceMark("段名") 一行，
+// 报"距上一笔"与"距起点"。**不打点时不产生任何输出**，也不需要复位（每次
+// rdTraceBegin 覆盖）。日志形如：
+//   I (12345) RdT: 开书拆账: render drain           812 ms (起点起    812 ms)
+static int64_t s_traceT0 = 0;
+static int64_t s_traceLast = 0;
+static bool s_traceOn = false;
+
+static void rdTraceBegin() {
+  s_traceT0 = s_traceLast = esp_timer_get_time();
+  s_traceOn = true;
+}
+
+static void rdTraceMark(const char *name) {
+  if (!s_traceOn) return;
+  const int64_t now = esp_timer_get_time();
+  ESP_LOGI(TAG, "开书拆账: %-26s %6lld ms (起点起 %6lld ms)", name,
+           (long long)((now - s_traceLast) / 1000), (long long)((now - s_traceT0) / 1000));
+  s_traceLast = now;
+}
+
 // ── 打开书籍 ────────────────────────────────────────────────────────────
 
 static bool openEpub(const std::string &path) {
@@ -713,6 +742,7 @@ static bool openEpub(const std::string &path) {
     applyUserContentFont();
     return false;
   }
+  rdTraceMark("Epub::load(元数据/索引)");
   st.epub = epub;
   // 内联插图是**延迟提取**的：解析章节时只读图片头部拿尺寸，真正的图片数据要等第一
   // 次翻到那一页才从 zip 里抠出来（ImageBlock::ensureExtracted）。抠的那一步走的是
@@ -778,10 +808,17 @@ static bool openEpub(const std::string &path) {
     // 用户字体。这一支也是"上一本书的内嵌字体"唯一的还原点。
     if (!loaded) applyUserContentFont();
   }
+  rdTraceMark("内嵌字体(解压+装面)");
 
-  st.spineIndex = 0;
+  // 这里**不排首章**：紧接着 rdRestoreProgress() 会按"上次读到哪"开目标章，先排首章
+  // 十有八九是白排一遍（实测 151ms + 首排 116ms）再扔掉。只有"第一次读这本书"才真
+  // 需要首章，那由 rdRestoreProgress() 兜底。st.section 一并放掉，免得它继续挂着上一
+  // 本书（或本书上一次版式）的那份；st.spineIndex = -1 是"章节还没定"的哨兵，所有
+  // `sp != st.spineIndex` 的判据都会因此强制开一次 Section（openSpine 会置真章号）。
+  st.section.reset();
+  st.spineIndex = -1;
   st.page = 0;
-  return openSpine(0);
+  return true;
 }
 
 bool openSpine(int idx) {
@@ -802,9 +839,32 @@ bool openSpine(int idx) {
   st.pageInfoPage = -1;
   // 字号梯子必须在 startBuild 之前灌：排版期就要按它把 CSS font-size 吸附到某一档。
   applyCssFontLadder();
-  if (!st.section->startBuild(makeSpec())) return false;
+  rdTraceMark("Section 对象+字号梯子");
+  // 先把磁盘上那份排版产物读回来（只认同一把 spec 键，见 Section::loadSectionFile）：
+  //   · 整章已排完（finalized）→ pageCount 就是整章页数，一行都不用重排；
+  //   · 上次退出时挂起的（partial）→ pageCount 是"上次排到哪"的水位，也够直接显示。
+  // 这是开书卡顿的主犯：buildToPage 没有页索引，想跳到第 N 页就得把 0..N 重排一遍
+  // （实测 ~114ms/页，一章读得越深越慢）。而产物本来就在写 —— 每次退出阅读器
+  // suspendBuild 都落一份（"Suspended build: N pages persisted"），只是以前没人读它。
+  const ReaderRenderSpec spec = makeSpec();
+  const bool resumed = st.section->loadSectionFile(spec);
+  if (resumed) {
+    ESP_LOGI(TAG, "排版产物复用: %s，%u 页直接可读", st.section->isPartial() ? "partial" : "整章",
+             static_cast<unsigned>(st.section->pageCount));
+    rdTraceMark(st.section->isPartial() ? "复用排版产物(partial)" : "复用排版产物(整章)");
+  }
+  // partial 只是"上次排到哪"，后面还得接着排（空闲帧里补，翻页时按需补），否则翻到
+  // 水位就到头了；整章那份是 complete，没有任何待续的活，再 startBuild 一次就是白排。
+  if (!resumed || st.section->isPartial()) {
+    if (!st.section->startBuild(spec)) return false;
+    rdTraceMark("Section startBuild(解析本章)");
+  }
   st.page = 0;
-  st.section->buildSomeMore(2);  // 先排出前几页，立即可读
+  // 先排出前几页、立即可读 —— 复用的那几页本来就可读，再排一遍纯属白费。
+  if (!resumed) {
+    st.section->buildSomeMore(2);
+    rdTraceMark("首排 2 页");
+  }
   return true;
 }
 
@@ -956,10 +1016,13 @@ static bool openTxt(const std::string &path) {
     ulen = r.utf8Length;
   }
   st.txtUtf8.resize(ulen);
+  rdTraceMark("TXT 读盘+转码");
   st.bookTitle = txt.getTitle().empty() ? path : txt.getTitle();
   st.txtPage = 0;
   buildTxtChapters();  // 先扫章节：paginateTxt 要拿它判断"段末"（章节标题前留空行）
+  rdTraceMark("TXT 扫章节");
   paginateTxt();
+  rdTraceMark("TXT 全量分页");
   return true;
 }
 
@@ -980,7 +1043,7 @@ static void rdAheadClear();
 static void pushRecent(const std::string &path, int kind, const std::string &title);
 // 阅读位置落盘/恢复：定义在 buildToPage 之后（恢复要靠它跳页），这里先声明。
 static void rdRememberProgress(bool force);
-static void rdRestoreProgress();
+static bool rdRestoreProgress();
 static void rdStatsBeginSession();  // 定义在 chapterPage() 之后（要用到章节进度）
 void buildToPage(int target);  // 同上：reopenBook 重排后要靠它跳回原页
 
@@ -1005,8 +1068,10 @@ bool openBook(const std::string &path, int kind) {
   if (ok) {
     // 读到哪就从哪继续。显式跳页的调用方（书签/返回点）随后会再跳一次覆盖掉，
     // 那条路径不受影响。
-    rdRestoreProgress();
+    if (!rdRestoreProgress()) return false;   // 章没排出来 = 这次开书失败（见其说明）
+    rdTraceMark("恢复阅读位置");
     generateCoverForOpenedBook();
+    rdTraceMark("封面(文件在就跳过)");
     pushRecent(path, kind, st.bookTitle);
     // 刚打开的这本立刻挪到进度表表头。"最近阅读的一本"= 用户此刻在看的这本，而表头原本
     // 只在**位置变了**（翻页）时才挪 —— 于是"打开一本旧书、还没翻页就待机"的窗口里表头
@@ -1018,6 +1083,7 @@ bool openBook(const std::string &path, int kind) {
     // 统计会话：同一本书因为改字号/行距重排会再走一次这里（reopenBook），
     // rdStatsBeginSession 内部认活跃路径，同书不重开会话。
     rdStatsBeginSession();
+    rdTraceMark("进度落盘+统计会话");
   }
   return ok;
 }
@@ -1208,6 +1274,10 @@ static void rdBuildStandbyCoverForOpenBook() {
   StandbyCoverLayout lay{};
   readerStandbyCoverLayout(lay);
   const int bw = lay.boxW, bh = lay.boxH;
+  // 这一笔**必须报耗时**：它挂在进书后的第一个空闲帧上（rdPrebuildAhead 开头那段），
+  // 也就是"页面已经上屏、读者正想往下按"的那一刻。整段不可切分、又在主任务上，
+  // 卡顿体感直接等于这一行 —— 所以它不跟拆账开关联动，一本书打一次，永远可见。
+  const int64_t t0 = esp_timer_get_time();
   bool ok = false;
   if (st.bookKind == 0) {
     if (st.epub) ok = st.epub->generateStandbyCoverBmp(out, bw, bh);
@@ -1215,7 +1285,8 @@ static void rdBuildStandbyCoverForOpenBook() {
     Txt t(st.bookPath, CACHE_DIR);
     if (t.load()) ok = t.generateStandbyCoverBmp(out, bw, bh);
   }
-  ESP_LOGI(TAG, "待机封面: %s (%dx%d) %s", out.c_str(), bw, bh, ok ? "已生成" : "无原图，退回书架封面");
+  ESP_LOGI(TAG, "待机封面: %s (%dx%d) %s 耗时 %lld ms", out.c_str(), bw, bh,
+           ok ? "已生成" : "无原图，退回书架封面", (long long)((esp_timer_get_time() - t0) / 1000));
 }
 
 // ── 待机表盘「图片」：用户自己选的那张图 ─────────────────────────────────
@@ -1358,10 +1429,13 @@ static void reopenBook() {
   else if (st.bookKind == 1) openTxt(st.bookPath);
   else if (st.bookKind == 2) openXtc(st.bookPath);
 
-  if (st.bookKind == 0 && st.epub && st.section) {
+  // 判据里**不再看 st.section**：openEpub 现在不开章，重排后它必定是空的，看它就整段跳过、
+  // 留下一本没有 Section 的书。开章由下面的 openSpine 承担 —— openEpub 把 st.spineIndex
+  // 置成 -1，所以 `sp != st.spineIndex` 一定成立，哪怕 wantSpine 就是 0 也会开一次。
+  if (st.bookKind == 0 && st.epub) {
     const int n = st.epub->getSpineItemsCount();
     const int sp = clampI(wantSpine, 0, std::max(0, n - 1));
-    if (sp != st.spineIndex) openSpine(sp);
+    if (sp != st.spineIndex || !st.section) openSpine(sp);
     if (st.section) buildToPage(wantPage);
   } else if (st.bookKind == 1 && !st.txtLineStarts.empty()) {
     st.txtPage = clampI(wantTxt, 0, std::max(0, totalPages() - 1));
@@ -5467,25 +5541,34 @@ static void rdRememberProgress(bool force) {
   saveProgress();
 }
 
-// 打开书之后调用：这本书上次读到哪就跳到哪。没有记录（第一次读）保持原样——
-// openEpub/openTxt/openXtc 给的首屏。
-static void rdRestoreProgress() {
+// 打开书之后调用：这本书上次读到哪就跳到哪。
+// EPUB 的**首章也由这里开**（openEpub 不再预先排首章）：有记录就开目标章，没有记录
+// （第一次读这本书）落回首章首屏。TXT/XTC 的分页在 openTxt/openXtc 里就做完了，这里
+// 只是把页码挪到上次那一页。
+// 返回 false = 章节没排出来（磁盘/HTML 坏）。这一条以前由 openEpub 的 `return
+// openSpine(0)` 兜着，现在得由它自己报，否则"开书成功但一个 Section 都没有"会漏出去。
+static bool rdRestoreProgress() {
   loadProgress();
-  if (st.bookPath.empty()) return;
+  if (st.bookPath.empty()) return true;
   for (const auto &r : s_progress) {
     if (r.path != st.bookPath || r.kind != st.bookKind) continue;
     if (st.bookKind == 0 && st.epub) {
       const int spines = st.epub->getSpineItemsCount();
       const int sp = clampI(r.spine, 0, std::max(0, spines - 1));
-      if (sp != st.spineIndex) openSpine(sp);
+      if (sp != st.spineIndex || !st.section) {
+        if (!openSpine(sp)) return false;
+      }
       buildToPage(r.page);
     } else if (st.bookKind == 1 && !st.txtLineStarts.empty()) {
       st.txtPage = clampI(r.txtPage, 0, std::max(0, totalPages() - 1));
     } else if (st.bookKind == 2 && st.xtc) {
       st.xtcPage = clampI(r.xtcPage, 0, std::max(0, static_cast<int>(st.xtc->getPageCount()) - 1));
     }
-    return;
+    return true;
   }
+  // 进度表里没有这本书：第一次读，落到首章首屏。
+  if (st.bookKind == 0 && !st.section) return openSpine(0);
+  return true;
 }
 
 static void gotoBookmark(int idx) {
@@ -6258,6 +6341,10 @@ void renderCurrent() {
 // 分章排版，大书要好几秒；e-ink 上这几秒整屏不动，用户会以为死机。
 // renderCurrent 收尾已经把 fullRefresh/dirty 复位，这里不用再管。
 void rdShowBusy(const char *msg, const std::string &sub) {
+  // 点书开书这条路（书架/最近/文件浏览器/导出）的拆账起点就在这里：这一行之下就是
+  // 用户点下去之后要干等的**全部**时间（含下面这一帧"正在…"本身的 ~1s 全刷）。
+  // 切模式那条路不经过这里，它的起点在 screen_reader_init() 开头。
+  rdTraceBegin();
   st.busyMsg = msg;
   st.busySub = sub;
   st.fullRefresh = true;   // 浮层首帧走全刷，免得和上一屏的残影叠在一起
@@ -9702,7 +9789,11 @@ static void rdRestoreReturnPoint() {
       openBook(r.bookPath, r.bookKind)) {
     if (r.bookKind == 0) {
       if (r.spine != st.spineIndex) openSpine(r.spine);
+      rdTraceMark("openSpine(目标章)");
+      // 这一笔跟"上次读到哪"成正比：buildToPage 是逐页排到目标页，没有页索引可跳。
+      // 章末的书会比章首的书明显慢 —— 拆账里看点开同一本书、换位置前后这一行差多少。
       buildToPage(r.page);
+      rdTraceMark("buildToPage(逐页排到目标页)");
       // 目录选中行夹一下界就够（条目本身按书重建，行号在原书里没变）。
       if (st.epub) st.tocSel = clampI(st.tocSel, 0, std::max(0, st.epub->getTocItemsCount() - 1));
       st.bookmarkSel = clampI(st.bookmarkSel, 0,
@@ -9754,6 +9845,9 @@ static void rdRestoreReturnPoint() {
 // ── 公开入口 ────────────────────────────────────────────────────────────
 
 void screen_reader_init() {
+  // 这一次 init 是从按电源键切模式那一刻起、到阅读页上屏为止的**全部**耗时（屏在这段
+  // 里一动不动）。每次进入都起一次账 —— 见上面 rdTraceBegin 的说明。
+  rdTraceBegin();
   // 阅读器整条绘制路径**绕过** core1 的渲染任务：GfxRenderer 画的就是 epdiy 的
   // front_fb，刷屏直接调 epd_hl_update_screen（都是本任务、同步）。所以进阅读器前
   // 必须等在飞的那一帧推完 —— 否则 core0 一边画 front_fb、core1 一边在
@@ -9766,6 +9860,9 @@ void screen_reader_init() {
   // 阅读器刷新同时进 epdiy。先 invalidate 让渲染任务把它们丢掉，再 drain 等它跑完。
   ui_render_invalidate();
   ui_render_drain();
+  // 上一个界面（写作/计划）刚推过一屏的话，这里要等它扫完 —— 切模式时那一下卡顿的
+  // 一部分可能根本不在阅读器这边，账本上能看出来。
+  rdTraceMark("ui_render drain");
 
   // 阅读器方向：默认横屏 1216×684，可在菜单里切竖屏；退出时 board_restore_orientation
   // 恢复全局方向设置。applyReaderOrientation 同时设 epd 旋转与渲染器方向标志。
@@ -9788,6 +9885,7 @@ void screen_reader_init() {
 
   // g_rd.begin() 之后 frameBuffer 才有效，立刻把 u8g2 shim 也钉上去（理由见 rdPinShimFb）。
   rdPinShimFb();
+  rdTraceMark("g_rd.begin+方向+shim");
 
   // 揭页动画期间每 8 拍补采一次输入。动画 ≈1.06s 是这一段同步阻塞里最长的一截，
   // 期间没人读触摸控制器 —— 而点按必须"按下"与"抬手"各被采到一次，整段落在动画里的
@@ -9807,6 +9905,7 @@ void screen_reader_init() {
     g_bodyFont[i].set(kBodyPx[i], kBodyPx[i] * 4 / 5);
     g_rd.insertFont(BODY_FONT_ID_BASE + i, g_bodyFont[i].family);
   }
+  rdTraceMark("字面装载(UI+全档正文)");
 
   // 恢复阅读设定（与写作模式共享 settings 存储，键名带 reader_ 前缀）。
   // 字号档换过表：26/30/34px 三档删掉后，老下标在新表里是另一个大小（老 6=64px 会变
@@ -9854,6 +9953,7 @@ void screen_reader_init() {
   // 阅读统计：一开机读一次。统计文件在 SD 根（和 reader_progress.txt/reader_notes.txt
   // 放一起），时钟没同步时只有总时长、没有日桶（见 reading_stats.cpp 的 clockValid）。
   ReadingStats::load();
+  rdTraceMark("设置+书签/最近/笔记/统计");
   st.fbPath = "/sdcard";
 
   st.mode = RdMode::Browser;
@@ -9896,13 +9996,23 @@ void screen_reader_init() {
   st.txtChapterOffsets.clear();
   st.txtChapterTitles.clear();
   scanBooks();
+  rdTraceMark("扫书架");
   // 从其它模式切回来时回到切换出去前那一屏（书的位置一起带回）。开机首次进入时
   // s_return 无效，保持上面的"书架首页"默认。
   rdRestoreReturnPoint();
+  // 上面这一行里是**开书**：Epub::load + 内嵌字体 + Section 重解析 + 排到上次那一页，
+  // 切模式卡顿的主犯基本都在这一段里，它自己会在上面插好各自的明细。
+  rdTraceMark("恢复返回点(含开书)");
   ESP_LOGI(TAG, "阅读模式初始化: %d 本书, ui=%dpx, body=%dpx, 行距档=%d, 缩进=%d",
            (int)st.books.size(), uiPx, kBodyPx[st.fontLevel],
            spacingIdx(), st.indentMode);
   renderCurrent();
+  // 首屏推屏：fullRefresh=true 时这里是整屏 GC16，本身就是 ~1s。
+  // 注意这一笔**含 renderCurrent 收尾的进书预建**（rdPrebuildAhead：封面那一段 + 下一页
+  // 留档的排版与字形，实测 ~1s）——那一段在推屏**之后**才跑，所以"用户看到页"的时刻比
+  // 这一笔早 ~1s，而它挡住的只是紧随其后的第一次按键采样。要分开看得在里面补打点。
+  rdTraceMark("首屏绘制+推屏+进书预建");
+  s_traceOn = false;
 }
 
 void screen_reader_exit() {

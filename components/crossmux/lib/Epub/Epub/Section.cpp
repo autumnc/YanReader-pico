@@ -316,6 +316,13 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
     }
     partial_ = true;
     partialPageCount_ = pageCount;
+  } else {
+    // 整章已排完的 .bin：没有任何待续的活，直接标记完成。读端全靠这个判据决定"还要
+    // 不要再 build"（翻页越过页数时要不要续排、空闲帧要不要补排版）——不标的话，一个
+    // 既没有活构建、isBuildComplete() 又恒为 false 的 Section 会被那些循环当成"还在
+    // 排，再等等"，在空闲帧里反复空转调 buildSomeMore（每次都打在"no active build"上）。
+    // 之后真要继续排（比如版式变了要重排）走 startBuild()，它开头会把它清回 false。
+    buildComplete_ = true;
   }
 
   // Explicit close() required: member variable persists beyond function scope
