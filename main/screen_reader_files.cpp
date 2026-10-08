@@ -24,6 +24,7 @@
 #include "editor_vk.h"             // 重命名框复用编辑器那套虚拟键盘
 #include "ime/IME.h"
 #include "app_services.h"
+#include "app_async.h"             // appAsyncTaskExit（fb_scan 的栈水线，同其余 worker）
 
 #include <algorithm>
 #include <atomic>
@@ -60,10 +61,17 @@ static int fbKindForName(const std::string &name, bool isDir) {
   return 4;
 }
 
+// 「显示隐藏文件」：点文件（以 . 开头）列不列。默认关 —— 关着就是改动前的样子。
+// 键名 fm_show_hidden 与网页版那只眼睛是同一件事的两个前端（web 端走
+// file_manager_server.cpp 的 hidden=1 参数）；两边各存各的状态，互不干扰。
+static bool fbShowHidden() { return g_settings.getString("fm_show_hidden", "0") == "1"; }
+
 static void fbScanBuild(const std::string &dir, std::vector<BookEntry> &out) {
   out.clear();
   std::vector<AppFileEntry> entries;
-  app_scan_directory(dir, entries, fbKindForName, false);
+  // 点文件(隐藏文件)按设置决定列不列。默认不列 —— 这是改动前的行为，也是用户看惯的
+  // 那副样子；开关本身是右下角那只眼睛（fbHiddenToggle）。
+  app_scan_directory(dir, entries, fbKindForName, fbShowHidden());
   out.reserve(entries.size());
   for (auto &e : entries) out.push_back({std::move(e.path), std::move(e.name), e.kind});
 }
@@ -83,49 +91,84 @@ struct FbScanJob {
 };
 
 static std::atomic<bool> s_fbScanRunning{false};
-static std::atomic<bool> s_fbScanDone{false};
 static std::atomic<FbScanJob *> s_fbScanReady{nullptr};
 
 static void fbScanTask(void *arg) {
   std::unique_ptr<FbScanJob> job(static_cast<FbScanJob *>(arg));
   fbScanBuild(job->dir, job->entries);
   s_fbScanReady.store(job.release(), std::memory_order_release);
-  s_fbScanDone.store(true, std::memory_order_release);
   s_fbScanRunning.store(false, std::memory_order_release);
-  vTaskDelete(nullptr);
+  appAsyncTaskExit("fb_scan", 6144);
 }
 
+// "这一趟还没交代完"：正在跑，或者跑完了但结果还没被 poll 取走应用。
+// 原来这是 running + done 两个旗子，而 worker 先置 done 再清 running —— 中间那一瞬两个
+// 都为真，于是界面会在一份**已经铺好的**列表上盖一行"正在扫描目录..."，handle 那边也会
+// 多吞掉一个键。改成"取件即结束"（ready 被 exchange 走 = 交代完了）就没有这个窗口了。
 static bool fbScanAsyncActive() {
   return s_fbScanRunning.load(std::memory_order_acquire) ||
-         s_fbScanDone.load(std::memory_order_acquire);
+         s_fbScanReady.load(std::memory_order_acquire) != nullptr;
 }
 
-static void fbScanAsyncPoll() {
-  if (!s_fbScanDone.load(std::memory_order_acquire)) return;
-  s_fbScanDone.store(false, std::memory_order_release);
+// 扫描在跑时来的请求**不能丢**：进子目录 / 返回上一级正好发生在这个窗口里（一次扫描
+// 几十到几百 ms），原来只弹一句"正在扫描目录"就把请求连目录名一起扔了 —— 用户看到浮层、
+// 列表却还在原目录。这里记下来，等这一趟落地后补发。同一窗口里连按几次只留最后一次
+// （用户要的是最终那个目录）。
+static bool s_fbPendingValid = false;
+static std::string s_fbPendingDir, s_fbPendingKeep;
+
+static void fbStartScan(const std::string &dir, const std::string &keepPath);
+
+// 返回值 = 这一趟**动了界面要用的状态**（落地了新列表，或补发了一份挂起的请求）。
+// 空闲帧靠它决定要不要当场重绘，见 rdFileScanIdleTick。
+static bool fbScanAsyncPoll() {
   std::unique_ptr<FbScanJob> job(s_fbScanReady.exchange(nullptr, std::memory_order_acq_rel));
-  if (!job) return;
-  if (job->dir != st.fbPath) return;
-  st.fbEntries = std::move(job->entries);
-  st.fbSel = 0;
-  if (!job->keepPath.empty()) {
-    for (size_t i = 0; i < st.fbEntries.size(); i++) {
-      if (st.fbEntries[i].path == job->keepPath) {
-        st.fbSel = static_cast<int>(i);
-        break;
+  if (!job) return false;   // 没有新的落地件（可能还在跑）
+  bool changed = false;
+  if (job->dir == st.fbPath) {
+    st.fbEntries = std::move(job->entries);
+    st.fbSel = 0;
+    if (!job->keepPath.empty()) {
+      for (size_t i = 0; i < st.fbEntries.size(); i++) {
+        if (st.fbEntries[i].path == job->keepPath) {
+          st.fbSel = static_cast<int>(i);
+          break;
+        }
       }
     }
+    st.fbSel = clampI(st.fbSel, 0, std::max(0, static_cast<int>(st.fbEntries.size()) - 1));
+    st.dirty = 1;
+    changed = true;
   }
-  st.fbSel = clampI(st.fbSel, 0, std::max(0, static_cast<int>(st.fbEntries.size()) - 1));
-  st.dirty = 1;
+  // 先把这一份放掉再补发：补发要新分配一份，别两份结果挤在同一时刻（各自几百字节到几 KB）。
+  job.reset();
+  if (s_fbPendingValid) {
+    s_fbPendingValid = false;
+    const std::string d = s_fbPendingDir, k = s_fbPendingKeep;
+    s_fbPendingDir.clear();
+    s_fbPendingKeep.clear();
+    fbStartScan(d, k);   // 它自己会置 st.dirty（列表已清空，接下来画的是"正在扫描目录..."）
+    changed = true;
+  }
+  return changed;
 }
 
-static void fbRequestScan(const std::string &dir, const std::string &keepPath = std::string()) {
-  fbScanAsyncPoll();
-  if (s_fbScanRunning.load(std::memory_order_acquire)) {
-    rdShowFloat("正在扫描目录", "请稍候", 1200);
-    return;
-  }
+// 空闲帧：把异步扫描落地的那份结果取回来。**必须当场重绘**。
+//
+// 取件原先只挂在两条路上 —— handleFileBrowser 开头（按键帧）和 renderFileBrowser 开头
+// （渲染时）。可阅读器的空闲分支跑完那几拍就 return（见 screen_reader_handle），两条路
+// 一条都走不到：worker 早把结果放进 s_fbScanReady 退出了，却没人取，屏幕就一直挂着
+// "正在扫描目录..."，直到用户点一下才恢复（那一拍才走按键帧那条路）。和同一处 float
+// 检查是一个毛病：**空闲帧没人替我们推屏，"只标脏"等于没画**。
+//
+// 取件本身**不按模式设闸**：用户可能扫到一半就切走了，那份 job（含整个目录表）总得有人
+// 放掉；只是不在文件浏览这一屏时不必拿它去重绘当前界面。
+bool rdFileScanIdleTick() {
+  if (!fbScanAsyncPoll()) return false;
+  return st.mode == RdMode::FileBrowser;
+}
+
+static void fbStartScan(const std::string &dir, const std::string &keepPath) {
   std::unique_ptr<FbScanJob> job(new (std::nothrow) FbScanJob());
   if (!job) {
     fbScan(dir);
@@ -138,7 +181,6 @@ static void fbRequestScan(const std::string &dir, const std::string &keepPath = 
   st.fbSel = 0;
   st.fmStatus.clear();
   st.dirty = 1;
-  s_fbScanDone.store(false, std::memory_order_release);
   s_fbScanRunning.store(true, std::memory_order_release);
   TaskHandle_t h = nullptr;
   if (xTaskCreate(fbScanTask, "fb_scan", 6144, job.get(), 1, &h) != pdPASS) {
@@ -147,6 +189,18 @@ static void fbRequestScan(const std::string &dir, const std::string &keepPath = 
     return;
   }
   (void)job.release();
+}
+
+static void fbRequestScan(const std::string &dir, const std::string &keepPath = std::string()) {
+  fbScanAsyncPoll();
+  if (s_fbScanRunning.load(std::memory_order_acquire)) {
+    s_fbPendingDir = dir;
+    s_fbPendingKeep = keepPath;
+    s_fbPendingValid = true;
+    rdShowFloat("正在扫描目录", "请稍候", 800);
+    return;
+  }
+  fbStartScan(dir, keepPath);
 }
 
 // 进文件浏览器：重扫当前目录。三个入口（1 号位应用页的文件夹图标、书架菜单的
@@ -234,18 +288,54 @@ static void fbDrawRefreshFab() {
   if (fb) icon_font_draw_sized(fb, x + (b - g) / 2, y + (b - g) / 2, g, g, BAR_ICON_REFRESH, false, g);
 }
 
-// 重扫当前目录。fbScan 会把 fbSel 归零，所以先记下选中项的路径、扫完再选回去——
-// 刷新只该更新列表内容，不该把用户的位置弄丢。
-static void fbRefreshAction() {
+// 重扫当前目录，并尽量把光标留在原来那一行上：fbScan 会把 fbSel 归零，所以先记下
+// 选中项的路径、扫完再选回去。刷新与「显示隐藏文件」开关都要这一步。
+static void fbRescanKeepSelection() {
   std::string keep;
   if (st.fbSel >= 0 && st.fbSel < static_cast<int>(st.fbEntries.size()))
     keep = st.fbEntries[st.fbSel].path;
+  fbRequestScan(st.fbPath, keep);
+}
+
+static void fbRefreshAction() {
   const std::string dir = st.fbPath;
   const int before = static_cast<int>(st.fbEntries.size());
-  fbRequestScan(dir, keep);
+  fbRescanKeepSelection();
   ESP_LOGI(TAG, "文件刷新: %s (%d → %d 项)", dir.c_str(), before,
            static_cast<int>(st.fbEntries.size()));
   rdShowFloat("正在刷新", dir, 1500);
+  st.dirty = 1;
+}
+
+// 「显示隐藏文件」浮动按钮：FAB 列的第 4 枚，叠在「刷新」之上。
+// 关着画线框眼睛、开着画实心白眼睛 —— 和上面的地球按钮同一套"实心 = 正在生效"的约定。
+// 为什么要有：SD 卡上以 . 开头的目录不少（.crossmux 的书缓存、.pxc 之类），网页版那只
+// 眼睛早就有，本机这份列表却一直没有入口，想看一眼/清一下隐藏目录只能去开 WiFi 传书。
+static int fbHiddenFabY() { return fbRefreshFabY() - fbFabBoxPx() - 12; }
+static bool fbHiddenFabHit(int x, int y) {
+  const int pad = 8, b = fbFabBoxPx();
+  const int bx = fbFabX(), by = fbHiddenFabY();
+  return x >= bx - pad && x <= bx + b + pad && y >= by - pad && y <= by + b + pad;
+}
+
+static void fbDrawHiddenFab() {
+  const int b = fbFabBoxPx(), g = fbFabGlyphPx();
+  const int x = fbFabX(), y = fbHiddenFabY();
+  const bool on = fbShowHidden();
+  if (on) g_rd.fillRect(x, y, b, b, true);
+  else g_rd.drawRect(x, y, b, b, true);
+  uint8_t *fb = g_rd.getFrameBuffer();
+  // 眼睛是 icon_font.c 里按几何画的（子集没有 eye 字形，也没有 fontTools 重裁），
+  // 所以只能走 icon_font_draw —— _sized() 找不到字形会直接画个空白。
+  if (fb) icon_font_draw(fb, x + (b - g) / 2, y + (b - g) / 2, g, g, FAB_ICON_EYE, on);
+}
+
+static void fbHiddenToggle() {
+  const bool on = !fbShowHidden();
+  g_settings.setString("fm_show_hidden", on ? "1" : "0");
+  ESP_LOGI(TAG, "显示隐藏文件: %s", on ? "开" : "关");
+  fbRescanKeepSelection();   // 立刻按新口径重扫这一层，不然要退出再进来才生效
+  rdShowFloat(on ? "显示隐藏文件" : "不显示隐藏文件", "", 1500);
   st.dirty = 1;
 }
 
@@ -315,9 +405,12 @@ static void fbFabAction() {
     return;
   }
   if (st.netServerUp) {
-    // 服务已经在跑：这一下就是"再看一眼地址"。要停服务用长按（见 handleFileBrowser
-    // 的 KEY_TOUCH_LONG）—— 把停服务挂在同一下点按上，想看地址的人会不小心把服务关掉。
-    fbFabShowAddress();
+    // 服务已经在跑：这一下就是"关服务"。按钮本来就是个开关（实心=开着，见 fbDrawFab），
+    // 点一下开、再点一下关，别让 httpd 一直在后台耗电（WiFi + 每秒的 accept 轮询）。
+    // 「再看一眼地址」挪去长按（见 fbFabLongPress）—— 点按要留给开/关本身。
+    file_manager_server_stop();
+    st.netServerUp = false;
+    rdShowFloat("网络文件管理已停止", "", 3000);
     return;
   }
   rdShowBusy("正在启动服务…", std::string());
@@ -329,30 +422,25 @@ static void fbFabAction() {
     st.netServerUp = true;
     fbFabShowAddress();
   } else {
-    rdShowFloat("服务启动失败", "端口被占用?", 5000);
+    rdShowFloat("服务启动失败", file_manager_server_last_error(), 5000);
   }
 }
 
-// 长按浮动按钮 = 停服务。返回真表示这一下被 FAB 吃掉了（别再当列表长按处理）。
+// 长按浮动按钮 = 再看一眼地址（服务开着时才有意义，地址抄给手机/电脑用）。返回真表示
+// 这一下被 FAB 吃掉了（别再当列表长按处理）；服务没开就返回假，长按还给列表弹行菜单。
 static bool fbFabLongPress() {
   if (!st.netServerUp) return false;
-  const FmXfer *x = file_manager_get_xfer();
-  if (x->active.load(std::memory_order_acquire)) {
-    rdShowFloat("正在传输", "传完才能停服务", 3000);
-    return true;
-  }
-  file_manager_server_stop();
-  st.netServerUp = false;
-  rdShowFloat("网络文件管理已停止", "", 3000);
+  fbFabShowAddress();
   return true;
 }
 
 // 网络传输的心跳。httpd 在自己的任务里收发，主任务这边屏幕一动不动，传大文件时
 // 看着像死机 —— 空闲帧里轮询进度，**文案变了才重绘**，并且限流：阅读器的推屏一次
 // 几百毫秒，刷太勤会把主循环按住。只在文件浏览 / WiFi 传书两个界面轮询。
-void rdNetTick() {
-  if (!st.netServerUp) return;
-  if (st.mode != RdMode::FileBrowser && st.mode != RdMode::NetShare) return;
+// 返回值 = 这一拍该重绘（置了脏），空闲帧拿自己去收帧，见 screen_reader_handle 的空闲分支。
+bool rdNetTick() {
+  if (!st.netServerUp) return false;
+  if (st.mode != RdMode::FileBrowser && st.mode != RdMode::NetShare) return false;
   const FmXfer *x = file_manager_get_xfer();
   const int64_t now = esp_timer_get_time();
   static std::string s_drawn;
@@ -367,16 +455,17 @@ void rdNetTick() {
     memcpy(nm, x->name, sizeof(x->name));
     nm[sizeof(x->name)] = '\0';
     rdShowFloat(x->kind.load(std::memory_order_relaxed) == 0 ? "已接收" : "已发送", nm, 4000);
-    return;
+    return true;   // rdShowFloat 已置脏
   }
-  if (!active) return;
+  if (!active) return false;
   s_wasActive = true;
   const std::string s = rdNetXferText();
-  if (s == s_drawn) return;
-  if (now - s_last_us < 1000000) return;   // 限流 1s
+  if (s == s_drawn) return false;
+  if (now - s_last_us < 1000000) return false;   // 限流 1s
   s_last_us = now;
   s_drawn = s;
   st.dirty = 1;
+  return true;
 }
 
 // 文件标签：路径面包屑 + 目录/文件列表。以前它是从书架菜单进来的子界面（用 drawTitle
@@ -496,7 +585,8 @@ void renderFileBrowser() {
     // 的那块）。右端必须让开 FAB 那一列：「传书」按钮就压在这一行的右段上，擦白和文字
     // 都只到 fbFabX()-8 为止，越界就把按钮蹭花了。
     const std::string hint = g_rd.truncatedText(
-        uiFontId(), "n 新建  r 刷新  e 改名  d 删除  c/x/v 复制  f 传书", fbFabX() - 8 - MARGIN);
+        uiFontId(), "n 新建  r 刷新  h 隐藏  e 改名  d 删除  c/x/v 复制  f 传书",
+        fbFabX() - 8 - MARGIN);
     g_rd.fillRect(0, hintY, fbFabX() - 8, uiLineHeight(), false);
     drawLineText(MARGIN, hintY, hint.c_str(), true);
   }
@@ -504,6 +594,7 @@ void renderFileBrowser() {
   fbDrawFab();
   fbDrawNewFab();
   fbDrawRefreshFab();
+  fbDrawHiddenFab();
 }
 
 void handleFileBrowser(int key) {
@@ -519,6 +610,7 @@ void handleFileBrowser(int key) {
     if (t >= 0) { switchTab(t); return; }
     if (fbNewFabHit(tapX, tapY)) { fmBeginMkdir(); return; }
     if (fbRefreshFabHit(tapX, tapY)) { fbRefreshAction(); return; }
+    if (fbHiddenFabHit(tapX, tapY)) { fbHiddenToggle(); return; }
     if (fbFabHit(tapX, tapY)) { fbFabAction(); return; }
   }
   // ←→ 换标签：这个界面现在是 1 号根标签，和其他三个标签的左右键行为一致。
@@ -544,7 +636,7 @@ void handleFileBrowser(int key) {
   // ── 实体键盘快捷键（蓝牙键盘）───────────────────────────────────────────
   // 上面这些事原来只能点右下角那三个浮动按钮、或长按列表项弹菜单——插着键盘的人得腾出
   // 一只手去戳屏幕。键位取文件管理器的惯例：
-  //   n 新建文件夹   r 刷新   c 复制   x 剪切   v 粘贴   e 改名
+  //   n 新建文件夹   r 刷新   h 隐藏文件开关   c 复制   x 剪切   v 粘贴   e 改名
   //   d 删除（连按两次，别的键撤销）   i 详情   f 网络传书   Enter 打开
   // 作用对象一律取当前选中行：fm* 那几个动作读的是 st.fmIdx（"长按锁定的那一行"），
   // 先把它对齐到 st.fbSel 再动，免得作用在上一次长按选中的条目上。
@@ -552,11 +644,17 @@ void handleFileBrowser(int key) {
   if (key >= 'A' && key <= 'Z') key = key - 'A' + 'a';   // Shift+N 与 n 等价
   if (key >= 'a' && key <= 'z') {
     // n/r/f/v 与选中行无关（空目录里也能用），其余的在空目录里直接吃掉。
-    if (n == 0 && key != 'n' && key != 'r' && key != 'f' && key != 'v') { st.dirty = 1; return; }
+    // h 必须在这一串例外里：目录里**只剩隐藏文件**时列表就是空的，而那恰恰是最需要
+    // 这只眼睛的时候 —— 按不动就等于"设了隐藏却看不见、也关不掉"。
+    if (n == 0 && key != 'n' && key != 'r' && key != 'h' && key != 'f' && key != 'v') {
+      st.dirty = 1;
+      return;
+    }
     st.fmIdx = st.fbSel;
     switch (key) {
       case 'n': fmBeginMkdir(); return;
       case 'r': fbRefreshAction(); return;
+      case 'h': fbHiddenToggle(); return;
       case 'f': fbFabAction(); return;
       case 'c': fmCopy(false); return;
       case 'x': fmCopy(true); return;
@@ -591,7 +689,7 @@ void handleFileBrowser(int key) {
   if (key == KEY_TOUCH_LONG) {
     int lx = 0, ly = 0;
     if (input_tap_xy(&lx, &ly)) {
-      // 长按右下角浮动按钮 = 停掉网络文件管理（点按是"起服务/再看一眼地址"）。
+      // 长按右下角浮动按钮 = 再看一眼地址（点按才是开/关服务，见 fbFabAction）。
       if (fbNewFabHit(lx, ly)) return;   // 长按「+」不弹行菜单（点按才建文件夹）
       if (fbRefreshFabHit(lx, ly)) return;   // 长按「刷新」同理，别弹行菜单
       if (fbFabHit(lx, ly) && fbFabLongPress()) return;

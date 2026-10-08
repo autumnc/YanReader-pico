@@ -6,6 +6,7 @@
 #include "deepseek_client.h"
 #include "wifi_manager.h"
 #include "settings_manager.h"
+#include "font_store.h"       // font_store_get_path：折行/竖排缓存键里的字体**文件**
 #include "quick_edit.h"
 #include "typing_click.h"
 #include "ui_helpers.h"
@@ -83,6 +84,12 @@ struct EditorState {
     bool cachedFirstLineIndent = false;
     // 折行缓存是按哪个**正文字号**算出来的（"显示与版式 → 正文字号"改了就要重排）。
     int cachedBodyPx = 0;
+    // 折行缓存还按哪个 **markdown 渲染开关** / **字体文件**算出来的：前者改行内前缀
+    // （标题/列表/引用那几栏宽度），后者改拉丁步进（g_font.halfAdvance）。原来这两样都
+    // 不在键上 —— 开关 markdown 时"信息(GetMdInfo)跟着刷新了、行几何没刷新"，两者对不上。
+    // 字形尺寸走 cachedBodyPx，字体**文件**没有别的出口，只能单独进键。
+    bool vrowsCachedMdOn = false;
+    std::string vrowsCachedFont;
     int cachedWordCount = 0;
     bool wordCountDirty = true;
     bool mdInfoDirty = true;
@@ -96,6 +103,8 @@ struct EditorState {
     bool verticalCachedMdOn = false;
     int verticalCachedRows = 0;
     int verticalCachedBodyPx = 0;
+    // 竖排同样按字体**文件**走（列宽/行高都取 g_font），只比字号不够。
+    std::string verticalCachedFont;
     int verticalCachedCursorLine = -1;
     int verticalCachedCursorByte = -1;
     // 折叠的标题行号(Ctrl+T 切换)。视图态:不随文本持久化,按行号平移维护。
@@ -396,14 +405,20 @@ static const std::vector<VRow>& getVrows() {
     // 本函数可能被界面字号的上下文调到（screen_editor_handle 的第一句就是它），也可能
     // 在正文作用域里被调到，所以自己钉一次字号：缓存的 vrow 永远是正文口径，谁读都对。
     const int bodyPx = editorBodyFontPx();
+    // markdown 开关与字体**文件**也进键（原来只有 vrowsDirty/首行缩进/字号，见字段注释）。
+    const bool mdOn = g_settings.markdownRender();
+    const char *fp = font_store_get_path();
+    const std::string fontPath = fp ? fp : "";
     if (g_editor.vrowsDirty || g_editor.cachedFirstLineIndent != firstLineIndent ||
-        g_editor.cachedBodyPx != bodyPx) {
+        g_editor.cachedBodyPx != bodyPx || g_editor.vrowsCachedMdOn != mdOn ||
+        g_editor.vrowsCachedFont != fontPath) {
         FontScope body(bodyPx);
         g_editor.cachedBodyPx = bodyPx;
         g_editor.cachedFirstLineIndent = firstLineIndent;
+        g_editor.vrowsCachedMdOn = mdOn;
+        g_editor.vrowsCachedFont = fontPath;
         // 传缓存避免重复 classify;md 渲染关闭时缓存全零,须传 nullptr 让
         // buildVrows 自行 classify(首行缩进仍需区分标题/列表)。
-        bool mdOn = g_settings.markdownRender();
         const auto &mi = getMdInfo(mdOn);
         g_editor.cachedVrows = buildVrows(g_editor.lines, mdOn ? &mi : nullptr,
                                           &g_editor.foldedHeadings);
@@ -431,11 +446,14 @@ static const VerticalData& getVerticalData(const VerticalLayoutMetrics &vm,
                                            int cursorBytePos = -1) {
     const bool mdOn = g_settings.markdownRender();
     const int bodyPx = editorBodyFontPx();
+    const char *fp = font_store_get_path();
+    const std::string fontPath = fp ? fp : "";
     if (g_editor.verticalDirty ||
         g_editor.verticalCachedRev != g_editor.layoutRevision ||
         g_editor.verticalCachedMdOn != mdOn ||
         g_editor.verticalCachedRows != vm.rows ||
         g_editor.verticalCachedBodyPx != bodyPx ||
+        g_editor.verticalCachedFont != fontPath ||
         g_editor.verticalCachedCursorLine != cursorLineIdx ||
         g_editor.verticalCachedCursorByte != cursorBytePos) {
         FontScope body(bodyPx);
@@ -452,6 +470,7 @@ static const VerticalData& getVerticalData(const VerticalLayoutMetrics &vm,
         g_editor.verticalCachedMdOn = mdOn;
         g_editor.verticalCachedRows = vm.rows;
         g_editor.verticalCachedBodyPx = bodyPx;
+        g_editor.verticalCachedFont = fontPath;
         g_editor.verticalCachedCursorLine = cursorLineIdx;
         g_editor.verticalCachedCursorByte = cursorBytePos;
     }
@@ -3897,6 +3916,17 @@ bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw) {
 
 void screen_editor_reset_drawn() {
     g_editor.drawnOnce = false;
+}
+
+// 屏幕方向在**编辑器开着的时候**变了（写作模式方向的「自适应」档，见 main.cpp 的
+// auto_orient_tick）。两件事都要做，缺一件都还是错的画面：
+//  - reset_drawn：编辑器空转 tick 按 drawnOnce 记账跳过重绘，不复位它就"方向换了屏上不动"；
+//  - markDirty：SCREEN_W 是**烤进折行预算**的（buildVrows 里的 maxpx），旧行几何在新宽度下
+//    全错 —— 只复位 drawnOnce 的话重绘的还是按旧宽度折的行。
+// 与旁边 ime.repaginateForWidthChange() 是同一件事的两个侧（输入法候选行 / 正文行）。
+void screen_editor_on_width_change() {
+    screen_editor_reset_drawn();
+    markDirty();
 }
 
 // 查找/替换对话框是否打开(供 main.cpp 屏蔽全局按键)

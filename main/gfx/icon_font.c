@@ -131,6 +131,52 @@ static void draw_prog(uint8_t* fb, int bx, int by, int bw, int bh,
                               cx, by + bh - 2, color, fb);
             break;
         }
+        case 0x1F441: {  // 👁 眼睛：「显示隐藏文件」开关（子集里没有 eye 字形）
+            // 杏仁形轮廓 = 上下两条对称的椭圆弧，中间一个实心瞳孔。
+            // 横长比例（宽 : 高 ≈ 8 : 5）—— 眼睛本来就不是圆的，画成正圆认不出来。
+            const int w2 = (bw * 40) / 100;        // 半宽（占 box 宽的 80%）
+            const int h2 = (bh * 25) / 100;        // 半高（上下弧各自的矢高）
+            const int t = (bh + 27) / 28;          // 弧线粗细（56px 的 box → 2px）
+            const long w2sq = (long)w2 * w2;
+            if (w2 < 3 || h2 < 2 || t < 1) break;
+            // 逐列画：dy = h2·√(1-(dx/w2)²)，两边都用整数比，不必开浮点。
+            // 只在**相邻两列之间**填出落差（弧越陡，两列的 dy 差得越多）—— 不补这一步，
+            // 靠近两端的地方会断成一串虚点。
+            int prevTop = cy, prevBot = cy;
+            for (int dx = -w2; dx <= w2; dx++) {
+                long num = (long)h2 * h2 * (w2sq - (long)dx * dx);
+                int dy = 0;
+                while (dy < h2 && (long)(dy + 1) * (dy + 1) * w2sq <= num) dy++;
+                const int top = cy - dy, bot = cy + dy;
+                // 防呆：跨度只可能 ≤ 2·h2+t，超过就说明上面哪个式子写坏了，
+                // 宁可这一列空着，也别糊成一根竖条。
+                const int run = (top < prevTop ? top : prevTop);
+                const int l = (top > prevTop ? top : prevTop) - run + t;
+                if (l <= 2 * h2 + t) {
+                    EpdRect r = { cx + dx, run, 1, l };
+                    epd_fill_rect(r, color, fb);           // 上弧
+                }
+                const int run2 = (bot < prevBot ? bot : prevBot);
+                const int l2 = (bot > prevBot ? bot : prevBot) - run2 + t;
+                if (l2 <= 2 * h2 + t) {
+                    EpdRect r = { cx + dx, run2 - t + 1, 1, l2 };
+                    epd_fill_rect(r, color, fb);           // 下弧
+                }
+                prevTop = top;
+                prevBot = bot;
+            }
+            // 瞳孔：实心圆。半径取矢高的 45% —— 再大就把上下弧顶穿了（那是"日"不是"眼"）。
+            const int pr = (h2 * 45) / 100;
+            if (pr < 2) break;
+            for (int dy = -pr; dy <= pr; dy++) {
+                int hw = 0;
+                while (hw < pr && (long)(hw + 1) * (hw + 1) + (long)dy * dy <= (long)pr * pr) hw++;
+                if (hw <= 0) continue;
+                EpdRect r = { cx - hw, cy + dy, 2 * hw + 1, 1 };
+                epd_fill_rect(r, color, fb);
+            }
+            break;
+        }
         default:
             break;
     }
@@ -172,7 +218,11 @@ void icon_font_draw(uint8_t* fb, int boxX, int boxY, int boxW, int boxH,
 
     // 程序化图形（子集缺失）
     switch (cp) {
-        case 0x1F786: case 0x25CB: case 0x25D0: case 0x25B8: case 0x25BE:
+        // 0x1F441(👁) 是文件浏览页 FAB 借用的"显示隐藏文件"字形。**故意不进
+        // icon_font_is_icon()**：那样会把正文/输入里偶然出现的 👁 也从文本路改道到
+        // 这里，而画得出来画不出来都只是小事、改道却是行为变化。调用方（FAB）直接
+        // 调本函数，本来也不需要 is_icon 认它。
+        case 0x1F786: case 0x25CB: case 0x25D0: case 0x25B8: case 0x25BE: case 0x1F441:
             draw_prog(fb, boxX, boxY, boxW, boxH, cp, color);
             return;
         case 0x270E:  // 铅笔 → NF-Propo 的 pencil (F03EB)

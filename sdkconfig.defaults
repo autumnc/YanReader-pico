@@ -65,6 +65,39 @@ CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 # 加密，PSRAM 内容不上加密总线；个人阅读设备可接受。
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
+# ── 关掉 mbedTLS 的硬件 SHA / 硬件 AES（保留硬件 MPI）────────────────────────
+# 现场：生成 Flomo Token 报「登录失败 / 网络连接失败」，串口上是
+#     E crypto_shared_gdma: Failed to acquire DMA channel, Err=257
+#     E esp-sha:            esp_sha_dma_start failed, no DMA channel available
+#     E esp-tls-mbedtls:    mbedtls_ssl_handshake returned -0x0093
+# Err=257 = ESP_ERR_NO_MEM —— **不是通道被占满，是分配不出通道对象本身**。
+# 逐行核对 IDF v6.1 源码后，硬件加解密在 TLS 的每一步都要向「能落 DMA 的内部 RAM」
+# 要一小块，而这块池子在本机开机几百毫秒后就被打成了碎片（实测两个 DMA 内部堆区
+# 剩 788 / 676 字节、**最大连续块只有 24 字节**，长期稳定不是偶发）：
+#   · 纯软件路径（ROM MD5 / esp_rom_md5）：不碰 DMA，一直好使。
+#   · 所有 SHA 都走 PSA —— esp_sha.c:71 的 esp_sha() 只是 psa_hash_compute() 的薄壳；
+#     而 PSA 的 esp_sha256 驱动**每一次 esp_sha_hash_setup() 都分配 124 字节、
+#     caps 必须是 MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL**（psa_crypto_driver_esp_sha.c:140/161/189）。
+#     分配失败正是日志里那 5 条 `ALLOC FAILED size=124 caps=0x80c in heap_caps_malloc`。
+#   · 硬件 AES 一样：每次 CBC/GCM 运算都现造 DMA 描述符表，同样是
+#     MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL（esp_aes_dma_core.c:462，用完即 free），
+#     外加对齐用的临时缓冲（:471/:493）。
+#   · 输入超过阈值（SHA >256 字节、AES >128/512 字节）还得再要一对共享 GDMA 通道，
+#     通道对象是 124 字节的 heap_caps_calloc(…, MALLOC_CAP_INTERNAL|8BIT|DMA)
+#     （gdma.c:100），失败后驱动每 100ms 重试、连试 1 秒才认输 —— 这 1 秒里
+#     WiFi 管理帧被一起挤丢（日志 `wifi:m f null` 的时间窗就是它）。
+# 结论：硬件 SHA/AES 的**每一次操作**都要从这口碎片池里要一小块，这是预热/预分配
+# 绕不过去的（通道能预热，逐次分配的上下文和描述符不能）。所以让 TLS 的密码学根本
+# 不去碰这口池子，改用软件实现 —— 这是 IDF 支持的自包含配置，不依赖堆的实时状态，
+# 也不动 WiFi/蓝牙的取舍。
+# 代价（评估过，可接受）：本机每次握手只哈希几 KB（<10ms），AES 只用在 WebDAV/词典
+# 这类几 MB 传输上（软件 AES 约 2~4MB/s，多花几秒）。RSA/ECC 的证书验签仍走硬件 MPI
+# —— bignum 端口全文件零分配（只 include 了 malloc.h），不吃这口池子，没必要关。
+# 若日后要换回硬件：先解决这口池的碎片化（真正的根在蓝牙/WiFi 的内部 DMA 占用，
+# 见 CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST），再删掉下面两行。
+# CONFIG_MBEDTLS_HARDWARE_SHA is not set
+# CONFIG_MBEDTLS_HARDWARE_AES is not set
+
 # HTTP（文件管理服务器 + WebDAV/Flomo/Deepseek 客户端）
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=1024

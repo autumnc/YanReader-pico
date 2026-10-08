@@ -2,8 +2,10 @@
 #include "journal_storage.h"
 #include "settings_manager.h"
 #include "screen_reader.h"  // readerRequestStandbyImage（/api/set_standby 投递给主任务解图）
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_http_server.h>
+#include <cstdio>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -18,6 +20,10 @@
 static const char *TAG = "FileMgr";
 static httpd_handle_t s_server = nullptr;
 static uint16_t s_port = 80;
+
+// 最近一次启动失败的原因（见头文件）。只在 start/stop 这两条路径上写，主任务读，
+// 不跨任务并发写；失败时顺带把内部 RAM 余量记进去 —— 这条报错十有八九是内存。
+static char s_lastErr[80] = "";
 
 // 停机旗子。httpd_stop() 是个**调用方忙等**（httpd_main.c: `while (status !=
 // THREAD_STOPPED) sleep(100)`），而 httpd 线程只在**当前请求处理完之后**才看停机
@@ -202,7 +208,7 @@ static void putU32(uint8_t *buf, uint32_t v) { buf[0]=v; buf[1]=v>>8; buf[2]=v>>
 static void collectFiles(const std::string &dirPath, const std::string &basePath,
                          std::vector<ZipEntry> &entries, uint64_t &totalSize,
                          int depth = 0) {
-    // 递归深度上限：这个 handler 跑在 httpd 的 8KB 栈上（见 file_manager_server_start
+    // 递归深度上限：这个 handler 跑在 httpd 的任务栈上（见 file_manager_server_start
     // 的 config.stack_size），目录树离谱地深时递归会直接爆栈 panic（不是卡死，是崩溃）。
     if (depth > 12) return;
     DIR *dir = opendir(dirPath.c_str());
@@ -486,6 +492,30 @@ static esp_err_t __attribute__((unused)) handler_list(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// SD 读缓冲（下载/打包下载共用，见 handler_download 里那段长注释说明为什么不能放栈上）。
+// 用 RAII：这两个 handler 里有好几处提前 return，手工 free 迟早漏一处。
+// 取值优先级：内部 DMA RAM 大块 → 内部 DMA RAM 小块 → PSRAM → libc 兜底。
+// 要内部 DMA 是为了走 SDMMC 的「直接 DMA」档；退到 PSRAM 也不会坏，只是回到驱动自带的
+// 弹跳档（临时分配 + memcpy，慢一点但仍然正确）。
+struct SdReadBuf {
+    char *p = nullptr;
+    size_t len = 4096;
+    SdReadBuf() {
+        p = static_cast<char *>(heap_caps_malloc(len, MALLOC_CAP_DMA));
+        if (!p) {  // 写作模式内部最大连续块只有 ~1.7KB，1024 才落得进去
+            len = 1024;
+            p = static_cast<char *>(heap_caps_malloc(len, MALLOC_CAP_DMA));
+        }
+        if (!p) {
+            len = 4096;
+            p = static_cast<char *>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM));
+        }
+        if (!p) p = static_cast<char *>(malloc(len));
+    }
+    ~SdReadBuf() { free(p); }  // heap_caps_malloc 的内存也用 free（同一个分配器）
+    bool ok() const { return p != nullptr; }
+};
+
 static esp_err_t __attribute__((unused)) handler_download(httpd_req_t *req) {
     if (!authOk(req)) return sendAuthError(req);
     std::string path = getQueryParam(req, "path");
@@ -527,14 +557,27 @@ static esp_err_t __attribute__((unused)) handler_download(httpd_req_t *req) {
     XferGuard xferGuard;
     xferBegin(1, filename.c_str(), (uint32_t)st.st_size);
 
-    char buf[4096];
+    // 读缓冲不能放栈上：任务栈现在落在 PSRAM（见 file_manager_server_start 的
+    // config.task_caps），而 S3 的 SDMMC 驱动**只对内部缓冲直接 DMA**，PSRAM 缓冲一律走
+    // 「弹跳」档 —— 每次 fread 都要临时分配 ≥512 字节的内部 DMA RAM 再 memcpy 一遍
+    // （sdmmc_cmd.c: 条件是 `is_aligned && !esp_ptr_external_ram`，而
+    //  SOC_SDMMC_PSRAM_DMA_CAPABLE 在 S3 上**没有定义**）。写作模式的内部 DMA RAM 很紧，
+    // 别让下载热路径反复去要这块临时缓冲。SdReadBuf 会优先要内部 DMA RAM。
+    SdReadBuf buf;
+    if (!buf.ok()) {
+        fclose(f);
+        if (mtx) xSemaphoreGiveRecursive(mtx);
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+
     size_t n;
     bool sendOk = true;
     while (!s_shutdown.load(std::memory_order_relaxed)) {
-        n = fread(buf, 1, sizeof(buf), f);
+        n = fread(buf.p, 1, buf.len, f);
         if (n == 0) break;
         if (mtx) xSemaphoreGiveRecursive(mtx);
-        if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) {
+        if (httpd_resp_send_chunk(req, buf.p, n) != ESP_OK) {
             sendOk = false;
             if (mtx) xSemaphoreTakeRecursive(mtx, portMAX_DELAY);
             break;
@@ -545,6 +588,10 @@ static esp_err_t __attribute__((unused)) handler_download(httpd_req_t *req) {
     fclose(f);
     if (mtx) xSemaphoreGiveRecursive(mtx);
     if (sendOk) httpd_resp_send_chunk(req, nullptr, 0);
+    // 量一下 httpd 任务的栈水线：大缓冲已经挪到堆上，这里剩下的最深帧是 collectFiles 的
+    // 12 层递归。收尾打一行，余量低于 1KB 就得回来看看。
+    ESP_LOGI(TAG, "下载结束 缓冲%u字节 栈余 %u 字节", (unsigned)buf.len,
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     return ESP_OK;
 }
 
@@ -590,7 +637,11 @@ static esp_err_t __attribute__((unused)) handler_download_dir(httpd_req_t *req) 
     httpd_resp_set_hdr(req, "Content-Disposition", hdr);
 
     // Write zip: local file headers + file data, then central directory, then end record
-    uint8_t buf[4096];      // file read buffer
+    SdReadBuf buf;  // 同 handler_download：不能放栈上，优先内部 DMA RAM
+    if (!buf.ok()) {
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
     uint32_t offset = 0;
 
     // Pass 1: write local file headers + data
@@ -628,8 +679,8 @@ static esp_err_t __attribute__((unused)) handler_download_dir(httpd_req_t *req) 
         uint32_t fsize = 0;
         if (f) {
             size_t n;
-            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-                crc = computeCRC32(buf, n, crc);
+            while ((n = fread(buf.p, 1, buf.len, f)) > 0) {
+                crc = computeCRC32(reinterpret_cast<const uint8_t *>(buf.p), n, crc);
                 fsize += n;
             }
             rewind(f);
@@ -656,10 +707,10 @@ static esp_err_t __attribute__((unused)) handler_download_dir(httpd_req_t *req) 
             size_t n;
             while (!s_shutdown.load(std::memory_order_relaxed)) {
                 if (mtx) xSemaphoreTakeRecursive(mtx, portMAX_DELAY);
-                n = fread(buf, 1, sizeof(buf), f);
+                n = fread(buf.p, 1, buf.len, f);
                 if (mtx) xSemaphoreGiveRecursive(mtx);
                 if (n == 0) break;
-                if (httpd_resp_send_chunk(req, (const char*)buf, n) != ESP_OK) {
+                if (httpd_resp_send_chunk(req, buf.p, n) != ESP_OK) {
                     fclose(f);
                     return ESP_OK;
                 }
@@ -968,13 +1019,43 @@ bool file_manager_server_start(uint16_t port) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.max_uri_handlers = 10;
-    config.stack_size = 8192;
+    // 任务栈从 **PSRAM** 出（IDF 默认是 MALLOC_CAP_INTERNAL|8BIT，见 HTTPD_DEFAULT_CONFIG）。
+    // 这是写作模式「文件管理」起不来的唯一原因，串口上抓到的现场：
+    //     E Heap: ALLOC FAILED size=6144 caps=0x804 in heap_caps_calloc
+    //     E FileMgr: Failed to start HTTP server: ESP_ERR_HTTPD_TASK (int free=3611 largest=1792)
+    // 阅读模式里内部 RAM 宽裕时这套能起来，所以一直没暴露；但**写作模式下打字/IME 之后
+    // 内部 RAM 只剩 3.6KB、最大连续块 1792 字节**，连 IDF 默认的 4096 都放不下 —— 之前
+    // 从 8192 收到 6144 那笔只是让它"在内部 RAM 更富余的场景下能活"，治不了写作模式。
+    // 本机的内部 RAM 就是这个量级，任何几 KB 的内部连续块都别指望（见 sdkconfig.defaults
+    // 里 SPIRAM_MALLOC_ALWAYSINTERNAL=0 那段）。PSRAM 还空着 5MB，这 6KB 从那里出才是正解。
+    // 两个开关早就打开了，所以这里只是选 caps：CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y、
+    // CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y。
+    // 代价/风险：PSRAM 栈的任务不能自己去禁用 flash cache（NVS 落盘、OTA 写 flash）——
+    // 这个 handler 只做 lwIP 收发 + FATFS 读 SD，不碰 flash；落盘在设置 worker 里，它提交
+    // NVS 时 IDF 会把别的核 stall 住，安全。
+    config.stack_size = 6144;
+    config.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     config.lru_purge_enable = true;
 
-    if (httpd_start(&s_server, &config) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start HTTP server");
+    const esp_err_t err = httpd_start(&s_server, &config);
+    if (err != ESP_OK) {
+        // 别只说"启动失败"：把错误码和两栏内存余量一起记下来。httpd 起不来最常见的还是
+        // 内存不够（任务栈现在从 PSRAM 出；别的失败点如 lwIP 套接字仍在内部），光看"失败"
+        // 两个字分不出是内存、还是 lwIP 套接字、还是别处真占了 80 端口。
+        const size_t intFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const size_t intLargest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        const size_t psFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        const size_t psLargest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        snprintf(s_lastErr, sizeof(s_lastErr), "%s 内部RAM余%uK(最大块%uK) PSRAM余%uK(最大块%uK)",
+                 esp_err_to_name(err), (unsigned)(intFree / 1024), (unsigned)(intLargest / 1024),
+                 (unsigned)(psFree / 1024), (unsigned)(psLargest / 1024));
+        ESP_LOGE(TAG, "Failed to start HTTP server: %s (int free=%u largest=%u; psram free=%u largest=%u)",
+                 esp_err_to_name(err), (unsigned)intFree, (unsigned)intLargest,
+                 (unsigned)psFree, (unsigned)psLargest);
+        s_server = nullptr;
         return false;
     }
+    s_lastErr[0] = '\0';
     s_port = port;
 
     httpd_uri_t uris[] = {
@@ -1008,3 +1089,5 @@ void file_manager_server_stop() {
 uint16_t file_manager_server_get_port() {
     return s_port;
 }
+
+const char *file_manager_server_last_error() { return s_lastErr; }

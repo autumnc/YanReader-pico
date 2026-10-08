@@ -1352,13 +1352,43 @@ static void rdQueueStandbyCoverForOpenBook() {
 // 与「书籍封面」同一条路子（见 screen_reader.h 的接口说明）：**不**在待机那一刻解码
 // 原图，而是选中时就按当前屏尺寸解成一张 Gray8 BMP 缓存，待机只做"读 BMP + 铺屏"。
 // 缓存名带屏尺寸 —— 横竖屏的表盘尺寸不同，转了屏自然换一张，转回来还能命中老的。
-static std::string standbyImageCacheFor(int w, int h) {
-  return std::string(CACHE_DIR) + "/standby/image_" + std::to_string(w) + "x" + std::to_string(h) + ".bmp";
+// 还要带**源图的身份**：同一屏尺寸下换一张图也必须换名字，否则调用方的"缓存文件在就
+// 跳过"会让待机画面纹丝不动（转屏才换，转回来又命中更老的那张）。源图身份取路径的
+// FNV-1a 短哈希 —— 路径本身就是"哪张图"的唯一身份，也不必把长路径塞进文件名。
+static uint32_t rdPathHash32(const std::string &s) {
+  uint32_t h = 2166136261u;   // FNV-1a 32 位偏移基
+  for (unsigned char c : s) { h ^= static_cast<uint32_t>(c); h *= 16777619u; }
+  return h;
+}
+
+static std::string standbyImageCacheFor(const std::string &src, int w, int h) {
+  char hx[9];
+  snprintf(hx, sizeof(hx), "%08x", static_cast<unsigned>(rdPathHash32(src)));
+  return std::string(CACHE_DIR) + "/standby/image_" + std::to_string(w) + "x" +
+         std::to_string(h) + "_" + hx + ".bmp";
+}
+
+// 换图之后，同一个屏尺寸下那张旧缓存再也读不到了（每张几百 KB），顺手删掉；改名前的
+// image_<w>x<h>.bmp 也一并收。**别的屏尺寸不动** —— 转回来还要命中它（详见上面注释里
+// "转回来还能命中老的"那句），代价是同一条待机图存两份而不是一份，可忽略。
+static void rdSweepStandbyImageCache(const std::string &keep, int w, int h) {
+  const std::string dir = std::string(CACHE_DIR) + "/standby";
+  const std::string prefix = "image_" + std::to_string(w) + "x" + std::to_string(h);
+  DIR *dp = opendir(dir.c_str());
+  if (!dp) return;
+  struct dirent *e;
+  while ((e = readdir(dp)) != nullptr) {
+    const std::string nm = e->d_name;
+    if (nm.rfind(prefix, 0) != 0) continue;   // 不是这个尺寸的：留着
+    const std::string full = dir + "/" + nm;
+    if (full != keep) Storage.remove(full.c_str());
+  }
+  closedir(dp);
 }
 
 bool readerStandbyImage(std::string &bmpPath, std::string &srcPath) {
   srcPath = g_settings.getString("standby_image");
-  bmpPath = standbyImageCacheFor(SCREEN_W, SCREEN_H);
+  bmpPath = standbyImageCacheFor(srcPath, SCREEN_W, SCREEN_H);
   return !srcPath.empty();
 }
 
@@ -1388,7 +1418,7 @@ static bool rdBuildStandbyImageCache(const std::string &src, std::string &err) {
   // fit（crop=false）+ 整屏盒子：待机要的是"整张图都看得见"，裁掉两边去填满会把
   // 画面切掉一块。留白由绘制端居中处理（readerCoverScale 的 ox/oy）。
   const int w = SCREEN_W, h = SCREEN_H;
-  const std::string out = standbyImageCacheFor(w, h);
+  const std::string out = standbyImageCacheFor(src, w, h);
   Storage.mkdir((std::string(CACHE_DIR) + "/standby").c_str(), true);
   bool ok = false;
   {
@@ -1405,6 +1435,8 @@ static bool rdBuildStandbyImageCache(const std::string &src, std::string &err) {
     ESP_LOGW(TAG, "待机图片: 解码失败 %s", src.c_str());
     return false;
   }
+  // 新缓存写好了 → 同一屏尺寸下别的源图那张（以及改名前的旧命名）再也读不到了，收掉。
+  rdSweepStandbyImageCache(out, w, h);
   ESP_LOGI(TAG, "待机图片: %s -> %s (%dx%d)", src.c_str(), out.c_str(), w, h);
   return true;
 }
@@ -1413,20 +1445,8 @@ bool readerSetStandbyImage(const std::string &srcPath, std::string &err) {
   if (!rdBuildStandbyImageCache(srcPath, err)) return false;
   g_settings.setString("standby_image", srcPath);
   g_settings.setString("clock_face", standbyFaceKey(StandbyFace::Image));
-  // 别的屏尺寸的老缓存顺手删掉（每张几百 KB）。当前这张留着——待机就要用它。
-  const std::string dir = std::string(CACHE_DIR) + "/standby";
-  const std::string keep = standbyImageCacheFor(SCREEN_W, SCREEN_H);
-  DIR *dp = opendir(dir.c_str());
-  if (dp) {
-    struct dirent *e;
-    while ((e = readdir(dp)) != nullptr) {
-      const std::string nm = e->d_name;
-      if (nm == "." || nm == "..") continue;
-      const std::string full = dir + "/" + nm;
-      if (full != keep) Storage.remove(full.c_str());
-    }
-    closedir(dp);
-  }
+  // 旧缓存的清理已经在 rdBuildStandbyImageCache 成功收尾时做了（同一尺寸下别的源图，
+  // 以及改名前的旧命名）；这里不再自己扫一遍，免得两处口径各写一份。
   return true;
 }
 
@@ -1456,7 +1476,7 @@ void readerStandbyPump() {
   if (!s_sbPending.load(std::memory_order_acquire)) return;
   s_sbPending.store(false, std::memory_order_relaxed);
   const std::string src = s_sbPendingSrc;   // 先拷一份，别再跨线程读
-  if (src.empty() || Storage.exists(standbyImageCacheFor(SCREEN_W, SCREEN_H).c_str())) return;
+  if (src.empty() || Storage.exists(standbyImageCacheFor(src, SCREEN_W, SCREEN_H).c_str())) return;
   std::string err;
   if (rdBuildStandbyImageCache(src, err)) {
     // 告诉空闲补做"这组已经好了"，省得它过 8 秒又解一遍。
@@ -1967,7 +1987,7 @@ static void rdStandbyImageIdlePrebuild() {
   s_rdSbImageSrc = src;
   s_rdSbImageW = w;
   s_rdSbImageH = h;
-  if (Storage.exists(standbyImageCacheFor(w, h).c_str())) return;   // 已经有缓存
+  if (Storage.exists(standbyImageCacheFor(src, w, h).c_str())) return;   // 已经有缓存
   std::string err;
   rdBuildStandbyImageCache(src, err);
   if (!err.empty()) ESP_LOGW(TAG, "待机图片: 空闲补做失败 %s", err.c_str());
@@ -3970,7 +3990,124 @@ static std::vector<RdCoverThumb> s_coverThumbs;
 static size_t s_coverThumbBytes = 0;
 static const size_t kCoverThumbBudget = 5u * 1024 * 1024;  // PSRAM 预算
 
+// ── 缩略图的**磁盘**缓存 ──────────────────────────────────────────────────
+// 上面那份是进程内的：每次开机第一次进书架都要把当前页重算一遍（实测量到 3.0s/页，
+// 大头是每本读 170KB 的 cover_v3.bmp，不是缩放那点数学）。而结果只取决于
+// **(源封面, 格子尺寸, 抖动档)** 三样，三样都跨重启不变 —— 所以把它落盘：下次直接读
+// 十几 KB 的成品，源文件一个字节都不读、缩放管线一步都不跑，5MB 淘汰和重启也带不走它。
+// 实测（空卡首启 → 复位再启，读的是同一批书）「首屏绘制+推屏+进书预建」那一段
+// **4084ms → 822ms**，就是这条缓存的收益；两次跑的内存读数完全一样，不留占用。
+//
+// 命名照 cover_v3.bmp / .pxc 那套：**版本 + 规格 + 抖动档全进名字**。任何一样变了就是
+// 另一个文件，不可能命中旧口径（.pxc 那段注释里 g16br 的道理与此完全一样）。
+// 文件体 = 短表头 + dw*dh 个 0..15 的裸数组，与内存里那份逐字节同构：读出来直接就能用，
+// 不用过 BMP 解析、不用再量化一遍。
+// 不另做原子写：写坏的后果只是这一本下次重算（表头 magic + 尺寸对不上就丢）。
+//
+// 落盘之后**不必**再另做"空闲时预热封面"那条路（写过一版，删了）：缩略图在每一次绘制
+// 当前页时就经 rdCoverThumbEnsure 进了内存缓存（键 = 路径+框大小，5MB 预算在几百本书
+// 这个量级也基本不淘汰），等那个 8 秒停手闸放开时当前页早就齐了 —— 那种预热永远挑不出
+// 可补的一本。要再往前一步只有"预热**下一页**"（当前页的活儿在按下翻页那一刻就做完了），
+// 但那得先量出书架翻页还差多少，别凭空加一条空闲路径。
+static const char kRdThumbMagic[4] = {'P', 'J', 'T', '1'};
+
+struct RdThumbHeader {
+  char magic[4];
+  uint16_t boxW, boxH;
+  uint16_t dw, dh;
+  uint16_t ox, oy;
+};
+
+// 抖动档一个字母，与 .pxc 的后缀同一套约定（o/r/n = 有序/行/无）。
+static const char *rdDitherKey() {
+  switch (rdCoverDitherMode()) {
+    case DitherMode::Row: return "r";
+    case DitherMode::None: return "n";
+    case DitherMode::Ordered:
+    default: return "o";
+  }
+}
+
+// <book cache dir>/thumb_v1_<boxW>x<boxH>_<抖动档>.tbn
+static std::string thumbCachePathFor(const std::string &coverBmp, int boxW, int boxH) {
+  const size_t slash = coverBmp.rfind('/');
+  const std::string dir = (slash == std::string::npos) ? std::string() : coverBmp.substr(0, slash);
+  return dir + "/thumb_v1_" + std::to_string(boxW) + "x" + std::to_string(boxH) + "_" +
+         rdDitherKey() + ".tbn";
+}
+
+// 读磁盘成品。任何一步不对都返回 false（当作没有，走现算那条路）。
+static bool rdThumbLoad(const std::string &file, const std::string &coverBmp, int boxW, int boxH,
+                        RdCoverThumb &out) {
+  if (!Storage.exists(file.c_str())) return false;
+  HalFile f;
+  if (!Storage.openFileForRead(TAG, file, f)) return false;
+  RdThumbHeader h{};
+  if (f.read(&h, sizeof(h)) != static_cast<int>(sizeof(h))) return false;
+  if (memcmp(h.magic, kRdThumbMagic, 4) != 0) return false;
+  if (h.boxW != boxW || h.boxH != boxH || h.dw == 0 || h.dh == 0) return false;
+  const size_t need = static_cast<size_t>(h.dw) * h.dh;
+  uint8_t *pix = static_cast<uint8_t *>(heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!pix) pix = static_cast<uint8_t *>(heap_caps_malloc(need, MALLOC_CAP_8BIT));
+  if (!pix) return false;
+  if (f.read(pix, need) != static_cast<int>(need)) {
+    heap_caps_free(pix);
+    return false;
+  }
+  out.path = coverBmp;
+  out.boxW = boxW; out.boxH = boxH;
+  out.dw = h.dw; out.dh = h.dh; out.ox = h.ox; out.oy = h.oy;
+  out.pix = pix;
+  return true;
+}
+
+// 落盘，并顺手清掉这本书**别的抖动档/旧版本**留下的缩略图（换了抖动档或改了版本号之后
+// 它们再也读不到了，每张十几 KB）。当前抖动档下别的格子尺寸**不删** —— 网格和列表各用
+// 一份，两个视图来回切不该重算。
+static void rdThumbSave(const std::string &file, const std::string &coverBmp, const RdCoverThumb &t) {
+  const size_t need = static_cast<size_t>(t.dw) * t.dh;
+  bool wrote = false;
+  {
+    HalFile f;
+    if (Storage.openFileForWrite(TAG, file, f)) {
+      RdThumbHeader h{};
+      memcpy(h.magic, kRdThumbMagic, 4);
+      h.boxW = static_cast<uint16_t>(t.boxW); h.boxH = static_cast<uint16_t>(t.boxH);
+      h.dw = static_cast<uint16_t>(t.dw); h.dh = static_cast<uint16_t>(t.dh);
+      h.ox = static_cast<uint16_t>(t.ox); h.oy = static_cast<uint16_t>(t.oy);
+      const size_t a = f.write(&h, sizeof(h));
+      const size_t b = f.write(t.pix, need);
+      f.flush();
+      wrote = (a == sizeof(h) && b == need);
+    }
+  }
+  // 落不下就说一声（卡满 / 只读）：这不是崩溃，但这个"落盘缓存"本来就白做了、以后每次
+  // 开机都要重算一遍 170KB×N —— 静默失败最难查。键上的抖动档/尺寸已经保证不会读到半份。
+  if (!wrote) {
+    ESP_LOGW(TAG, "封面缩略图落盘失败（这本以后每次开机都要重算）: %s", file.c_str());
+    return;   // 没写成就不做下面那套清理，别在半途上删到别的
+  }
+  const size_t slash = coverBmp.rfind('/');
+  if (slash == std::string::npos) return;
+  const std::string dir = coverBmp.substr(0, slash);
+  const std::string keepSuffix = std::string("_") + rdDitherKey() + ".tbn";
+  DIR *dp = opendir(dir.c_str());
+  if (!dp) return;
+  struct dirent *e;
+  while ((e = readdir(dp)) != nullptr) {
+    const std::string nm = e->d_name;
+    if (nm.rfind("thumb_", 0) != 0) continue;                    // 不是缩略图
+    if (nm.size() >= keepSuffix.size() &&
+        nm.compare(nm.size() - keepSuffix.size(), keepSuffix.size(), keepSuffix) == 0)
+      continue;                                                  // 当前抖动档：留着
+    Storage.remove((dir + "/" + nm).c_str());
+  }
+  closedir(dp);
+}
+
 // 封面被重新生成后作废对应的缓存条目（路径是 <book cache dir>/cover_v3.bmp）。
+// **磁盘那份也要删**：不删的话下次开机 rdThumbLoad 会把旧封面的缩略图原样读回来，
+// 表现成"换了封面但书架上还是老图"，而内存缓存明明是空的。
 static void rdCoverThumbForget(const std::string &bmpPath) {
   for (size_t i = 0; i < s_coverThumbs.size();) {
     if (s_coverThumbs[i].path == bmpPath) {
@@ -3980,64 +4117,93 @@ static void rdCoverThumbForget(const std::string &bmpPath) {
       ++i;
     }
   }
+  const size_t slash = bmpPath.rfind('/');
+  if (slash == std::string::npos) return;
+  const std::string dir = bmpPath.substr(0, slash);
+  DIR *dp = opendir(dir.c_str());
+  if (!dp) return;
+  struct dirent *e;
+  while ((e = readdir(dp)) != nullptr) {
+    const std::string nm = e->d_name;
+    if (nm.rfind("thumb_", 0) != 0) continue;   // 不是缩略图（cover_v3.bmp 之类都在别处）
+    Storage.remove((dir + "/" + nm).c_str());
+  }
+  closedir(dp);
 }
 
 // 抖动档变了：缓存里的 pix 是按旧档量化好的，留着就是"设置改了但书架不变"。
 // 整个清掉 —— 重算一页 12 本约 3 秒，只有换档那一次付。
+// **只用清内存这份**：盘上那份的名字里带抖动档（thumb_v1_<尺寸>_<档>.tbn），换档就是换了
+// 文件名 —— 旧档既读不到（不会拿旧档的像素冒充新档），也不必在这儿删：这本书下次落盘时
+// rdThumbSave 会顺手把"当前档之外"的旧名字清掉。
 static void rdCoverThumbClearAll() {
   s_coverThumbs.clear();
   s_coverThumbBytes = 0;
 }
 
-// 取（必要时算）path 这本封面缩到"格子大小 boxW×boxH"里的缩略图，然后 blit 到
-// (boxX,boxY) 那个格子左上角。返回是否画出了真实封面（false=交给占位/空处理）。
+// 把 path 这本封面备成"格子大小 boxW×boxH"的缩略图：内存缓存 → **磁盘成品** → 现算。
+// 现算那份会落盘并进内存缓存。返回是否可用（drawCoverThumb 就调它一条路）。
+static bool rdCoverThumbEnsure(const std::string &path, int boxW, int boxH) {
+  for (const auto &t : s_coverThumbs) {
+    if (t.pix && t.boxW == boxW && t.boxH == boxH && t.path == path) return true;
+  }
+  const std::string tfile = thumbCachePathFor(path, boxW, boxH);
+  RdCoverThumb t;
+  if (!rdThumbLoad(tfile, path, boxW, boxH, t)) {
+    // 磁盘上没有（或读坏了）→ 现算：读源封面 + 整条缩放管线。算完落盘：这一本这一规格
+    // 从此只付这一次，之后每次开机都走上面那条"读十几 KB 成品"的路。
+    if (!Storage.exists(path.c_str())) return false;
+    HalFile f;
+    if (!Storage.openFileForRead(TAG, path, f)) return false;
+    Bitmap bmp(f);
+    if (bmp.parseHeaders() != BmpReaderError::Ok || bmp.getWidth() <= 0 || bmp.getHeight() <= 0) return false;
+    const int sw = bmp.getWidth(), sh = bmp.getHeight();
+    const float scale = std::min(static_cast<float>(boxW) / sw, static_cast<float>(boxH) / sh);
+    int dw = static_cast<int>(sw * scale), dh = static_cast<int>(sh * scale);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    const size_t need = static_cast<size_t>(dw) * dh;
+    uint8_t *pix = static_cast<uint8_t *>(heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!pix) pix = static_cast<uint8_t *>(heap_caps_malloc(need, MALLOC_CAP_8BIT));  // PSRAM 不够退内部
+    if (!pix) return false;  // 算不出来就什么都不画（占位分支会兜底）
+    if (!rdBuildCoverThumb(bmp, dw, dh, pix)) {
+      heap_caps_free(pix);
+      return false;
+    }
+    t.path = path;
+    t.boxW = boxW; t.boxH = boxH;
+    t.dw = dw; t.dh = dh; t.ox = (boxW - dw) / 2; t.oy = (boxH - dh) / 2;
+    t.pix = pix;
+    rdThumbSave(tfile, path, t);
+  }
+  // 入内存缓存。预算满了整个清掉（不是 LRU，够用）—— 清了也不怕：磁盘那份还在，
+  // 下一拍从它重建，不读源封面、不跑缩放。
+  const size_t need = static_cast<size_t>(t.dw) * t.dh;
+  if (s_coverThumbBytes + need > kCoverThumbBudget) {
+    s_coverThumbs.clear();
+    s_coverThumbBytes = 0;
+  }
+  s_coverThumbBytes += need;
+  s_coverThumbs.push_back(std::move(t));
+  return true;
+}
+
+// 取（必要时算）缩略图并 blit 到 (boxX,boxY) 那个格子左上角。
+// 返回是否画出了真实封面（false=交给占位/空处理）。
 static bool drawCoverThumb(const std::string &path, int boxX, int boxY, int boxW, int boxH) {
   if (path.empty() || boxW <= 0 || boxH <= 0) return false;
-  auto blit = [&](const RdCoverThumb &t) {
+  if (!rdCoverThumbEnsure(path, boxW, boxH)) return false;
+  for (const auto &t : s_coverThumbs) {
+    if (!(t.pix && t.boxW == boxW && t.boxH == boxH && t.path == path)) continue;
     for (int y = 0; y < t.dh; y++) {
       const uint8_t *row = t.pix + static_cast<size_t>(y) * t.dw;
       for (int x = 0; x < t.dw; x++) {
         g_rd.drawGrayscale16Pixel(boxX + t.ox + x, boxY + t.oy + y, row[x]);
       }
     }
-  };
-  for (const auto &t : s_coverThumbs) {
-    if (t.pix && t.boxW == boxW && t.boxH == boxH && t.path == path) {
-      blit(t);
-      return true;
-    }
+    return true;
   }
-  if (!Storage.exists(path.c_str())) return false;
-  HalFile f;
-  if (!Storage.openFileForRead(TAG, path, f)) return false;
-  Bitmap bmp(f);
-  if (bmp.parseHeaders() != BmpReaderError::Ok || bmp.getWidth() <= 0 || bmp.getHeight() <= 0) return false;
-  const int sw = bmp.getWidth(), sh = bmp.getHeight();
-  const float scale = std::min(static_cast<float>(boxW) / sw, static_cast<float>(boxH) / sh);
-  int dw = static_cast<int>(sw * scale), dh = static_cast<int>(sh * scale);
-  if (dw < 1) dw = 1;
-  if (dh < 1) dh = 1;
-  const size_t need = static_cast<size_t>(dw) * dh;
-  uint8_t *pix = static_cast<uint8_t *>(heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (!pix) pix = static_cast<uint8_t *>(heap_caps_malloc(need, MALLOC_CAP_8BIT));  // PSRAM 不够退内部
-  if (!pix) return false;  // 算不出来就什么都不画（占位分支会兜底）
-  if (!rdBuildCoverThumb(bmp, dw, dh, pix)) {
-    heap_caps_free(pix);
-    return false;
-  }
-  if (s_coverThumbBytes + need > kCoverThumbBudget) {  // 满了整个清掉（不是 LRU，够用）
-    s_coverThumbs.clear();
-    s_coverThumbBytes = 0;
-  }
-  RdCoverThumb t;
-  t.path = path;
-  t.boxW = boxW; t.boxH = boxH;
-  t.dw = dw; t.dh = dh; t.ox = (boxW - dw) / 2; t.oy = (boxH - dh) / 2;
-  t.pix = pix;
-  s_coverThumbBytes += need;
-  s_coverThumbs.push_back(std::move(t));
-  blit(s_coverThumbs.back());
-  return true;
+  return false;
 }
 
 // 画一个封面单元，返回是否画出了真实封面（false=占位）。
@@ -8619,7 +8785,7 @@ static void applyRdPick(int act, const std::string &value) {
         const std::string img = g_settings.getString("standby_image");
         if (img.empty()) {
           rdShowFloat("还没选待机图片", "文件管理里长按一张图 → 设为待机画面", 2500);
-        } else if (!Storage.exists(standbyImageCacheFor(SCREEN_W, SCREEN_H).c_str())) {
+        } else if (!Storage.exists(standbyImageCacheFor(img, SCREEN_W, SCREEN_H).c_str())) {
           std::string err;
           rdBuildStandbyImageCache(img, err);
           if (!err.empty()) rdShowFloat(std::string("待机图片: ") + err, "", 2000);
@@ -10439,6 +10605,15 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     // 待机「图片」表盘的缓存补做（转屏后 / 网页设的图）。它自己带停手闸，别被这里的
     // "空闲帧"名义骗了——里面解一张大图是秒级的。
     rdStandbyImageIdlePrebuild();
+    // 两个"结果/进度落在别处算"的读数，只有空闲帧能发现它们变了：
+    //   · rdNetTick   —— 传书进度行（httpd 在自己的任务里收，界面这一侧只能轮询）
+    //   · rdFileScanIdleTick —— 文件浏览的异步扫描落地（worker 早就退出了）
+    // 两者都只标脏；而**空闲帧没有帧末统一推屏**（下面那串按模式分发的动作不能为空闲
+    // 白跑一遍），所以谁动了谁就得自己收帧 —— 和上面 float 检查同一个道理。不收的
+    // 症状就是"正在扫描目录..."一直挂着、点一下屏幕才恢复。
+    const bool netTick = rdNetTick();
+    const bool scanTick = rdFileScanIdleTick();
+    if (netTick || scanTick) renderCurrent();
     return APP_READER;
   }
 

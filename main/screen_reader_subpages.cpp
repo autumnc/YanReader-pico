@@ -1490,7 +1490,8 @@ void netShareConnect() {
   bool ok = file_manager_server_start(80);
   st.netServerUp = ok;
   st.netBusy = false;
-  st.netStatus = ok ? ("服务已启动  " + g_wifi.getIp()) : "服务启动失败(端口被占用?)";
+  st.netStatus = ok ? ("服务已启动  " + g_wifi.getIp())
+                    : ("服务启动失败: " + std::string(file_manager_server_last_error()));
   if (ok && !g_wifi.getIp().empty()) rdShowFloat("网络文件管理已开启", "http://" + g_wifi.getIp() + "/", 8000);
   st.dirty = 1;
 }

@@ -23,6 +23,10 @@ bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw);
 // over it, e.g. returning from inspiration/polish).
 void screen_editor_reset_drawn();
 
+// 宽高变了（自适应方向中途转屏）：既复位重绘记账，也作废按旧宽度烤出来的折行缓存。
+// 见 screen_editor.cpp 里的实现注释。
+void screen_editor_on_width_change();
+
 // IME state for global Ctrl+Space toggle
 bool app_ime_active();
 void app_toggle_ime();

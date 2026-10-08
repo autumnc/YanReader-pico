@@ -1120,7 +1120,7 @@ static void settingsFlomoTokenTask(void *) {
     std::string pass = g_settings.flomoPassword();
     if (email.empty() || pass.empty()) {
         s_settingsAsync.finish("请先设置Flomo邮箱和密码");
-        vTaskDelete(nullptr);
+        appAsyncTaskExit("settings_flomo", 7680);
         return;
     }
     bool wifiWas = false;
@@ -1141,7 +1141,7 @@ static void settingsFlomoTokenTask(void *) {
         }
     }
     app_disconnect_wifi_if_needed(wifiWas);
-    vTaskDelete(nullptr);
+    appAsyncTaskExit("settings_flomo", 7680);
 }
 
 static void settingsSyncTimeTask(void *) {
@@ -1149,14 +1149,14 @@ static void settingsSyncTimeTask(void *) {
     bool ok = app_connect_wifi_from_settings(&wifiWas);
     if (!ok) {
         s_settingsAsync.finish("WiFi连接失败");
-        vTaskDelete(nullptr);
+        appAsyncTaskExit("settings_sync", 4096);
         return;
     }
     if (!wifiWas) vTaskDelay(pdMS_TO_TICKS(500));
     if (s_settingsAsync.cancelled()) {
         s_settingsAsync.finish("已取消");
         app_disconnect_wifi_if_needed(wifiWas);
-        vTaskDelete(nullptr);
+        appAsyncTaskExit("settings_sync", 4096);
         return;
     }
     std::string ntp = g_settings.ntpServer();
@@ -1196,7 +1196,7 @@ static void settingsSyncTimeTask(void *) {
         }
     }
     app_disconnect_wifi_if_needed(wifiWas);
-    vTaskDelete(nullptr);
+    appAsyncTaskExit("settings_sync", 4096);
 }
 
 static void settingsBackupTask(void *) {
@@ -1206,7 +1206,7 @@ static void settingsBackupTask(void *) {
         err == ESP_OK ? "已备份到 TF 卡 settings_backup/"
         : err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
                                        : "备份失败，请检查卡剩余空间");
-    vTaskDelete(nullptr);
+    appAsyncTaskExit("settings_backup", 6144);
 }
 
 static void settingsRestoreTask(void *) {
@@ -1219,7 +1219,7 @@ static void settingsRestoreTask(void *) {
         s_settingsAsync.finish(err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
                                                             : "备份不可用，恢复未执行");
     }
-    vTaskDelete(nullptr);
+    appAsyncTaskExit("settings_restore", 6144);
 }
 
 static bool startSettingsAsync(SettingsAsyncOp op) {
@@ -1242,11 +1242,27 @@ static bool startSettingsAsync(SettingsAsyncOp op) {
     s_settingsAsyncRestart = false;
     s_settingsAsync.begin(title, busy);
     TaskFunction_t fn = settingsSyncTimeTask;
-    if (op == SettingsAsyncOp::FlomoToken) fn = settingsFlomoTokenTask;
-    else if (op == SettingsAsyncOp::Backup) fn = settingsBackupTask;
-    else if (op == SettingsAsyncOp::Restore) fn = settingsRestoreTask;
-    if (!s_settingsAsync.start(fn, "settings_async", 8192)) {
-        s_settingsAsync.failToStart("任务启动失败");
+    // 每个操作用自己的栈尺寸，**不再一律 8192**。原因：xTaskCreate 的栈只能从内部 RAM 出，
+    // 而 WiFi 一开这块内存的最大连续块就是 8192（实测 `int free=18415 largest=8192`）——
+    // 申请 8192 正好差一个块头就失败，于是"生成 Token"报"任务启动失败"、无线传书报
+    // ESP_ERR_HTTPD_TASK，两个都是同一个坎。落到 6144/4096 就稳稳落在块内。
+    // 数字依据：同步时间实测只用 1856 → 4096；备份/恢复走的是静态 4KB 缓冲、帧很浅 → 6144；
+    // Flomo 登录走 TLS，**6144 实机崩过一次**（CANARY 抓的栈溢出 → 重启），真实需求落在
+    // (6144, 8192] 之间 —— 所以取 7680：仍然落在同一个 8192 的块里（余 512 给块头），
+    // 又比 6144 多 1.5KB 给 TLS 握手。收尾那行水线会报实际余量，低于 1KB 还得回来重算。
+    uint32_t stackBytes = 4096;
+    if (op == SettingsAsyncOp::FlomoToken) {
+        fn = settingsFlomoTokenTask;
+        stackBytes = 7680;
+    } else if (op == SettingsAsyncOp::Backup) {
+        fn = settingsBackupTask;
+        stackBytes = 6144;
+    } else if (op == SettingsAsyncOp::Restore) {
+        fn = settingsRestoreTask;
+        stackBytes = 6144;
+    }
+    if (!s_settingsAsync.start(fn, "settings_async", stackBytes)) {
+        s_settingsAsync.failToStart("任务启动失败(内存不足)");
         return false;
     }
     return true;

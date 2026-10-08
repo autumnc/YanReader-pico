@@ -2,8 +2,10 @@
 #include "http_cap.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 #include <esp_crt_bundle.h>
+#include <esp_heap_caps.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -228,7 +230,18 @@ Response request(const Request &req) {
         (methodHasBody(req.method) && !req.body.empty()) ? static_cast<int>(req.body.size()) : 0;
     esp_err_t e = esp_http_client_open(client, bodyLen);
     if (e != ESP_OK) {
-        ESP_LOGW(TAG, "open 失败: %s url=%s", esp_err_to_name(e), req.url.c_str());
+        // 顺手把当时的内部堆两栏一起打出来。TLS 握手失败（-0x0093 / ESP_ERR_HTTP_CONNECT）
+        // 的根因往往不在网络而在**内部 RAM 不够/被碎片化**（读缓冲、握手上下文都从这里出）
+        // —— 单打一句 "open 失败" 只会把人往网络上带。两栏口径与分配失败日志一致
+        // （dma=0x80c）。若这栏常年见底而 TLS 仍失败，去看 sdkconfig.defaults 里
+        // MBEDTLS_HARDWARE_SHA/AES 那段（曾经就是这口池把硬件加解密逼死的）。
+        const uint32_t dmaCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
+        ESP_LOGW(TAG, "open 失败: %s url=%s（内部RAM free=%u largest=%u；可落DMA free=%u largest=%u）",
+                 esp_err_to_name(e), req.url.c_str(),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(dmaCaps),
+                 (unsigned)heap_caps_get_largest_free_block(dmaCaps));
         r.err = e;
         r.error = "网络连接失败";
         esp_http_client_cleanup(client);
@@ -255,7 +268,21 @@ Response request(const Request &req) {
                                     ? esp_timer_get_time() + effective_deadline_ms * 1000
                                     : 0;
 
-    char buf[1024];
+    // 1KB 读缓冲从**栈上搬到堆上**。GCC 在函数入口就把 `char buf[1024]` 的帧分配好了，
+    // 所以 TLS 握手（跑在 esp_http_client_open 里）那一刻它也压在这趟调用的栈上 ——
+    // 而这趟调用常跑在只有 4096~7680 栈的 worker 里（Flomo 登录、词典下载、WebDAV 同步），
+    // 那 1KB 就是它们栈里最重的一块可搬重量。放 PSRAM：它不是 DMA 缓冲（走
+    // esp_http_client_read 的 memcpy 路径），外部内存安全，而且不占内部 RAM ——
+    // 内部 RAM 的最大连续块正是这里最紧的东西（WiFi 一开就只剩 8192）。
+    // 兜底用内部堆：宁可多吃 1KB 内部内存，也别让请求不干活。
+    char *buf = static_cast<char *>(heap_caps_malloc(1024, MALLOC_CAP_SPIRAM));
+    if (!buf) buf = static_cast<char *>(malloc(1024));
+    if (!buf) {
+        esp_http_client_cleanup(client);
+        r.err = ESP_ERR_NO_MEM;
+        r.error = "内存不足";
+        return r;
+    }
     while (true) {
         if (req.cancel && req.cancel->load(std::memory_order_acquire)) {
             r.cancelled = true;
@@ -270,7 +297,7 @@ Response request(const Request &req) {
             else r.truncated = true;
             break;
         }
-        const int n = esp_http_client_read(client, buf, sizeof(buf));
+        const int n = esp_http_client_read(client, buf, 1024);
         if (n > 0) {
             const CapDecision cap = decideCapKeep(r.got, static_cast<size_t>(n), req.cap, req.cap_hard);
             const size_t keep = cap.keep;
@@ -289,6 +316,7 @@ Response request(const Request &req) {
             break;  // 0 = 读完；<0 = 传输错误
         }
     }
+    free(buf);   // heap_caps_malloc 的内存也用 free 释放（同一个分配器）
     esp_http_client_cleanup(client);
 
     r.err = ESP_OK;

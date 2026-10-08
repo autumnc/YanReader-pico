@@ -39,6 +39,7 @@
 #include "font_store.h"
 #include "read_pico_board.h"
 #include "hw/auto_orient.h"   // auto_orient_tick：自适应屏幕方向（写作/计划模式的「自适应」档）
+#include "app_async.h"        // appAsyncStackReportTick：把 worker 退出的栈水线打出来
 #include "read_pico_pmu.h"
 #include "read_pico_sd.h"
 #include "epdiy.h"
@@ -1008,7 +1009,6 @@ extern "C" void app_main() {
     // 搬去 core1 之后 core0 那段时间还能采样输入、服务 BLE/WiFi。详见 ui_render.h。
     ui_render_init();
 
-
     // ── WiFi 早初始化 ────────────────────────────────────────────────────────
     // esp_wifi_init() 会一次性分配静态 RX/TX 缓冲池，且**必须落在内部 DMA RAM**
     // （PSRAM 走不了）。等到阅读模式起来后内部 RAM 只剩 ~30KB（epdiy ~33KB +
@@ -1286,12 +1286,13 @@ extern "C" void app_main() {
         // s_last_activity_us 当"最近有没有按键/触摸"：打字、划列表期间不掉头。
         //
         // 转成了还得补两件事，都在下面：① 候选行按新宽度重分页（分页表只在 buildPage
-        // 里算，而它只在候选变化时被叫 —— 光转屏没人叫它）；② 让**编辑器**这一屏重画
-        // （它的空转 tick 按 drawnOnce 记账跳过重绘，方向换了它不会自己知道；别的界面
-        // 空转时本来就每拍 draw+commit，作废快照那一步已经在 tick 里做过了）。
+        // 里算，而它只在候选变化时被叫 —— 光转屏没人叫它）；② 让**编辑器**这一屏重画，
+        // 并且把按旧宽度烤出来的折行缓存一起作废（它的空转 tick 按 drawnOnce 记账跳过
+        // 重绘，方向换了它不会自己知道；别的界面空转时本来就每拍 draw+commit，作废快照
+        // 那一步已经在 tick 里做过了）。两件事由 screen_editor_on_width_change 一起做。
         if (auto_orient_tick(autoOrientWantedFor(currentState), s_last_activity_us)) {
             ime.repaginateForWidthChange();
-            if (currentState == APP_EDITOR) screen_editor_reset_drawn();
+            if (currentState == APP_EDITOR) screen_editor_on_width_change();
         }
 
         // TEMP 堆水位（定位内部 RAM 耗尽崩溃，见 bt_keyboard.cpp:947 的 fgets 锁 OOM）
@@ -1303,9 +1304,22 @@ extern "C" void app_main() {
                 s_heap_log_us = nowh;
                 unsigned intFree = (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
                 unsigned intLargest = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-                ESP_LOGI("Heap", "int free=%u largest=%u min=%u psram free=%u",
+                // dma=0x80c（INTERNAL|DMA|8BIT）：能落 DMA 的那部分内部 RAM，与失败分配
+                // 完全同一口径。SDMMC 弹跳缓冲、SPI 逐行缓冲都要从这里出（都在开机早期
+                // 要到手并长期持有）。本机它长年只剩 24 字节的最大连续块 —— 所以这栏常年
+                // 很小是**预期**的，别照着它去调红线；真分配失败有下面的 OOM 计数兜底
+                // （带 caps，能一眼看出是这片池的锅）。
+                // 注：这片池的碎片化曾经让硬件 SHA/AES 的逐次分配（124 字节上下文、
+                // DMA 描述符表）在 TLS 握手时失败、报「生成 Token 网络连接失败」——
+                // 现在 mbedTLS 走软件实现绕开了它，见 sdkconfig.defaults 的
+                // MBEDTLS_HARDWARE_SHA/AES 段。
+                const uint32_t dmaCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
+                unsigned dmaFree = (unsigned)heap_caps_get_free_size(dmaCaps);
+                unsigned dmaLargest = (unsigned)heap_caps_get_largest_free_block(dmaCaps);
+                ESP_LOGI("Heap", "int free=%u largest=%u min=%u dma free=%u largest=%u psram free=%u",
                          intFree, intLargest,
                          (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                         dmaFree, dmaLargest,
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
                 // 提前预警：内堆见底时刷屏/网络一步就 OOM。留出 4KB 余量当红线——
                 // 到这一步还没崩，说明是在哪次大分配前后擦边，先报警好定位。
@@ -1321,15 +1335,24 @@ extern "C" void app_main() {
                              (unsigned)s_oom_caps.load(std::memory_order_relaxed), fn ? fn : "?");
                 }
             }
-            // 每 60s 打一次内部堆分区详情（含为 DMA 预留的那块）
+            // 每 60s 打一次内部堆分区详情（含为 DMA 预留的那块），再补一份**只列能落
+            // DMA 的分区**：内部堆是分区的，INTERNAL 那份的 free 可能几乎全落在不具 DMA
+            // 能力的保留区里（实测 free 18KB / largest 24 字节就是这么来的），只看
+            // INTERNAL 那一份会得出「还有 18KB 呢」的错误印象。两份并排看才知道真话。
             if (s_heap_info_us != 0 && nowh - s_heap_info_us > 60000000) {
                 s_heap_info_us = nowh;
                 ESP_LOGI("Heap", "---- internal regions ----");
                 heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+                ESP_LOGI("Heap", "---- DMA-capable regions ----");
+                heap_caps_print_heap_info(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
             } else if (s_heap_info_us == 0) {
                 s_heap_info_us = nowh;
             }
         }
+
+        // worker 留在那儿的栈水线，这一拍打出来（见 app_async.h：worker 自己打印要额外
+        // 吃几百字节栈，而量水线恰恰是在量"还剩多少"，所以登记和打印分在两处）。
+        appAsyncStackReportTick();
 
         // Check for key repeat events
         g_bt.checkKeyRepeat();

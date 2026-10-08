@@ -43,6 +43,10 @@ static const uint32_t BAR_ICON_WEREAD    = 0xF05DA;  // md-book-open-page-varian
 // ── 文件浏览页的浮动按钮（网络文件管理）──────────────────────────────────
 // 是新加进子集的（scripts/subset_icon_font.py 的 FAB 组）。
 static const uint32_t FAB_ICON_WEB       = 0xF059F;  // md-web 地球：浏览器打开传书
+// 眼睛（「显示隐藏文件」开关）：**子集里没有这个字形，也没有 fontTools 重裁**，
+// 由 gfx/icon_font.c 的 draw_prog() 按几何画（同 ◐/▸ 那几个的做法）。所以它只能走
+// icon_font_draw()，**不能**用 icon_font_draw_sized()——后者找不到字形会直接返回空白。
+static const uint32_t FAB_ICON_EYE       = 0x1F441;  // 👁 眼睛：显示隐藏文件
 
 // ── 标签栏几何：阅读模式和计划模式共用一套 ───────────────────────────────
 // 图标从原来的 42~45px（一个 UI 行高）放大到 56px。原因：e-ink 上手指落点很糙，

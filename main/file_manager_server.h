@@ -7,6 +7,11 @@ bool file_manager_server_start(uint16_t port = 80);
 void file_manager_server_stop();
 uint16_t file_manager_server_get_port();
 
+// 上一次启动失败的**真因**（启动成功则为空串）。给界面显示用：原来三处调用点各自写死了
+// 「端口被占用?」，那只是猜 —— 实际上 `if (s_server) return true` 已经排除了自己占自己，
+// 真正常见的是内部 RAM 不够（httpd 自己要 8KB 栈的任务，而 WiFi 一开内部 RAM 掉得最狠）。
+const char *file_manager_server_last_error();
+
 // ── 传输进度（给界面显示用）─────────────────────────────────────────────
 // 上传/下载都在 httpd 自己的任务里跑，主任务这边屏幕一动不动，传大文件时看着像死机。
 // 这里暴露一份只读快照给界面轮询，用来画"正在接收 xxx 1.2/8.4MB"。

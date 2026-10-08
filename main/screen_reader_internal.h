@@ -723,7 +723,8 @@ void renderNoteEdit();  // 笔记编辑页（重命名/改文件名共用同一�
 // fmTarget 给 fileMenuAction 之外没人用，但它是"文件菜单锁定那一项"的唯一取数口。
 void fbScan(const std::string &dir);
 void rdEnterFileTab();
-void rdNetTick();          // 传书服务器运行时的每拍推进（主循环空转也要调）
+bool rdNetTick();          // 传书服务器运行时的每拍推进（主循环空转也要调）；返回是否该重绘
+bool rdFileScanIdleTick(); // 空闲帧取回异步扫描的结果（返回是否该重绘当前界面）
 void renderFileBrowser();
 void handleFileBrowser(int key);
 const BookEntry *fmTarget();

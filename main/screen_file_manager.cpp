@@ -75,7 +75,7 @@ static void fileMgrStartTask(void *arg) {
         ok = true;
         port = file_manager_server_get_port();
     } else {
-        fileMgrSetStatus("服务启动失败");
+        fileMgrSetStatus("服务启动失败: " + std::string(file_manager_server_last_error()));
     }
 
 done:
@@ -93,7 +93,7 @@ done:
     std::string result = g_fileMgrState.status;
     fileMgrUnlock();
     s_fileMgrJob.finish(ok ? "服务已启动" : result);
-    vTaskDelete(nullptr);
+    appAsyncTaskExit("file_mgr_start", 6144);
 }
 
 void screen_file_manager_init() {
@@ -112,7 +112,7 @@ void screen_file_manager_init() {
     g_fileMgrState.wifiWasConnected = g_wifi.isConnected();
     fileMgrUnlock();
 
-    if (!s_fileMgrJob.start(fileMgrStartTask, "file_mgr_start", 8192)) {
+    if (!s_fileMgrJob.start(fileMgrStartTask, "file_mgr_start", 6144)) {
         fileMgrSetStatus("系统繁忙,请重试");
         s_fileMgrJob.failToStart("系统繁忙,请重试");
     }
