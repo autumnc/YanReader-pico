@@ -8,12 +8,15 @@
 #include "flomo_client.h"
 #include "ime/IME.h"
 #include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划/阅读共用一份）
+#include "ui/list_view.h"
 #include "editor_vk.h"   // editorVkSetLayout：键盘布局这一行直接改虚拟键盘的键位表
 #include "text_sel.h"    // 输入框的触摸选区（三模式共享件）
 #include "pcf85063.h"
 #include "standby_clock.h"
 #include "quick_edit.h"
 #include "settings_backup.h"   // 通用分类末尾的「备份设置与记录 / 从备份恢复」
+#include "app_async.h"
+#include "app_services.h"
 #include "read_pico_sd.h"      // 卡在不在（恢复前的提示要分开说）
 #include "typing_click.h"
 #include "ui_helpers.h"
@@ -94,6 +97,7 @@ static const SettingField SETTINGS_FIELDS[] = {
     {"page_turn_anim", "翻页动画", false, false, CAT_DISPLAY},
     {"reader_perf_log", "翻页性能日志", false, false, CAT_DISPLAY},
     {"ui_perf_log", "界面性能日志", false, false, CAT_DISPLAY},
+    {"webdav_debug_log", "WebDAV调试日志", false, false, CAT_DISPLAY},
     {"_editor_orientation", "文字方向", false, true, CAT_DISPLAY},
     {"vertical_ref_line", "竖排参考线", false, false, CAT_DISPLAY},
     {"_vertical_ref_line_style", "参考线样式", false, true, CAT_DISPLAY},
@@ -445,6 +449,7 @@ static bool isToggleField(const char *key) {
            strcmp(key, "page_turn_anim") == 0 ||
            strcmp(key, "reader_perf_log") == 0 ||
            strcmp(key, "ui_perf_log") == 0 ||
+           strcmp(key, "webdav_debug_log") == 0 ||
            strcmp(key, "night_mode") == 0;
 }
 
@@ -1104,81 +1109,43 @@ static const std::vector<int> &dictFilteredIndices(const std::vector<IME::UserEn
     return g_settingsState.dictFilteredCache;
 }
 
-static bool connect_wifi_from_settings() {
-    std::string ssid = g_settings.wifiSsid();
-    if (ssid.empty()) return false;
-    std::string pass = g_settings.wifiPassword();
-    g_wifi.begin();
-    return g_wifi.connect(ssid.c_str(), pass.c_str());
-}
-
 enum class SettingsAsyncOp { None, FlomoToken, SyncTime, Backup, Restore };
-enum class SettingsAsyncState { Idle, Running, Done };
-
-static std::atomic<SettingsAsyncState> s_settingsAsyncState{SettingsAsyncState::Idle};
 static SettingsAsyncOp s_settingsAsyncOp = SettingsAsyncOp::None;
-static SemaphoreHandle_t s_settingsAsyncMutex = nullptr;
-static std::string s_settingsAsyncTitle;
-static std::string s_settingsAsyncBusy;
-static std::string s_settingsAsyncResult;
-static bool s_settingsAsyncDrawn = false;
+static AppAsyncJob s_settingsAsync;
 static bool s_settingsAsyncRestart = false;
-static int64_t s_settingsAsyncUntilUs = 0;
-
-static void ensureSettingsAsyncMutex() {
-    if (!s_settingsAsyncMutex) s_settingsAsyncMutex = xSemaphoreCreateMutex();
-}
-
-static void settingsAsyncSetResult(const std::string &msg) {
-    ensureSettingsAsyncMutex();
-    xSemaphoreTake(s_settingsAsyncMutex, portMAX_DELAY);
-    s_settingsAsyncResult = msg;
-    xSemaphoreGive(s_settingsAsyncMutex);
-}
-
-static std::string settingsAsyncResult() {
-    ensureSettingsAsyncMutex();
-    xSemaphoreTake(s_settingsAsyncMutex, portMAX_DELAY);
-    std::string msg = s_settingsAsyncResult;
-    xSemaphoreGive(s_settingsAsyncMutex);
-    return msg;
-}
 
 static void settingsFlomoTokenTask(void *) {
     std::string email = g_settings.flomoEmail();
     std::string pass = g_settings.flomoPassword();
     if (email.empty() || pass.empty()) {
-        settingsAsyncSetResult("请先设置Flomo邮箱和密码");
-        s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+        s_settingsAsync.finish("请先设置Flomo邮箱和密码");
         vTaskDelete(nullptr);
         return;
     }
-    bool wifiWas = g_wifi.isConnected();
-    bool ok = wifiWas || connect_wifi_from_settings();
+    bool wifiWas = false;
+    bool ok = app_connect_wifi_from_settings(&wifiWas);
     if (!ok) {
-        settingsAsyncSetResult("WiFi连接失败");
+        s_settingsAsync.finish("WiFi连接失败");
     } else {
         g_flomo.configure(email, pass);
         std::string token = g_flomo.login();
         if (!token.empty()) {
             g_flomo.setCachedToken(token);
-            settingsAsyncSetResult("Token生成成功");
+            s_settingsAsync.finish("Token生成成功");
         } else {
             std::string why = g_flomo.lastError();
-            settingsAsyncSetResult(why.empty() ? "Flomo登录失败" : ("登录失败: " + why));
+            s_settingsAsync.finish(why.empty() ? "Flomo登录失败" : ("登录失败: " + why));
         }
     }
-    if (!wifiWas) g_wifi.disconnect();
-    s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+    app_disconnect_wifi_if_needed(wifiWas);
     vTaskDelete(nullptr);
 }
 
 static void settingsSyncTimeTask(void *) {
-    bool wifiWas = g_wifi.isConnected();
-    bool ok = wifiWas || connect_wifi_from_settings();
+    bool wifiWas = false;
+    bool ok = app_connect_wifi_from_settings(&wifiWas);
     if (!ok) {
-        settingsAsyncSetResult("WiFi连接失败");
-        s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+        s_settingsAsync.finish("WiFi连接失败");
         vTaskDelete(nullptr);
         return;
     }
@@ -1187,7 +1154,7 @@ static void settingsSyncTimeTask(void *) {
     std::string tz = g_settings.timezone();
     if (tz.empty()) tz = "CST-8";
     if (ntp.empty()) {
-        settingsAsyncSetResult("请先设置NTP服务器");
+        s_settingsAsync.finish("请先设置NTP服务器");
     } else {
         esp_sntp_stop();
         esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
@@ -1211,23 +1178,21 @@ static void settingsSyncTimeTask(void *) {
             char ts[64];
             strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
             g_rtc.setTime(now);
-            settingsAsyncSetResult(std::string("同步成功: ") + ts);
+            s_settingsAsync.finish(std::string("同步成功: ") + ts);
         } else {
-            settingsAsyncSetResult("时间同步失败");
+            s_settingsAsync.finish("时间同步失败");
         }
     }
-    if (!wifiWas) g_wifi.disconnect();
-    s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+    app_disconnect_wifi_if_needed(wifiWas);
     vTaskDelete(nullptr);
 }
 
 static void settingsBackupTask(void *) {
     const esp_err_t err = settings_backup_save();
-    settingsAsyncSetResult(
+    s_settingsAsync.finish(
         err == ESP_OK ? "已备份到 TF 卡 settings_backup/"
         : err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
                                        : "备份失败，请检查卡剩余空间");
-    s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
     vTaskDelete(nullptr);
 }
 
@@ -1235,80 +1200,72 @@ static void settingsRestoreTask(void *) {
     const esp_err_t err = settings_backup_restore();
     if (err == ESP_OK) {
         s_settingsAsyncRestart = true;
-        settingsAsyncSetResult("已恢复，正在重启...");
+        s_settingsAsync.finish("已恢复，正在重启...");
     } else {
-        settingsAsyncSetResult(err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
+        s_settingsAsync.finish(err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
                                                             : "备份不可用，恢复未执行");
     }
-    s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
     vTaskDelete(nullptr);
 }
 
 static bool startSettingsAsync(SettingsAsyncOp op) {
-    if (s_settingsAsyncState.load(std::memory_order_acquire) == SettingsAsyncState::Running) return false;
-    ensureSettingsAsyncMutex();
+    if (s_settingsAsync.state() == AppAsyncState::Running) return false;
     s_settingsAsyncOp = op;
+    std::string title, busy;
     if (op == SettingsAsyncOp::FlomoToken) {
-        s_settingsAsyncTitle = "Flomo Token";
-        s_settingsAsyncBusy = "正在生成...";
+        title = "Flomo Token";
+        busy = "正在生成...";
     } else if (op == SettingsAsyncOp::SyncTime) {
-        s_settingsAsyncTitle = "网络同步时间";
-        s_settingsAsyncBusy = "正在同步...";
+        title = "网络同步时间";
+        busy = "正在同步...";
     } else if (op == SettingsAsyncOp::Backup) {
-        s_settingsAsyncTitle = "备份设置与记录";
-        s_settingsAsyncBusy = "正在备份...";
+        title = "备份设置与记录";
+        busy = "正在备份...";
     } else {
-        s_settingsAsyncTitle = "从备份恢复";
-        s_settingsAsyncBusy = "正在恢复...";
+        title = "从备份恢复";
+        busy = "正在恢复...";
     }
-    settingsAsyncSetResult("");
-    s_settingsAsyncDrawn = false;
     s_settingsAsyncRestart = false;
-    s_settingsAsyncUntilUs = 0;
-    s_settingsAsyncState.store(SettingsAsyncState::Running, std::memory_order_release);
-    TaskHandle_t h = nullptr;
+    s_settingsAsync.begin(title, busy);
     TaskFunction_t fn = settingsSyncTimeTask;
     if (op == SettingsAsyncOp::FlomoToken) fn = settingsFlomoTokenTask;
     else if (op == SettingsAsyncOp::Backup) fn = settingsBackupTask;
     else if (op == SettingsAsyncOp::Restore) fn = settingsRestoreTask;
-    if (xTaskCreate(fn, "settings_async", 8192, nullptr, 1, &h) != pdPASS) {
-        settingsAsyncSetResult("任务启动失败");
-        s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+    if (!s_settingsAsync.start(fn, "settings_async", 8192)) {
+        s_settingsAsync.failToStart("任务启动失败");
         return false;
     }
     return true;
 }
 
 static bool settingsAsyncHandle(int key) {
-    SettingsAsyncState state = s_settingsAsyncState.load(std::memory_order_acquire);
-    if (state == SettingsAsyncState::Idle) return false;
-    if (state == SettingsAsyncState::Running) {
-        if (!s_settingsAsyncDrawn) {
+    AppAsyncState state = s_settingsAsync.state();
+    if (state == AppAsyncState::Idle) return false;
+    if (state == AppAsyncState::Running) {
+        if (!s_settingsAsync.drawn) {
             ui_clear();
-            ui_draw_text_centered(FONT_H, s_settingsAsyncTitle.c_str(), false, true);
-            ui_show_message_centered(s_settingsAsyncBusy.c_str());
+            ui_draw_text_centered(FONT_H, s_settingsAsync.title().c_str(), false, true);
+            ui_show_message_centered(s_settingsAsync.busy().c_str());
             ui_commit();
-            s_settingsAsyncDrawn = true;
+            s_settingsAsync.drawn = true;
         }
         vTaskDelay(pdMS_TO_TICKS(80));
         return true;
     }
-    if (s_settingsAsyncUntilUs == 0 || key > 0) {
+    if (s_settingsAsync.untilUs == 0 || key > 0) {
         ui_clear();
-        ui_show_message_centered(settingsAsyncResult().c_str());
+        ui_show_message_centered(s_settingsAsync.result().c_str());
         ui_commit();
-        s_settingsAsyncUntilUs = esp_timer_get_time() + 1800LL * 1000;
+        s_settingsAsync.untilUs = esp_timer_get_time() + 1800LL * 1000;
         return true;
     }
-    if (esp_timer_get_time() < s_settingsAsyncUntilUs) return true;
+    if (esp_timer_get_time() < s_settingsAsync.untilUs) return true;
     if (s_settingsAsyncRestart) {
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
     }
-    s_settingsAsyncState.store(SettingsAsyncState::Idle, std::memory_order_release);
+    s_settingsAsync.reset();
     s_settingsAsyncOp = SettingsAsyncOp::None;
-    s_settingsAsyncDrawn = false;
-    s_settingsAsyncUntilUs = 0;
     drawBrowseList();
     return true;
 }
@@ -1319,15 +1276,41 @@ static bool settingsAsyncHandle(int key) {
 static int settingsListTop() { return 2 * FONT_H - g_font.ascent(); }
 static int settingsListVisible() { return (SCREEN_H - 2 * FONT_H + FONT_H - 1) / FONT_H; }
 
+static ListView settingsCategoryListView() {
+    ListView lv;
+    lv.top = settingsListTop();
+    lv.itemH = FONT_H;
+    lv.count = CAT_COUNT;
+    lv.rows = settingsListVisible();
+    lv.sel = g_settingsState.selection;
+    lv.first = 0;
+    listViewScroll(lv);
+    return lv;
+}
+
+static ListView settingsBrowseListView() {
+    ListView lv;
+    lv.top = settingsListTop();
+    lv.itemH = FONT_H;
+    lv.count = fieldVisibleCount();
+    lv.rows = settingsListVisible();
+    lv.sel = g_settingsState.selection;
+    lv.first = g_settingsState.scroll;
+    listViewFollow(lv);
+    return lv;
+}
+
 static void drawSettingsCategories() {
     ui_clear();
     ui_draw_text_centered(FONT_H, "设置", false, true);
-    int y = 2 * FONT_H;
-    for (int i = 0; i < CAT_COUNT; i++) {
-        bool sel = (i == g_settingsState.selection);
+    ListView lv = settingsCategoryListView();
+    g_settingsState.selection = lv.sel;
+    for (int row = 0; row < lv.rows && row < lv.count; row++) {
+        int i = lv.first + row;
+        bool sel = (i == lv.sel);
         char buf[64];
         snprintf(buf, sizeof(buf), "▶ %s (%d)", SETTINGS_CAT_NAMES[i], catFieldCount(i));
-        ui_draw_text(8, y + i * FONT_H, buf, sel);
+        ui_draw_text(8, 2 * FONT_H + row * FONT_H, buf, sel);
     }
     ui_commit();
 }
@@ -1509,29 +1492,18 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             ctx.nextState = g_quickEdit ? APP_EDITOR : APP_MAIN;
             return ctx.nextState;
         }
-        if (key == 'k' || key == KEY_UP) { if (g_settingsState.selection > 0) g_settingsState.selection--; }
-        if (key == 'j' || key == KEY_DOWN) {
-            if (g_settingsState.selection < CAT_COUNT - 1) g_settingsState.selection++;
-        }
-        // 触摸上下滑 = 整页翻（全仓同一条规矩，见 ui/list_view.h 的 listViewPageStep）：
-        // 一步跨一屏的行数。**分类一屏放得下就没得翻**，吃掉这一划什么都不动 ——
-        // 以前这里是无条件 `selection ± 一屏` 再夹到 CAT_COUNT-1，七行的小表上就变成
-        // "按一下就跳到最后一个分类"，看着是"上下选择"而不是翻页。
-        if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-            int pageRows = settingsListVisible();
-            if (pageRows < 1) pageRows = 1;
-            if (CAT_COUNT > pageRows) {
-                int t = g_settingsState.selection + (key == KEY_PAGE_DOWN ? pageRows : -pageRows);
-                if (t < 0) t = 0;
-                if (t > CAT_COUNT - 1) t = CAT_COUNT - 1;
-                g_settingsState.selection = t;
-            }
+        if (key == 'k') key = KEY_UP;
+        else if (key == 'j') key = KEY_DOWN;
+        {
+            ListView lv = settingsCategoryListView();
+            if (listViewKey(lv, key)) g_settingsState.selection = lv.sel;
         }
         if (key == 0x0A || key == 0x0D) {
             int tx, ty;
             if (input_tap_xy(&tx, &ty)) {
-                int row = (ty >= settingsListTop()) ? (ty - settingsListTop()) / FONT_H : -1;
-                if (row < 0 || row >= CAT_COUNT) return APP_SETTINGS;  // 点标题/列表外空白
+                ListView lv = settingsCategoryListView();
+                int row = listViewHitAt(lv, ty);
+                if (row < 0) return APP_SETTINGS;  // 点标题/列表外空白
                 g_settingsState.selection = row;
             }
             s_cat = g_settingsState.selection;      // 进入该分类
@@ -1851,19 +1823,13 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
         drawSettingsCategories();
         return APP_SETTINGS;
     }
-    if (key == 'k' || key == KEY_UP) { if (g_settingsState.selection > 0) g_settingsState.selection--; }
-    if (key == 'j' || key == KEY_DOWN) { if (g_settingsState.selection < fieldVisibleCount()-1) g_settingsState.selection++; }
-    // 触摸上下滑 = 整页翻：一屏的行数，高亮跟着页走（scroll 由 selection 在绘制时反推）。
-    // **整个分类一屏放得下就没得翻**，什么都不动（与分类列表同一个口径）。
-    if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-        int pageRows = settingsListVisible();  // 与绘制时 visible 同式
-        if (pageRows < 1) pageRows = 1;
-        int n = fieldVisibleCount();
-        if (n > pageRows) {
-            int t = g_settingsState.selection + (key == KEY_PAGE_DOWN ? pageRows : -pageRows);
-            if (t > n - 1) t = n - 1;
-            if (t < 0) t = 0;
-            g_settingsState.selection = t;
+    if (key == 'k') key = KEY_UP;
+    else if (key == 'j') key = KEY_DOWN;
+    {
+        ListView lv = settingsBrowseListView();
+        if (listViewKey(lv, key)) {
+            g_settingsState.selection = lv.sel;
+            g_settingsState.scroll = lv.first;
         }
     }
     if (key == 'd' || key == 'D') {
@@ -1874,11 +1840,9 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
         // 触摸点选：把点按位置映射到字段行，先选中再激活；点标题/空白则忽略本次点按。
         int tx, ty;
         if (input_tap_xy(&tx, &ty)) {
-            int listTop = 2 * FONT_H - g_font.ascent();   // 首行顶部（标题占第一行基线 FONT_H）
-            int row = (ty - listTop) / FONT_H;
-            if (row < 0) return APP_SETTINGS;              // 点标题区
-            int fieldRow = g_settingsState.scroll + row;
-            if (fieldRow >= fieldVisibleCount()) return APP_SETTINGS;  // 点列表下方空白
+            ListView lv = settingsBrowseListView();
+            int fieldRow = listViewHitAt(lv, ty);
+            if (fieldRow < 0) return APP_SETTINGS;
             g_settingsState.selection = fieldRow;
         }
         auto &f = SETTINGS_FIELDS[fieldAt(g_settingsState.selection)];
@@ -2006,15 +1970,14 @@ static void drawBrowseListBody() {
     ui_clear(); int y = FONT_H;
     std::string title = std::string("设置 · ") + SETTINGS_CAT_NAMES[s_cat];
     ui_draw_text_centered(y, title.c_str(), false, true); y += FONT_H;
-    int visible = (SCREEN_H - y + FONT_H - 1) / FONT_H;
-    if (g_settingsState.selection < g_settingsState.scroll) g_settingsState.scroll = g_settingsState.selection;
-    if (g_settingsState.selection >= g_settingsState.scroll + visible)
-        g_settingsState.scroll = g_settingsState.selection - visible + 1;
+    ListView lv = settingsBrowseListView();
+    g_settingsState.selection = lv.sel;
+    g_settingsState.scroll = lv.first;
 
     int rowCount = fieldVisibleCount();
-    for (int i = 0; i < visible && (g_settingsState.scroll + i) < rowCount; i++) {
-        bool sel = (g_settingsState.scroll + i == g_settingsState.selection);
-        int idx = fieldAt(g_settingsState.scroll + i); auto &f = SETTINGS_FIELDS[idx];
+    for (int i = 0; i < lv.rows && (lv.first + i) < rowCount; i++) {
+        bool sel = (lv.first + i == lv.sel);
+        int idx = fieldAt(lv.first + i); auto &f = SETTINGS_FIELDS[idx];
         char buf[80];
         if (f.action) {
             if (strcmp(f.key, "_font") == 0) {

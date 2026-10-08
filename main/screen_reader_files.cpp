@@ -23,11 +23,15 @@
 #include "bt_keyboard.h"           // g_bt（蓝牙键盘连接状态）
 #include "editor_vk.h"             // 重命名框复用编辑器那套虚拟键盘
 #include "ime/IME.h"
+#include "app_services.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <memory>
+#include <new>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
@@ -47,39 +51,102 @@ static const char *TAG = "Reader";
 static bool rdIsImageName(const std::string &n);
 static void imgBuildList(const std::string &path);
 
+static int fbKindForName(const std::string &name, bool isDir) {
+  if (isDir) return -1;
+  if (endsWith(name, ".epub")) return 0;
+  if (endsWith(name, ".txt")) return 1;
+  if (endsWith(name, ".xtc")) return 2;
+  if (rdIsImageName(name)) return 3;
+  return 4;
+}
+
+static void fbScanBuild(const std::string &dir, std::vector<BookEntry> &out) {
+  out.clear();
+  std::vector<AppFileEntry> entries;
+  app_scan_directory(dir, entries, fbKindForName, false);
+  out.reserve(entries.size());
+  for (auto &e : entries) out.push_back({std::move(e.path), std::move(e.name), e.kind});
+}
+
 void fbScan(const std::string &dir) {
   st.fbPath = dir;
   st.fbEntries.clear();
   st.fbSel = 0;
   st.fmStatus.clear();   // 进新目录/重扫：清掉上一条"已重命名/已删除"提示
-  DIR *dp = opendir(dir.c_str());
-  if (!dp) return;
-  std::vector<BookEntry> dirs, files;
-  struct dirent *e;
-  while ((e = readdir(dp)) != nullptr) {
-    std::string name = e->d_name;
-    if (name.empty() || name[0] == '.') continue;  // 跳过隐藏项（含 .crossmux）
-    std::string full = dir + "/" + name;
-    struct stat sb;
-    if (stat(full.c_str(), &sb) != 0) continue;
-    if (S_ISDIR(sb.st_mode)) {
-      dirs.push_back({full, name, -1});
-    } else if (S_ISREG(sb.st_mode)) {
-      int kind = -1;
-      if (endsWith(name, ".epub")) kind = 0;
-      else if (endsWith(name, ".txt")) kind = 1;
-      else if (endsWith(name, ".xtc")) kind = 2;
-      else if (rdIsImageName(name)) kind = 3;
-      else kind = 4;   // 其它任何普通文件：列出来、能改名/删除/复制/剪切，但打不开（见 fbOpenEntry）
-      files.push_back({full, name, kind});
+  fbScanBuild(dir, st.fbEntries);
+}
+
+struct FbScanJob {
+  std::string dir;
+  std::string keepPath;
+  std::vector<BookEntry> entries;
+};
+
+static std::atomic<bool> s_fbScanRunning{false};
+static std::atomic<bool> s_fbScanDone{false};
+static std::atomic<FbScanJob *> s_fbScanReady{nullptr};
+
+static void fbScanTask(void *arg) {
+  std::unique_ptr<FbScanJob> job(static_cast<FbScanJob *>(arg));
+  fbScanBuild(job->dir, job->entries);
+  s_fbScanReady.store(job.release(), std::memory_order_release);
+  s_fbScanDone.store(true, std::memory_order_release);
+  s_fbScanRunning.store(false, std::memory_order_release);
+  vTaskDelete(nullptr);
+}
+
+static bool fbScanAsyncActive() {
+  return s_fbScanRunning.load(std::memory_order_acquire) ||
+         s_fbScanDone.load(std::memory_order_acquire);
+}
+
+static void fbScanAsyncPoll() {
+  if (!s_fbScanDone.load(std::memory_order_acquire)) return;
+  s_fbScanDone.store(false, std::memory_order_release);
+  std::unique_ptr<FbScanJob> job(s_fbScanReady.exchange(nullptr, std::memory_order_acq_rel));
+  if (!job) return;
+  if (job->dir != st.fbPath) return;
+  st.fbEntries = std::move(job->entries);
+  st.fbSel = 0;
+  if (!job->keepPath.empty()) {
+    for (size_t i = 0; i < st.fbEntries.size(); i++) {
+      if (st.fbEntries[i].path == job->keepPath) {
+        st.fbSel = static_cast<int>(i);
+        break;
+      }
     }
   }
-  closedir(dp);
-  auto byName = [](const BookEntry &a, const BookEntry &b) { return a.name < b.name; };
-  std::sort(dirs.begin(), dirs.end(), byName);
-  std::sort(files.begin(), files.end(), byName);
-  st.fbEntries = std::move(dirs);
-  st.fbEntries.insert(st.fbEntries.end(), files.begin(), files.end());
+  st.fbSel = clampI(st.fbSel, 0, std::max(0, static_cast<int>(st.fbEntries.size()) - 1));
+  st.dirty = 1;
+}
+
+static void fbRequestScan(const std::string &dir, const std::string &keepPath = std::string()) {
+  fbScanAsyncPoll();
+  if (s_fbScanRunning.load(std::memory_order_acquire)) {
+    rdShowFloat("正在扫描目录", "请稍候", 1200);
+    return;
+  }
+  std::unique_ptr<FbScanJob> job(new (std::nothrow) FbScanJob());
+  if (!job) {
+    fbScan(dir);
+    return;
+  }
+  job->dir = dir;
+  job->keepPath = keepPath;
+  st.fbPath = dir;
+  st.fbEntries.clear();
+  st.fbSel = 0;
+  st.fmStatus.clear();
+  st.dirty = 1;
+  s_fbScanDone.store(false, std::memory_order_release);
+  s_fbScanRunning.store(true, std::memory_order_release);
+  TaskHandle_t h = nullptr;
+  if (xTaskCreate(fbScanTask, "fb_scan", 6144, job.get(), 1, &h) != pdPASS) {
+    s_fbScanRunning.store(false, std::memory_order_release);
+    fbScan(dir);
+    return;
+  }
+  (void)job.release();
 }
 
 // 进文件浏览器：重扫当前目录。三个入口（1 号位应用页的文件夹图标、书架菜单的
@@ -88,8 +155,9 @@ void fbScan(const std::string &dir) {
 // 会提前 return 吃掉点按，连标签都切不走，看上去就是"卡死"。
 void rdEnterFileTab() {
   const int keep = st.fbSel;   // 换标签来回切时保住光标位置
-  fbScan(st.fbPath.empty() ? std::string("/sdcard") : st.fbPath);
-  st.fbSel = clampI(keep, 0, std::max(0, static_cast<int>(st.fbEntries.size()) - 1));
+  std::string keepPath;
+  if (keep >= 0 && keep < static_cast<int>(st.fbEntries.size())) keepPath = st.fbEntries[keep].path;
+  fbRequestScan(st.fbPath.empty() ? std::string("/sdcard") : st.fbPath, keepPath);
   st.tab = 1;
   st.mode = RdMode::FileBrowser;
   st.fullRefresh = true;
@@ -174,14 +242,10 @@ static void fbRefreshAction() {
     keep = st.fbEntries[st.fbSel].path;
   const std::string dir = st.fbPath;
   const int before = static_cast<int>(st.fbEntries.size());
-  fbScan(dir);
-  if (!keep.empty()) {
-    for (size_t i = 0; i < st.fbEntries.size(); i++)
-      if (st.fbEntries[i].path == keep) { st.fbSel = static_cast<int>(i); break; }
-  }
+  fbRequestScan(dir, keep);
   ESP_LOGI(TAG, "文件刷新: %s (%d → %d 项)", dir.c_str(), before,
            static_cast<int>(st.fbEntries.size()));
-  rdShowFloat("已刷新", dir, 1500);
+  rdShowFloat("正在刷新", dir, 1500);
   st.dirty = 1;
 }
 
@@ -359,7 +423,7 @@ static void fmSetStandbyImage() {
 // 此刻已被析构，后面 opendir(dir.c_str()) 读的就是已释放内存。
 static void fbOpenEntry(BookEntry e) {
   if (e.kind < 0) {
-    fbScan(e.path);
+    fbRequestScan(e.path);
   } else if (e.kind == 3) {
     imgBuildList(e.path);
     st.imgZoom = 1.0f;
@@ -387,6 +451,7 @@ static void fbOpenEntry(BookEntry e) {
 }
 
 void renderFileBrowser() {
+  fbScanAsyncPoll();
   g_rd.clearScreen();
   int w = g_rd.getScreenWidth();
   drawTabBar();
@@ -404,7 +469,8 @@ void renderFileBrowser() {
   const ListView fblv = fbListView();
   int top = fblv.top;
   int n = fblv.count;
-  if (n == 0) drawCenteredLine(g_rd.getScreenHeight() / 2, "空目录");
+  if (fbScanAsyncActive()) drawCenteredLine(g_rd.getScreenHeight() / 2, "正在扫描目录...");
+  else if (n == 0) drawCenteredLine(g_rd.getScreenHeight() / 2, "空目录");
   int itemH = fblv.itemH;
   int maxRows = fblv.rows;
   int start = fblv.first;
@@ -441,6 +507,7 @@ void renderFileBrowser() {
 }
 
 void handleFileBrowser(int key) {
+  fbScanAsyncPoll();
   int n = static_cast<int>(st.fbEntries.size());
   // 点按坐标只读一次（input_tap_xy 读完即清），标签命中和下面的列表行命中共用这一份。
   int tapX = 0, tapY = 0;
@@ -460,7 +527,7 @@ void handleFileBrowser(int key) {
   if (key == 0x1B || key == KEY_LONG_CONFIRM || key == KEY_BACK) {
     if (st.fbPath != "/sdcard" && !st.fbPath.empty()) {
       size_t slash = st.fbPath.rfind('/');
-      fbScan(slash == 0 ? "/" : st.fbPath.substr(0, slash));
+      fbRequestScan(slash == 0 ? "/" : st.fbPath.substr(0, slash));
     } else {
       // 已经在卡根：退回「应用」标签的图标入口页 —— 文件浏览器现在是它的子界面
       // （1 号位改成应用页之后，卡根再往上退就是那一页；想回书架再 Esc 一次）。
@@ -516,7 +583,7 @@ void handleFileBrowser(int key) {
   // 撤销"删除待确认"：只在真的按了别的键时撤，**空转帧（key==0）绝不能撤**——那两下中间
   // 夹着一个空闲帧，撤了就永远等不到第二次 d。
   if (key > 0 && key != 'd' && st.fmDelArm) st.fmDelArm = false;
-  if (n == 0) return;
+  if (n == 0 || fbScanAsyncActive()) return;
   // 长按列表项 → 弹出上下文菜单（打开/重命名/删除/详情）。长按落点在哪一行就作用于哪
   // 一行：先把 st.fbSel 指过去，菜单里的动作走同一套入口（与键盘"先选中再操作"等价）。
   // 这个键能到达这里，是因为 screen_reader_handle 顶部把 KEY_TOUCH_LONG 展平成 0x1B 的
@@ -729,7 +796,7 @@ static void fmDeleteConfirmed() {
 
   fmCloseBookIf(e.path);   // 删的正好是当前打开的书（或它所在的目录）→ 先放掉
   ESP_LOGI(TAG, "文件菜单删除: %s", e.path.c_str());
-  fbScan(st.fbPath);
+  fbRequestScan(st.fbPath);
   st.fmStatus = "已删除";
   fmBackToBrowser();
 }
@@ -821,7 +888,7 @@ static void fmPaste() {
     st.fmClipPath.clear();
     st.fmClipName.clear();
     st.fmClipCut = false;
-    fbScan(st.fbPath);   // 刷新当前目录（粘进子目录时列表不变，但重扫代价可忽略）
+    fbRequestScan(st.fbPath);   // 刷新当前目录（粘进子目录时列表不变，但重扫代价可忽略）
     st.fmStatus = "已粘贴";
   } else {
     st.fmStatus = "粘贴失败";
@@ -856,7 +923,7 @@ static void fmCommitRename() {
     if (Storage.exists(dir.c_str())) { st.fmStatus = "同名已存在"; fmBackToBrowser(); return; }
     const bool ok = Storage.mkdir(dir.c_str(), true);
     ESP_LOGI(TAG, "文件菜单新建文件夹: %s (%d)", dir.c_str(), static_cast<int>(ok));
-    if (ok) { fbScan(st.fbPath); st.fmStatus = "已新建文件夹"; }
+    if (ok) { fbRequestScan(st.fbPath); st.fmStatus = "已新建文件夹"; }
     else st.fmStatus = "新建失败";
     fmBackToBrowser();
     return;
@@ -876,7 +943,7 @@ static void fmCommitRename() {
   if (ok) {
     // 正在读的就是这本书 → 跟着改名，否则进度/书签按旧路径存，重开对不上。
     if (st.bookKind == e->kind && st.bookPath == oldPath) st.bookPath = newPath;
-    fbScan(st.fbPath);
+    fbRequestScan(st.fbPath);
     st.fmStatus = "已重命名";
   } else {
     st.fmStatus = "重命名失败";

@@ -228,6 +228,7 @@ static void ntpSyncTask(void *arg) {
 // 主任务里做"检查+置位"（两个 spawn 点都在主任务），置位后才创建任务。
 static std::atomic<bool> s_btInitRunning{false};
 static std::atomic<bool> s_btInitStop{false};
+static std::atomic<bool> s_btManageActive{false};
 
 static void btInitBody() {
     ESP_LOGI(TAG, "Starting Bluetooth...");
@@ -235,20 +236,50 @@ static void btInitBody() {
         ESP_LOGE(TAG, "Bluetooth init failed");
         return;
     }
-    g_bt.loadPairedDevices();
-    if (g_bt.pairedDeviceCount() == 0) return;
-    ESP_LOGI(TAG, "Found %d saved keyboard(s), will auto-connect...",
-             g_bt.pairedDeviceCount());
-    const BtPairedDevice *p = g_bt.getPairedDevice(0);
-    int64_t deadline = esp_timer_get_time() + 60 * 1000000LL;
-    // 200ms 一片而不是整 5 秒睡：休眠要起新实例时，旧实例最多 200ms 就能退出，
-    // 不用等它睡满 5 秒（等待循环见 spawnBtInit）。
-    while (!g_bt.isConnected() && esp_timer_get_time() < deadline &&
-           !s_btInitStop.load(std::memory_order_relaxed)) {
-        if (!g_bt.isScanning()) g_bt.connectBDA(p->bda, p->addr_type);
-        for (int i = 0; i < 25 && !s_btInitStop.load(std::memory_order_relaxed); i++) {
-            vTaskDelay(pdMS_TO_TICKS(200));
+    int64_t lastReloadUs = 0;
+    int64_t lastRetryUs = 0;
+    int tryIdx = 0;
+    bool listLoaded = false;
+    bool wasConnected = false;
+    while (!s_btInitStop.load(std::memory_order_relaxed)) {
+        if (s_btManageActive.load(std::memory_order_relaxed)) {
+            wasConnected = false;
+            lastRetryUs = 0;
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
         }
+        if (g_bt.isConnected()) {
+            if (!wasConnected) ESP_LOGI(TAG, "Bluetooth connected, stopping retry logic");
+            wasConnected = true;
+            lastRetryUs = 0;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        if (wasConnected) {
+            ESP_LOGW(TAG, "Bluetooth disconnected");
+            wasConnected = false;
+        }
+        const int64_t nowUs = esp_timer_get_time();
+        if (!listLoaded || nowUs - lastReloadUs > 30000000) {
+            lastReloadUs = nowUs;
+            g_bt.loadPairedDevices();
+            listLoaded = g_bt.pairedDeviceCount() > 0;
+            tryIdx = 0;
+            if (listLoaded) ESP_LOGI(TAG, "Loaded %d paired device(s)", g_bt.pairedDeviceCount());
+        }
+        if (listLoaded && !g_bt.isConnecting() &&
+            (lastRetryUs == 0 || nowUs - lastRetryUs > 2000000)) {
+            lastRetryUs = nowUs;
+            const int n = g_bt.pairedDeviceCount();
+            if (n > 0) {
+                if (tryIdx >= n) tryIdx = 0;
+                const BtPairedDevice *p = g_bt.getPairedDevice(tryIdx);
+                ESP_LOGI(TAG, "BT auto-reconnect retry %d/%d...", tryIdx + 1, n);
+                if (p) g_bt.connectBDA(p->bda, p->addr_type);
+                tryIdx = (tryIdx + 1) % n;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
@@ -272,6 +303,7 @@ static void spawnBtInit() {
             return;
         }
     }
+    s_btInitStop.store(false, std::memory_order_relaxed);
     s_btInitRunning.store(true, std::memory_order_release);
     if (xTaskCreatePinnedToCore(btInitTask, "bt_init", 8192, NULL, 5, NULL, 1) != pdPASS) {
         s_btInitRunning.store(false, std::memory_order_release);
@@ -344,6 +376,10 @@ static void enterLightSleep(void) {
     typingClickRelease();
 
     // 完全关断 BLE 射频(若键盘已连接,deinit 会同时断开 HID 连接)
+    s_btInitStop.store(true, std::memory_order_relaxed);
+    for (int i = 0; i < 30 && s_btInitRunning.load(std::memory_order_acquire); i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
     g_bt.deinit();
 
     // 墨水屏断电(双稳态保留画面)
@@ -1407,64 +1443,7 @@ extern "C" void app_main() {
             key = 0;
         }
 
-        // ── BT auto-reconnect retry ──────────────────────────────────────
-        // 多设备: 断线后按最近使用顺序轮询已配对设备, 谁在线连谁
-        // 面板内暂停自动重连, 避免干扰扫描/管理
-        {
-            static int64_t last_bt_retry_us = 0;
-            static int64_t last_bt_reload_us = 0;
-            static bool bt_list_loaded = false;
-            static int bt_try_idx = 0;
-            static bool bt_was_connected = false;
-
-            if (currentState == APP_BT_MANAGE) {
-                // 用户正在管理面板, 暂停自动重连
-                bt_was_connected = false;
-                last_bt_retry_us = 0;
-            } else if (g_bt.isConnected()) {
-                if (!bt_was_connected) {
-                    ESP_LOGI(TAG, "Bluetooth connected, stopping retry logic");
-                }
-                bt_was_connected = true;
-                last_bt_retry_us = 0;
-            } else {
-                if (bt_was_connected) {
-                    ESP_LOGW(TAG, "Bluetooth disconnected");
-                    bt_was_connected = false;
-                }
-
-                if (!bt_was_connected) {
-                    // Periodically reload paired device list (反映面板增删/新连接)
-                    if (g_bt.isInitialized()) {
-                        int64_t now_us = esp_timer_get_time();
-                        if (last_bt_reload_us == 0 || (now_us - last_bt_reload_us) > 30000000) {
-                            last_bt_reload_us = now_us;
-                            g_bt.loadPairedDevices();
-                            bt_list_loaded = g_bt.pairedDeviceCount() > 0;
-                            bt_try_idx = 0;
-                            if (bt_list_loaded)
-                                ESP_LOGI(TAG, "Loaded %d paired device(s)", g_bt.pairedDeviceCount());
-                        }
-                    }
-
-                    if (bt_list_loaded && !g_bt.isConnecting()) {
-                        int64_t now_us = esp_timer_get_time();
-                        if (last_bt_retry_us == 0 || (now_us - last_bt_retry_us) > 2000000) {
-                            last_bt_retry_us = now_us;
-                            int n = g_bt.pairedDeviceCount();
-                            if (n > 0) {
-                                if (bt_try_idx >= n) bt_try_idx = 0;
-                                const BtPairedDevice *p = g_bt.getPairedDevice(bt_try_idx);
-                                ESP_LOGI(TAG, "BT auto-reconnect retry %d/%d...",
-                                         bt_try_idx + 1, n);
-                                g_bt.connectBDA(p->bda, p->addr_type);
-                                bt_try_idx = (bt_try_idx + 1) % n;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        s_btManageActive.store(currentState == APP_BT_MANAGE, std::memory_order_relaxed);
 
         // ── Physical key handling (3 电容键 → input_key_held) ────────────
         // 单击动作在双击窗口结束后才生效(防止双击第一下误发导航键,仅蓝牙管理面板有双击动作)
@@ -1772,6 +1751,7 @@ extern "C" void app_main() {
         // 界面生命周期收口（后半）：收各屏 handle 返回的 next（Esc 退出、进子页…）。
         // 与上面那次同一个函数，幂等 —— 界面没换就是一次比较。
         syncScreenLifecycle(currentState, ctx);
+        const Screen &activeScr = kScreens[currentState];
 
         // 网页端「设为待机画面」的取件点。投递方是 httpd 任务（栈只有 8KB，解不了
         // 几百万像素的大图），真正解图必须落在主任务（16KB）上，见 screen_reader.h。
@@ -1788,7 +1768,7 @@ extern "C" void app_main() {
         // 面板会僵在屏幕上直到下次按键。这里只管**整界面**进出时的兜底。
         // 名单**不在这一行了**，它是 kScreens 的 vk_host 列（main/ui/screen.h）——
         // 加一个会打字的界面时改表，别再在这里补一个 ||。
-        const bool vkHost = scr.vk_host;
+        const bool vkHost = activeScr.vk_host;
         if (!vkHost && editorVkVisible()) editorVkSetVisible(false);
         // 打字极速刷新（整屏 DU 差分，每键约 220ms，比 GL16 整屏 410ms 快一倍）只在
         // **实体键盘**输入时开：物理键连发才需要抢这半拍。虚拟键盘是手点的，一键一次、
@@ -1816,7 +1796,7 @@ extern "C" void app_main() {
         // 新扩的宿主（灵感/润色/提示词/flomo）只在**键盘真弹着**时算：没弹键盘时它们
         // 本来就没有抢时间的输入，走默认规则。
         const bool gtdBrowsing = (currentState == APP_GTD) && !typingHere;
-        ui_set_local_only((vkHost && vkHere) || scr.local_only || gtdBrowsing);
+        ui_set_local_only((vkHost && vkHere) || activeScr.local_only || gtdBrowsing);
 
         // 蓝牙键盘低电提示：电量是 HID 异步上报的（bt_keyboard 的事件回调），这里
         // 把待发标记取出来，借现成的居中提示通道报 1.5s。状态栏那个蓝牙图标只表示

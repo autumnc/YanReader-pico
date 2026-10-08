@@ -1,5 +1,6 @@
 #include "webdav_client.h"
 #include "journal_storage.h"
+#include "settings_manager.h"
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
@@ -14,6 +15,10 @@
 
 static const char *TAG = "WebDAV";
 WebDavClient g_webdav;
+
+static bool webdavDebugLogOn() {
+    return g_settings.getString("webdav_debug_log", "0") == "1";
+}
 
 // Simple XML parser for PROPFIND multi-status responses
 // Finds all <d:response> elements and extracts href, getlastmodified
@@ -158,8 +163,9 @@ static std::string httpRequest(const std::string &url, const std::string &method
                  esp_err_to_name(resp.err));
         status = -static_cast<int>(resp.err);  // 用负的错误码表示网络错误
     } else {
-        ESP_LOGI(TAG, "HTTP %s %s status=%d bytes=%u", method.c_str(), url.c_str(), status,
-                 static_cast<unsigned>(resp.got));
+        if (webdavDebugLogOn())
+            ESP_LOGI(TAG, "HTTP %s %s status=%d bytes=%u", method.c_str(), url.c_str(), status,
+                     static_cast<unsigned>(resp.got));
         if (resp.truncated) ESP_LOGW(TAG, "Response body exceeds 2MB limit, truncating");
     }
     if (outStatusCode) *outStatusCode = status;
@@ -170,10 +176,10 @@ bool WebDavClient::ensureDirectory(const std::string &path) {
     if (!isConfigured()) return false;
     std::string url = buildUrl(path);
     std::string auth = authHeader();
-    ESP_LOGI(TAG, "MKCOL request for: %s", url.c_str());
+    if (webdavDebugLogOn()) ESP_LOGI(TAG, "MKCOL request for: %s", url.c_str());
     int status = 0;
     httpRequest(url, "MKCOL", auth, "", "", "", &status);
-    ESP_LOGI(TAG, "MKCOL status: %d", status);
+    if (webdavDebugLogOn()) ESP_LOGI(TAG, "MKCOL status: %d", status);
     // 201=Created, 405=Already exists, 200/301/302=OK
     return (status == 201 || status == 200 || status == 405 || status == 301 || status == 302);
 }
@@ -228,20 +234,21 @@ std::vector<std::pair<std::string, std::string>> WebDavClient::listFiles(const s
     auto body = httpRequest(url, "PROPFIND", auth, propfindBody,
                             "application/xml; charset=utf-8", "1", &status);
 
-    ESP_LOGI(TAG, "PROPFIND status: %d, response length: %d", status, (int)body.length());
+    const bool debugLog = webdavDebugLogOn();
+    if (debugLog) ESP_LOGI(TAG, "PROPFIND status: %d, response length: %d", status, (int)body.length());
     if (status != 207 && status != 200) {
         ESP_LOGW(TAG, "PROPFIND failed with status %d", status);
         return result;
     }
 
     // Debug: log first 500 chars of response
-    if (!body.empty()) {
+    if (debugLog && !body.empty()) {
         std::string preview = body.substr(0, std::min((size_t)500, body.length()));
         ESP_LOGI(TAG, "PROPFIND response preview:\n%s", preview.c_str());
     }
 
     auto entries = parsePropfindResponse(body);
-    ESP_LOGI(TAG, "Parsed %d entries from PROPFIND", (int)entries.size());
+    if (debugLog) ESP_LOGI(TAG, "Parsed %d entries from PROPFIND", (int)entries.size());
     for (auto &e : entries) {
         if (e.isCollection) continue;
         // Extract filename from href
@@ -365,38 +372,39 @@ SyncResult WebDavClient::sync(const std::string &localDir) {
     }
 
     // Collect local files with mtimes
+    const bool debugLog = webdavDebugLogOn();
     auto localPairs = g_journal.listFileMtimes();
-    ESP_LOGI(TAG, "Local files found: %d", (int)localPairs.size());
+    if (debugLog) ESP_LOGI(TAG, "Local files found: %d", (int)localPairs.size());
     std::map<std::string, time_t> localFiles;
     for (auto &p : localPairs) {
         localFiles[p.first] = p.second;
-        ESP_LOGI(TAG, "  Local: %s (mtime=%lld)", p.first.c_str(), (long long)p.second);
+        if (debugLog) ESP_LOGI(TAG, "  Local: %s (mtime=%lld)", p.first.c_str(), (long long)p.second);
     }
 
     // Collect remote files with mtimes
-    ESP_LOGI(TAG, "Fetching remote file list from: %s", remoteDir.c_str());
+    if (debugLog) ESP_LOGI(TAG, "Fetching remote file list from: %s", remoteDir.c_str());
     auto remoteList = listFiles(remoteDir);
-    ESP_LOGI(TAG, "Remote files found: %d", (int)remoteList.size());
+    if (debugLog) ESP_LOGI(TAG, "Remote files found: %d", (int)remoteList.size());
     std::map<std::string, time_t> remoteFiles;
     for (auto &rf : remoteList) {
         if (!isJournalFile(rf.first)) continue;
         remoteFiles[rf.first] = parseWebdavDate(rf.second);
-        ESP_LOGI(TAG, "  Remote: %s (mtime=%lld)", rf.first.c_str(), (long long)remoteFiles[rf.first]);
+        if (debugLog) ESP_LOGI(TAG, "  Remote: %s (mtime=%lld)", rf.first.c_str(), (long long)remoteFiles[rf.first]);
     }
 
     // Load previous sync state
     auto prevState = loadSyncState();
-    ESP_LOGI(TAG, "Previous sync state entries: %d", (int)prevState.size());
+    if (debugLog) ESP_LOGI(TAG, "Previous sync state entries: %d", (int)prevState.size());
 
     // If no remote files found, try listing root directory
     if (remoteFiles.empty() && remoteDir != "") {
-        ESP_LOGI(TAG, "No files in journal/, trying root directory...");
+        if (debugLog) ESP_LOGI(TAG, "No files in journal/, trying root directory...");
         auto rootList = listFiles("");
-        ESP_LOGI(TAG, "Root directory files: %d", (int)rootList.size());
+        if (debugLog) ESP_LOGI(TAG, "Root directory files: %d", (int)rootList.size());
         for (auto &rf : rootList) {
             if (!isJournalFile(rf.first)) continue;
             remoteFiles[rf.first] = parseWebdavDate(rf.second);
-            ESP_LOGI(TAG, "  Root: %s (mtime=%lld)", rf.first.c_str(), (long long)remoteFiles[rf.first]);
+            if (debugLog) ESP_LOGI(TAG, "  Root: %s (mtime=%lld)", rf.first.c_str(), (long long)remoteFiles[rf.first]);
         }
     }
 
@@ -424,8 +432,9 @@ SyncResult WebDavClient::sync(const std::string &localDir) {
         bool remoteExists = remoteFiles.find(fname) != remoteFiles.end();
         bool inPrev = prevState.find(fname) != prevState.end();
 
-        ESP_LOGI(TAG, "Processing %s: local=%d remote=%d inPrev=%d",
-                 fname.c_str(), localExists, remoteExists, inPrev);
+        if (debugLog)
+            ESP_LOGI(TAG, "Processing %s: local=%d remote=%d inPrev=%d",
+                     fname.c_str(), localExists, remoteExists, inPrev);
 
         time_t localMtime = localExists ? localFiles[fname] : 0;
         time_t remoteMtime = remoteExists ? remoteFiles[fname] : 0;
@@ -439,7 +448,7 @@ SyncResult WebDavClient::sync(const std::string &localDir) {
                 else failed++;
             } else {
                 // Remote new → download
-                ESP_LOGI(TAG, "Downloading remote file: %s", fname.c_str());
+                if (debugLog) ESP_LOGI(TAG, "Downloading remote file: %s", fname.c_str());
                 int dlStatus = 0;
                 std::string content = download(remoteDir + fname, &dlStatus);
                 if ((dlStatus == 200 || dlStatus == 203) &&

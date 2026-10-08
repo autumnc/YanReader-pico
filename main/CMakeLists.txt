@@ -37,6 +37,8 @@ endif()
 idf_component_register(SRCS
     "main.cpp"
     "pjournal_app.cpp"
+    "app_async.cpp"
+    "app_services.cpp"
     "ui_helpers.cpp"
     "ui_render.cpp"
     "safe_file.cpp"
