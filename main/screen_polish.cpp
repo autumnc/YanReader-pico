@@ -91,6 +91,13 @@ static void drawWorking(const char *msg) {
     ui_commit();
 }
 
+// 结果正文一屏的行数（与 drawResult 的首行同源）——翻页步长用它。
+static int polishResultRows() {
+    const int y = FONT_H + 8 + LINE_SPACING;
+    int v = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
+    return v < 1 ? 1 : v;
+}
+
 static void drawResult() {
     ui_clear();
     char src[32];
@@ -221,6 +228,11 @@ AppState screen_polish_handle(int key, ScreenContext &ctx) {
         return APP_EDITOR;
     }
 
+    // 触摸上下滑的翻页键（主循环不再替本界面回退成单步）：只有**润色结果页**按屏翻
+    // （下面接 KEY_PAGE_*）；指令对话框里的上下键归文本光标/输入法，保持单步。
+    if ((key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) && g.phase != P_RESULT)
+        key = (key == KEY_PAGE_UP) ? KEY_UP : KEY_DOWN;
+
     // ── instruction dialog (R key) ──
     if (g.phase == P_EDIT_INSTR) {
         // 虚拟键盘点按：落在键盘面板上的点按翻译成键码，喂给下面的输入逻辑。
@@ -340,6 +352,12 @@ AppState screen_polish_handle(int key, ScreenContext &ctx) {
             if (g.scroll > 0) g.scroll--;
         } else if (key == KEY_DOWN) {
             g.scroll++;
+        } else if (key == KEY_PAGE_UP) {
+            // 触摸上下滑 = 整页翻（与列表/长文同一条规矩）：一步一屏。上限在画的时候夹住。
+            g.scroll -= polishResultRows();
+            if (g.scroll < 0) g.scroll = 0;
+        } else if (key == KEY_PAGE_DOWN) {
+            g.scroll += polishResultRows();
         }
         drawResult();
         return APP_POLISH;

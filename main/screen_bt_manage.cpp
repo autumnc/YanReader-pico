@@ -1,6 +1,7 @@
 #include "screen_bt_manage.h"
 #include "bt_keyboard.h"
 #include "ui_helpers.h"
+#include "ui/list_view.h"  // listPageStep：手写列表的翻页步长（一屏行数 / 没得翻 = 0）
 #include "quick_edit.h"
 #include "input.h"       // input_tap_xy：点按/长按的落点靠它（浮动按钮与长按菜单都要）
 #include <cstdio>
@@ -48,6 +49,24 @@ static int fabW() { return g_font.textWidth("+ 添加设备") + 36; }
 static int fabH() { return FONT_H + 10; }
 static int fabX() { return SCREEN_W - fabW() - 10; }
 static int fabY() { return STATUS_Y - fabH() - 8; }
+
+// ── 翻页步长（触摸上下滑 = 整页翻）：与对应绘制函数**同一个基准**（那边是排版，
+// 这边是翻页；两处各写一遍式子迟早会漂）。行数 < 1 时抬到 1。
+static int btScanRows() {
+    const int y = FONT_H + 8 + LINE_SPACING + (g_btState.connecting ? FONT_H : 0);
+    int v = (STATUS_Y - y + FONT_H - 1) / FONT_H;  // 与 drawScan 同式
+    return v < 1 ? 1 : v;
+}
+static int btPairedRows() {
+    const int y = manageRowBase() + (g_btState.connecting ? FONT_H : 0);
+    int v = (fabY() - 4 - y + FONT_H - 1) / FONT_H;  // 与 drawManageBase 同式
+    return v < 1 ? 1 : v;
+}
+static int btHelpRows() {
+    const int contentY = ui_title_baseline() + g_font.descent() + 12;
+    int v = (STATUS_Y - contentY) / LINE_SPACING;  // 与 drawHelp 同式
+    return v < 1 ? 1 : v;
+}
 static bool fabHit(int x, int y) {
     return x >= fabX() && x < fabX() + fabW() && y >= fabY() && y < fabY() + fabH();
 }
@@ -322,6 +341,12 @@ static void drawHelp() {
 }
 
 AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
+    // 触摸上下滑的翻页键（主循环不再替本界面回退成单步）：扫描列表 / 已配对列表 /
+    // 帮助正文都按屏翻（下面各自接 KEY_PAGE_*）；只有长按弹的设备菜单保持单步。
+    if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+        if (g_btState.menuOpen) key = (key == KEY_PAGE_UP) ? KEY_UP : KEY_DOWN;
+    }
+
     // 扫描完成跟踪
     if (g_btState.scanning && !g_bt.isScanning()) {
         g_btState.scanning = false;
@@ -352,6 +377,11 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
             if (g_btState.helpScroll > 0) g_btState.helpScroll--;
         } else if (key == KEY_DOWN) {
             g_btState.helpScroll++;
+        } else if (key == KEY_PAGE_UP) {
+            g_btState.helpScroll -= btHelpRows();
+            if (g_btState.helpScroll < 0) g_btState.helpScroll = 0;
+        } else if (key == KEY_PAGE_DOWN) {
+            g_btState.helpScroll += btHelpRows();  // 上限在画的时候夹住
         } else if (key == 0x1B || key == 'q' || key == 'Q' || key == '?') {
             g_btState.showHelp = false;
         }
@@ -386,6 +416,15 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
                 if (g_btState.selection > 0) g_btState.selection--;
             } else if (key == KEY_DOWN) {
                 if (g_btState.selection < g_bt.deviceCount() - 1) g_btState.selection++;
+            } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+                // 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。
+                const int n = g_bt.deviceCount();
+                const int step = listPageStep(n, btScanRows());
+                if (step > 0) {
+                    g_btState.selection += (key == KEY_PAGE_DOWN) ? step : -step;
+                    if (g_btState.selection < 0) g_btState.selection = 0;
+                    if (g_btState.selection > n - 1) g_btState.selection = n - 1;
+                }
             } else if (key == 0x0A || key == 0x0D) {
                 int n = g_bt.deviceCount();
                 if (n > 0 && g_btState.selection < n) {
@@ -480,6 +519,15 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
         if (g_btState.selection > 0) g_btState.selection--;
     } else if (key == KEY_DOWN) {
         if (g_btState.selection < g_bt.pairedDeviceCount() - 1) g_btState.selection++;
+    } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+        // 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。
+        const int n = g_bt.pairedDeviceCount();
+        const int step = listPageStep(n, btPairedRows());
+        if (step > 0) {
+            g_btState.selection += (key == KEY_PAGE_DOWN) ? step : -step;
+            if (g_btState.selection < 0) g_btState.selection = 0;
+            if (g_btState.selection > n - 1) g_btState.selection = n - 1;
+        }
     } else if (key == 0x0A || key == 0x0D) {
         int n = g_bt.pairedDeviceCount();
         int tx = 0, ty = 0;

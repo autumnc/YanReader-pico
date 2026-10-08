@@ -2052,17 +2052,24 @@ static bool face_has_cp(int role, uint32_t cp) {
 }
 
 // 替补顺序：**与当前面互补的那一面优先**。
-//   当前是正文面(CONTENT)          → 内置面：它覆盖最全(7717 字，ASCII 全在)。
+//   当前是正文面(CONTENT)          → 先这本书自己的家族面(ALT/ALT2)、再内置面。
 //   当前是内置面(界面外壳)         → 内容面：用户装的字体 CJK 覆盖通常比内置子集更宽。
 //   当前是书内某个家族面(ALT/ALT2) → 先内容面、再**另一个家族面**：同一本书、同一套观感；
 //                                    最后才轮到内置面（覆盖最全，兜底）。
 // 未打开的面 face_has_cp 立刻返回 false，所以给两家族的书多带一列、多试一个家族面不花时间。
 // 返回角色；-1 = 谁都没有(调用方照旧画 .notdef)。
+//
+// ★ 正文面的第一替补是**书里的家族面**，不是内置面 —— 这条曾经是反的，代价是整块注文变
+// 空白。内置面那 7717 字是"通用汉字最全"，但一本学术书的字表可以整块落在通用表之外：
+// 莊子校詮 正文面是书里 2965 字形的书宋子集，注文那 5743 个字里有 2848 个不在它里面，
+// 也不在内置面里（内建只cover 该书的 2815/5824），而书里那份 6117 字形的注文字面
+// (家族 st4) 覆盖 5752/5824 —— 它当时根本没被装进 ALT 槽（选面口径所限，见 Epub.cpp 的
+// resolveEmbeddedFonts），就算装进来了，正文面也只会去问内置面，问不到手上就有的那一份。
 static int fallback_role_for(uint32_t cp) {
     // 行 = 当前面，列 = 依次尝试的替补面，-1 表示到此为止。**四个角色各一行**，
     // TTF_ROLE_COUNT 变了这里必须跟着变（列数=角色数）。
     static const int8_t kOrder[TTF_ROLE_COUNT][TTF_ROLE_COUNT] = {
-        /* CONTENT      */ {TTF_ROLE_UI, -1, -1, -1},
+        /* CONTENT      */ {TTF_ROLE_CONTENT_ALT, TTF_ROLE_CONTENT_ALT2, TTF_ROLE_UI, -1},
         /* UI           */ {TTF_ROLE_CONTENT, -1, -1, -1},
         /* CONTENT_ALT  */ {TTF_ROLE_CONTENT, TTF_ROLE_CONTENT_ALT2, TTF_ROLE_UI, -1},
         /* CONTENT_ALT2 */ {TTF_ROLE_CONTENT, TTF_ROLE_CONTENT_ALT, TTF_ROLE_UI, -1},

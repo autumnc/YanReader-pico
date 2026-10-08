@@ -144,7 +144,9 @@ std::string Txt::findCoverImage() const {
 
 // v2 = 8 位灰阶封面，与 Epub 同步换名（改名才会让老缓存失效重生成）。
 // / v2 = 8-bit grayscale cover, renamed in step with Epub so the old cache is invalidated.
-std::string Txt::getCoverBmpPath() const { return cachePath + "/cover_v2.bmp"; }
+// 名字要与 Epub/Xtc 以及 screen_reader 的 coverBmpPathFor 一致（见 Epub::getCoverBmpPath
+// 的说明）。TXT 封面不是 JPEG，v2→v3 只是跟着一起换名，内容不变。
+std::string Txt::getCoverBmpPath() const { return cachePath + "/cover_v3.bmp"; }
 
 bool Txt::generateCoverBmp() const {
   // Already generated, return true

@@ -5,6 +5,8 @@
 #include <JPEGDEC.h>
 #include <Logging.h>
 #include <Memory.h>
+#include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -13,6 +15,10 @@
 #include <new>
 
 #include "BitmapHelpers.h"
+// 只要声明（实现在 StbImageImpl.cpp，那里把 stb 的分配钉在 PSRAM）。
+// / Declarations only; the implementation lives in StbImageImpl.cpp.
+#include "stb_image.h"
+#include "ProgressiveJpegScaled.h"
 
 // ============================================================================
 // IMAGE PROCESSING OPTIONS - Toggle these to test different configurations
@@ -541,6 +547,366 @@ int bmpDrawCallback(JPEGDRAW* pDraw) {
 
 }  // namespace
 
+// =============================================================================
+// 渐进式 JPEG 封面：换一个能**全解**的解码器（stb_image）
+// =============================================================================
+// JPEGDEC 对渐进式（SOF2）只解第一条扫描的 DC 系数 —— 那固定是 1/8 分辨率，也是它
+// 能给出的最好结果（jpeg.inl 把 scaleOption 钉成 JPEG_SCALE_EIGHTH 的原因）。封面
+// 盒子 396×528（待机整屏 593×890），所以糊多少完全由源图多宽决定：600px 的封面退化
+// 到 75px 再双线性放大 5 倍，糊成一团；2644px 的扫描件退化到 330px 只放大 1.2 倍，
+// 只是略软。同一格书架上"有的清楚有的糊"就是这么来的 —— 基线与 PNG 走的是
+// chooseJpegScale 的 DCT 缩放 + 区域平均，干净利落。
+//
+// 真修：渐进式来源交给 stb_image（公有领域单头文件；实现 TU 见 StbImageImpl.cpp，
+// 兄弟仓库 read_pico_firmware 对同一个问题用的也是它）。全部扫描解出来之后再按区域
+// 平均缩到目标尺寸，采样口径与基线那条路的 flushScaledRow 一致，所以两条路清晰度同级。
+//
+// 代价是内存：渐进式的系数必须整幅留在 RAM 里（每个系数像素 raw_data 1 + raw_coeff
+// 2 字节，彩色还要按分量采样比累加），出图再要 3 字节/像素。所以这条路只走得起中小
+// 源图（8 MB PSRAM 上大约 800×1200 以内）—— 而更大的源图本来就只是略软（1/8 也够
+// 396px 的盒子用），落回 JPEGDEC 老路没有损失。够不够是**按 SOF 算出来的峰值**当场
+// 判的，不是拍一个像素上限：判完写一行 INFO，设备自己就把"库里渐进式占多少、够不够
+// 全解"报出来。
+//
+// 位置：在 JPEGDEC 打开**之前**。一是成功时根本不建那套解码器（省 ~18 KB scratch），
+// 二是失败时必须能干净回退 —— JPEGDEC 的读取是顺序的、自己记 iPos，中途被我们
+// seek(0) 读一遍会把它的状态搞乱，所以只能在 `jpeg->open()` 之前动文件。
+// =============================================================================
+
+// SOF 段里能读到的、决定"要不要走 stb"的全部信息。
+struct JpegSofInfo {
+  int width = 0;
+  int height = 0;
+  int components = 0;
+  uint8_t marker = 0;        // 帧段标记（0xC0/0xC1 基线，0xC2 渐进式）
+  uint8_t sampling[4] = {};  // 高 4 位水平、低 4 位垂直采样因子
+};
+
+// 沿段结构走到 SOF（不解码、不解熵）。失败一律返回 false —— 判不出来就不接管，
+// 让 JPEGDEC 那条老路去处理。
+static bool jpegScanSof(const uint8_t* buf, const size_t len, JpegSofInfo* out) {
+  if (len < 4 || buf[0] != 0xFF || buf[1] != 0xD8) return false;  // 不是 JPEG
+  size_t pos = 2;
+  while (pos + 4 <= len) {
+    if (buf[pos] != 0xFF) return false;  // 段边界对不上，别猜
+    const uint8_t marker = buf[pos + 1];
+    if (marker == 0xFF) {  // 段间填充
+      pos++;
+      continue;
+    }
+    pos += 2;
+    if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;  // 无载荷
+    if (marker == 0xD9 || marker == 0xDA) return false;                  // 到 SOS/EOI 还没见 SOF
+    if (pos + 2 > len) return false;
+    const size_t segLen = (static_cast<size_t>(buf[pos]) << 8) | buf[pos + 1];
+    if (segLen < 2 || pos + segLen > len) return false;
+    // SOF0..SOF15，去掉 DHT(0xC4) / JPG(0xC8) / DAC(0xCC) 三个非帧段。
+    const bool isSof = marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+    if (isSof) {
+      const uint8_t* p = buf + pos + 2;  // 精度(1) 高(2) 宽(2) 分量数(1) 各分量(3)
+      if (segLen < 8) return false;
+      out->height = (static_cast<int>(p[1]) << 8) | p[2];
+      out->width = (static_cast<int>(p[3]) << 8) | p[4];
+      out->components = p[5];
+      if (out->width <= 0 || out->height <= 0) return false;
+      if (out->components < 1 || out->components > 4) return false;
+      if (segLen < 8 + 3 * static_cast<size_t>(out->components)) return false;
+      for (int i = 0; i < out->components; i++) out->sampling[i] = p[7 + 3 * i];
+      out->marker = marker;
+      return true;
+    }
+    pos += segLen;
+  }
+  return false;
+}
+
+// 渐进式全解的峰值内存（照 stb 的分配算：每个分量 raw_data 1 + raw_coeff 2 字节，
+// 尺寸按 MCU 对齐后的 w2×h2；再算上出图的 img_n 通道整幅）。
+// / Peak bytes for a full progressive decode, from stb's own allocation pattern.
+static size_t progressiveDecodeBytes(const JpegSofInfo& sof) {
+  int hMax = 1, vMax = 1;
+  for (int i = 0; i < sof.components; i++) {
+    const int h = sof.sampling[i] >> 4, v = sof.sampling[i] & 0x0F;
+    if (h > hMax) hMax = h;
+    if (v > vMax) vMax = v;
+  }
+  if (hMax <= 0 || vMax <= 0) return SIZE_MAX;
+  const size_t mcuX = (static_cast<size_t>(sof.width) + hMax * 8 - 1) / (hMax * 8);
+  const size_t mcuY = (static_cast<size_t>(sof.height) + vMax * 8 - 1) / (vMax * 8);
+  size_t bytes = 0;
+  for (int i = 0; i < sof.components; i++) {
+    const int h = sof.sampling[i] >> 4, v = sof.sampling[i] & 0x0F;
+    if (h <= 0 || v <= 0) return SIZE_MAX;
+    bytes += mcuX * h * 8 * mcuY * v * 8 * 3;
+  }
+  // 出图那一幅：彩色源我们直接要 3 通道（避免 stb 转换时两幅并存），灰度源 1 通道。
+  bytes += static_cast<size_t>(sof.width) * sof.height * (sof.components > 1 ? 3 : 1);
+  // stb 自己的固定开销（霍夫曼表、行缓冲、那两三个内部缓冲）实测约 20 KB，跟图大小
+  // 基本无关（主机端拿计数分配器量过 200×300 / 600×800 / 900×1200 / 1600×2000 四张，
+  // 差值稳定在 19~23 KB）。这里多留一点：峰值估计只许偏大，偏小就是 OOM。
+  bytes += 64 * 1024;
+  return bytes;
+}
+
+// PSRAM 上的裸缓冲。用 memory::ByteBuffer（它的释放是 free()，在
+// CONFIG_SPIRAM_USE_MALLOC 下与 heap_caps_malloc 配对，Memory.h 自己的
+// makePsramByteBuffer* 就是这么用的）。**不用**那个 helper：它要求在编译期定义
+// BOARD_HAS_PSRAM，本工程没有这个宏，它会一律返回空。
+// stb 那边的分配器同样钉在 PSRAM（StbImageImpl.cpp）—— 阅读模式下内部堆只剩
+// 几十 KB，几百 KB 的文件缓冲进去就是灾难。
+static memory::ByteBuffer allocPsramBuffer(const size_t size) {
+  if (size == 0) return {};
+  return memory::ByteBuffer{static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT))};
+}
+
+// 输出尺寸：没给目标尺寸就是源尺寸（渐进式沿用 1/8 的旧口径），给了就按 fit/fill 缩放并
+// 夹到 1 像素以上。抽出来给两条路共用 —— 渐进式那条要在 JPEGDEC 打开之前就算出与老路
+// 一模一样的 outWidth/outHeight。
+// / Output dimensions, shared by both decoders so they agree exactly.
+static bool computeOutputDims(const int srcWidth, const int srcHeight, const int targetWidth, const int targetHeight,
+                              const bool crop, const bool progressiveDecode, int* outWidth, int* outHeight) {
+  constexpr int MAX_IMAGE_WIDTH = 2048;
+  constexpr int MAX_IMAGE_HEIGHT = 3072;
+  int w = srcWidth;
+  int h = srcHeight;
+  if (targetWidth <= 0 || targetHeight <= 0) {
+    w = progressiveDecode ? (srcWidth + 7) / 8 : srcWidth;
+    h = progressiveDecode ? (srcHeight + 7) / 8 : srcHeight;
+  } else if (srcWidth != targetWidth || srcHeight != targetHeight) {
+    const float scaleToFitWidth = static_cast<float>(targetWidth) / srcWidth;
+    const float scaleToFitHeight = static_cast<float>(targetHeight) / srcHeight;
+    const float scale = crop ? (scaleToFitWidth > scaleToFitHeight ? scaleToFitWidth : scaleToFitHeight)
+                             : (scaleToFitWidth < scaleToFitHeight ? scaleToFitWidth : scaleToFitHeight);
+    w = static_cast<int>(srcWidth * scale);
+    h = static_cast<int>(srcHeight * scale);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+  }
+  if (w <= 0 || h <= 0 || w > MAX_IMAGE_WIDTH || h > MAX_IMAGE_HEIGHT) return false;
+  *outWidth = w;
+  *outHeight = h;
+  return true;
+}
+
+enum class ProgressiveResult {
+  NotApplicable,  // 不是渐进式 / 内存不够 / 认不出来 —— 交给 JPEGDEC，没有任何输出
+  Done,           // 已经写出完整 BMP
+  Failed,         // 已经开始写 BMP 却失败了，调用方不要再接着写第二份
+};
+
+// 降尺度解那棵树里的分配全走 PSRAM：这本来就是内存最紧的时候（DRAM 那边还要留给
+// 解码器和帧缓冲），而且解出来的平面会一直活到写完 BMP。
+const pjscaled::Alloc kPsramAlloc = {
+    [](size_t bytes) -> void* { return heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); },
+    [](void* p) { heap_caps_free(p); }};
+
+// 两条解码路共用的"源图"。stb 解出来的是 srcW×srcH、每像素 comp（1 或 3）通道；降尺度解
+// 出来的是一张 1 通道、行距可能大于宽度的灰度平面（块边界对齐的那种多余列别去读）。
+struct GraySource {
+  const uint8_t* pixels = nullptr;
+  int width = 0;
+  int height = 0;
+  int stride = 0;  // 每行字节数（≥ width·comp）
+  int comp = 1;    // 1 = 已是灰度；3 = RGB，需按 77/151/28 转
+};
+
+// 按区域平均缩到 outW×outH → 写 8bit BMP。两条路共用同一套取样口径，出来的尺寸和亮度
+// 换算与老路逐像素一致。
+//
+// 三个小缓冲先要下来再说 —— 一旦 header 写出去就只能一路写到底，那之后失败只能是
+// Failed（回退给 JPEGDEC 会写出两份 BMP）。所以这函数要么在动笔之前干净地返回
+// NotApplicable，要么返回 Done / Failed。
+static ProgressiveResult writeScaledGrayBmp(Print& bmpOut, const GraySource& src, const int outW,
+                                            const int outH) {
+  const int bytesPerRow = (outW + 3) / 4 * 4;
+  auto row = makeUniqueNoThrow<uint8_t[]>(bytesPerRow);
+  auto accum = makeUniqueNoThrow<uint32_t[]>(outW);
+  auto xEdges = makeUniqueNoThrow<uint32_t[]>(2 * static_cast<size_t>(outW));  // [0,outW) 起 / [outW,..) 止
+  if (!row || !accum || !xEdges) {
+    LOG_ERR("JPG", "OOM: 渐进式缩放缓冲");
+    return ProgressiveResult::NotApplicable;
+  }
+  CheckedBmpOutput checked(bmpOut);
+  writeBmpHeader8bit(checked, outW, outH);
+  if (checked.failed) return ProgressiveResult::Failed;
+
+  // 每个输出列的源列区间，与基线路径的 rowAccum/rowCount 是同一套区域平均。
+  // **两端都向下取整**（瓦片互不重叠、恰好铺满 0..srcW）：早期版本把末端写成 ceil，
+  // 相邻两列会重叠一列源像素，左边缘被重复计权，整幅输出均值会系统性漂一点
+  // （主机端拿 600×800 渐变实测均值掉 0.42 级），做的是缩放不是平移 —— 别改成 ceil。
+  uint32_t* xHi = xEdges.get() + outW;
+  for (int ox = 0; ox < outW; ox++) {
+    uint32_t lo = static_cast<uint32_t>((static_cast<uint64_t>(ox) * src.width) / outW);
+    uint32_t hi = static_cast<uint32_t>((static_cast<uint64_t>(ox + 1) * src.width) / outW);
+    if (hi <= lo) hi = lo + 1;  // 放大时也要至少吃掉一个源像素
+    if (lo >= static_cast<uint32_t>(src.width)) lo = static_cast<uint32_t>(src.width) - 1;
+    if (hi > static_cast<uint32_t>(src.width)) hi = static_cast<uint32_t>(src.width);
+    xEdges[ox] = lo;
+    xHi[ox] = hi;
+  }
+
+  for (int oy = 0; oy < outH; oy++) {
+    const uint32_t y0 = static_cast<uint32_t>((static_cast<uint64_t>(oy) * src.height) / outH);
+    uint32_t y1 = static_cast<uint32_t>((static_cast<uint64_t>(oy + 1) * src.height) / outH);  // 同 x：两端都向下取整
+    if (y1 <= y0) y1 = y0 + 1;
+    if (y1 > static_cast<uint32_t>(src.height)) y1 = static_cast<uint32_t>(src.height);
+    memset(accum.get(), 0, static_cast<size_t>(outW) * sizeof(uint32_t));
+    for (uint32_t y = y0; y < y1; y++) {
+      const uint8_t* srcRow = src.pixels + static_cast<size_t>(y) * src.stride;
+      uint32_t* acc = accum.get();
+      for (int ox = 0; ox < outW; ox++, acc++) {
+        const uint8_t* p = srcRow + static_cast<size_t>(xEdges[ox]) * src.comp;
+        uint32_t sum = 0;
+        for (uint32_t x = xEdges[ox]; x < xHi[ox]; x++, p += src.comp) {
+          // 灰度源直接用；彩色按 stb 同一套亮度权重（77/151/28，和为 256）转一趟。
+          sum += src.comp == 1 ? p[0] : static_cast<uint32_t>((77u * p[0] + 151u * p[1] + 28u * p[2] + 128u) >> 8);
+        }
+        *acc += sum;
+      }
+    }
+    const uint32_t rows = y1 - y0;
+    uint8_t* dst = row.get();
+    for (int ox = 0; ox < outW; ox++) {
+      const uint32_t v = accum[ox] / ((xHi[ox] - xEdges[ox]) * rows);
+      dst[ox] = v > 255 ? 255 : static_cast<uint8_t>(v);
+    }
+    memset(dst + outW, 0, static_cast<size_t>(bytesPerRow - outW));
+    checked.write(dst, bytesPerRow);
+    if ((oy & 15) == 0) vTaskDelay(1);  // 与 IO 路径同样的礼让
+  }
+  if (checked.failed) {
+    LOG_ERR("JPG", "封面 BMP 写入失败（渐进式）");
+    return ProgressiveResult::Failed;
+  }
+  return ProgressiveResult::Done;
+}
+
+// 读整个文件 → stb 全解灰度 → 区域平均缩到目标尺寸 → 写 8bit BMP。
+// 只有"源是渐进式 JPEG + 目标 Gray8"才可能返回 Done；其余情况返回 NotApplicable，
+// 且保证没往 bmpOut 写过任何字节。
+static ProgressiveResult progressiveJpegToGrayBmp(HalFile& file, Print& bmpOut, const int targetWidth,
+                                                  const int targetHeight, const bool crop) {
+  constexpr size_t MAX_FILE_BYTES = 4u << 20;  // stbi_load_from_memory 的长度参数是 int
+  const size_t fileBytes = file.size();
+  if (fileBytes < 16 || fileBytes > MAX_FILE_BYTES) return ProgressiveResult::NotApplicable;
+
+  // 整个文件读进来：渐进式的解码要来回跳扫描，边读边解不划算（而且我们反正要把
+  // 全部扫描喂给 stb）。放不下就安静回退 —— 大文件对应的源图本来就只是略软。
+  memory::ByteBuffer fileBuf = allocPsramBuffer(fileBytes);
+  if (!fileBuf) return ProgressiveResult::NotApplicable;
+  if (!file.seek(0)) return ProgressiveResult::NotApplicable;
+  size_t got = 0;
+  while (got < fileBytes) {
+    const int n = file.read(fileBuf.get() + got, fileBytes - got);
+    if (n <= 0) break;
+    got += static_cast<size_t>(n);
+  }
+  if (got != fileBytes) {
+    LOG_WRN("JPG", "封面文件只读到 %u/%u 字节，落回 JPEGDEC", static_cast<unsigned>(got),
+            static_cast<unsigned>(fileBytes));
+    return ProgressiveResult::NotApplicable;
+  }
+
+  JpegSofInfo sof;
+  if (!jpegScanSof(fileBuf.get(), got, &sof)) {
+    LOG_INF("JPG", "封面：段结构不认识（非 JPEG 或截断），走 JPEGDEC");
+    return ProgressiveResult::NotApplicable;
+  }
+  if (sof.marker != 0xC2) {
+    LOG_INF("JPG", "封面源 %dx%d / %d 分量：非渐进式（SOF 0x%02X），走 JPEGDEC（DCT 缩放 + 区域平均）", sof.width,
+            sof.height, sof.components, sof.marker);
+    return ProgressiveResult::NotApplicable;
+  }
+
+  // 目标尺寸先定下来：两条解码路共用，而且要在解码之前就算得出来（越界就早退，别白解）。
+  int outW = 0, outH = 0;
+  if (!computeOutputDims(sof.width, sof.height, targetWidth, targetHeight, crop, true, &outW, &outH)) {
+    LOG_WRN("JPG", "封面源 %dx%d：目标尺寸越界", sof.width, sof.height);
+    return ProgressiveResult::NotApplicable;
+  }
+
+  const size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  const size_t decodeBytes = progressiveDecodeBytes(sof);
+
+  // ---- 路一：stb 全解（源够小、PSRAM 放得下时质量最好：真·全分辨率）--------------------
+  // fileBuf 已经在账上了，这里只判解码要的那份。
+  if (decodeBytes != SIZE_MAX && freePsram >= decodeBytes + memory::PSRAM_FREE_RESERVE) {
+    // 彩色直接要 3 通道、灰度要 1 通道：与源通道数一致时 stb 不必再分配一幅转换结果
+    // （3→1 的转换会让两幅整图同时活着）。
+    const int reqComp = sof.components > 1 ? 3 : 1;
+    int srcW = 0, srcH = 0, comp = 0;
+    const int64_t startedUs = esp_timer_get_time();
+    stbi_uc* src = stbi_load_from_memory(fileBuf.get(), static_cast<int>(got), &srcW, &srcH, &comp, reqComp);
+    if (src) {
+      const ScopedCleanup freeSrc{[src]() { stbi_image_free(src); }};
+      fileBuf.reset();  // 解完就能放：后面的大头是解出来的那幅像素
+      LOG_DBG("JPG", "Progressive full decode: %dx%d -> %dx%d", srcW, srcH, outW, outH);
+      const GraySource gs{src, srcW, srcH, srcW * reqComp, reqComp};
+      const ProgressiveResult r = writeScaledGrayBmp(bmpOut, gs, outW, outH);
+      if (r == ProgressiveResult::Done) {
+        LOG_INF("JPG", "封面源 %dx%d / %d 分量：渐进式 → stb 全解 %dx%d，峰值约 %u KB，%u ms", srcW, srcH, comp,
+                outW, outH, static_cast<unsigned>(decodeBytes / 1024),
+                static_cast<unsigned>((esp_timer_get_time() - startedUs) / 1000));
+      }
+      return r;
+    }
+    LOG_WRN("JPG", "封面源 %dx%d：渐进式全解失败（%s），改走降尺度解", sof.width, sof.height,
+            stbi_failure_reason());
+  } else {
+    LOG_INF("JPG", "封面源 %dx%d / %d 分量：渐进式，全解约需 %u KB > PSRAM 空闲 %u KB，改走降尺度解",
+            sof.width, sof.height, sof.components, static_cast<unsigned>(decodeBytes / 1024),
+            static_cast<unsigned>(freePsram / 1024));
+  }
+
+  // ---- 路二：降尺度解（渐进式专用）------------------------------------------------------
+  //
+  // 全解放不下时走这条：只解低频、把 8×8 块的 64 个系数折叠回 S×S，内存随**目标盒子**走
+  // （1200×1600 的封面 1/2 约 2.5 MB、1/4 约 1.2 MB），所以大封面也进得来，而且出来的就是
+  // 精确的箱平均（对拍 djpeg -scale，mean ≤0.3 级）。
+  //   · 1/2（S=4）优先 —— "糊"就糊在 JPEGDEC 的渐进式被钉死在 1/8 上，1/2 比它细四倍；
+  //   · 放不下才退 1/4（S=2）；
+  //   · 1/8 不做：它和 JPEGDEC 的 DC 解完全等价（都是 8×8 块平均），再读一遍文件不划算。
+  int hMax = 1, vMax = 1;
+  for (int i = 0; i < sof.components; i++) {
+    const int h = sof.sampling[i] >> 4, v = sof.sampling[i] & 0x0F;
+    if (h > hMax) hMax = h;
+    if (v > vMax) vMax = v;
+  }
+  int yH = sof.sampling[0] >> 4, yV = sof.sampling[0] & 0x0F;  // 0 号分量就是亮度
+  if (yH < 1) yH = 1;
+  if (yV < 1) yV = 1;
+
+  for (int scaleLog2 = 1; scaleLog2 <= 2; scaleLog2++) {
+    const size_t need = pjscaled::peakBytes(sof.width, sof.height, yH, yV, hMax, vMax, scaleLog2);
+    if (need == 0 || freePsram < need + memory::PSRAM_FREE_RESERVE) {
+      LOG_INF("JPG", "封面源 %dx%d：降尺度 1/%d 约需 %u KB > PSRAM 空闲 %u KB，退一档", sof.width, sof.height,
+              1 << scaleLog2, static_cast<unsigned>((need + 1023) / 1024),
+              static_cast<unsigned>(freePsram / 1024));
+      continue;
+    }
+    pjscaled::Plane plane;
+    const int64_t startedUs = esp_timer_get_time();
+    if (!pjscaled::decodeGray(fileBuf.get(), got, scaleLog2, kPsramAlloc, &plane)) {
+      LOG_INF("JPG", "封面源 %dx%d：降尺度 1/%d 认不出来（段结构不认识 / 截断），退一档", sof.width, sof.height,
+              1 << scaleLog2);
+      continue;
+    }
+    const ScopedCleanup freePlane{[&plane]() { kPsramAlloc.release(plane.pixels); }};
+    const GraySource gs{plane.pixels, plane.width, plane.height, plane.stride, 1};
+    const ProgressiveResult r = writeScaledGrayBmp(bmpOut, gs, outW, outH);
+    if (r == ProgressiveResult::Done) {
+      LOG_INF("JPG", "封面源 %dx%d / %d 分量：渐进式 → 降尺度 1/%d 解出 %dx%d，峰值约 %u KB，%u ms", sof.width,
+              sof.height, sof.components, 1 << scaleLog2, plane.width, plane.height,
+              static_cast<unsigned>(need / 1024),
+              static_cast<unsigned>((esp_timer_get_time() - startedUs) / 1000));
+    }
+    return r;
+  }
+
+  LOG_INF("JPG", "封面源 %dx%d：降尺度解也放不下，落回 JPEGDEC 的 1/8（略软）", sof.width, sof.height);
+  return ProgressiveResult::NotApplicable;
+}
+
 // Internal implementation with configurable target size and bit depth
 bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& bmpOut, int targetWidth,
                                                      int targetHeight, Output output, bool crop) {
@@ -549,6 +915,19 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
           : output == Output::Gray8 ? "8-bit"
                                     : "2-bit",
           targetWidth, targetHeight);
+
+  // 渐进式灰度封面先试 stb 全解（见上面的长注释）。必须在 JPEGDEC 打开之前 ——
+  // 我们这里要 seek(0) 把文件整个读一遍，落在那之后会把解码器的读取状态搞乱。
+  if (output == Output::Gray8) {
+    switch (progressiveJpegToGrayBmp(jpegFile, bmpOut, targetWidth, targetHeight, crop)) {
+      case ProgressiveResult::Done:
+        return true;
+      case ProgressiveResult::Failed:
+        return false;  // 已经写了一半 BMP，绝不能再让下面接第二份
+      case ProgressiveResult::NotApplicable:
+        break;  // 老路（对基线本来就够好，对渐进式是 1/8 兜底）
+    }
+  }
 
   // Cover generation already lends the 48KB framebuffer. Reuse it for the
   // 17.9KB decoder after ZIP extraction releases its inflate claim; callers
@@ -611,37 +990,21 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
     return false;
   }
 
-  // 输出侧的上限（BMP 行缓冲 / 缩放后 MCU 行）。
-  constexpr int MAX_IMAGE_WIDTH = 2048;
-  constexpr int MAX_IMAGE_HEIGHT = 3072;
-
-  // Calculate output dimensions (pre-scale to fit display exactly)
-  int outWidth = srcWidth;
-  int outHeight = srcHeight;
-  if (targetWidth <= 0 || targetHeight <= 0) {
-    outWidth = progressiveDecode ? (srcWidth + 7) / 8 : srcWidth;
-    outHeight = progressiveDecode ? (srcHeight + 7) / 8 : srcHeight;
+  // 输出侧的尺寸与上限（BMP 行缓冲 / 缩放后 MCU 行）都在 computeOutputDims 里，
+  // 渐进式那条路在 JPEGDEC 打开之前算的就是同一个函数，两条路的 outWidth/outHeight
+  // 必须逐字节一致（否则同一本书会因为走了哪条路而尺寸不同）。
+  int outWidth = 0;
+  int outHeight = 0;
+  if (!computeOutputDims(srcWidth, srcHeight, targetWidth, targetHeight, crop, progressiveDecode, &outWidth,
+                         &outHeight)) {
+    LOG_WRN("JPG", "Image has absurd output dimensions (%dx%d) from source %dx%d", outWidth, outHeight, srcWidth,
+            srcHeight);
+    return false;
   }
 
   uint32_t scaleX_fp = 65536;  // 1.0 in 16.16 fixed point
   uint32_t scaleY_fp = 65536;
   bool needsScaling = false;
-
-  if (targetWidth > 0 && targetHeight > 0 && (srcWidth != targetWidth || srcHeight != targetHeight)) {
-    const float scaleToFitWidth = static_cast<float>(targetWidth) / srcWidth;
-    const float scaleToFitHeight = static_cast<float>(targetHeight) / srcHeight;
-    float scale = 1.0f;
-    if (crop) {
-      scale = (scaleToFitWidth > scaleToFitHeight) ? scaleToFitWidth : scaleToFitHeight;
-    } else {
-      scale = (scaleToFitWidth < scaleToFitHeight) ? scaleToFitWidth : scaleToFitHeight;
-    }
-
-    outWidth = static_cast<int>(srcWidth * scale);
-    outHeight = static_cast<int>(srcHeight * scale);
-    if (outWidth < 1) outWidth = 1;
-    if (outHeight < 1) outHeight = 1;
-  }
 
   // Use JPEGDEC's reduced DCT output before the line-buffered fine scaling.
   // This bounds a 2048-pixel source's MCU buffer to 4 KB at 1/8 scale instead
@@ -674,9 +1037,8 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
       progressiveDecode && needsScaling && scaleSrcWidth <= outWidth && scaleSrcHeight <= outHeight;
 
   CheckedBmpOutput checkedOutput(bmpOut);
-  // Write BMP header with output dimensions
+  // Write BMP header with output dimensions（尺寸与上限已经由 computeOutputDims 把关）
   int bytesPerRow = 0;
-  if (outWidth <= 0 || outHeight <= 0 || outWidth > MAX_IMAGE_WIDTH || outHeight > MAX_IMAGE_HEIGHT) return false;
   switch (output) {
     case Output::Gray8:
       writeBmpHeader8bit(checkedOutput, outWidth, outHeight);

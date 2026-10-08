@@ -131,7 +131,9 @@ const std::vector<xtc::ChapterInfo>& Xtc::getChapters() {
 // / The v2 bump only tracks Epub/Txt (the reader builds all cover paths the same way).
 // XTC's cover content is unchanged: it writes page 0 out as a BMP at the book's own
 // bit depth.
-std::string Xtc::getCoverBmpPath() const { return cachePath + "/cover_v2.bmp"; }
+// 名字要与 Epub/Txt 以及 screen_reader 的 coverBmpPathFor 一致（见 Epub::getCoverBmpPath
+// 的说明）。XTC 封面本来就取第 0 页原分辨率、不走 JPEG 解，v2→v3 只是跟着一起换名。
+std::string Xtc::getCoverBmpPath() const { return cachePath + "/cover_v3.bmp"; }
 
 bool Xtc::generateCoverBmp() const {
   // Already generated

@@ -494,9 +494,13 @@ gfx/ font/                 # u8g2 shim + 图标字体 + ttf_font（stb_truetype�
 tests/host/ime/run.sh            # 拼音输入法：bug 复现 + 回归（zhege→这个 / jiushi→就是）
 tests/host/ime/run.sh --verify-fix   # 证明回归测试在修复前的 IME.cpp 上会失败
 tests/host/rotation/run.sh       # 旋转映射等价性对拍（665 万个点）
+tests/host/jpeg/run.sh           # 渐进式 JPEG 降尺度解码：逐像素对拍 libjpeg -scale 1/N
+tests/host/parser/run.sh         # ChapterHtmlSlimParser 的锚点 / 脚注 transcript 对拍
 ```
 
 `tests/host/ime/README.md` 详细说明了桩、`#define private public` 的用法与新增用例的方法。
+尺寸 / 内存 / 缩放这类改动的通用做法是先在这里对拍：切出纯函数 + 计数分配器量峰值，
+**不用等设备**（`tests/host/jpeg/README.md` 是这套办法的样板）。
 
 ---
 

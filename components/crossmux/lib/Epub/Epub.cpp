@@ -1022,12 +1022,15 @@ std::string Epub::getCoverOverridePath() const { return cachePath + "/cover.over
 bool Epub::hasCoverOverride() const { return coverImageType(getCoverOverridePath()) != CoverImageType::None; }
 
 std::string Epub::getCoverBmpPath(bool cropped) const {
-  // v2 = 8 位灰阶封面（旧的是 2 位 + Atkinson 抖动）。名字必须换：generateCoverBmp()
-  // 见到文件已存在就直接返回，不改名的话老机器上永远用着那张脏封面。
-  // / v2 = 8-bit grayscale cover (the old one was 2-bit + Atkinson dithering). The name
-  // has to change: generateCoverBmp() returns early when the file exists, so without a
-  // bump an upgraded device would keep serving the old blotchy cover forever.
-  const auto coverFileName = std::string("cover_v2") + (cropped ? "_crop" : "");
+  // v2 = 8 位灰阶封面（旧的是 2 位 + Atkinson 抖动）；v3 = 渐进式封面改用降尺度解码
+  // （JPEGDEC 对 SOF2 只解 DC，出来是 1/8，塞进书架格子就是糊的；现在 1/2 起步）。
+  // 名字必须换：generateCoverBmp() 见到文件已存在就直接返回，不改名的话老机器上
+  // 永远用着那张脏封面 / 糊封面。改名字的四个地方（这里、Txt、Xtc、screen_reader
+  // 的 coverBmpPathFor）要一起改 —— 那边是读、这边是写，对不上书架就只剩占位框。
+  // / v2 = 8-bit grayscale (was 2-bit + Atkinson dithering); v3 = progressive covers now
+  // use reduced-scale decoding (JPEGDEC pins SOF2 to 1/8). The name has to change because
+  // generateCoverBmp() returns early when the file exists; bump all four sites together.
+  const auto coverFileName = std::string("cover_v3") + (cropped ? "_crop" : "");
   return cachePath + "/" + coverFileName + ".bmp";
 }
 
@@ -1209,7 +1212,7 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
 
   // Ask the per-book cache first. This runs on every open and the answer is stable
   // for a given file, so the common cases — no font at all, or one already resolved
-  // — must not pay for a ZIP enumeration. Format (v6):
+  // — must not pay for a ZIP enumeration. Format (v7):
   //   <href>\n<size>\n<family>\n  ×3  (primary, then alt, then alt2)
   // with an empty primary href meaning the book ships no usable body font.
   // v1 -> v2: the selector tiers below changed which books resolve at all, so every
@@ -1226,10 +1229,13 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
   // v5 -> v6: 标题家族（h1..h6）从"排除"改成"算候选"。**必须 bump**：v5 的缓存里
   // 三槽的书往往只有主 + 次两份（标题那一份没被选中），接受了就永久少一份 ——
   // 而 v5 与 v6 的**文件格式完全相同**（都是 3×3 行），光看内容分不出来，只能靠版本号。
+  // v6 -> v7: 家族槽的挑选口径从"引用次数"改成"字形容量（文件大小）"，见下面 ranked 那段。
+  // **必须 bump**：v6 缓存里那些"选错了面"的书（莊子校詮：两个槽装成装饰面，注文整块缺字）
+  // 再也不会重扫，接受了就等于让它们永久缺字。格式同样是 3×3 行，只能靠版本号分。
   {
     bool cacheOk = false;
     const std::string cached = Storage.readFile(cacheFile.c_str(), &cacheOk);
-    if (cacheOk && cached.rfind("v6\n", 0) == 0) {
+    if (cacheOk && cached.rfind("v7\n", 0) == 0) {
       std::vector<std::string> lines;
       for (size_t start = 3; start <= cached.size();) {
         size_t nl = cached.find('\n', start);
@@ -1322,26 +1328,55 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
     if (matched) break;
   }
 
-  // 家族字面：候选按引用次数降序（同数保持先出现的在前），跳过正文家族、跳过解不出文件的、
-  // 跳过跟已选字面指向同一个文件的 —— 同一份字面装两遍只是白占一份 PSRAM。
+  // 家族字面：候选按**字形容量**降序（= 那一份文件有多大），同容量再按引用次数（同数保持先
+  // 出现的在前）；跳过正文家族、跳过解不出文件的、跳过跟已选字面指向同一个文件的 —— 同一份
+  // 字面装两遍只是白占一份 PSRAM。
+  //
+  // ★ v6 的口径是"纯按引用次数"，它数的是**样式表里有几条规则点了这个家族**，而那不等于
+  // "这个家族担着多少正文"。两处会跑偏：
+  //   1) 元素级规则白送次数：h1..h6 是六条规则，一个只在标题里用的装饰面一次就能捡 6 次引用；
+  //   2) 成片的正文往往只由一条规则点中：莊子校詮的注文（书里 5013 处用它）只有 .zhushi 一条。
+  // 合起来的结果是 8 次引用的装饰面（99 字形的小标宋）压过 1 次引用的注文字面（6117 字形），
+  // 两个槽都装成装饰面，正文面缺的那 2848 个字形无处可补（见 ttf_font.c 的 fallback_role_for）。
+  // 文件大小是"这个面能不能担起一段正文"的廉价代理（一份 CJK 字面 ≈ 600 B/字形）：26KB / 64KB
+  // 那两份装不下任何一段正文，3.6MB 那份正是注文的字面。代价是每本书多扫几遍 zip 目录，且只在
+  // 缓存未命中那一次发生。
+  struct RankedFamily {
+    std::string family;
+    int refs;
+    size_t size;   // 0 = 解不出可装载的文件（排最后，下面那趟循环会跳过它）
+  };
+  std::vector<RankedFamily> ranked;
+  ranked.reserve(candidates.altFamilies.size());
+  for (const std::pair<std::string, int>& entry : candidates.altFamilies) {
+    size_t size = 0;
+    for (const CssFontFace& face : candidates.faces) {
+      if (face.family != entry.first) continue;
+      std::string url;
+      if (!pickFontUrl(face.src, &url)) break;
+      const std::string href = resolveFontHref(face.cssHref, url);
+      if (href.empty() || !getItemSize(href, &size)) size = 0;
+      break;   // 一个家族名只认一条 @font-face（与下面那趟循环同一个口径）
+    }
+    ranked.push_back({entry.first, entry.second, size});
+  }
+  std::stable_sort(ranked.begin(), ranked.end(), [](const RankedFamily& a, const RankedFamily& b) {
+    if (a.size != b.size) return a.size > b.size;
+    return a.refs > b.refs;
+  });
   // 同一个循环跑两遍 = 第二 / 第三个家族：第一遍选出 alt，把它的家族名与文件也记进
-  // "已占用"，第二遍就只能挑到**另一个**家族了（一般就是引用次数第二多的那个）。
-  std::vector<std::pair<std::string, int>> ranked = candidates.altFamilies;
-  std::stable_sort(ranked.begin(), ranked.end(),
-                   [](const std::pair<std::string, int>& a, const std::pair<std::string, int>& b) {
-                     return a.second > b.second;
-                   });
+  // "已占用"，第二遍就只能挑到**另一个**家族了。
   std::vector<std::string> takenFamilies{font.family};
   std::vector<std::string> takenFiles;
   if (!font.itemHref.empty()) takenFiles.push_back(font.itemHref);
   int altIndex = 0;
   for (EmbeddedFont* slot : {&set.alt, &set.alt2}) {
     ++altIndex;
-    for (const auto& entry : ranked) {
-      if (containsName(takenFamilies, entry.first)) continue;  // 正文/已选中的家族
+    for (const RankedFamily& entry : ranked) {
+      if (containsName(takenFamilies, entry.family)) continue;  // 正文/已选中的家族
       const CssFontFace* face = nullptr;
       for (const CssFontFace& candidate : candidates.faces) {
-        if (candidate.family == entry.first) {
+        if (candidate.family == entry.family) {
           face = &candidate;
           break;
         }
@@ -1357,9 +1392,9 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
       slot->family = face->family;
       takenFamilies.push_back(slot->family);
       takenFiles.push_back(slot->itemHref);
-      LOG_INF("EBP", "第%u家族 '%s' → %s (%u refs, %u bytes)", static_cast<unsigned>(altIndex + 1),
-              slot->family.c_str(), slot->itemHref.c_str(), static_cast<unsigned>(entry.second),
-              static_cast<unsigned>(slot->size));
+      LOG_INF("EBP", "第%u家族 '%s' → %s （引用 %u 次，%u KB）", static_cast<unsigned>(altIndex + 1),
+              slot->family.c_str(), slot->itemHref.c_str(), static_cast<unsigned>(entry.refs),
+              static_cast<unsigned>(size / 1024));
       break;
     }
   }
@@ -1377,7 +1412,7 @@ Epub::EmbeddedFontSet Epub::resolveEmbeddedFonts() {
     LOG_DBG("EBP", "Embedded alt2 font: none");
   }
 
-  std::string cacheContent = "v6\n";
+  std::string cacheContent = "v7\n";
   const auto appendFont = [&cacheContent](const EmbeddedFont& f) {
     cacheContent += f.itemHref;
     cacheContent += '\n';

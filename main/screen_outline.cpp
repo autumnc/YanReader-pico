@@ -5,6 +5,7 @@
 #include "json_parser.h"
 #include "journal_storage.h"
 #include "ui_helpers.h"
+#include "ui/list_view.h"  // listPageStep：手写列表的翻页步长（一屏行数 / 没得翻 = 0）
 #include "ui_render.h"
 #include "ime/IME.h"
 #include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划/阅读共用一份）
@@ -1156,6 +1157,22 @@ static int outlineListRows() {
     return vis < 1 ? 1 : vis;
 }
 
+// ── 翻页步长（触摸上下滑 = 整页翻）──────────────────────────────────────
+// "从 y0 起到 maxY 装得下几行"，与对应的绘制函数**同一个基准**（那边是排版，这边是
+// 翻页；两处各写一遍式子迟早会漂）。行数 < 1 时抬到 1。
+static int olVisRows(int y0, int maxY) {
+    int vis = (maxY - y0 + LINE_SPACING - 1) / LINE_SPACING;
+    return vis < 1 ? 1 : vis;
+}
+static int olProjectRows() { return olVisRows(FONT_H + 8 + LINE_SPACING + 2, outlineListMaxY()); }
+static int olTagMgrRows() { return olVisRows(FONT_H + 6 + LINE_SPACING, STATUS_Y); }
+static int olBookmarkRows() { return olVisRows(FONT_H + 8 + LINE_SPACING, STATUS_Y); }
+static int olHelpRows() {   // 帮助是固定尺寸的小浮层（与 drawHelp 同式）
+    const int boxH = 250, boxY = (SCREEN_H - boxH) / 2;
+    const int contentY = (boxY + 8 + g_font.ascent()) + g_font.descent() + 10;
+    return olVisRows(contentY, boxY + boxH - 8);
+}
+
 // ── Screen entry ─────────────────────────────────────────────────────────
 void screen_outline_init() {
     mkdir(OUTLINE_DIR, 0777);
@@ -1595,6 +1612,15 @@ static bool olHandleTagMgr(int &key, AppState &out) {
             if (g.tagMgrSel > 0) g.tagMgrSel--;
         } else if (key == KEY_DOWN || key == 'j') {
             if (g.tagMgrSel < (int)g.tagList.size() - 1) g.tagMgrSel++;
+        } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+            // 触摸上下滑 = 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻。
+            const int n = (int)g.tagList.size();
+            const int step = listPageStep(n, olTagMgrRows());
+            if (step > 0) {
+                g.tagMgrSel += (key == KEY_PAGE_DOWN) ? step : -step;
+                if (g.tagMgrSel < 0) g.tagMgrSel = 0;
+                if (g.tagMgrSel > n - 1) g.tagMgrSel = n - 1;
+            }
         } else if (key == 'a' || key == 'A') {
             g.mode = M_ADD_TAG;
             g.editBuf.clear(); g.editCur = 0;
@@ -1747,6 +1773,11 @@ static bool olHandleHelp(int &key, AppState &out) {
             if (g.helpScroll > 0) g.helpScroll--;
         } else if (key == KEY_DOWN) {
             g.helpScroll++;
+        } else if (key == KEY_PAGE_UP) {
+            g.helpScroll -= olHelpRows();
+            if (g.helpScroll < 0) g.helpScroll = 0;
+        } else if (key == KEY_PAGE_DOWN) {
+            g.helpScroll += olHelpRows();   // 上限在画的时候夹住
         } else if (key == KEY_LEFT) {
             if (g.helpScroll > 5) g.helpScroll -= 5; else g.helpScroll = 0;
         } else if (key == KEY_RIGHT) {
@@ -1769,6 +1800,14 @@ static bool olHandleBookmarkMgr(int &key, AppState &out) {
             if (g.bmMgrSel > 0) g.bmMgrSel--;
         } else if (key == KEY_DOWN || key == 'k') {
             if (g.bmMgrSel < bmCount - 1) g.bmMgrSel++;
+        } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+            // 触摸上下滑 = 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻。
+            const int step = listPageStep(bmCount, olBookmarkRows());
+            if (step > 0) {
+                g.bmMgrSel += (key == KEY_PAGE_DOWN) ? step : -step;
+                if (g.bmMgrSel < 0) g.bmMgrSel = 0;
+                if (g.bmMgrSel > bmCount - 1) g.bmMgrSel = bmCount - 1;
+            }
         } else if (key == 0x0A || key == 0x0D) {
             // Jump to bookmarked node
             if (g.bmMgrSel >= 0 && g.bmMgrSel < bmCount && g.nodes) {
@@ -2020,6 +2059,16 @@ static bool olHandleProjects(int &key, AppState &out, ScreenContext &ctx) {
         if (key == 'k' || key == KEY_UP) {
             if (g.sel > 0) g.sel--;
         }
+        if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+            // 触摸上下滑 = 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻。
+            const int n = (int)g.projects.size();
+            const int step = listPageStep(n, olProjectRows());
+            if (step > 0) {
+                g.sel += (key == KEY_PAGE_DOWN) ? step : -step;
+                if (g.sel < 0) g.sel = 0;
+                if (g.sel > n - 1) g.sel = n - 1;
+            }
+        }
         if (key == 'n' || key == 'N') {
             g.mode = M_ADD_PROJECT;
             g.editBuf.clear(); g.editCur = 0;
@@ -2125,6 +2174,17 @@ static bool olHandleBrowse(int &key, AppState &out, ScreenContext &ctx) {
         if (key == KEY_DOWN) {
             int maxIdx = g.filterText.empty() ? (int)g.nodeCount : (int)g_filteredIdx.size();
             if (g.sel < maxIdx - 1) g.sel++;
+        }
+        if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+            // 触摸上下滑 = 整页翻：一步一屏（树里是**可见行**，折叠起来更少），高亮跟着
+            // 页走；一屏放得下就没得翻（吃掉这一划）。滚动窗口由绘制按 g.sel 反推。
+            const int n = g.filterText.empty() ? (int)g.nodeCount : (int)g_filteredIdx.size();
+            const int step = listPageStep(n, outlineListRows());
+            if (step > 0) {
+                g.sel += (key == KEY_PAGE_DOWN) ? step : -step;
+                if (g.sel < 0) g.sel = 0;
+                if (g.sel > n - 1) g.sel = n - 1;
+            }
         }
 
         // hjkl: reorder and hierarchy
@@ -2483,6 +2543,15 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
     static int s_prevMode = M_PROJECTS;
     if (g.mode != s_prevMode && olVkEditing()) editorVkAutoShow();
     s_prevMode = g.mode;
+
+    // 触摸上下滑的翻页键（主循环不再替写作界面回退成单步）：**列表/长文**按屏翻
+    // ——下面的各 olHandleXxx 里接 KEY_PAGE_*；其余模式（详情表单、选择器、条目菜单、
+    // 多行备注、摘要）保持原来的单步语义。
+    if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+        const bool pageMode = (g.mode == M_PROJECTS || g.mode == M_BROWSE || g.mode == M_TAG_MGR ||
+                               g.mode == M_BOOKMARK_MGR || g.mode == M_HELP);
+        if (!pageMode) key = (key == KEY_PAGE_UP) ? KEY_UP : KEY_DOWN;
+    }
 
     // 虚拟键盘（编辑态，与写作/计划模式同一套）：先认状态栏上的键盘开关图标，再认
     // 键盘面板。命中就把点按翻译成普通键码，交给下面既有的输入逻辑——不重复实现

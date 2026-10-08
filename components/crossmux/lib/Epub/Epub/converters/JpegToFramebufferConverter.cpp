@@ -7,6 +7,8 @@
 #include <JPEGDEC.h>
 #include <Logging.h>
 #include <Memory.h>
+#include <ProgressiveJpegScaled.h>
+#include <esp_heap_caps.h>
 
 #include <cstdlib>
 #include <memory>
@@ -139,6 +141,25 @@ int chooseJpegScale(float targetScale, int& jpegScaleOption) {
   }
   jpegScaleOption = 0;
   return 1;
+}
+
+// 渐进式降尺度解（见本文件 decodeToFramebuffer 的说明）的分配器：整幅 plane 与折叠
+// 累加器都放 PSRAM。跟 JpegToBmpConverter 里那份同一个路子。
+const pjscaled::Alloc kPsramAlloc = {
+    [](size_t bytes) -> void* { return heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); },
+    [](void* p) { heap_caps_free(p); }};
+
+// PSRAM 上的整幅**文件**缓冲（渐进式那条要先读进来才谈得上解）。
+//
+// **不要**用 memory::makePsramByteBuffer*：它挂在 `#if defined(BOARD_HAS_PSRAM)` 上，而
+// 本工程从来没定义过这个宏，所以那个 helper 恒返回空 —— 编译器据此认定 progFile 是空的，
+// 把整个 `if (progFile) { …peakBytes/decodeGray… }` 当死代码删掉。症状极具迷惑性：代码改了、
+// 编译过了、刷进去了，屏幕上**一点变化都没有**（书内封面照样糊），因为那段压根没进固件。
+// JpegToBmpConverter 的 allocPsramBuffer 踩过同一个坑，注释写在那儿。
+// ByteBuffer 的释放是 free()，在 CONFIG_SPIRAM_USE_MALLOC 下与 heap_caps_malloc 配对。
+memory::ByteBuffer allocPsramBuffer(const size_t size) {
+  if (size == 0) return {};
+  return memory::ByteBuffer{static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT))};
 }
 
 // Fixed-point 16.16 arithmetic avoids software float emulation on ESP32-C3 (no FPU).
@@ -440,7 +461,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
 
   bool isProgressive = jpeg->getJPEGType() == JPEG_MODE_PROGRESSIVE;
   if (isProgressive) {
-    LOG_INF("JPG", "Progressive JPEG detected - decoding DC coefficients only (lower quality)");
+    LOG_INF("JPG", "Progressive JPEG detected - may decode DC-only (1/8) or reduced-scale via pjscaled");
   }
 
   // Calculate overall target scale
@@ -476,6 +497,71 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
     if (winY + winH > srcHeight) winH = srcHeight - winY;
   }
 
+  // ---- 渐进式：绕开 JPEGDEC 的 1/8，自己按降尺度 IDCT 解 ---------------------------
+  //
+  // JPEGDEC 对渐进式（SOF2）只解第一扫描，那条固定是 DC —— 也就是 1/8。1200 宽的封面
+  // 出来才 150px，铺到整页就是用户报的"书里面的封面也糊"。这里把整个文件读进来，用
+  // pjscaled 解 1/2（PSRAM 放不下退 1/4）的精确箱平均，稍后按行喂进**同一套**目标映射
+  // （复用 jpegDrawCallback，窗口/缓存/抖动都不用改）。解不出来或放不下就保持 0，
+  // 落回 JPEGDEC 的 1/8 老路（略软，但不会错）。
+  memory::ByteBuffer progFile;
+  pjscaled::Plane progPlane;
+  int progressiveScaleLog2 = 0;
+  if (isProgressive) {
+    // 只在"JPEGDEC 的 1/8 会被明显放大"时才值得自己解：目标尺寸已经不大于源/8 的话，
+    // 1/8 本来就够细，自己解不会更清楚、还多花几倍时间（插图页的翻页延迟就是这么来的）。
+    // 阈值集中在 chooseScaleForTarget 里（纯函数，tests/host/jpeg 对拍）。
+    const int bestLog2 = pjscaled::chooseScaleForTarget(srcWidth, srcHeight, destWidth, destHeight);
+
+    if (bestLog2 > 0) {
+      constexpr size_t MAX_FILE_BYTES = 4u << 20;  // 与 JpegToBmpConverter 同限
+      size_t fileBytes = 0;
+      HalFile f;
+      if (Storage.openFileForRead("JPG", imagePath, f)) {
+        fileBytes = f.size();
+        if (fileBytes >= 16 && fileBytes <= MAX_FILE_BYTES) {
+          progFile = allocPsramBuffer(fileBytes);
+          if (progFile) {
+            size_t got = 0;
+            while (got < fileBytes) {
+              const int n = f.read(progFile.get() + got, fileBytes - got);
+              if (n <= 0) break;
+              got += static_cast<size_t>(n);
+            }
+            if (got != fileBytes) progFile.reset();
+          }
+        }
+        f.close();
+      }
+      if (progFile) {
+        const size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        // 从 bestLog2 起只往粗走：比它再细就是白花时间（目标尺寸吃不下那么多细节）。
+        for (int s = bestLog2; s <= 2; s++) {
+          const size_t need = pjscaled::peakBytesForImage(progFile.get(), fileBytes, s);
+          if (need == 0) break;  // 不是我们能认的渐进式：别试了，落回 JPEGDEC
+          if (freePsram < need + memory::PSRAM_FREE_RESERVE) {
+            LOG_INF("JPG", "插图 %dx%d 渐进式降尺度 1/%d 约需 %u KB > PSRAM 空闲 %u KB，退一档", srcWidth, srcHeight,
+                    1 << s, static_cast<unsigned>((need + 1023) / 1024), static_cast<unsigned>(freePsram / 1024));
+            continue;
+          }
+          if (pjscaled::decodeGray(progFile.get(), fileBytes, s, kPsramAlloc, &progPlane)) {
+            progressiveScaleLog2 = s;
+            break;
+          }
+        }
+        progFile.reset();  // 解完就能放：后面的大头是解出来的像素
+        if (progressiveScaleLog2 == 0)
+          LOG_INF("JPG", "插图 %dx%d：渐进式降尺度解不可用，落回 JPEGDEC 1/8", srcWidth, srcHeight);
+        else
+          LOG_INF("JPG", "插图 %dx%d → 目标 %dx%d：渐进式自解 1/%d（JPEGDEC 只能出 1/8）", srcWidth, srcHeight,
+                  destWidth, destHeight, 1 << progressiveScaleLog2);
+      }
+    }
+  }
+  const ScopedCleanup freeProgPlane{[&progPlane]() {
+    if (progPlane.pixels) kPsramAlloc.release(progPlane.pixels);
+  }};
+
   // Choose JPEGDEC built-in scaling for coarse downscaling.
   // Progressive JPEGs: JPEGDEC forces JPEG_SCALE_EIGHTH internally (DC-only
   // decode produces 1/8 resolution). We must match this to avoid the if/else
@@ -485,8 +571,14 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   int jpegScaleOption;
   int jpegScaleDenom;
   if (isProgressive) {
-    jpegScaleOption = JPEG_SCALE_EIGHTH;
-    jpegScaleDenom = 8;
+    if (progressiveScaleLog2 > 0) {
+      // 自己解，比例就是降尺度倍数；下面 windowSrc*/scaledSrc* 全按它换算。
+      jpegScaleOption = 0;
+      jpegScaleDenom = 1 << progressiveScaleLog2;
+    } else {
+      jpegScaleOption = JPEG_SCALE_EIGHTH;
+      jpegScaleDenom = 8;
+    }
   } else if (windowed) {
     jpegScaleOption = 0;
     jpegScaleDenom = 1;
@@ -537,7 +629,34 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
 
   unsigned long decodeStart = millis();
   ctx.lastYieldMs = decodeStart;
-  rc = jpeg->decode(0, 0, jpegScaleOption);
+  if (progressiveScaleLog2 > 0) {
+    // 把整幅降尺度 plane 按"每段 16 个缩放后源行"喂给现成的 jpegDrawCallback —— 它本来
+    // 就是"一段灰度行 + 块原点 → 目标像素"这个契约，窗口、分带缓存、抖动全在里面。
+    // 段高取 16，是为了每段映射出的目标行数不超过缓存单带高度（跟 JPEGDEC 一条 MCU 行
+    // 等价；间隔由 advanceTo 负责冲掉）。
+    const int planeX = winX / jpegScaleDenom;  // 窗口左上角在 plane 里的坐标
+    const int planeY = winY / jpegScaleDenom;
+    const int winCols = ctx.scaledSrcWidth;  // = ceil(winW / denom)，就是 plane 的有效列
+    const int winRows = ctx.scaledSrcHeight;
+    for (int row0 = 0; row0 < winRows; row0 += 16) {
+      const int rows = (winRows - row0 < 16) ? (winRows - row0) : 16;
+      JPEGDRAW d{};
+      d.pUser = &ctx;
+      // pPixels 声明成 uint16_t*（JPEGDEC 内部当 16 位用），但回调立刻 reinterpret 回
+      // uint8_t* —— 我们喂的本来就是 8 位灰度，只是地址，不解引用成 16 位。
+      d.pPixels = reinterpret_cast<uint16_t*>(progPlane.pixels +
+                                               static_cast<size_t>(planeY + row0) * progPlane.stride + planeX);
+      d.iWidth = progPlane.stride;
+      d.iWidthUsed = winCols;
+      d.iHeight = rows;
+      d.x = ctx.windowSrcX;          // ⇒ 回调里 blockX = 0（这段从窗口左边界起）
+      d.y = ctx.windowSrcY + row0;   // ⇒ blockY = row0（本段在窗口内的行偏移）
+      if (jpegDrawCallback(&d) == 0) break;  // 0 只可能是 abortPoll 让收手
+    }
+    rc = ctx.aborted ? 0 : 1;
+  } else {
+    rc = jpeg->decode(0, 0, jpegScaleOption);
+  }
   unsigned long decodeTime = millis() - decodeStart;
 
   if (ctx.aborted) {

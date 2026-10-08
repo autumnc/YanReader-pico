@@ -179,6 +179,10 @@ class ChapterHtmlSlimParser {
     const ParsedText* block = nullptr;
     int wordOffset = 0;
     std::string id;
+    // 记这一笔时尚未折成词的字节数（partWordBufferIndex）。只有"紧邻上一个空 <a id>"
+    // 那条兜底判据用得上：arm 之后既没往块里加词、也没往待刷缓冲里加字，才说明两者之间
+    // 什么都没有。见 startTag 里那条兜底的说明。
+    int pendingAtArm = 0;
   };
   std::vector<InlineAnchorArm> inlineAnchorArms;
   void armInlineAnchor(const std::string& id, const char* elementName);

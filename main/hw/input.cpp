@@ -552,6 +552,14 @@ static int poll_pmu_key() {
                 ESP_LOGI(TAG, "吞掉唤醒那一按的抬手 id=%u held=%u（待机唤醒不切模式）", (unsigned)id,
                          (unsigned)s->event.arg0);
             } else {
+                if (s_wake_swallow) {
+                    // **登记过却超时** = 这一按被判成"唤醒之后的另一下"，会去切模式。
+                    // 把间隔和按键时长都打出来：窗口只差一点就说明还得再放宽，差很远就是
+                    // 登记点/唤醒路径另有问题（正常情况下这条不该出现）。
+                    ESP_LOGW(TAG, "唤醒抬手超出窗 %lldms（窗 %lldms, held=%u）→ 当短按上报",
+                             (long long)((esp_timer_get_time() - s_wake_us) / 1000),
+                             (long long)(WAKE_SWALLOW_US / 1000), (unsigned)s->event.arg0);
+                }
                 short_press = true;
                 ESP_LOGI(TAG, "KEY_SHORT id=%u held=%u", (unsigned)id, (unsigned)s->event.arg0);
             }

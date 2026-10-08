@@ -1,16 +1,21 @@
 ==== page 0 ====
    footnote  num='〔一〕'  href='fixture.xhtml#note-001'
    footnote  num='〔二〕'  href='fixture.xhtml#note-002'
+   footnote  num='〔三〕'  href='fixture.xhtml#note-003'
    link      href='fixture.xhtml#note-001'
    link      href='fixture.xhtml#note-002'
+   link      href='fixture.xhtml#note-003'
    link      href='fixture.xhtml#ref-001'
    link      href='fixture.xhtml#ref-002'
+   link      href='fixture.xhtml#ref-003'
 ==== tail (after last page) ====
 
-total: 2 footnote entries, 4 link rects, 1 pages
+total: 3 footnote entries, 6 link rects, 1 pages
 
-==== anchors (4) ====
+==== anchors (6) ====
    anchor 'ref-001' -> page 0 element 1
    anchor 'ref-002' -> page 0 element 3
-   anchor 'note-001' -> page 0 element 5
-   anchor 'note-002' -> page 0 element 6
+   anchor 'ref-003' -> page 0 element 4
+   anchor 'note-001' -> page 0 element 7
+   anchor 'note-002' -> page 0 element 8
+   anchor 'note-003' -> page 0 element 9

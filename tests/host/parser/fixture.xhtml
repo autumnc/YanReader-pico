@@ -10,9 +10,15 @@
   <p class="p">第一段正文<a id="ref-001"></a><a href="fixture.xhtml#note-001"><sup>〔一〕</sup></a>，后面还有一些文字，用来把这一页撑开一点。</p>
   <p class="p">第二段正文<a id="ref-002"></a><a href="fixture.xhtml#note-002"><sup>〔二〕</sup></a>，同样写一些文字让版面有一点内容。</p>
 
+  <!-- 第三种形态：注号 id 挂在**紧邻的前一个空 <a>** 上，两边回引都不带 class
+       （《古典柏拉图主义哲学导论》整本这样）。没有这条兜底，注文侧那条回引认不出来，
+       会当成脚注收下 —— 试金石就是 probe 里的 "footnote entries" 计数。 -->
+  <p class="p">第三段正文<a id="ref-003"></a><a href="fixture.xhtml#note-003"><sup>〔三〕</sup></a>，这一对的两个 a 之间没有夹文本，只看 id 相邻。</p>
+
   <hr/>
 
   <p class="note"><a id="note-001"></a><a class="note-backref" href="fixture.xhtml#ref-001">〔一〕</a> 第一条注文的内容。</p>
   <p class="note"><a id="note-002"></a><a class="note-backref" href="fixture.xhtml#ref-002">〔二〕</a> 第二条注文的内容。</p>
+  <p class="note"><a id="note-003"></a><a href="fixture.xhtml#ref-003">〔三〕</a> 第三条注文，回引不带 class。</p>
 </body>
 </html>

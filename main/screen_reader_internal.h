@@ -596,7 +596,7 @@ void handleWereadDl(int key);
 void weDrive();   // 推进一拍（联网请求同步阻塞，见 screen_reader_weread.cpp）
 
 // 微读「重新获取封面」把 epub 在原地换掉之后调它：把这本书的封面产物（书架缩略图
-// cover_v2.bmp、待机封面 standby_v4.bmp、以及内存里那份缩略图缓存）全部作废重建。
+// cover_v3.bmp、待机封面 standby_v5.bmp、以及内存里那份缩略图缓存）全部作废重建。
 // 定义在 screen_reader.cpp（封面那套私有原语都在那儿）。
 void rdRebuildBookCoverArtifacts(const std::string &path, int kind);
 

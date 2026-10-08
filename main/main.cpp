@@ -373,12 +373,6 @@ static void enterLightSleep(void) {
         esp_sleep_enable_gpio_wakeup();
     }
 
-    // 唤醒用的是**电源键**，而按电源键在这台机器上还有"切模式"的含义。唤醒那一按的
-    // KEY_DOWN 已经被 take_key_wakeup ack 掉了，可松手时的 KEY_SHORT 会在我们醒着之后
-    // 才进队列 → 不拦的话就是"在待机画面按一下叫醒，回来发现模式被转了"。登记一次，
-    // 让它把紧接着的那个抬手事件吞掉（input.cpp 里有时间窗）。
-    if (key_wake) input_note_key_wake();
-
     // 先把 sleeping 期间锁住的那些总线脚解回来、接线重建（display_bus_park 的逆操作），
     // 再上电清屏 —— epd_clear 就要用总线了。
     display_bus_unpark();
@@ -394,6 +388,18 @@ static void enterLightSleep(void) {
         struct timeval tv = {(time_t)t, 0};
         settimeofday(&tv, NULL);
     }
+
+    // 唤醒用的是**电源键**，而按电源键在这台机器上还有"切模式"的含义。唤醒那一按的
+    // KEY_DOWN 已经被 take_key_wakeup ack 掉了，可松手时的 KEY_SHORT 会在我们醒着之后
+    // 才进队列 → 不拦的话就是"在待机画面按一下叫醒，回来发现模式被转了"。登记一次，
+    // 让它把紧接着的那个抬手事件吞掉（input.cpp 里有时间窗）。
+    //
+    // **登记点必须放在这一行，不能提前**：上面那段尾巴（epd_poweron + epd_clear +
+    // ui_restore_snapshot 从白重绘）本身就要 1~2s，而 input.cpp 那边是"从登记起 N 秒内
+    // 才算唤醒那一按的抬手"。登记在尾巴之前的话，用户看到画面亮起来再松手时窗口早就过
+    // 了 —— 抬手被当成正常短按上报，就是"按电源键唤醒顺带切了模式"（2026-10-08 反馈）。
+    // 登记在这里，窗口从"画面已经回来"起算，用户松手的那一下稳稳落在窗内。
+    if (key_wake) input_note_key_wake();
 
     // 后台重新 init BLE + 自动重连键盘(即使休眠失败也恢复 BT 栈)
     spawnBtInit();
@@ -1598,13 +1604,28 @@ extern "C" void app_main() {
             key = 0;
         }
 
-        // 触摸上下滑产生翻页键：设置界面自行整页滚动，计划模式的列表也一样
-        // （任务列表要整页翻，见 screen_gtd 的 M_BROWSE），其余界面回退为单步上下。
-        // 阅读模式也留着原样：目录是长列表，"一格一格选"根本走不动，要按屏翻——
-        // 由阅读器自己按当前子界面决定（screen_reader 里只有目录认整页，其余照旧单步）。
-        if (currentState != APP_SETTINGS && currentState != APP_GTD && currentState != APP_READER) {
-            if (key == KEY_PAGE_UP) key = KEY_UP;
-            else if (key == KEY_PAGE_DOWN) key = KEY_DOWN;
+        // 触摸上下滑产生翻页键：**上下滑 = 整页翻**，这条在各界面内部实现（列表按屏翻、
+        // 长文按屏滚），主循环只把还没实现的界面回退成单步上下。名单里的界面都自己
+        // 按子状态决定：列表按屏翻（一屏放得下就什么都不做），表单/小菜单仍单步。
+        // 不在名单里的（写作主菜单的图标行、编辑器正文、文件信息页、提示词编辑器…）
+        // 保持原来的单步语义。
+        switch (currentState) {
+            case APP_SETTINGS:    // 分类/字段/选项弹层/词典表
+            case APP_GTD:         // 任务列表（screen_gtd 的 gtdScrollByPage）
+            case APP_READER:      // 目录/书架/书签/脚注/最近/统计… 见 screen_reader
+            case APP_BROWSER:     // 日记列表
+            case APP_VIEWER:      // 查看正文（横排按行、竖排按列）
+            case APP_HISTORY:     // 历史版本列表 + 预览
+            case APP_OUTLINE:     // 项目/标题树/标签/书签
+            case APP_INSPIRATION: // 灵感列表 + 检索结果
+            case APP_FLOMO:       // 条目列表 + 检索结果
+            case APP_BT_MANAGE:   // 扫描列表 / 已配对列表
+            case APP_POLISH:      // 润色结果页
+                break;
+            default:
+                if (key == KEY_PAGE_UP) key = KEY_UP;
+                else if (key == KEY_PAGE_DOWN) key = KEY_DOWN;
+                break;
         }
 
         // 触摸拖动增量：计划模式的列表用它平滑滚屏，阅读模式用它拖选区的两个手柄，

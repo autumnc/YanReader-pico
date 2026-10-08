@@ -351,9 +351,22 @@ static void rdSplitPageLines(const Page &page, int fontId, std::vector<std::stri
 // 这本来报错。
 //
 // 因此这里不无条件相信 1)：锚点行的段首号码**明确和要取的不一样**时，改取它**前面**
-// 最近的一条同号行（错位一格时那正是注文自己那一行）。锚点行没有号码可认（Duokan 的
-// ※ 注文）时只在近处（12 行内）回溯 —— 免得把远处正文里形似号码的段首误当成注文；
-// 号码对得上、或什么都认不出，仍旧信锚点行。
+// 最近的一条同号行（错位一格时那正是注文自己那一行）。
+//
+// **但"号码对不上"这条判据不能只看字面。** 有一类书的注文正文**根本不带号码** —— 号码
+// 只写在段末的回引链接里（Sigil Footnote Ultimate 的 `<aside id="note_1"><p
+// class="footnote">Last Lectures，182 ff.<a href="#noteref_1">原文〔1〕</a></p>`，见
+// 《希腊人与非理性》），正文常常以引文页码起头（"137 ff."、"1.412."、"9.376."）。
+// 拿 rdLeadingNoteMarker 去读，它会把 "137" 读成段首号码串，于是 late 误判为真、锚点行
+// 被弃掉，再去满页找"段首号码等于 6 的行" —— 找着的是**别的注文**（"1.5." 被读成号码
+// 15，正好撞上第 15 条），找不着就退回整页。离线拿真解析器 + 真函数跑这本书全书 1113 条
+// 注文：74 条取到别的注、37 条退回整页。
+//
+// 所以 late 只在**锚点行自己长得像一条注文抬头**时才作数：抬头 = 段首号码像样到带括号
+// （rdStartsBracketed，晉書〔一〕/Duokan（1）都是这个长相）。正文以页码起头的行不满足，
+// 一律信锚点序号。同理，"回溯同号行"只在确凿错位（late）时才允许 —— 没有错位信号时
+// 锚点行唯一说话。原来还允许"锚点行认不出号码就往后 12 行内找同号行"，对这类书是灾难：
+// 页码起头的段首到处都是，随便一条就能把正确的锚点行顶掉。
 static int rdFindNoteStartLine(const std::vector<std::string> &lines,
                                const std::vector<int> &lineStart, int elementIdx,
                                const std::string &noteNum, int elementCount,
@@ -373,12 +386,11 @@ static int rdFindNoteStartLine(const std::vector<std::string> &lines,
   if (anchorLine >= 0 && !want.empty()) {
     std::string mark;
     rdLeadingNoteMarker(lines[anchorLine], &mark);
-    late = !mark.empty() && rdNormalizeNoteNumber(mark) != want;
+    late = !mark.empty() && rdNormalizeNoteNumber(mark) != want && rdStartsBracketed(lines[anchorLine]);
   }
   if (anchorLate) *anchorLate = late;
 
   if (!want.empty()) {
-    constexpr int kNearLines = 12;  // 锚点行没号码可认时允许回溯的行数
     for (int strict = 1; strict >= 0; strict--) {
       int before = -1, first = -1, hits = 0;
       for (size_t i = 0; i < lines.size(); i++) {
@@ -399,7 +411,7 @@ static int rdFindNoteStartLine(const std::vector<std::string> &lines,
         if (hits > 1) break;          // 这一档就撞了，放宽一档只会更多
         continue;
       }
-      if (before >= 0 && (late || anchorLine - before <= kNearLines)) return before;
+      if (before >= 0 && late) return before;  // 只有确凿的错位才拿同号行覆盖锚点行
     }
   }
 
@@ -489,6 +501,79 @@ static std::string rdStripLeadingNoteNumber(const std::string &line, const std::
   return line.substr(after);
 }
 
+// 段末回引的收尾（Sigil Footnote Ultimate 那类书）。这类书的注文正文**不带号码**，号码
+// 只写在段末的回引链接里：
+//   <aside id="note_1"><p class="footnote">Last Lectures，182 ff.
+//     <a href="#noteref_1"><small>原文〔1〕</small></a></p></aside>
+// 于是弹注正文每条都拖着"原文〔N〕"（见《希腊人与非理性》全书 1113 条注文，无例外）。
+// 抬头已经写了「脚注 〔N〕」，正文再带一遍是重，这里把它切掉。
+//
+// 判据**刻意收得很紧，宁可留着也不误删注文正文**：
+//   · 结尾的号码必须**等于本条注号**（〔1〕配 1、注释＊ 配 ＊）；
+//   · 号码左边的短前缀 ≤ 3 个字符，且不含数字；
+//   · 短前缀再左边一个字符必须是句末标点（。．！？；）或已到文本开头。
+// 三条都满足才切。正文里回引别的注号（"…参见前注〔三〕…"）不在结尾，前缀也不止 3 个字，
+// 天然躲开。离线拿真解析器跑过本仓 10 本书：只有《希腊人与非理性》会切（1092 条，其中
+// 1067 是"原文〔N〕"、10 是"注释＊"、15 还带着回引前那一个收尾标点，如 `”原文〔98〕`）；
+// 其余 9 本（晋书 4638 条、莊子 5122 条、祖堂集 3690 条…）一条都不切。没有一条动到正文
+// （见 tests/host/parser 里那套探针的用法）。
+static std::string rdTrimTrailingBackref(const std::string &text, const std::string &noteNum) {
+  const std::string want = rdNormalizeNoteNumber(noteNum);
+  if (want.empty() || text.empty()) return text;
+  std::vector<std::string> cs;  // 拆成 UTF-8 字符
+  for (size_t i = 0; i < text.size();) {
+    const int len = rdUtf8Len(static_cast<unsigned char>(text[i]));
+    if (i + static_cast<size_t>(len) > text.size()) return text;
+    cs.push_back(text.substr(i, static_cast<size_t>(len)));
+    i += static_cast<size_t>(len);
+  }
+  static const char *kClose[] = {"〕", "]", ")", "）", "】", "｝", "」", "》"};
+  static const char *kOpen[] = {"〔", "[", "(", "（", "【", "｛", "「", "《"};
+  size_t markerStart = cs.size();
+  bool isClose = false;
+  for (const char *c : kClose)
+    if (cs.back() == c) { isClose = true; break; }
+  if (isClose) {
+    for (size_t i = cs.size() - 1; i + 1 > 0 && cs.size() - i <= 8; i--) {
+      for (const char *o : kOpen)
+        if (cs[i] == o) {
+          std::string inner;
+          for (size_t k = i + 1; k + 1 < cs.size(); k++) inner += cs[k];
+          if (rdNormalizeNoteNumber(inner) == want) markerStart = i;
+          break;
+        }
+      if (markerStart != cs.size()) break;
+    }
+  } else if (cs.back() == want) {
+    markerStart = cs.size() - 1;  // 裸注号结尾（"注释＊"）
+  }
+  if (markerStart == cs.size()) return text;
+  // 短前缀：从 markerStart 往回最多 3 个字符，遇到句末标点或数字就停。
+  static const char *kStop[] = {"。", "．", ".", "！", "!", "？", "?", "；", ";", "，", ",", "、", "："};
+  size_t pre = markerStart;
+  while (pre > 0 && markerStart - pre < 3) {
+    const std::string &c = cs[pre - 1];
+    if (c[0] >= '0' && c[0] <= '9') break;
+    bool stop = false;
+    for (const char *s : kStop)
+      if (c == s) { stop = true; break; }
+    if (stop) break;
+    pre--;
+  }
+  if (pre == markerStart) return text;  // 号码紧贴前文，不像"回引标签 + 号码"
+  if (pre > 0) {                        // 前缀左边必须是句末标点，否则不动
+    const std::string &c = cs[pre - 1];
+    bool sent = false;
+    static const char *kSent[] = {"。", "．", ".", "！", "!", "？", "?", "；", ";", "）", ")"};
+    for (const char *s : kSent)
+      if (c == s) { sent = true; break; }
+    if (!sent) return text;
+  }
+  std::string out;
+  for (size_t i = 0; i < pre; i++) out += cs[i];
+  return out.empty() ? text : out;
+}
+
 // 取一条注释的**全部**正文。核心是**跨页**：注释条目常常正好排在翻页处，只读锚点那一页，
 // 正文会在页边界处被硬生生截断——这正是"同一条注文有的显示完整、有的只剩两行"的区别所在
 // （少的就是落在下一页的那几行）。所以这里从锚点那一行起一路读下去，直到**撞上源段落的边界**
@@ -508,8 +593,8 @@ static std::string rdStripLeadingNoteNumber(const std::string &line, const std::
 // 用户侧"注文有时被截断、有时又完整"的由来：注文跨页时撞上没排完的窗口就截断。
 // 排完之后（isBuildComplete）再拿不到就是真的没有了，那时 incomplete 保持 false，半截
 // 就是全部。
-static std::string rdNoteText(Section &sec, int pageIdx, int elementIdx, int fontId,
-                              const std::string &noteNum, bool *incomplete = nullptr) {
+static std::string rdNoteTextRaw(Section &sec, int pageIdx, int elementIdx, int fontId,
+                                 const std::string &noteNum, bool *incomplete = nullptr) {
   constexpr int kMaxExtraPages = 3;  // 锚点页之外最多再读 3 页
   constexpr int kMaxLines = 240;     // 总行数上限，防跑飞
 
@@ -659,6 +744,13 @@ static std::string rdNoteText(Section &sec, int pageIdx, int elementIdx, int fon
     // 本页读完还没见着结尾 → 注文跨页了，接着读下一页（下一轮 cur 从 0 起）
   }
   return out;
+}
+
+// 取注文正文，并在结尾做一次"段末回引"收尾（见 rdTrimTrailingBackref）。
+// 这是唯一对外的入口：Raw 只负责跨页取行，取到什么算什么。
+static std::string rdNoteText(Section &sec, int pageIdx, int elementIdx, int fontId, const std::string &noteNum,
+                             bool *incomplete = nullptr) {
+  return rdTrimTrailingBackref(rdNoteTextRaw(sec, pageIdx, elementIdx, fontId, noteNum, incomplete), noteNum);
 }
 
 // 取出第 idx 条脚注的正文并开弹注。三种结果见 enum FnPop 的说明。

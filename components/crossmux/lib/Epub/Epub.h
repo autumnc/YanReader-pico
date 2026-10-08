@@ -77,11 +77,11 @@ class Epub {
   // 待机整屏封面：拿书里的**原图**按 (maxW,maxH) 解一次（8 位灰阶 + fit，只缩不放），
   // 输出路径由调用方给（阅读器的待机缓存路径，见 screen_reader.cpp 的
   // standbyCoverPathFor）。和 generateCoverBmp 的区别只有两点：目标尺寸不再是那个
-  // 396×528 的书架盒子，名字也不再是 cover_v2.bmp —— 那张是给货架格子用的缩略图，
+  // 396×528 的书架盒子，名字也不再是 cover_v3.bmp —— 那张是给货架格子用的缩略图，
   // 待机整屏拿它放大就是用户说的"待机封面糊"。
   // / Full-screen standby cover generated from the book's ORIGINAL cover image at
   // (maxW,maxH): 8-bit gray, fit, never upscaled. Separate from generateCoverBmp
-  // because that one targets the 396×528 shelf box and its cover_v2.bmp name.
+  // because that one targets the 396×528 shelf box and its cover_v3.bmp name.
   bool generateStandbyCoverBmp(const std::string& outputPath, int maxW, int maxH) const;
   std::string getThumbBmpPath() const;
   std::string getThumbBmpPath(int height) const;

@@ -17,6 +17,7 @@ BIN="$BUILD/probe"
 FIXTURE="$SCRIPT_DIR/fixture.xhtml"
 GOLDEN="$SCRIPT_DIR/expected.txt"
 PARSER_REL="components/crossmux/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp"
+PARSER_H_REL="components/crossmux/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.h"
 
 # The commit that fixed the note-number back-jump ("注文区点注号跳不回正文"). Its parent
 # still treats every `<a class="...backref...">` as a non-internal link, so the note pages
@@ -58,10 +59,12 @@ REAL_SRC=(
   "$CROSS/lib/Utf8/Utf8.cpp"
 )
 
-# build_probe <out-binary> <parser-source>
+# build_probe <out-binary> <parser-source> [extra-include-dir-first]
 build_probe() {
+  local extra=()
+  [ "$#" -ge 3 ] && extra=(-I "$3")
   echo ">> compiling $1  (parser: ${2#"$REPO"/})"
-  "$CXX" "${CXXFLAGS[@]}" "${INCLUDES[@]}" "${DEFS[@]}" \
+  "$CXX" "${CXXFLAGS[@]}" "${extra[@]}" "${INCLUDES[@]}" "${DEFS[@]}" \
       "$SCRIPT_DIR/probe.cpp" "$SCRIPT_DIR/stubs.cpp" \
       "${REAL_SRC[@]}" "$2" \
       "$BUILD/expat/"*.o -o "$1"
@@ -89,7 +92,12 @@ case "${1:-}" in
     if cmp -s "$BUILD/ChapterHtmlSlimParser_prefix.cpp" "$CROSS/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp"; then
       echo ">> WARNING: the working copy equals $PRE_FIX_REF; the check is vacuous"
     fi
-    build_probe "$BUILD/probe_prefix" "$BUILD/ChapterHtmlSlimParser_prefix.cpp"
+    # 老 ref 的 .cpp 得配**它当年的头文件**才编得过：头文件里的类成员（StyleStackEntry 等）
+    # 这些年一直在长，拿现在的头文件去编老 .cpp 只会报一串 "no member named ..."。
+    # 放**平铺**的一层：那个 .cpp 里写的是 `#include "ChapterHtmlSlimParser.h"`，不是带目录的路径。
+    mkdir -p "$BUILD/prefix_inc"
+    git -C "$REPO" show "$PRE_FIX_REF:$PARSER_H_REL" > "$BUILD/prefix_inc/ChapterHtmlSlimParser.h"
+    build_probe "$BUILD/probe_prefix" "$BUILD/ChapterHtmlSlimParser_prefix.cpp" "$BUILD/prefix_inc"
     run_probe "$BUILD/probe_prefix" "$FIXTURE" > "$BUILD/prefix.txt"
     run_probe "$BIN" "$FIXTURE" > "$BUILD/current.txt"
     echo ">> delta  $PRE_FIX_REF  ->  working copy:"

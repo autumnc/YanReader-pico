@@ -393,7 +393,7 @@ static void drawAlmanacFace(bool valid) {
 //
 // 清晰度靠两件事，都不在绘制这一层：
 //   1) 封面框取常见封面的 2:3：同一张图下采样比更小，丢的细节更少；待机封面缓存就是
-//      按这个框解出来的（standby_v4.bmp），绘制端与它 1:1；
+//      按这个框解出来的（standby_v5.bmp），绘制端与它 1:1；
 //   2) readerCoverScale 里**只缩不放**（scale ≤ 1）：源图比框小就按原尺寸画。
 //      放大要么复制像素、要么插值，画出来的细节都是编的，只会更糊。
 // 封面像素用 fb_fast 直写（0..15 灰阶），不走 g_rd.drawGrayscale16Pixel：g_rd 绑的是

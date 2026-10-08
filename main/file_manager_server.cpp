@@ -245,7 +245,7 @@ static const char *HTML_PAGE = R"raw(<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>文件管理</title>
 <style>
-body{font-family:sans-serif;max-width:800px;margin:0 auto;padding:12px;font-size:14px}
+body{font-family:sans-serif;max-width:800px;margin:0 auto;padding:12px 12px 76px;font-size:14px}
 h1{font-size:18px;margin:0 0 12px}
 #breadcrumb{margin-bottom:8px;color:#666}
 table{width:100%;border-collapse:collapse}
@@ -266,6 +266,14 @@ th{background:#f5f5f5;font-weight:600}
 #up .bar i{display:block;height:100%;width:0;background:#2563eb;transition:width .15s linear}
 #up .txt{font-size:12px;color:#555;margin-top:4px}
 button[disabled]{opacity:.5;cursor:default}
+/* 右下角浮动的「看隐藏文件」开关：没开时是白底灰眼睛（灰=次要），开了变成蓝底白眼睛。
+   两枚 SVG 都写在 DOM 里靠 .on 切显示，省得 JS 里再拼一遍图标字符串。 */
+#eyeBtn{position:fixed;right:16px;bottom:16px;width:48px;height:48px;border-radius:50%;border:1px solid #d1d5db;background:#fff;color:#4b5563;box-shadow:0 2px 8px rgba(0,0,0,.25);cursor:pointer;padding:0;display:flex;align-items:center;justify-content:center;z-index:10}
+#eyeBtn.on{background:#2563eb;border-color:#2563eb;color:#fff}
+#eyeBtn svg{width:24px;height:24px}
+#eyeBtn #eyeOn{display:none}
+#eyeBtn.on #eyeOff{display:none}
+#eyeBtn.on #eyeOn{display:block}
 </style></head><body>
 <h1>pjournal - 文件管理</h1>
 <div id="breadcrumb"></div>
@@ -280,16 +288,21 @@ button[disabled]{opacity:.5;cursor:default}
 <div id="msg"></div>
 <table><thead><tr><th>名称</th><th>大小</th><th>操作</th></tr></thead>
 <tbody id="list"></tbody></table>
+<button id="eyeBtn" onclick="toggleHidden()" title="显示隐藏文件" aria-pressed="false">
+<svg id="eyeOff" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+<svg id="eyeOn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+</button>
 <script>
 var curPath='/sdcard';
 var upBusy=false;
+var showHidden=false;
 var token='';try{token=localStorage.getItem('pjournal_token')||''}catch(e){}
 function hd(){return token?{'X-Auth-Token':token}:{}}
 function setToken(){var t=prompt('文件管理密码(留空则不设)',token);if(t!==null){token=t.trim();try{localStorage.setItem('pjournal_token',token)}catch(e){}}}
 function showMsg(t,ok){var e=document.getElementById('msg');e.textContent=t;e.className=ok?'ok':'err';e.style.display='block';setTimeout(function(){e.style.display='none'},3000)}
 function loadDir(p){
   curPath=p;
-  fetch('/api/list?path='+encodeURIComponent(p),{headers:hd()}).then(r=>r.json()).then(d=>{
+  fetch('/api/list?path='+encodeURIComponent(p)+(showHidden?'&hidden=1':''),{headers:hd()}).then(r=>r.json()).then(d=>{
     document.getElementById('breadcrumb').textContent=d.path;
     var h='';
     if(d.path!=='/sdcard') h+='<tr><td class="dir" onclick="loadDir(\''+esc(p.replace(/\/[^/]+$/,''))+'\')">..</td><td></td><td></td></tr>';
@@ -371,6 +384,16 @@ function mkdir(){
   .then(r=>r.json()).then(d=>{showMsg(d.ok?'创建成功':'创建失败: '+d.error,d.ok);if(d.ok){document.getElementById('dirName').value='';loadDir(curPath)}})
   .catch(()=>showMsg('创建失败',false));
 }
+// 隐藏文件开关：只影响列目录（服务端按 hidden=1 才把点文件发过来）。不写 localStorage，
+// 刷新即复位 —— 点文件（.crossmux 缓存、.Trash 之类）平时不该出现在列表里。
+function toggleHidden(){
+  showHidden=!showHidden;
+  var b=document.getElementById('eyeBtn');
+  b.className=showHidden?'on':'';
+  b.title=showHidden?'隐藏隐藏文件':'显示隐藏文件';
+  b.setAttribute('aria-pressed',showHidden?'true':'false');
+  loadDir(curPath);
+}
 loadDir('/sdcard');
 </script></body></html>)raw";
 
@@ -386,6 +409,8 @@ static esp_err_t __attribute__((unused)) handler_list(httpd_req_t *req) {
     if (!authOk(req)) return sendAuthError(req);
     std::string path = getQueryParam(req, "path");
     if (path.empty()) path = "/sdcard";
+    // 网页右下角那只眼睛：默认（不带 hidden=1）照旧滤掉点文件，带上了才一起列出来。
+    const bool showHidden = getQueryParam(req, "hidden") == "1";
     if (!isSafePath(path)) {
         sendJsonError(req, "invalid path");
         return ESP_OK;
@@ -414,7 +439,11 @@ static esp_err_t __attribute__((unused)) handler_list(httpd_req_t *req) {
     int count = 0;
     bool truncated = false;
     while ((ent = readdir(dir)) != nullptr) {
-        if (ent->d_name[0] == '.') continue;
+        // "." 和 ".." 永远不列（后者是 readdir 给的真实条目，点进来会拼出 path + "/.."）；
+        // 其余点文件只在开了眼睛之后才发。前端那行 ".." 是自己按 path 算的，与此无关。
+        const char *nm = ent->d_name;
+        if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0'))) continue;
+        if (!showHidden && nm[0] == '.') continue;
         if (count >= kMaxEntries) { truncated = true; break; }
         count++;
         std::string full = path + "/" + ent->d_name;

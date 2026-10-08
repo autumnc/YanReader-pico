@@ -836,6 +836,14 @@ static void drawDictChoose() {
     ui_commit();
 }
 
+// 词典表的几何：表头基线 / 一屏行数。drawDictList 与按键翻页共用同一份
+// ——两处各写一遍式子迟早会漂（ui/list_view.h 开头那段讲的就是这个坑）。
+static int dictListLastBase() { return STATUS_Y - FONT_H + g_font.ascent(); }
+static int dictListVisibleRows() {
+    int v = (dictListLastBase() - FONT_H * 2) / FONT_H;
+    return v < 1 ? 1 : v;
+}
+
 static void drawDictList(bool doCommit = true) {
     auto &entries = currentDictEntries();
     auto &filtered = dictFilteredIndices(entries);
@@ -851,7 +859,7 @@ static void drawDictList(bool doCommit = true) {
 
     // 表格底部贴住状态栏分割线:由最后一行单元格底边=STATUS_Y反推表头基线,
     // 空出的顶部余量让表头整体下移,能多放一行就多放一行
-    int lastBase = STATUS_Y - FONT_H + g_font.ascent();
+    int lastBase = dictListLastBase();
     int visible = (lastBase - FONT_H * 2) / FONT_H;
     int startY = lastBase - visible * FONT_H;
     if (visible < 1) visible = 1;
@@ -1280,13 +1288,19 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
         if (key == 'j' || key == KEY_DOWN) {
             if (g_settingsState.selection < CAT_COUNT - 1) g_settingsState.selection++;
         }
+        // 触摸上下滑 = 整页翻（全仓同一条规矩，见 ui/list_view.h 的 listViewPageStep）：
+        // 一步跨一屏的行数。**分类一屏放得下就没得翻**，吃掉这一划什么都不动 ——
+        // 以前这里是无条件 `selection ± 一屏` 再夹到 CAT_COUNT-1，七行的小表上就变成
+        // "按一下就跳到最后一个分类"，看着是"上下选择"而不是翻页。
         if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
             int pageRows = settingsListVisible();
             if (pageRows < 1) pageRows = 1;
-            int t = g_settingsState.selection + (key == KEY_PAGE_DOWN ? pageRows : -pageRows);
-            if (t < 0) t = 0;
-            if (t > CAT_COUNT - 1) t = CAT_COUNT - 1;
-            g_settingsState.selection = t;
+            if (CAT_COUNT > pageRows) {
+                int t = g_settingsState.selection + (key == KEY_PAGE_DOWN ? pageRows : -pageRows);
+                if (t < 0) t = 0;
+                if (t > CAT_COUNT - 1) t = CAT_COUNT - 1;
+                g_settingsState.selection = t;
+            }
         }
         if (key == 0x0A || key == 0x0D) {
             int tx, ty;
@@ -1387,6 +1401,16 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             if (g_settingsState.dictSelection > 0) g_settingsState.dictSelection--;
         } else if (key == KEY_DOWN || key == 'j') {
             if (g_settingsState.dictSelection < total - 1) g_settingsState.dictSelection++;
+        } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+            // 触摸上下滑 = 整页翻（与分类/字段列表同一条规矩）：一步一屏，高亮跟着页走，
+            // 一屏放得下就没得翻（原先这支没有 KEY_PAGE 分支，上下滑在这里什么都不做）。
+            const int pageRows = dictListVisibleRows();
+            if (total > pageRows) {
+                int t = g_settingsState.dictSelection + (key == KEY_PAGE_DOWN ? pageRows : -pageRows);
+                if (t < 0) t = 0;
+                if (t > total - 1) t = total - 1;
+                g_settingsState.dictSelection = t;
+            }
         } else if (key == '/') {
             g_settingsState.dictSearching = true;
             g_settingsState.dictSearchCursor = (int)g_settingsState.dictSearchBuffer.length();
@@ -1604,17 +1628,15 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
     }
     if (key == 'k' || key == KEY_UP) { if (g_settingsState.selection > 0) g_settingsState.selection--; }
     if (key == 'j' || key == KEY_DOWN) { if (g_settingsState.selection < fieldVisibleCount()-1) g_settingsState.selection++; }
-    // 触摸上下滑 = 整页滚动：整屏移动选项单(非逐项)。scroll 由 selection 在绘制时反推。
+    // 触摸上下滑 = 整页翻：一屏的行数，高亮跟着页走（scroll 由 selection 在绘制时反推）。
+    // **整个分类一屏放得下就没得翻**，什么都不动（与分类列表同一个口径）。
     if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
         int pageRows = settingsListVisible();  // 与绘制时 visible 同式
         if (pageRows < 1) pageRows = 1;
         int n = fieldVisibleCount();
-        if (key == KEY_PAGE_DOWN) {
-            int t = g_settingsState.selection + pageRows;
+        if (n > pageRows) {
+            int t = g_settingsState.selection + (key == KEY_PAGE_DOWN ? pageRows : -pageRows);
             if (t > n - 1) t = n - 1;
-            g_settingsState.selection = t;
-        } else {
-            int t = g_settingsState.selection - pageRows;
             if (t < 0) t = 0;
             g_settingsState.selection = t;
         }

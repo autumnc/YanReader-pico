@@ -13,7 +13,7 @@
 // native framebuffer, so the payload can be copied back pixel-for-pixel without
 // re-quantizing (see DitherUtils.h setNibble/getNibble).
 //
-// File layout: uint16 width, uint16 height, uint8 version (=2), then the payload,
+// File layout: uint16 width, uint16 height, uint8 version (=3), then the payload,
 // row-major. The version byte is what makes a stale 2bpp cache (same name, half
 // the row stride) impossible to misinterpret; ImageBlock additionally puts the
 // format in the file *name* (.g16*.pxc), so old caches are simply never opened.
@@ -32,7 +32,12 @@
 // to contiguous, non-overlapping destination row ranges, so once a block whose
 // top row is Y arrives, every output row < Y is final and is flushed to disk.
 struct PixelCache {
-  static constexpr uint8_t kFormatVersion = 2;  // 2 = 16-level 4bpp payload
+  // 3 = 16-level 4bpp payload（**格式没变**，抬版本是为了让老缓存作废）：书内图片走的
+  // JpegToFramebufferConverter 以前对渐进式 JPEG 只解 JPEGDEC 的 DC 扫描（固定 1/8），
+  // 那些 1/8 像素的 .pxc 会**原样命中**新固件 —— 名字和宽高都没变，version 还是 2 ——
+  // 于是封面页照旧糊、根本不重解。刷机不清 SD，所以必须靠抬版本字节把老缓存赶掉。
+  // 代价是所有书的插图缓存一次性重解，之后回到正常（只此一次）。
+  static constexpr uint8_t kFormatVersion = 3;  // 3 = 16-level 4bpp payload
   static constexpr int kHeaderBytes = 5;        // w16 + h16 + version8
   uint8_t* buffer;   // band buffer: (bandRows + 1) rows; last row kept zeroed
   uint8_t* zeroRow;  // points at the spare zeroed row, for gap/clip fill

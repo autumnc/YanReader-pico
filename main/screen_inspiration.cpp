@@ -4,6 +4,7 @@
 #include "json_parser.h"
 #include "journal_storage.h"
 #include "ui_helpers.h"
+#include "ui/list_view.h"  // listPageStep：手写列表的翻页步长（一屏行数 / 没得翻 = 0）
 #include "ime/IME.h"
 #include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划/阅读共用一份）
 #include "clipboard.h"
@@ -123,6 +124,31 @@ static std::string readFileContent(const std::string &path) {
 }
 
 // ── Drawing ──────────────────────────────────────────────────────────────
+
+// ── 翻页步长（触摸上下滑 = 整页翻）──────────────────────────────────────
+// 一屏的行数，与对应绘制函数**同一个基准**（那边是排版，这边是翻页，两处各写一遍
+// 式子迟早会漂）。行数 < 1 时抬到 1。
+static int inspListVis() {
+    const int y = FONT_H + 8 + LINE_SPACING;  // 与 drawList 的首行同源
+    int v = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
+    return v < 1 ? 1 : v;
+}
+
+static int inspSearchVis() {
+    const bool vk = editorVkVisible();
+    const bool composing = g.searchImeActive && g_ime.composing() && !vk;
+    const int listY = (FONT_H + 4) + LINE_SPACING;
+    const int listMaxY = vk ? (editorVkTop() - LINE_SPACING)
+                            : (composing ? imeFullscreenPanelTopY() - LINE_SPACING : SCREEN_H);
+    int v = (listMaxY - listY + LINE_SPACING - 1) / LINE_SPACING;  // 与 drawSearch 同式
+    return v < 1 ? 1 : v;
+}
+
+static int inspHelpVis() {
+    const int contentY = ui_title_baseline() + g_font.descent() + 12;
+    int v = (STATUS_Y - contentY) / LINE_SPACING;  // 与 drawHelp 同式
+    return v < 1 ? 1 : v;
+}
 
 static void drawList() {
     ui_clear();
@@ -396,6 +422,14 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
         if (g.mode != s_prevMode) { textSelReset(); s_prevMode = g.mode; }
     }
 
+    // 触摸上下滑的翻页键（主循环不再替写作界面回退成单步）：**列表和帮助**按屏翻
+    // ——下面的 IM_LIST / IM_SEARCH / IM_HELP 各自接 KEY_PAGE_*；其余子状态
+    // （关键词编辑等）保持原来的单步语义（那些分支只认 KEY_UP/DOWN）。
+    if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+        const bool pageMode = (g.mode == IM_LIST || g.mode == IM_SEARCH || g.mode == IM_HELP);
+        if (!pageMode) key = (key == KEY_PAGE_UP) ? KEY_UP : KEY_DOWN;
+    }
+
     // ── IM_HELP ──
     if (g.mode == IM_HELP) {
         if (key == 0x1B || key == 'q' || key == 'Q' || key == 0x0A || key == 0x0D) {
@@ -404,6 +438,11 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
             if (g.helpScroll > 0) g.helpScroll--;
         } else if (key == KEY_DOWN) {
             g.helpScroll++;
+        } else if (key == KEY_PAGE_UP) {
+            g.helpScroll -= inspHelpVis();
+            if (g.helpScroll < 0) g.helpScroll = 0;
+        } else if (key == KEY_PAGE_DOWN) {
+            g.helpScroll += inspHelpVis();  // 上限在画的时候夹住
         }
         drawHelp();
         return APP_INSPIRATION;
@@ -558,6 +597,15 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
             if (g.sel > 0) g.sel--;
         } else if (key == KEY_DOWN) {
             if (g.sel < (int)g.searchResults.size() - 1) g.sel++;
+        } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+            // 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。
+            const int n = (int)g.searchResults.size();
+            const int step = listPageStep(n, inspSearchVis());
+            if (step > 0) {
+                g.sel += (key == KEY_PAGE_DOWN) ? step : -step;
+                if (g.sel < 0) g.sel = 0;
+                if (g.sel > n - 1) g.sel = n - 1;
+            }
         } else if (key == 0x7F || key == 0x08) {
             // 只在真的删掉一个码点后重算结果/复位选中：和原来 `if (searchCur > 0)` 等价
             if (imeFieldBackspace(inspSearchField())) {
@@ -585,6 +633,15 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
         if (g.sel > 0) g.sel--;
     } else if (key == KEY_DOWN) {
         if (g.sel < (int)g.itemCount - 1) g.sel++;
+    } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+        // 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。
+        const int n = (int)g.itemCount;
+        const int step = listPageStep(n, inspListVis());
+        if (step > 0) {
+            g.sel += (key == KEY_PAGE_DOWN) ? step : -step;
+            if (g.sel < 0) g.sel = 0;
+            if (g.sel > n - 1) g.sel = n - 1;
+        }
     } else if (key == 'a' || key == 'A') {
         // Add new inspiration — open editor
         JsonValue item;

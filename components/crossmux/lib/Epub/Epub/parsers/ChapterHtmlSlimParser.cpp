@@ -460,7 +460,9 @@ void ChapterHtmlSlimParser::armInlineAnchor(const std::string& id, const char* e
   if (!currentTextBlock) return;
   // 上限只是防病态输入（一个 <p> 里挂几千个 id）。真到上限就退回延后那条路，宁可贵一点。
   if (inlineAnchorArms.size() >= 64) return;
-  inlineAnchorArms.push_back({currentTextBlock.get(), static_cast<int>(currentTextBlock->size()), id});
+  inlineAnchorArms.push_back(
+      {currentTextBlock.get(), static_cast<int>(currentTextBlock->size()), id, partWordBufferIndex}
+  );
 }
 
 void ChapterHtmlSlimParser::resolveInlineAnchors(TextBlock* line) {
@@ -1868,6 +1870,27 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         if (self->hasFailed()) return;
       }
 
+      // 兜底第三种形态：注号 id 挂在**紧邻的前一个空 `<a>`** 上，本链接自己没有 id、
+      // pendingAnchorId 也是空的
+      //   <a id="w1"></a><a href="part0003.html#m1"><sup>[1]</sup></a>
+      //   （《古典柏拉图主义哲学导论》整本都是两两一对：正文侧 `<a id="w1">`+`<a href="#m1">`，
+      //     注文侧 `<a id="m1">`+`<a href="#w1">`。前两条 id 都没人登记，回引认不出来，
+      //     每章凭空多出一倍的假脚注）。
+      // 唯一线索是 inlineAnchorArms 里那条"刚 arm 过、之后一个字都没动过"的行内锚点。
+      // 判据必须取在**下面这次 flush 之前**：arm 时尾部还有没折成词的文本，flush 一跑游标
+      // 就往后走，取在后面永远比不上。两条同时成立才算紧邻 —— 块游标没动（没往块里加词）、
+      // 待刷缓冲长度没动（两个 `<a>` 之间没有夹着文本）。少了后一条，`<a id="x"></a>文字<a href>`
+      // 这种也会被误认成紧邻。
+      std::string adjacentAnchorId;
+      if (self->currentTextBlock && !self->inlineAnchorArms.empty()) {
+        const InlineAnchorArm& last = self->inlineAnchorArms.back();
+        if (last.block == self->currentTextBlock.get() &&
+            last.wordOffset == static_cast<int>(self->currentTextBlock->size()) &&
+            last.pendingAtArm == self->partWordBufferIndex) {
+          adjacentAnchorId = last.id;
+        }
+      }
+
       // Flush buffer before style change
       if (self->partWordBufferIndex > 0) {
         self->flushPartWordBuffer();
@@ -1899,13 +1922,27 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
           (!localAnchor.empty() &&
            std::find(self->footnoteMarkerAnchors.begin(), self->footnoteMarkerAnchors.end(), localAnchor) !=
                self->footnoteMarkerAnchors.end());
-      // 只有**非回引**才登记 pendingAnchorId：回引的外层 id 是"注文那条"的 id
+      // 登记"注号锚点"（见头文件 footnoteMarkerAnchors 的说明）。注号 id 的来源**有两个**，
+      // 按优先级取：
+      //   · 链接**自己**的 id —— `<a id="noteref_1" href="#note_1">`（Duokan/Sigil 一系）、
+      //     `<a id="1" href="#2">`（趙州録）。这类 id 在属性循环里已经被 armInlineAnchor 收进
+      //     inlineAnchorArms 了，**不会**落到 pendingAnchorId，所以必须在这儿直接读自己的 id。
+      //     原来只读 pendingAnchorId，于是这几种书一条注号锚点都没登记 —— 注文侧那条回引认不
+      //     出来，全被当成脚注收下（《希腊人与非理性》每章凭空多出 116 条指向正文的假脚注，
+      //     既挤占每页 16 条的 FootnoteList，点上去还弹错东西）。
+      //   · 外层元素的 id —— `<sup id="ref-001"><a href="#note-001">`（晋书）才是
+      //     pendingAnchorId 的用武之地。
+      // 只有**非回引**才登记：回引的外层 id 是"注文那条"的 id
       // （<p id="note-013"><a class="note-backref" href="#ref-013">），把它也收进注号锚点表，
       // 之后任何指向该注文的链接都会被误判成回引、不再登记成脚注（一注多引的书就点不出弹注）。
-      if (!self->currentFootnoteIsBackref && !self->pendingAnchorId.empty() &&
-          std::find(self->footnoteMarkerAnchors.begin(), self->footnoteMarkerAnchors.end(), self->pendingAnchorId) ==
+      const char* ownId = getAttribute(atts, "id");
+      std::string markerId = ownId != nullptr ? std::string(ownId) : self->pendingAnchorId;
+      // 第三种形态（id 挂在紧邻的前一个空 `<a>` 上）—— 判据见上面取 adjacentAnchorId 处。
+      if (markerId.empty()) markerId = adjacentAnchorId;
+      if (!self->currentFootnoteIsBackref && !markerId.empty() &&
+          std::find(self->footnoteMarkerAnchors.begin(), self->footnoteMarkerAnchors.end(), markerId) ==
               self->footnoteMarkerAnchors.end()) {
-        self->footnoteMarkerAnchors.push_back(self->pendingAnchorId);
+        self->footnoteMarkerAnchors.push_back(markerId);
       }
 
       // Apply underline style to visually indicate the link.

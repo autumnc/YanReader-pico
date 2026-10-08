@@ -11,6 +11,7 @@
 #include "screen_editor.h"
 #include "vertical_layout.h"
 #include "input.h"
+#include "ui/list_view.h"  // listPageStep：手写列表的翻页步长（一屏行数 / 没得翻 = 0）
 #include <cstdlib>
 #include <cstdio>
 #include <ctime>
@@ -649,6 +650,17 @@ AppState screen_browser_handle(int key, ScreenContext &ctx) {
     if (key == 'q' || key == 'Q' || key == 0x1B) { ctx.nextState = APP_MAIN; return APP_MAIN; }
     if (key == 'j' || key == KEY_DOWN) { g_browser.selection++; if (g_browser.selection>=(int)entries.size()) g_browser.selection=(int)entries.size()-1; }
     if (key == 'k' || key == KEY_UP) { g_browser.selection--; if (g_browser.selection<0) g_browser.selection=0; }
+    if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+        // 触摸上下滑 = 整页翻：一步一屏（brwVisibleRows：底部要给浮动按钮让一条），
+        // 高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。窗口由绘制按选中项反推。
+        const int n = (int)entries.size();
+        const int step = listPageStep(n, brwVisibleRows());
+        if (step > 0) {
+            g_browser.selection += (key == KEY_PAGE_DOWN) ? step : -step;
+            if (g_browser.selection < 0) g_browser.selection = 0;
+            if (g_browser.selection > n - 1) g_browser.selection = n - 1;
+        }
+    }
     if (key == 0x0A || key == 0x0D) {
         // 触摸点按（input_tap_xy 是一次性的，只读一次）：先看右下角两个浮动按钮，
         // 都不是就落在哪一行选哪一行，再打开——"点哪行开哪行"。
@@ -813,6 +825,9 @@ AppState screen_viewer_handle(int key, ScreenContext &ctx) {
     int maxScroll = (int)vrows.size() - visible;
     if (maxScroll < 0) maxScroll = 0;
     if (g_viewer.scroll > maxScroll) g_viewer.scroll = maxScroll;
+    // 触摸上下滑 = 整页翻（横排正文的一屏就是 visible 行）。
+    if (key == KEY_PAGE_UP) { g_viewer.scroll -= visible; if (g_viewer.scroll < 0) g_viewer.scroll = 0; }
+    if (key == KEY_PAGE_DOWN) { g_viewer.scroll += visible; if (g_viewer.scroll > maxScroll) g_viewer.scroll = maxScroll; }
 
     ui_clear();
 
@@ -870,6 +885,13 @@ static AppState historyReturn(ScreenContext &ctx) {
 
 static void drawHistoryConfirm(const char *title, const char *action) {
     ui_draw_confirm_dialog(title, action, "ESC=取消");
+}
+
+// 历史列表一屏的行数（与 drawHistoryList 的首行同源）——翻页步长用它。
+static int historyListRows() {
+    const int rowH = LINE_SPACING;
+    int v = (STATUS_Y - (FONT_H + rowH) + rowH - 1) / rowH;
+    return v < 1 ? 1 : v;
 }
 
 static void drawHistoryList() {
@@ -1078,6 +1100,15 @@ AppState screen_history_handle(int key, ScreenContext &ctx) {
     if (key == 'q' || key == 'Q' || key == 0x1B) return historyReturn(ctx);
     if (key == 'j' || key == KEY_DOWN) { if (g_history.selection < total - 1) g_history.selection++; }
     if (key == 'k' || key == KEY_UP) { if (g_history.selection > 0) g_history.selection--; }
+    if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+        // 触摸上下滑 = 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻。
+        const int step = listPageStep(total, historyListRows());
+        if (step > 0) {
+            g_history.selection += (key == KEY_PAGE_DOWN) ? step : -step;
+            if (g_history.selection < 0) g_history.selection = 0;
+            if (g_history.selection > total - 1) g_history.selection = total - 1;
+        }
+    }
     if ((key == 0x0A || key == 0x0D) && total > 0) {
         ui_clear(); ui_show_message_centered("正在读取..."); ui_commit();
         std::string content = g_journal.readHistoryVersion(g_history.filename, g_history.versions[g_history.selection].filename);

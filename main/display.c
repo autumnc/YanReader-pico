@@ -654,6 +654,17 @@ int reader_refresh_test_present(int which) {
 // 本仓库不动它 —— 这里只读数。
 int reader_leading_skip(void) { return epd_last_leading_skip(); }
 
+// 见 reader_refresh_bridge.h：GL16 表里「不变的白底」(15→15) 挂几相白推。
+// 档位本身在波形组件里（e0470_epaper_waveform.c），这里只是把阅读器那道 include 墙
+// 绕过去的一层薄壳 —— 阅读器 TU 摸不到 epdiy/波形类型。改表必须在下一次推屏之前。
+void reader_set_white_pushes(int count) {
+    e0470_waveform_set_white_pushes(count);
+}
+
+int reader_white_pushes(void) {
+    return e0470_waveform_white_pushes();
+}
+
 // ── 清一块区域的残影（输入法那两行）────────────────────────────────────────
 //
 // **必须是 GC16，不能是 GL16。** 这是实测踩出来的：很长一段时间里输入法编码区/候选区

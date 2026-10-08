@@ -5,6 +5,7 @@
 #include <Logging.h>
 #include <Memory.h>
 #include <Serialization.h>
+#include <esp_heap_caps.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -18,7 +19,7 @@
 // Cache file format:
 // - uint16_t width
 // - uint16_t height
-// - uint8_t version (= PixelCache::kFormatVersion, 2 = 16-level 4bpp)
+// - uint8_t version (= PixelCache::kFormatVersion, 3 = 16-level 4bpp)
 // - uint8_t pixels[...] - 4 bits per pixel, packed (2 pixels per byte: even column
 //   in the low nibble), row-major order
 //
@@ -179,6 +180,24 @@ uint64_t pxcSlotHash = 0;
 uint16_t pxcSlotWidth = 0;
 uint16_t pxcSlotHeight = 0;
 
+// PSRAM 裸缓冲。**不要**用 memory::makePsramByteBuffer*：它挂在 `#if defined(BOARD_HAS_PSRAM)`
+// 上，而本工程从不定义这个宏 —— 那两个 helper 恒返回空，编译器还会把下游的 `if (buf)`
+// 整块当死代码删掉（症状：编译过了、刷机了、屏幕上一点变化都没有）。同样的坑与更长的说明
+// 记在 JpegToBmpConverter.cpp 的 allocPsramBuffer 和 Epub/converters/JpegToFramebufferConverter.cpp。
+// ByteBuffer 的释放是 free()，在 CONFIG_SPIRAM_USE_MALLOC 下与 heap_caps_malloc 配对。
+memory::ByteBuffer allocPsramChunk(size_t size) {
+  if (size == 0) return {};
+  return memory::ByteBuffer{static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT))};
+}
+
+// memory::psramHasHeadroom 是同一个空桩（恒 false），所以这道门也得自己算，否则下面
+// allocateChunks(true) 永远轮不到。口径与 Memory.h 里那份逐字一致。
+bool psramSlotHasHeadroom(size_t totalBytes, size_t contiguousBytes) {
+  return memory::hasAllocationHeadroom(heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                                       heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), totalBytes,
+                                       contiguousBytes, memory::PSRAM_FREE_RESERVE, PXC_MAX_ALLOC_RESERVE);
+}
+
 void releasePxcSlot() {
   for (auto& chunk : pxcChunks) chunk.reset();
   pxcSlotHash = 0;
@@ -216,7 +235,7 @@ bool loadPxcSlot(uint64_t cacheHash, HalFile& cacheFile, uint16_t cachedWidth, u
     size_t remaining = payloadBytes;
     for (size_t i = 0; i < chunkCount; i++) {
       const size_t want = remaining < PXC_CHUNK_SIZE ? remaining : PXC_CHUNK_SIZE;
-      pxcChunks[i] = usePsram ? memory::makePsramByteBufferNoThrow(want) : memory::makeInternalByteBufferNoThrow(want);
+      pxcChunks[i] = usePsram ? allocPsramChunk(want) : memory::makeInternalByteBufferNoThrow(want);
       if (!pxcChunks[i]) {
         releasePxcSlot();
         return false;
@@ -229,7 +248,7 @@ bool loadPxcSlot(uint64_t cacheHash, HalFile& cacheFile, uint16_t cachedWidth, u
   const bool internalFits = memory::hasAllocationHeadroom(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), payloadBytes,
                                                           largestChunk, PXC_HEAP_RESERVE, PXC_MAX_ALLOC_RESERVE);
   if (!internalFits || !allocateChunks(false)) {
-    if (!memory::psramHasHeadroom(payloadBytes, largestChunk, PXC_MAX_ALLOC_RESERVE) || !allocateChunks(true)) {
+    if (!psramSlotHasHeadroom(payloadBytes, largestChunk) || !allocateChunks(true)) {
       return false;
     }
   }

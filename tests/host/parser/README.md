@@ -37,22 +37,35 @@ tests/host/parser/build/probe some.xhtml 1 1216 684
 | `probe.cpp` | the driver: construct a `ChapterHtmlSlimParser`, parse one file, print each page's transcript |
 | `stubs.cpp` | `Page::addLink`/`addFootnote` capture into globals, plus the image / bidi / hyphenation stubs the parser links against |
 | `stubs/*.h` | host shims for `Arduino.h`, `HalStorage.h`/`HalFile`, `GfxRenderer.h`, `Epub.h`, `Logging.h`, … |
-| `fixture.xhtml` | a two-note sample: body markers + a note section with `<a class="note-backref">` |
+| `fixture.xhtml` | a three-note sample: body markers + a note section with `<a class="note-backref">` |
 | `expected.txt` | the golden transcript for `fixture.xhtml` |
 | `run.sh` | one-command build + run + diff |
 | `build/` | build output (gitignored) |
 
 ## What the fixture exercises
 
-Two body paragraphs each carry a marker `<a href="fixture.xhtml#note-NNN">`, and the note
-section carries the matching back-links `<a class="note-backref" href="fixture.xhtml#ref-NNN">`.
-Both use the `filename#anchor` form (calibre's habit) so the `localAnchorOf` filename rule
-is in play. The golden transcript is therefore sensitive to:
+Three body paragraphs each carry a marker `<a href="fixture.xhtml#note-NNN">`, and the note
+section carries the matching back-links. Everything uses the `filename#anchor` form
+(calibre's habit) so the `localAnchorOf` filename rule is in play. Two shapes are covered:
+
+- `ref-001` / `ref-002` — the note-side back-link carries `class="note-backref"` (calibre's
+  habit), so the back-link is recognised by its class;
+- `ref-003` — neither side carries a class, and the note-number id hangs on an **empty `<a>`
+  immediately before** the link (`<a id="ref-003"></a><a href="…#note-003">`; this is
+  《古典柏拉图主义哲学导论》's shape, whole book). The back-link has nothing but the id to
+  go on, so this pair is the one that goes wrong if the "adjacent empty anchor" rule breaks.
+
+The golden transcript is therefore sensitive to:
 
 - the **footnote registration direction** — body markers must become footnotes, the
-  back-links must not (2 entries, not 4);
+  back-links must not (3 entries, not 6);
 - the **link rects** — body markers get one each, *and the back-links get one each too*
-  (4 rects, not 2). Zero rects on the back-links is the bug.
+  (6 rects, not 3). Zero rects on the back-links is the bug.
+
+Note that the body markers in the fixture use the *same* "empty `<a id>` then `<a href>`"
+shape; the pairs differ only in which side is the note. That asymmetry — the body side
+registers, the note side is then recognised as a back-link — is what the rule has to get
+right.
 
 ## `--verify-fix` (why this harness has teeth)
 
@@ -62,13 +75,28 @@ together with its footnote registration — and diffs its transcript against the
 copy. Expected delta on `fixture.xhtml`:
 
 ```
--total: 2 footnote entries, 2 link rects, 1 pages
-+total: 2 footnote entries, 4 link rects, 1 pages
+-   footnote  num='〔三〕'  href='fixture.xhtml#ref-003'
+    link      href='fixture.xhtml#note-001'
+    link      href='fixture.xhtml#note-002'
+    link      href='fixture.xhtml#note-003'
++   link      href='fixture.xhtml#ref-001'
++   link      href='fixture.xhtml#ref-002'
+    link      href='fixture.xhtml#ref-003'
+-total: 4 footnote entries, 4 link rects, 1 pages
++total: 3 footnote entries, 6 link rects, 1 pages
 ```
 
-i.e. the fix adds the two back-link rects **without** disturbing the footnote count. If the
-diff is empty, `run.sh` exits non-zero ("is the fix present?"). Override the reference with
+i.e. the fix adds the missing note-side link rects **without** disturbing the footnote
+count, and drops the one bogus footnote (`ref-003` had been registered as if the note
+section's back-link were a body marker). If the diff is empty, `run.sh` exits non-zero
+("is the fix present?"). Override the reference with
 `PRE_FIX_REF=<rev> tests/host/parser/run.sh --verify-fix`.
+
+An old `PRE_FIX_REF` is compiled against **its own** `ChapterHtmlSlimParser.h` (pulled out
+of git into `build/prefix_inc/` and put first on the include path). The header's class
+members keep growing (`StyleStackEntry::hasAltFont`, …), so the current header no longer
+compiles an old `.cpp` — without this, `--verify-fix` on any old revision fails with a wall
+of `no member named …`.
 
 ## Build gotchas (already handled in `run.sh`)
 

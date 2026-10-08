@@ -41,24 +41,51 @@ struct ListView {
     int rows = 1;   // 可见行数（窗口高 / 行高，至少 1）
     int top = 0;    // 首行**上沿**的 y（不是基线、不是行心 —— 与绘制同一个基准）
     int itemH = 1;  // 行高（含行距），必须 > 0
-    int page = 8;   // 翻页步长
+    // 翻页步长：0 = 自动（一屏的行数 rows），非 0 = 调用方指定的档位。自动口径就是
+    // "上下滑 = 整屏滚动"这条统一定义 —— 高亮跟着页走，屏幕上的相对行不变。
+    int page = 0;
 };
+
+// 一次翻页跨多少行：**一屏放得下就是 0**（没得翻），否则一屏的行数（= lv.rows）。
+// "没得翻就不动"是这套交互的一半：以前按下即夹到列表末尾（`sel ± 一屏` 再夹边界），
+// 一屏放得下的短列表上看着就是"上下选择"而不是翻页。
+inline int listViewPageStep(const ListView &lv) {
+    if (lv.count <= lv.rows) return 0;
+    return (lv.page > 0) ? lv.page : lv.rows;
+}
+
+// 同一个口径给**还没搬进 ListView 的手写列表**用：count 总行数、rows 一屏行数，
+// 返回 0 = 没得翻（键吃掉、不动）。各屏的手写列表照这样接：
+//
+//   if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+//       const int step = listPageStep(n, visibleRows);
+//       if (step > 0) sel = clampI(sel + (key == KEY_PAGE_DOWN ? step : -step), 0, n - 1);
+//   }
+inline int listPageStep(int count, int rows) {
+    if (rows < 1) rows = 1;
+    return (count > rows) ? rows : 0;
+}
 
 // 上下/翻页/首尾 → 改 sel，夹在 [0, count)。返回 true = 这个键归列表。
 // **边界上按一下也算 true**（键被吃掉、只是没动）—— 各屏原来的写法就是
 // `if (key == KEY_UP) { sel = max(0, sel-1); ...; return; }`，在顶上也照样 return。
+// 翻页键在"没得翻"时同样吃掉不动作（见 listViewPageStep）。
 // count <= 0 时返回 false：空列表没有"选中项"可动，键留给调用方。
 inline bool listViewKey(ListView &lv, int key) {
     if (lv.count <= 0) return false;
     const int last = lv.count - 1;
-    const int step = (lv.page > 0) ? lv.page : 1;
     switch (key) {
-        case KEY_UP:        lv.sel -= 1; break;
-        case KEY_DOWN:      lv.sel += 1; break;
-        case KEY_PAGE_UP:   lv.sel -= step; break;
-        case KEY_PAGE_DOWN: lv.sel += step; break;
-        case KEY_HOME:      lv.sel = 0; break;
-        case KEY_END:       lv.sel = last; break;
+        case KEY_UP:   lv.sel -= 1; break;
+        case KEY_DOWN: lv.sel += 1; break;
+        case KEY_PAGE_UP:
+        case KEY_PAGE_DOWN: {
+            const int step = listViewPageStep(lv);
+            if (step <= 0) return true;  // 一屏放得下：吃掉这一划，什么都不动
+            lv.sel += (key == KEY_PAGE_DOWN) ? step : -step;
+            break;
+        }
+        case KEY_HOME: lv.sel = 0; break;
+        case KEY_END:  lv.sel = last; break;
         default: return false;
     }
     if (lv.sel < 0) lv.sel = 0;
