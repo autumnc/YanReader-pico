@@ -24,7 +24,6 @@
 #include "editor_vk.h"             // 重命名框复用编辑器那套虚拟键盘
 #include "ime/IME.h"
 #include "app_services.h"
-#include "app_async.h"             // appAsyncTaskExit（fb_scan 的栈水线，同其余 worker）
 
 #include <algorithm>
 #include <atomic>
@@ -98,7 +97,7 @@ static void fbScanTask(void *arg) {
   fbScanBuild(job->dir, job->entries);
   s_fbScanReady.store(job.release(), std::memory_order_release);
   s_fbScanRunning.store(false, std::memory_order_release);
-  appAsyncTaskExit("fb_scan", 6144);
+  vTaskDelete(nullptr);
 }
 
 // "这一趟还没交代完"：正在跑，或者跑完了但结果还没被 poll 取走应用。

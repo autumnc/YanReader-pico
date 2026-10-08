@@ -1,5 +1,4 @@
 #include "settings_manager.h"
-#include "app_async.h"     // appAsyncTaskExit（settings_flush 的栈水线）
 #include "safe_file.h"
 #include <cstdio>
 #include <cstring>
@@ -65,7 +64,7 @@ static void settingsFlushTask(void *) {
             break;
         }
     }
-    appAsyncTaskExit("settings_flush", 6144);
+    vTaskDelete(nullptr);
 }
 
 static void settingsScheduleFlush() {

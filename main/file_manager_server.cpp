@@ -588,10 +588,6 @@ static esp_err_t __attribute__((unused)) handler_download(httpd_req_t *req) {
     fclose(f);
     if (mtx) xSemaphoreGiveRecursive(mtx);
     if (sendOk) httpd_resp_send_chunk(req, nullptr, 0);
-    // 量一下 httpd 任务的栈水线：大缓冲已经挪到堆上，这里剩下的最深帧是 collectFiles 的
-    // 12 层递归。收尾打一行，余量低于 1KB 就得回来看看。
-    ESP_LOGI(TAG, "下载结束 缓冲%u字节 栈余 %u 字节", (unsigned)buf.len,
-             (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     return ESP_OK;
 }
 

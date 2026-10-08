@@ -91,7 +91,7 @@ static void historyPreviewLoadTask(void *arg) {
     historyPreviewUnlock();
     delete job;
     s_historyPreviewJob.finish(s_historyPreviewJob.cancelled() ? "已取消" : "");
-    appAsyncTaskExit("hist_preview", 6144);
+    vTaskDelete(nullptr);
 }
 
 static void startHistoryPreviewLoad() {
@@ -225,7 +225,7 @@ static void viewerLoadTask(void *arg) {
     viewerLoadUnlock();
     delete job;
     s_viewerLoadJob.finish(s_viewerLoadJob.cancelled() ? "已取消" : "");
-    appAsyncTaskExit("viewer_load", 6144);
+    vTaskDelete(nullptr);
 }
 
 static void startViewerLoad(const std::string &filename) {

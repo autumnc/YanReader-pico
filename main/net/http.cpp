@@ -230,18 +230,7 @@ Response request(const Request &req) {
         (methodHasBody(req.method) && !req.body.empty()) ? static_cast<int>(req.body.size()) : 0;
     esp_err_t e = esp_http_client_open(client, bodyLen);
     if (e != ESP_OK) {
-        // 顺手把当时的内部堆两栏一起打出来。TLS 握手失败（-0x0093 / ESP_ERR_HTTP_CONNECT）
-        // 的根因往往不在网络而在**内部 RAM 不够/被碎片化**（读缓冲、握手上下文都从这里出）
-        // —— 单打一句 "open 失败" 只会把人往网络上带。两栏口径与分配失败日志一致
-        // （dma=0x80c）。若这栏常年见底而 TLS 仍失败，去看 sdkconfig.defaults 里
-        // MBEDTLS_HARDWARE_SHA/AES 那段（曾经就是这口池把硬件加解密逼死的）。
-        const uint32_t dmaCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
-        ESP_LOGW(TAG, "open 失败: %s url=%s（内部RAM free=%u largest=%u；可落DMA free=%u largest=%u）",
-                 esp_err_to_name(e), req.url.c_str(),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_free_size(dmaCaps),
-                 (unsigned)heap_caps_get_largest_free_block(dmaCaps));
+        ESP_LOGW(TAG, "open 失败: %s url=%s", esp_err_to_name(e), req.url.c_str());
         r.err = e;
         r.error = "网络连接失败";
         esp_http_client_cleanup(client);

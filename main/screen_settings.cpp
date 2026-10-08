@@ -1120,7 +1120,7 @@ static void settingsFlomoTokenTask(void *) {
     std::string pass = g_settings.flomoPassword();
     if (email.empty() || pass.empty()) {
         s_settingsAsync.finish("请先设置Flomo邮箱和密码");
-        appAsyncTaskExit("settings_flomo", 7680);
+        vTaskDelete(nullptr);
         return;
     }
     bool wifiWas = false;
@@ -1141,7 +1141,7 @@ static void settingsFlomoTokenTask(void *) {
         }
     }
     app_disconnect_wifi_if_needed(wifiWas);
-    appAsyncTaskExit("settings_flomo", 7680);
+    vTaskDelete(nullptr);
 }
 
 static void settingsSyncTimeTask(void *) {
@@ -1149,14 +1149,14 @@ static void settingsSyncTimeTask(void *) {
     bool ok = app_connect_wifi_from_settings(&wifiWas);
     if (!ok) {
         s_settingsAsync.finish("WiFi连接失败");
-        appAsyncTaskExit("settings_sync", 4096);
+        vTaskDelete(nullptr);
         return;
     }
     if (!wifiWas) vTaskDelay(pdMS_TO_TICKS(500));
     if (s_settingsAsync.cancelled()) {
         s_settingsAsync.finish("已取消");
         app_disconnect_wifi_if_needed(wifiWas);
-        appAsyncTaskExit("settings_sync", 4096);
+        vTaskDelete(nullptr);
         return;
     }
     std::string ntp = g_settings.ntpServer();
@@ -1196,7 +1196,7 @@ static void settingsSyncTimeTask(void *) {
         }
     }
     app_disconnect_wifi_if_needed(wifiWas);
-    appAsyncTaskExit("settings_sync", 4096);
+    vTaskDelete(nullptr);
 }
 
 static void settingsBackupTask(void *) {
@@ -1206,7 +1206,7 @@ static void settingsBackupTask(void *) {
         err == ESP_OK ? "已备份到 TF 卡 settings_backup/"
         : err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
                                        : "备份失败，请检查卡剩余空间");
-    appAsyncTaskExit("settings_backup", 6144);
+    vTaskDelete(nullptr);
 }
 
 static void settingsRestoreTask(void *) {
@@ -1219,7 +1219,7 @@ static void settingsRestoreTask(void *) {
         s_settingsAsync.finish(err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
                                                             : "备份不可用，恢复未执行");
     }
-    appAsyncTaskExit("settings_restore", 6144);
+    vTaskDelete(nullptr);
 }
 
 static bool startSettingsAsync(SettingsAsyncOp op) {

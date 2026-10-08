@@ -93,7 +93,7 @@ done:
     std::string result = g_fileMgrState.status;
     fileMgrUnlock();
     s_fileMgrJob.finish(ok ? "服务已启动" : result);
-    appAsyncTaskExit("file_mgr_start", 6144);
+    vTaskDelete(nullptr);
 }
 
 void screen_file_manager_init() {
