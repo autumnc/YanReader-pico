@@ -31,6 +31,11 @@
 static const char* TAG = "read_pico";
 static bool s_bulk_io;
 
+void epd_lcd_bus_park(void) __attribute__((weak));
+void epd_lcd_bus_unpark(void) __attribute__((weak));
+void e0470_waveform_set_white_pushes(int count) __attribute__((weak));
+int e0470_waveform_white_pushes(void) __attribute__((weak));
+
 void display_set_bulk_io(bool active) {
     s_bulk_io = active;
     ESP_LOGI(TAG, "bulk I/O scan margin %s", active ? "on" : "off");
@@ -90,14 +95,14 @@ static bool s_bus_parked;
 
 void display_bus_park(void) {
     if (s_bus_parked) return;
-    epd_lcd_bus_park();
+    if (epd_lcd_bus_park) epd_lcd_bus_park();
     s_bus_parked = true;
     ESP_LOGI(TAG, "panel bus parked (rails off)");
 }
 
 void display_bus_unpark(void) {
     if (!s_bus_parked) return;
-    epd_lcd_bus_unpark();
+    if (epd_lcd_bus_unpark) epd_lcd_bus_unpark();
     s_bus_parked = false;
 }
 
@@ -658,11 +663,11 @@ int reader_leading_skip(void) { return epd_last_leading_skip(); }
 // 档位本身在波形组件里（e0470_epaper_waveform.c），这里只是把阅读器那道 include 墙
 // 绕过去的一层薄壳 —— 阅读器 TU 摸不到 epdiy/波形类型。改表必须在下一次推屏之前。
 void reader_set_white_pushes(int count) {
-    e0470_waveform_set_white_pushes(count);
+    if (e0470_waveform_set_white_pushes) e0470_waveform_set_white_pushes(count);
 }
 
 int reader_white_pushes(void) {
-    return e0470_waveform_white_pushes();
+    return e0470_waveform_white_pushes ? e0470_waveform_white_pushes() : -1;
 }
 
 // ── 清一块区域的残影（输入法那两行）────────────────────────────────────────

@@ -50,6 +50,10 @@
 
 static const char *TAG = "ui_render";
 
+static bool uiPerfLogOn() {
+    return g_settings.getString("ui_perf_log", "0") == "1";
+}
+
 // epdiy 自己有两个 epd_prep 线程跑在 configMAX_PRIORITIES-1；渲染任务必须低于它们，
 // 否则行打包抢不到 CPU，送行队列欠载（EPD_DRAW_EMPTY_LINE_QUEUE）。
 #define UI_RENDER_CORE 1
@@ -359,7 +363,7 @@ static void ime_clean_tick(void) {
     if (!hl) return;
     // 打一行：上屏/句读写的是"账"，真正压在哪儿只有这一行说得清（区域 GC16，见
     // display.c）。查"为什么残影还在"时先看这里有没有出来。
-    ESP_LOGI(TAG, "清输入法两行残影 %d,%d %dx%d", r.x, r.y, r.width, r.height);
+    if (uiPerfLogOn()) ESP_LOGI(TAG, "清输入法两行残影 %d,%d %dx%d", r.x, r.y, r.width, r.height);
     guard_draw_result(hl, update_display_area_clean(hl, r));
 }
 
@@ -584,8 +588,10 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
                 guard_draw_result(hl, update_display_area_clean(hl, r));
                 ime_clean_forget();   // 连输入法那两行带欠账一起刚清过
                 s_fast_body_n = 0;
-                ESP_LOGI(TAG, "句读同步清 %d,%d %dx%d 耗时%lldms", r.x, r.y, r.width, r.height,
-                         (long long)((esp_timer_get_time() - tSync) / 1000));
+                if (uiPerfLogOn()) {
+                    ESP_LOGI(TAG, "句读同步清 %d,%d %dx%d 耗时%lldms", r.x, r.y, r.width, r.height,
+                             (long long)((esp_timer_get_time() - tSync) / 1000));
+                }
             } else {
                 copy_to_front(hl, cur);
                 guard_draw_result(hl,
@@ -777,7 +783,7 @@ void ui_render_reader_vk_settle_tick(void) {
     EpdiyHighlevelState *hl = board_hl();
     if (!hl || r.width <= 0 || r.height <= 0) return;
     guard_draw_result(hl, update_display_area_clean(hl, r));
-    ESP_LOGI(TAG, "阅读器键盘: 欠账坐实 %d,%d %dx%d", r.x, r.y, r.width, r.height);
+    if (uiPerfLogOn()) ESP_LOGI(TAG, "阅读器键盘: 欠账坐实 %d,%d %dx%d", r.x, r.y, r.width, r.height);
 }
 
 // 整屏全像素刷过一遍（进阅读器的 invalidate、翻页整屏全刷/换章）之后这块已经被驱动
@@ -806,8 +812,10 @@ void reader_vk_present(int panel_top, int cand_h) {
     const int64_t t0 = esp_timer_get_time();
     auto done = [&](const char *what, enum EpdDrawError err, EpdRect r) {
         guard_draw_result(hl, err);
-        ESP_LOGI(TAG, "键盘帧: %s 区域 %d,%d %dx%d 刷屏 %lldms", what, r.x, r.y, r.width,
-                 r.height, (long long)((esp_timer_get_time() - t0) / 1000));
+        if (uiPerfLogOn()) {
+            ESP_LOGI(TAG, "键盘帧: %s 区域 %d,%d %dx%d 刷屏 %lldms", what, r.x, r.y, r.width,
+                     r.height, (long long)((esp_timer_get_time() - t0) / 1000));
+        }
     };
     if (panel_top <= 0) {
         // 面板几何没拿到（调用方没把键盘顶边递下来）：退回整屏局刷，别拿 0 当分区线
@@ -918,16 +926,20 @@ void reader_list_present(void) {
         guard_draw_result(hl, update_display_area_clean(hl, r));
         // 每条路都打一行：区域 → 几十毫秒，整屏 → 几百毫秒。这是"连滚十几下还闪不闪"
         // 的唯一现场证据（帧数/矩形对不上时，先看这条日志选了哪条路、矩形多大）。
-        ESP_LOGI(TAG, "列表帧: 区域坐实 %d,%d %dx%d 刷屏 %lldms", r.x, r.y, r.width, r.height,
-                 (long long)((esp_timer_get_time() - t0) / 1000));
+        if (uiPerfLogOn()) {
+            ESP_LOGI(TAG, "列表帧: 区域坐实 %d,%d %dx%d 刷屏 %lldms", r.x, r.y, r.width, r.height,
+                     (long long)((esp_timer_get_time() - t0) / 1000));
+        }
         return;
     }
     // 波形/模式与整屏那条 HALF 路**完全一致**（display.c 默认档：E0470_WAVEFORM +
     // MODE_GL16），只是把驱动范围收窄 —— 画质不该因为收窄而变，变的只有"闪多大"。
     guard_draw_result(hl, update_display_area_with(hl, &E0470_WAVEFORM, MODE_GL16, d));
-    ESP_LOGI(TAG, "列表帧: 区域差分 %d,%d %dx%d 刷屏 %lldms (%d/%d)", d.x, d.y, d.width,
-             d.height, (long long)((esp_timer_get_time() - t0) / 1000), s_list_n,
-             LIST_GC16_EVERY);
+    if (uiPerfLogOn()) {
+        ESP_LOGI(TAG, "列表帧: 区域差分 %d,%d %dx%d 刷屏 %lldms (%d/%d)", d.x, d.y, d.width,
+                 d.height, (long long)((esp_timer_get_time() - t0) / 1000), s_list_n,
+                 LIST_GC16_EVERY);
+    }
 }
 
 // 立即整屏 GC16（长按全刷 / 休眠提示）。

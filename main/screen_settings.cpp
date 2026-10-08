@@ -24,12 +24,16 @@
 #include <cstring>
 #include <ctime>
 #include <algorithm>
+#include <atomic>
 #include <set>
 #include <vector>
 #include <esp_timer.h>
 #include <esp_system.h>   // esp_restart：「从备份恢复」换完文件后重启
 #include <esp_sntp.h>
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <sys/stat.h>
 #include <strings.h>  // strcasecmp
 #include "u8g2_shim.h"
@@ -88,6 +92,8 @@ static const SettingField SETTINGS_FIELDS[] = {
     // 错相揭页：阅读器翻页时用 16 条带依次入相的"揭页"替代普通差分刷（约 1.1s）。
     // 开着更好看但更慢，所以给个开关，默认开。
     {"page_turn_anim", "翻页动画", false, false, CAT_DISPLAY},
+    {"reader_perf_log", "翻页性能日志", false, false, CAT_DISPLAY},
+    {"ui_perf_log", "界面性能日志", false, false, CAT_DISPLAY},
     {"_editor_orientation", "文字方向", false, true, CAT_DISPLAY},
     {"vertical_ref_line", "竖排参考线", false, false, CAT_DISPLAY},
     {"_vertical_ref_line_style", "参考线样式", false, true, CAT_DISPLAY},
@@ -437,6 +443,8 @@ static bool isToggleField(const char *key) {
            strcmp(key, "ime_sentence") == 0 ||
            strcmp(key, "ime_doc_context") == 0 || strcmp(key, "ime_candidate_highlight") == 0 ||
            strcmp(key, "page_turn_anim") == 0 ||
+           strcmp(key, "reader_perf_log") == 0 ||
+           strcmp(key, "ui_perf_log") == 0 ||
            strcmp(key, "night_mode") == 0;
 }
 
@@ -1104,6 +1112,207 @@ static bool connect_wifi_from_settings() {
     return g_wifi.connect(ssid.c_str(), pass.c_str());
 }
 
+enum class SettingsAsyncOp { None, FlomoToken, SyncTime, Backup, Restore };
+enum class SettingsAsyncState { Idle, Running, Done };
+
+static std::atomic<SettingsAsyncState> s_settingsAsyncState{SettingsAsyncState::Idle};
+static SettingsAsyncOp s_settingsAsyncOp = SettingsAsyncOp::None;
+static SemaphoreHandle_t s_settingsAsyncMutex = nullptr;
+static std::string s_settingsAsyncTitle;
+static std::string s_settingsAsyncBusy;
+static std::string s_settingsAsyncResult;
+static bool s_settingsAsyncDrawn = false;
+static bool s_settingsAsyncRestart = false;
+static int64_t s_settingsAsyncUntilUs = 0;
+
+static void ensureSettingsAsyncMutex() {
+    if (!s_settingsAsyncMutex) s_settingsAsyncMutex = xSemaphoreCreateMutex();
+}
+
+static void settingsAsyncSetResult(const std::string &msg) {
+    ensureSettingsAsyncMutex();
+    xSemaphoreTake(s_settingsAsyncMutex, portMAX_DELAY);
+    s_settingsAsyncResult = msg;
+    xSemaphoreGive(s_settingsAsyncMutex);
+}
+
+static std::string settingsAsyncResult() {
+    ensureSettingsAsyncMutex();
+    xSemaphoreTake(s_settingsAsyncMutex, portMAX_DELAY);
+    std::string msg = s_settingsAsyncResult;
+    xSemaphoreGive(s_settingsAsyncMutex);
+    return msg;
+}
+
+static void settingsFlomoTokenTask(void *) {
+    std::string email = g_settings.flomoEmail();
+    std::string pass = g_settings.flomoPassword();
+    if (email.empty() || pass.empty()) {
+        settingsAsyncSetResult("请先设置Flomo邮箱和密码");
+        s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+        vTaskDelete(nullptr);
+        return;
+    }
+    bool wifiWas = g_wifi.isConnected();
+    bool ok = wifiWas || connect_wifi_from_settings();
+    if (!ok) {
+        settingsAsyncSetResult("WiFi连接失败");
+    } else {
+        g_flomo.configure(email, pass);
+        std::string token = g_flomo.login();
+        if (!token.empty()) {
+            g_flomo.setCachedToken(token);
+            settingsAsyncSetResult("Token生成成功");
+        } else {
+            std::string why = g_flomo.lastError();
+            settingsAsyncSetResult(why.empty() ? "Flomo登录失败" : ("登录失败: " + why));
+        }
+    }
+    if (!wifiWas) g_wifi.disconnect();
+    s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
+static void settingsSyncTimeTask(void *) {
+    bool wifiWas = g_wifi.isConnected();
+    bool ok = wifiWas || connect_wifi_from_settings();
+    if (!ok) {
+        settingsAsyncSetResult("WiFi连接失败");
+        s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+        vTaskDelete(nullptr);
+        return;
+    }
+    if (!wifiWas) vTaskDelay(pdMS_TO_TICKS(500));
+    std::string ntp = g_settings.ntpServer();
+    std::string tz = g_settings.timezone();
+    if (tz.empty()) tz = "CST-8";
+    if (ntp.empty()) {
+        settingsAsyncSetResult("请先设置NTP服务器");
+    } else {
+        esp_sntp_stop();
+        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, ntp.c_str());
+        esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+        esp_sntp_init();
+        setenv("TZ", tz.c_str(), 1);
+        tzset();
+        time_t now = 0;
+        for (int i = 0; i < 100; i++) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+                time(&now);
+                break;
+            }
+        }
+        esp_sntp_stop();
+        if (now > 1704067200) {
+            struct tm tmv;
+            localtime_r(&now, &tmv);
+            char ts[64];
+            strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+            g_rtc.setTime(now);
+            settingsAsyncSetResult(std::string("同步成功: ") + ts);
+        } else {
+            settingsAsyncSetResult("时间同步失败");
+        }
+    }
+    if (!wifiWas) g_wifi.disconnect();
+    s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
+static void settingsBackupTask(void *) {
+    const esp_err_t err = settings_backup_save();
+    settingsAsyncSetResult(
+        err == ESP_OK ? "已备份到 TF 卡 settings_backup/"
+        : err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
+                                       : "备份失败，请检查卡剩余空间");
+    s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
+static void settingsRestoreTask(void *) {
+    const esp_err_t err = settings_backup_restore();
+    if (err == ESP_OK) {
+        s_settingsAsyncRestart = true;
+        settingsAsyncSetResult("已恢复，正在重启...");
+    } else {
+        settingsAsyncSetResult(err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
+                                                            : "备份不可用，恢复未执行");
+    }
+    s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
+static bool startSettingsAsync(SettingsAsyncOp op) {
+    if (s_settingsAsyncState.load(std::memory_order_acquire) == SettingsAsyncState::Running) return false;
+    ensureSettingsAsyncMutex();
+    s_settingsAsyncOp = op;
+    if (op == SettingsAsyncOp::FlomoToken) {
+        s_settingsAsyncTitle = "Flomo Token";
+        s_settingsAsyncBusy = "正在生成...";
+    } else if (op == SettingsAsyncOp::SyncTime) {
+        s_settingsAsyncTitle = "网络同步时间";
+        s_settingsAsyncBusy = "正在同步...";
+    } else if (op == SettingsAsyncOp::Backup) {
+        s_settingsAsyncTitle = "备份设置与记录";
+        s_settingsAsyncBusy = "正在备份...";
+    } else {
+        s_settingsAsyncTitle = "从备份恢复";
+        s_settingsAsyncBusy = "正在恢复...";
+    }
+    settingsAsyncSetResult("");
+    s_settingsAsyncDrawn = false;
+    s_settingsAsyncRestart = false;
+    s_settingsAsyncUntilUs = 0;
+    s_settingsAsyncState.store(SettingsAsyncState::Running, std::memory_order_release);
+    TaskHandle_t h = nullptr;
+    TaskFunction_t fn = settingsSyncTimeTask;
+    if (op == SettingsAsyncOp::FlomoToken) fn = settingsFlomoTokenTask;
+    else if (op == SettingsAsyncOp::Backup) fn = settingsBackupTask;
+    else if (op == SettingsAsyncOp::Restore) fn = settingsRestoreTask;
+    if (xTaskCreate(fn, "settings_async", 8192, nullptr, 1, &h) != pdPASS) {
+        settingsAsyncSetResult("任务启动失败");
+        s_settingsAsyncState.store(SettingsAsyncState::Done, std::memory_order_release);
+        return false;
+    }
+    return true;
+}
+
+static bool settingsAsyncHandle(int key) {
+    SettingsAsyncState state = s_settingsAsyncState.load(std::memory_order_acquire);
+    if (state == SettingsAsyncState::Idle) return false;
+    if (state == SettingsAsyncState::Running) {
+        if (!s_settingsAsyncDrawn) {
+            ui_clear();
+            ui_draw_text_centered(FONT_H, s_settingsAsyncTitle.c_str(), false, true);
+            ui_show_message_centered(s_settingsAsyncBusy.c_str());
+            ui_commit();
+            s_settingsAsyncDrawn = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(80));
+        return true;
+    }
+    if (s_settingsAsyncUntilUs == 0 || key > 0) {
+        ui_clear();
+        ui_show_message_centered(settingsAsyncResult().c_str());
+        ui_commit();
+        s_settingsAsyncUntilUs = esp_timer_get_time() + 1800LL * 1000;
+        return true;
+    }
+    if (esp_timer_get_time() < s_settingsAsyncUntilUs) return true;
+    if (s_settingsAsyncRestart) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    }
+    s_settingsAsyncState.store(SettingsAsyncState::Idle, std::memory_order_release);
+    s_settingsAsyncOp = SettingsAsyncOp::None;
+    s_settingsAsyncDrawn = false;
+    s_settingsAsyncUntilUs = 0;
+    drawBrowseList();
+    return true;
+}
+
 // ── 设置分类列表(顶层) ───────────────────────────────────────────────────
 // 版式与字段列表完全一致：第一行标题，选项从第二行基线起，触屏按行映射。
 // 分类项显示本分类当前可见的项数，进分类后隐藏项(打字机/竖排专属)才真正消失。
@@ -1278,6 +1487,8 @@ static void drawSettingsEdit() {
 }
 
 AppState screen_settings_handle(int key, ScreenContext &ctx) {
+    if (settingsAsyncHandle(key)) return APP_SETTINGS;
+
     // ── 轮换制设置项的选项弹层（浮层，优先于其它一切按键）──
     if (g_settingsState.pickerOpen) return settingsPickerHandle(key, ctx);
 
@@ -1689,84 +1900,11 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                 return APP_SETTINGS;
             }
             if (strcmp(f.key, "_flomo_token") == 0) {
-                std::string email = g_settings.flomoEmail();
-                std::string pass = g_settings.flomoPassword();
-                if (email.empty() || pass.empty()) {
-                    ui_clear(); ui_show_message_centered("请先设置Flomo邮箱和密码");
-                    vTaskDelay(pdMS_TO_TICKS(2000)); return APP_SETTINGS;
-                }
-                bool wifiWas = g_wifi.isConnected();
-                if (!wifiWas) {
-                    ui_clear(); ui_show_message_centered("正在连接WiFi..."); ui_commit();
-                    if (!connect_wifi_from_settings()) {
-                        ui_clear(); ui_show_message_centered("WiFi连接失败");
-                        vTaskDelay(pdMS_TO_TICKS(2000)); return APP_SETTINGS;
-                    }
-                }
-                ui_clear(); ui_show_message_centered("正在生成Token..."); ui_commit();
-                g_flomo.configure(email, pass);
-                std::string token = g_flomo.login();
-                if (!token.empty()) {
-                    g_flomo.setCachedToken(token);
-                    ui_clear(); ui_show_message_centered("Token生成成功 ✓");
-                } else {
-                    // lastError() 能区分"密码错"和"服务端限流"，别一律说登录失败。
-                    std::string why = g_flomo.lastError();
-                    std::string msg = why.empty() ? std::string("Flomo登录失败")
-                                                  : ("登录失败: " + why);
-                    ui_show_message_centered(msg.c_str());
-                }
-                if (!wifiWas) g_wifi.disconnect();
-                vTaskDelay(pdMS_TO_TICKS(2000)); return APP_SETTINGS;
+                startSettingsAsync(SettingsAsyncOp::FlomoToken);
+                return APP_SETTINGS;
             }
             if (strcmp(f.key, "_sync_time") == 0) {
-                bool wifiWas = g_wifi.isConnected();
-                if (!wifiWas) {
-                    ui_clear(); ui_show_message_centered("正在连接WiFi..."); ui_commit();
-                    if (!connect_wifi_from_settings()) {
-                        ui_clear(); ui_show_message_centered("WiFi连接失败");
-                        vTaskDelay(pdMS_TO_TICKS(2000)); return APP_SETTINGS;
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                }
-                std::string ntp = g_settings.ntpServer();
-                std::string tz = g_settings.timezone();
-                if (tz.empty()) tz = "CST-8";
-                if (ntp.empty()) {
-                    ui_clear(); ui_show_message_centered("请先设置NTP服务器");
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                } else {
-                    esp_sntp_stop();
-                    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-                    esp_sntp_setservername(0, ntp.c_str());
-                    esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
-                    esp_sntp_init();
-                    setenv("TZ", tz.c_str(), 1);
-                    tzset();
-                    time_t now = 0;
-                    for (int i = 0; i < 100; i++) {
-                        vTaskDelay(pdMS_TO_TICKS(200));
-                        if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
-                            time(&now);
-                            break;
-                        }
-                    }
-                    if (now > 1704067200) {
-                        struct tm *tm = localtime(&now);
-                        char ts[64];
-                        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
-                        g_rtc.setTime(now);
-                        esp_sntp_stop();
-                        char msg[80];
-                        snprintf(msg, sizeof(msg), "同步成功: %s", ts);
-                        ui_clear(); ui_show_message_centered(msg);
-                    } else {
-                        esp_sntp_stop();
-                        ui_clear(); ui_show_message_centered("时间同步失败");
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                }
-                if (!wifiWas) g_wifi.disconnect();
+                startSettingsAsync(SettingsAsyncOp::SyncTime);
                 return APP_SETTINGS;
             }
             if (strcmp(f.key, "_file_mgr") == 0) {
@@ -1788,12 +1926,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                 return APP_BT_MANAGE;
             }
             if (strcmp(f.key, "_cfg_backup") == 0) {
-                const esp_err_t err = settings_backup_save();
-                ui_show_message_centered(
-                    err == ESP_OK ? "已备份到 TF 卡 settings_backup/"
-                    : err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
-                                                   : "备份失败，请检查卡剩余空间");
-                vTaskDelay(pdMS_TO_TICKS(1800));
+                startSettingsAsync(SettingsAsyncOp::Backup);
                 return APP_SETTINGS;
             }
             if (strcmp(f.key, "_cfg_restore") == 0) {
@@ -1816,19 +1949,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                     return APP_SETTINGS;
                 }
                 s_cfgRestoreConfirm = false;
-                const esp_err_t err = settings_backup_restore();
-                if (err != ESP_OK) {
-                    ui_show_message_centered(
-                        err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试"
-                                                     : "备份不可用，恢复未执行");
-                    vTaskDelay(pdMS_TO_TICKS(1800));
-                    return APP_SETTINGS;
-                }
-                // 文件换掉了，内存里那份设置缓存（settings_manager.cpp 的 s_cache）和
-                // 各模块从设置派生的状态还都是旧值 —— 重启一次让它们从头读。
-                ui_show_message_centered("已恢复，正在重启…");
-                vTaskDelay(pdMS_TO_TICKS(1500));
-                esp_restart();
+                startSettingsAsync(SettingsAsyncOp::Restore);
                 return APP_SETTINGS;
             }
             if (strcmp(f.key, "_polish_prompt") == 0) {

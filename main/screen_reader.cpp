@@ -26,6 +26,7 @@
 #include <cmath>  // 阅读档案的雷达图（cos/sin）
 #include <ctime>  // 导出文件名的年月日时分秒
 #include <atomic>  // s_sbPending：网页线程投递"设为待机画面"，主任务取件
+#include <new>
 
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
@@ -1292,6 +1293,57 @@ static void rdBuildStandbyCoverForOpenBook() {
            ok ? "已生成" : "无原图，退回书架封面", (long long)((esp_timer_get_time() - t0) / 1000));
 }
 
+struct RdStandbyCoverJob {
+  std::string path;
+  int kind = -1;
+  int boxW = 0;
+  int boxH = 0;
+};
+static std::atomic<bool> s_rdStandbyCoverTaskRunning{false};
+
+static void rdStandbyCoverTask(void *arg) {
+  std::unique_ptr<RdStandbyCoverJob> job(static_cast<RdStandbyCoverJob *>(arg));
+  const std::string out = standbyCoverPathFor(job->path, job->kind);
+  if (!Storage.exists(out.c_str())) {
+    const int64_t t0 = esp_timer_get_time();
+    bool ok = false;
+    if (job->kind == 0) {
+      auto epub = std::make_shared<Epub>(job->path, CACHE_DIR);
+      if (epub->load()) ok = epub->generateStandbyCoverBmp(out, job->boxW, job->boxH);
+    } else if (job->kind == 1) {
+      Txt t(job->path, CACHE_DIR);
+      if (t.load()) ok = t.generateStandbyCoverBmp(out, job->boxW, job->boxH);
+    }
+    if (g_settings.getString("reader_perf_log", "0") == "1") {
+      ESP_LOGI(TAG, "待机封面: %s (%dx%d) %s 耗时 %lld ms", out.c_str(), job->boxW, job->boxH,
+               ok ? "已生成" : "无原图，退回书架封面",
+               (long long)((esp_timer_get_time() - t0) / 1000));
+    }
+  }
+  s_rdStandbyCoverTaskRunning.store(false, std::memory_order_release);
+  vTaskDelete(nullptr);
+}
+
+static void rdQueueStandbyCoverForOpenBook() {
+  if (st.bookPath.empty() || st.bookKind == 2) return;
+  const std::string out = standbyCoverPathFor(st.bookPath, st.bookKind);
+  if (Storage.exists(out.c_str())) return;
+  bool expected = false;
+  if (!s_rdStandbyCoverTaskRunning.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+    return;
+  StandbyCoverLayout lay{};
+  readerStandbyCoverLayout(lay);
+  auto *job = new (std::nothrow) RdStandbyCoverJob{st.bookPath, st.bookKind, lay.boxW, lay.boxH};
+  if (!job) {
+    s_rdStandbyCoverTaskRunning.store(false, std::memory_order_release);
+    return;
+  }
+  if (xTaskCreate(rdStandbyCoverTask, "rd_sb_cover", 8192, job, 1, nullptr) != pdPASS) {
+    delete job;
+    s_rdStandbyCoverTaskRunning.store(false, std::memory_order_release);
+  }
+}
+
 // ── 待机表盘「图片」：用户自己选的那张图 ─────────────────────────────────
 // 与「书籍封面」同一条路子（见 screen_reader.h 的接口说明）：**不**在待机那一刻解码
 // 原图，而是选中时就按当前屏尺寸解成一张 Gray8 BMP 缓存，待机只做"读 BMP + 铺屏"。
@@ -1690,6 +1742,16 @@ static void rdStatsIdleTick() {
 // 这也是当前行为的上界（turnEpub 每次跨水位排 4 页，本来就领先 3~4 页），只是
 // 把这份工作量从"按键那一拍"挪到了"读者盯着这一页看"的空档里。
 static const int kPrebuildAhead = 5;
+static int64_t s_rdPrebuildDeadlineUs = 0;
+
+static bool rdPerfLogOn() {
+  return g_settings.getString("reader_perf_log", "0") == "1";
+}
+
+static bool rdPrebuildShouldYield() {
+  return input_pending_key() != 0 ||
+         (s_rdPrebuildDeadlineUs > 0 && esp_timer_get_time() >= s_rdPrebuildDeadlineUs);
+}
 
 // 「这本书的待机封面已经试过了吗」——见 rdPrebuildAhead 开头那一段。换书时路径变了
 // 自然失效，所以不用显式清。
@@ -1700,38 +1762,39 @@ static void rdPrepareAheadPages();
 
 static void rdPrebuildAhead() {
   if (st.mode != RdMode::Reading) return;
+  const int64_t kPrebuildBudgetUs = 10 * 1000;
+  s_rdPrebuildDeadlineUs = esp_timer_get_time() + kPrebuildBudgetUs;
   // （1）待机整屏封面：表盘是「书籍封面」时它总要生成，但开书那一趟被门控跳过了
   // （开书那一趟故意不做），改到这里补 —— 此时首页已经推上屏、
   // 读者正看着这一页，几秒的后台解码就藏在这段"没人按键"的空档里（跟下面排版
   // 余量同一个道理）。做成**一本书一次**：生成失败（书里没有可用原图）时文件不会
   // 出现，不记一笔的话每个空闲帧都会重试一次整趟解压（~50ms × 每 80ms 一帧）。
-  if (!st.bookPath.empty() && st.bookKind != 2 && s_rdSbTriedPath != st.bookPath) {
+  if (!rdPrebuildShouldYield() && !st.bookPath.empty() && st.bookKind != 2 &&
+      s_rdSbTriedPath != st.bookPath) {
     if (standbyFaceFromKey(g_settings.getString("clock_face").c_str()) == StandbyFace::Cover &&
         !Storage.exists(standbyCoverPathFor(st.bookPath, st.bookKind).c_str())) {
       s_rdSbTriedPath = st.bookPath;   // 试过就算，成功失败都别再进
-      rdBuildStandbyCoverForOpenBook();
+      rdQueueStandbyCoverForOpenBook();
     }
   }
   // （2）邻页留档：方向那一侧（s_turnDir）的整页字形 + 排版，以及另一侧的排版 —— 与上面
   // 的排版余量同一个道理：把"翻页那一拍要付的钱"提前。放在这里（而不是下面 bookKind==0
   // 那段里）是因为 TXT 也要备，而下面那条分支把非 EPUB 全都早退了。它自己判 mode/bookKind，
   // 且两份留档都带键去重，重复调是空操作。
-  rdPrepareAheadPages();
-  if (st.bookKind != 0 || !st.section) return;
+  if (!rdPrebuildShouldYield()) rdPrepareAheadPages();
+  if (st.bookKind != 0 || !st.section) { s_rdPrebuildDeadlineUs = 0; return; }
   // 挂起的弹注排在最前面：它要的是**锚点那一页**，可能远在几十页之外（注文常整块压在
   // 章末），比"领先读者 kPrebuildAhead 页"要紧得多。它自己带预算，也在里面把结果弹出来。
-  if (st.fnWaitIdx >= 0) rdFootnoteWaitTick();
-  if (st.section->isBuildComplete()) return;
-  // 单次调用有界：一次空闲帧最多花 kPrebuildBudgetUs 做排版，超了就留给下一帧。
-  // 空闲帧每 ~80ms 一拍（main.cpp 的 idleWaitWithTouch(80)），几帧就能把余量补满；
-  // 按键随时会来，所以这里宁可少排一点也不能让触摸轮询等太久。
-  const int64_t kPrebuildBudgetUs = 30 * 1000;
-  const int64_t deadline = esp_timer_get_time() + kPrebuildBudgetUs;
+  if (!rdPrebuildShouldYield() && st.fnWaitIdx >= 0) rdFootnoteWaitTick();
+  if (st.section->isBuildComplete()) { s_rdPrebuildDeadlineUs = 0; return; }
+  // 单次调用有界：一次空闲帧只啃很小一口，超了就留给下一帧。电子墨水屏推屏本来慢，
+  // 但输入采样不能跟着慢；预算小一点，连续翻页的手感更稳。
   while (!st.section->isBuildComplete() &&
          static_cast<int>(st.section->pageCount) < st.page + 1 + kPrebuildAhead) {
     st.section->buildSomeMore(1);
-    if (esp_timer_get_time() >= deadline) break;
+    if (rdPrebuildShouldYield()) break;
   }
+  s_rdPrebuildDeadlineUs = 0;
 }
 
 // ── 书架空闲预建：把"第一次打开一本书"的开销提前到空闲帧 ────────────────────
@@ -2153,7 +2216,7 @@ static bool rdWarmStrings(int role, const std::string &all, bool yieldToKey) {
     // yieldToKey：空闲帧预热传 true —— 真有点按在排队就立刻收手、返回"没做完"，让那
     // 一拍去翻页，下一次空闲帧从头重来。用户要翻页时，多半秒的等待比少暖几个字重要得多。
     // 翻页那一帧自己不能这么干（这一页马上要画），所以由调用方给 false。
-    if (input_pending_key() != 0 && yieldToKey) return false;
+    if (yieldToKey && rdPrebuildShouldYield()) return false;
   }
   return true;
 }
@@ -2189,6 +2252,27 @@ static bool rdWarmPageText(const RdPageText &pt, bool yieldToKey) {
     return false;
   }
   if (!rdWarmStrings(TTF_ROLE_CONTENT, main, yieldToKey)) return false;  // 同上，角色已在内容面
+  return true;
+}
+
+static bool rdWarmStringResume(int role, const std::string &text, size_t &offset, bool yieldToKey) {
+  if (offset >= text.size()) return true;
+  ttf_set_role(role);
+  RdBodyInkScope ink;
+  const int px = kBodyPx[st.fontLevel];
+  const size_t kChunk = 384;
+  char buf[kChunk + 4];
+  while (offset < text.size()) {
+    size_t n = std::min(kChunk, text.size() - offset);
+    while (offset + n < text.size() && (static_cast<unsigned char>(text[offset + n]) & 0xC0) == 0x80) n++;
+    memcpy(buf, text.data() + offset, n);
+    buf[n] = '\0';
+    ttf_warm_text_px(px, buf);
+    ttf_raster_text_px(px, buf);
+    offset += n;
+    if (offset >= text.size()) break;
+    if (yieldToKey && rdPrebuildShouldYield()) return false;
+  }
   return true;
 }
 
@@ -2265,6 +2349,9 @@ struct RdAheadPage {
   uint32_t offset = UINT32_MAX;
   bool hasImages = false;
   bool glyphsWarm = false;   // 整页字形已暖（方向由 s_turnDir 定，一次只暖一侧，见下）
+  std::string warmMain, warmAlt, warmAlt2;
+  int warmStage = 0;
+  size_t warmOffset = 0;
   // 这一页的**整帧像素**已经画在 s_preFb 里了（见 rdPrerenderTurnPage）。只由那个写入点
   // 置位、由 rdAheadFill 清掉；翻页那一拍要拿它当"那块 scratch 里真的是这一页"的凭据 ——
   // 光比键不够：键是"版式"的键，scratch 却是"某一趟画出来的像素"，留档一换人就得作废。
@@ -2324,6 +2411,46 @@ static const RdAheadPage *rdAheadFind(int spine, int page) {
   return nullptr;
 }
 
+static void rdAheadPrepareWarmText(RdAheadPage &dst) {
+  dst.warmMain.clear();
+  dst.warmAlt.clear();
+  dst.warmAlt2.clear();
+  for (const auto &w : dst.text.words) {
+    if (w.text.empty()) continue;
+    const uint16_t bits = static_cast<uint16_t>(w.style);
+    if ((bits & EpdFontFamily::ALT2_FONT) != 0) dst.warmAlt2 += w.text;
+    else if ((bits & EpdFontFamily::ALT_FONT) != 0) dst.warmAlt += w.text;
+    else dst.warmMain += w.text;
+  }
+  dst.warmStage = 0;
+  dst.warmOffset = 0;
+  dst.glyphsWarm = false;
+}
+
+static bool rdWarmAheadPage(RdAheadPage &dst, bool yieldToKey) {
+  while (dst.warmStage < 3) {
+    const int role = dst.warmStage == 0 ? TTF_ROLE_CONTENT_ALT2
+                   : dst.warmStage == 1 ? TTF_ROLE_CONTENT_ALT
+                                        : TTF_ROLE_CONTENT;
+    const std::string &text = dst.warmStage == 0 ? dst.warmAlt2
+                             : dst.warmStage == 1 ? dst.warmAlt
+                                                  : dst.warmMain;
+    if (!rdWarmStringResume(role, text, dst.warmOffset, yieldToKey)) {
+      ttf_set_role(TTF_ROLE_CONTENT);
+      return false;
+    }
+    dst.warmStage++;
+    dst.warmOffset = 0;
+    if (yieldToKey && rdPrebuildShouldYield()) {
+      ttf_set_role(TTF_ROLE_CONTENT);
+      return false;
+    }
+  }
+  ttf_set_role(TTF_ROLE_CONTENT);
+  dst.glyphsWarm = true;
+  return true;
+}
+
 // 把第 p 页读出来、排版建好，存进 dst（EPUB 与 TXT 两条腿）。返回"存了"；页读不出来
 // （越界 / 构建中）给 false 并**不动 dst**（那份旧留档靠键失配自然失效）。
 // 字形**不在这里暖**：暖不暖由调用方定（见 s_prev 的说明），本函数只管排版这一栏。
@@ -2349,9 +2476,9 @@ static bool rdAheadFill(int p, const std::string &key, RdAheadPage &dst) {
     dst.offset = offset;
     dst.hasImages = hasImages;
     dst.segs.clear();   // EPUB 用不到行表；留着别的书的 TXT 行表会让 TXT 那条路误命中
-    dst.glyphsWarm = false;
     dst.prerendered = false;   // 留档换了人，scratch 里那张图就不是这一页了
     dst.page = std::move(page);
+    rdAheadPrepareWarmText(dst);
     return true;
   }
   std::vector<std::string> segs;
@@ -2368,8 +2495,8 @@ static bool rdAheadFill(int p, const std::string &key, RdAheadPage &dst) {
   dst.footnotes = false;
   dst.offset = UINT32_MAX;
   dst.hasImages = false;
-  dst.glyphsWarm = false;
   dst.prerendered = false;   // 同上：留档换了人，scratch 里那张图就不是这一页了
+  rdAheadPrepareWarmText(dst);
   return true;
 }
 
@@ -2382,7 +2509,7 @@ static void rdPrepareAheadPages() {
   // 用户正要点：这一趟一个活都别开。最长的一段是方向那一侧的字形预热（实测 89~654ms），
   // 它自己会在块间让位（见 rdWarmStrings），但开头的排版留档（~150~250ms）不可中断，
   // 所以先在这里看一眼 —— 有人要点就去翻页，别让他在留档上等。
-  if (input_pending_key() != 0) return;
+  if (rdPrebuildShouldYield()) return;
 
   const bool epub = (st.bookKind == 0);
   const int spine = epub ? st.spineIndex : -1;
@@ -2407,9 +2534,10 @@ static void rdPrepareAheadPages() {
       const int64_t t = esp_timer_get_time();
       if (rdAheadFill(dp, key, *slot)) fwdLayoutMs = static_cast<int>((esp_timer_get_time() - t) / 1000);
     }
+    if (rdPrebuildShouldYield()) bailed = true;
     if (slot->key == key && !slot->glyphsWarm) {
       const int64_t t = esp_timer_get_time();
-      if (rdWarmPageText(slot->text, true)) slot->glyphsWarm = true;
+      rdWarmAheadPage(*slot, true);
       fwdWarmMs = static_cast<int>((esp_timer_get_time() - t) / 1000);
       // 让位给用户的点按（见 rdWarmStrings 的 yieldToKey）：没暖完就到此为止 —— 排版的账
       // 已经记下了，下一次空闲帧只补字形这一栏（看 slot->glyphsWarm 就知道）。
@@ -2428,7 +2556,7 @@ static void rdPrepareAheadPages() {
   // 下一趟补，所以两趟的数字要合起来看；对账的另一半在 renderCurrent 的「重画拆账」——
   // 排版那一栏在翻页帧上应当变成 0（命中留档）。方向也打：只暖一侧，看不到方向就分不清
   // "这一趟为什么没暖我要的那一侧"。
-  if (fwdLayoutMs >= 0 || fwdWarmMs >= 0 || backLayoutMs >= 0) {
+  if (rdPerfLogOn() && (fwdLayoutMs >= 0 || fwdWarmMs >= 0 || backLayoutMs >= 0)) {
     ESP_LOGI(TAG, "空闲帧留档: [%s %d]排版 %d + 字形 %d；[%s %d]排版 %d ms（-1 = 这一趟没做）",
              dir > 0 ? "下一页" : "上一页", dp, fwdLayoutMs, fwdWarmMs,
              dir > 0 ? "上一页" : "下一页", op, backLayoutMs);
@@ -3836,7 +3964,7 @@ struct RdCoverThumb {
 };
 static std::vector<RdCoverThumb> s_coverThumbs;
 static size_t s_coverThumbBytes = 0;
-static const size_t kCoverThumbBudget = 3u * 1024 * 1024;  // PSRAM 预算
+static const size_t kCoverThumbBudget = 5u * 1024 * 1024;  // PSRAM 预算
 
 // 封面被重新生成后作废对应的缓存条目（路径是 <book cache dir>/cover_v3.bmp）。
 static void rdCoverThumbForget(const std::string &bmpPath) {
@@ -6441,7 +6569,7 @@ void renderCurrent() {
   // 变化量也打出来：它决定档位（≥300‰ 走"局刷"而非"8灰阶正文刷"，也就是下面有没有
   // 揭页动画），而 `自适应` 档之外它不打日志，曾经一整场会话每页都被判成"图片页"却
   // 无从看出 —— 翻页这事上它是因，得记。它**不再**决定用哪条梯子（只剩一条了）。
-  if (turn != 0) {
+  if (turn != 0 && rdPerfLogOn()) {
     const int renderMs = (int)((tPushStartUs - tDrawStartUs) / 1000);
     const int pushMs = (int)((tPushEndUs - tPushStartUs) / 1000);
     // 档位也用名字打（"无动画"那一支尤其要看得出它是不是掉到了全刷）。
@@ -6476,7 +6604,8 @@ void renderCurrent() {
              renderMs - s_subLayoutMs - s_subWarmMs, src);
   }
   // 这一帧已经推出去了，用户正盯着新页看 —— 正是把排版余量补回来的空档。
-  rdPrebuildAhead();
+  // 但如果按键/触摸已经排队，先把控制权还给主循环；连续翻页时这 30ms 比预建更值钱。
+  if (!g_bt.waitKey(0) && input_pending_key() == 0) rdPrebuildAhead();
 }
 
 // 先刷一帧"正在…"（当前界面 + 居中浮层）再进阻塞段。openBook 会建元数据、解 zip、

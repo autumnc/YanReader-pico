@@ -93,12 +93,14 @@ enum class AsyncUiState {
 static std::atomic<AsyncUiState> s_webdavState{AsyncUiState::Idle};
 static SyncResult s_webdavResult = {false, ""};
 static int64_t s_webdavResultUntil = 0;
+static bool s_webdavBusyDrawn = false;
 
 static std::atomic<AsyncUiState> s_flomoState{AsyncUiState::Idle};
 static FlomoResult s_flomoResult = {false, ""};
 static std::string s_flomoText;
 static AppState s_flomoReturnTo = APP_EDITOR;
 static int64_t s_flomoResultUntil = 0;
+static bool s_flomoBusyDrawn = false;
 static SemaphoreHandle_t s_asyncResultMutex = nullptr;
 
 static void ensureAsyncResultMutex() {
@@ -165,6 +167,54 @@ static void flomoSendTask(void *arg) {
     s_flomoResult = result;
     unlockAsyncResult();
     s_flomoState.store(AsyncUiState::Done, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
+static void ntpSyncTask(void *arg) {
+    (void)arg;
+    std::string ssid = g_settings.wifiSsid();
+    if (ssid.empty()) {
+        ESP_LOGW(TAG, "WiFi not configured, cannot NTP sync");
+        vTaskDelete(nullptr);
+        return;
+    }
+    std::string pass = g_settings.wifiPassword();
+    std::string ntp = g_settings.ntpServer();
+    if (ntp.empty()) ntp = "pool.ntp.org";
+
+    bool wifiWasConnected = g_wifi.isConnected();
+    g_wifi.begin();
+    if (g_wifi.connect(ssid.c_str(), pass.c_str())) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_sntp_stop();
+        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, ntp.c_str());
+        esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+        esp_sntp_init();
+
+        time_t now = 0;
+        for (int i = 0; i < 100; i++) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+                time(&now);
+                break;
+            }
+        }
+        if (now > 1782864000) {
+            struct tm tmv;
+            localtime_r(&now, &tmv);
+            char ts[32];
+            strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+            ESP_LOGI(TAG, "NTP sync succeeded: %s", ts);
+            g_rtc.setTime(now);
+        } else {
+            ESP_LOGW(TAG, "NTP sync timeout (%s)", ntp.c_str());
+        }
+        esp_sntp_stop();
+    } else {
+        ESP_LOGW(TAG, "WiFi connection failed for NTP sync");
+    }
+    restore_wifi_state(wifiWasConnected);
     vTaskDelete(nullptr);
 }
 
@@ -633,6 +683,7 @@ static AppState scrSyncWebdav(int key, ScreenContext &ctx) {
         s_webdavResult = {false, ""};
         unlockAsyncResult();
         s_webdavResultUntil = 0;
+        s_webdavBusyDrawn = false;
         s_webdavState.store(AsyncUiState::Running, std::memory_order_release);
         TaskHandle_t h = nullptr;
         if (xTaskCreate(webdavSyncTask, "webdav_sync", 12288, nullptr, 1, &h) != pdPASS) {
@@ -645,7 +696,10 @@ static AppState scrSyncWebdav(int key, ScreenContext &ctx) {
     }
 
     if (state == AsyncUiState::Running) {
-        drawCenteredBusy("WebDAV 同步", "正在同步...");
+        if (!s_webdavBusyDrawn) {
+            drawCenteredBusy("WebDAV 同步", "正在同步...");
+            s_webdavBusyDrawn = true;
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
         return APP_SYNC_WEBDAV;
     }
@@ -664,6 +718,7 @@ static AppState scrSyncWebdav(int key, ScreenContext &ctx) {
         return APP_SYNC_WEBDAV;
     }
     s_webdavState.store(AsyncUiState::Idle, std::memory_order_release);
+    s_webdavBusyDrawn = false;
     return APP_MAIN;
 }
 
@@ -684,6 +739,7 @@ static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
         s_flomoResult = {false, ""};
         unlockAsyncResult();
         s_flomoResultUntil = 0;
+        s_flomoBusyDrawn = false;
         s_flomoState.store(AsyncUiState::Running, std::memory_order_release);
         TaskHandle_t h = nullptr;
         if (xTaskCreate(flomoSendTask, "flomo_send", 8192, nullptr, 1, &h) != pdPASS) {
@@ -696,9 +752,12 @@ static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
     }
 
     if (state == AsyncUiState::Running) {
-        ui_clear();
-        ui_show_message_centered("正在发送...");
-        ui_commit();
+        if (!s_flomoBusyDrawn) {
+            ui_clear();
+            ui_show_message_centered("正在发送...");
+            ui_commit();
+            s_flomoBusyDrawn = true;
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
         return APP_SYNC_SEND_FLOMO;
     }
@@ -719,6 +778,7 @@ static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
     }
     s_flomoText.clear();
     s_flomoState.store(AsyncUiState::Idle, std::memory_order_release);
+    s_flomoBusyDrawn = false;
     return s_flomoReturnTo;
 }
 
@@ -1054,9 +1114,7 @@ extern "C" void app_main() {
     // 开机动画（见 boot_splash.cpp）。它必须排在这里 —— board_apply_orientation() 上方
     // 已调用，动画的 ui_commit 正是让方向生效的那次整屏刷；早于方向设置画等于白画。
     // 末帧停在屏上，盖住阅读器装载(实测约 3s)那段空屏，首屏出图时被顶掉。
-    // cy 保留给下方 NTP 同步提示定位用（动画不占这个变量）。
     bootSplashDraw();
-    int cy = (SCREEN_H - 2 * LINE_SPACING) / 2;
 
     // Initialize WiFi manager (但不自动连接)
     // WiFi 将在需要时按需连接（WebDAV同步、Flomo发送、Deepseek提示生成等）
@@ -1069,7 +1127,8 @@ extern "C" void app_main() {
         tzset();
     }
 
-    // Time sync: prefer RTC if its time is recent (>= July 2026), otherwise NTP
+    // Time sync: prefer RTC if its time is recent (>= July 2026). If it is stale,
+    // keep boot moving and let a background task sync NTP.
     {
         time_t rtcTime = g_rtc.getTime();
         bool rtcRecent = (rtcTime >= 1782864000); // July 1, 2026 00:00:00 UTC
@@ -1082,58 +1141,15 @@ extern "C" void app_main() {
             strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
             ESP_LOGI(TAG, "RTC time is recent, using directly: %s", ts);
         } else {
-            ESP_LOGW(TAG, "RTC time (%lld) is before July 2026, attempting NTP sync...", (long long)rtcTime);
-            std::string ssid = g_settings.wifiSsid();
-            if (!ssid.empty()) {
-                std::string ntp = g_settings.ntpServer();
-                if (ntp.empty()) ntp = "pool.ntp.org";
-
-                // 上面那帧（空白启动屏）已经提交了，这一帧是叠在它上面补一行提示：
-                // 双缓冲下必须显式取回上一帧的内容，否则会画到别的缓冲上去。
-                ui_render_begin_overlay();
-                ui_draw_text_centered(cy + 2 * LINE_SPACING, "正在同步时间...");
-                ui_commit();
-
-                std::string pass = g_settings.wifiPassword();
-                g_wifi.begin();
-                if (g_wifi.connect(ssid.c_str(), pass.c_str())) {
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    esp_sntp_stop();
-                    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-                    esp_sntp_setservername(0, ntp.c_str());
-                    esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
-                    esp_sntp_init();
-
-                    time_t now = 0;
-                    for (int i = 0; i < 100; i++) {
-                        vTaskDelay(pdMS_TO_TICKS(200));
-                        if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
-                            time(&now);
-                            break;
-                        }
-                    }
-                    if (now > 1782864000) {
-                        struct tm *tm = localtime(&now);
-                        char ts[32];
-                        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
-                        ESP_LOGI(TAG, "NTP sync succeeded: %s", ts);
-                        g_rtc.setTime(now);
-                    } else {
-                        ESP_LOGW(TAG, "NTP sync timeout (%s)", ntp.c_str());
-                    }
-                    esp_sntp_stop();
-                } else {
-                    ESP_LOGW(TAG, "WiFi connection failed for NTP sync");
-                }
-                g_wifi.disconnect();
-            } else {
-                ESP_LOGW(TAG, "WiFi not configured, cannot NTP sync");
-            }
-            // Fallback: use whatever RTC has, even if old
+            ESP_LOGW(TAG, "RTC time (%lld) is before July 2026, starting background NTP sync...",
+                     (long long)rtcTime);
             if (rtcTime > 1704067200) {
                 struct timeval tv = {(time_t)rtcTime, 0};
                 settimeofday(&tv, NULL);
                 ESP_LOGW(TAG, "Fallback to RTC time");
+            }
+            if (xTaskCreate(ntpSyncTask, "ntp_sync", 6144, nullptr, 1, nullptr) != pdPASS) {
+                ESP_LOGW(TAG, "NTP sync task creation failed");
             }
         }
     }

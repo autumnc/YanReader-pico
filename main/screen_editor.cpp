@@ -31,6 +31,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <memory>
+#include <new>
 
 extern "C" {
     // 图标字体不走 u8g2，直接写 4bpp 帧缓冲；缓冲指针从 shim 现取（ui_render 每帧
@@ -86,6 +88,16 @@ struct EditorState {
     bool mdInfoDirty = true;
     std::vector<MdLineInfo> cachedMdInfo;
     bool cachedMdOn = false;
+    uint32_t layoutRevision = 1;
+    VerticalData cachedVertical;
+    std::vector<char> cachedVerticalHidden;
+    bool verticalDirty = true;
+    uint32_t verticalCachedRev = 0;
+    bool verticalCachedMdOn = false;
+    int verticalCachedRows = 0;
+    int verticalCachedBodyPx = 0;
+    int verticalCachedCursorLine = -1;
+    int verticalCachedCursorByte = -1;
     // 折叠的标题行号(Ctrl+T 切换)。视图态:不随文本持久化,按行号平移维护。
     std::set<int> foldedHeadings;
     std::vector<EditorSnapshot> undoStack;
@@ -175,6 +187,14 @@ static void markDirty() {
     g_editor.vrowsDirty = true;
     g_editor.wordCountDirty = true;
     g_editor.mdInfoDirty = true;
+    g_editor.verticalDirty = true;
+    g_editor.layoutRevision++;
+}
+
+static void markLayoutDirty() {
+    g_editor.vrowsDirty = true;
+    g_editor.verticalDirty = true;
+    g_editor.layoutRevision++;
 }
 
 // 打字机模式:光标居中 + 按键音效是否生效
@@ -404,6 +424,38 @@ static const std::vector<MdLineInfo>& getMdInfo(bool mdOn) {
         g_editor.mdInfoDirty = false;
     }
     return g_editor.cachedMdInfo;
+}
+
+static const VerticalData& getVerticalData(const VerticalLayoutMetrics &vm,
+                                           int cursorLineIdx = -1,
+                                           int cursorBytePos = -1) {
+    const bool mdOn = g_settings.markdownRender();
+    const int bodyPx = editorBodyFontPx();
+    if (g_editor.verticalDirty ||
+        g_editor.verticalCachedRev != g_editor.layoutRevision ||
+        g_editor.verticalCachedMdOn != mdOn ||
+        g_editor.verticalCachedRows != vm.rows ||
+        g_editor.verticalCachedBodyPx != bodyPx ||
+        g_editor.verticalCachedCursorLine != cursorLineIdx ||
+        g_editor.verticalCachedCursorByte != cursorBytePos) {
+        FontScope body(bodyPx);
+        mdSetRenderEnabled(mdOn);
+        const auto &mdInfo = getMdInfo(mdOn);
+        g_editor.cachedVerticalHidden =
+            mdFoldHiddenLines(g_editor.lines, mdOn ? &mdInfo : nullptr, &g_editor.foldedHeadings);
+        g_editor.cachedVertical =
+            buildVerticalData(g_editor.lines, vm.rows, &g_editor.cachedVerticalHidden,
+                              mdOn ? &mdInfo : nullptr, &g_editor.foldedHeadings,
+                              cursorLineIdx, cursorBytePos);
+        g_editor.verticalDirty = false;
+        g_editor.verticalCachedRev = g_editor.layoutRevision;
+        g_editor.verticalCachedMdOn = mdOn;
+        g_editor.verticalCachedRows = vm.rows;
+        g_editor.verticalCachedBodyPx = bodyPx;
+        g_editor.verticalCachedCursorLine = cursorLineIdx;
+        g_editor.verticalCachedCursorByte = cursorBytePos;
+    }
+    return g_editor.cachedVertical;
 }
 
 static int getWordCount() {
@@ -1400,7 +1452,7 @@ static void reconcileFoldsForCursor() {
     // foldAt == cy 时光标在折叠标题行本身(可见边界),不算落入折叠区
     if (hideLevel != 0 && foldAt >= 0 && foldAt != cy) {
         g_editor.foldedHeadings.erase(foldAt);
-        g_editor.vrowsDirty = true;
+        markLayoutDirty();
     }
 }
 
@@ -1979,13 +2031,7 @@ static void drawEditor() {
         bool vkOn = editorVkActive();
         VerticalLayoutMetrics vm = editorVerticalVm();
         bool mdOn = g_settings.markdownRender();
-        mdSetRenderEnabled(mdOn);
-        const std::vector<MdLineInfo> &mdInfo = getMdInfo(mdOn);
-        auto hidden = mdFoldHiddenLines(g_editor.lines, mdOn ? &mdInfo : nullptr,
-                                        &g_editor.foldedHeadings);
-        auto data = buildVerticalData(g_editor.lines, vm.rows, &hidden,
-                                      mdOn ? &mdInfo : nullptr, &g_editor.foldedHeadings,
-                                      g_editor.cy, g_editor.cx);
+        const auto &data = getVerticalData(vm, g_editor.cy, g_editor.cx);
         int cursorCol = verticalFindCol(data, g_editor.lines, g_editor.cy, g_editor.cx);
         if (editorTypewriter() && cursorCol >= 0) {
             g_editor.scroll = cursorCol - vm.cols / 2;
@@ -2297,6 +2343,65 @@ static bool saveCurrentContent(bool createHistory = true) {
     bool ok = g_journal.saveEntryRaw(g_editor.savedFilename, fullText, createHistory);
     if (ok) g_journal.clearRecoveryDraft();
     return ok;
+}
+
+struct EditorAsyncSaveReq {
+    bool quick = false;
+    int quickIndex = 0;
+    bool createHistory = false;
+    std::string filename;
+    std::string content;
+};
+static std::atomic<bool> s_editorSaveRunning{false};
+static std::atomic<bool> s_editorSaveQueued{false};
+
+static void editorAsyncSaveTask(void *arg) {
+    std::unique_ptr<EditorAsyncSaveReq> req(static_cast<EditorAsyncSaveReq *>(arg));
+    bool ok = false;
+    if (req->quick) ok = quickEditSave(req->quickIndex, req->content, req->createHistory);
+    else ok = g_journal.saveEntryRaw(req->filename, req->content, req->createHistory);
+    if (ok) g_journal.clearRecoveryDraft();
+    s_editorSaveQueued.store(false, std::memory_order_release);
+    s_editorSaveRunning.store(false, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
+static bool queueAutoSaveContent(bool createHistory = false) {
+    if (s_editorSaveRunning.load(std::memory_order_acquire)) return false;
+    std::string text = currentEditorText();
+    auto *req = new (std::nothrow) EditorAsyncSaveReq();
+    if (!req) return false;
+    req->createHistory = createHistory;
+    if (inQuickFileSession()) {
+        req->quick = true;
+        req->quickIndex = quickEditIndex();
+        req->content = std::move(text);
+    } else {
+        if (text.empty()) { delete req; return false; }
+        time_t now; time(&now); struct tm *tm = localtime(&now);
+        char ts[32]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+        int wc = getWordCount();
+        char header[128];
+        snprintf(header, sizeof(header), "日期: %s\n字数: %d\n\n", ts, wc);
+        req->content = std::string(header) +
+                       (editorPromptOn() ? ("提示词: " + g_editor.promptText + "\n\n") : "自由写作\n\n") +
+                       text;
+        if (g_editor.savedFilename.empty()) {
+            char fname[32];
+            strftime(fname, sizeof(fname), "%Y-%m-%d_%H%M%S", tm);
+            g_editor.savedFilename = std::string(fname) + ".txt";
+        }
+        req->filename = g_editor.savedFilename;
+    }
+    s_editorSaveRunning.store(true, std::memory_order_release);
+    s_editorSaveQueued.store(true, std::memory_order_release);
+    if (xTaskCreate(editorAsyncSaveTask, "editor_save", 8192, req, 1, nullptr) != pdPASS) {
+        s_editorSaveRunning.store(false, std::memory_order_release);
+        s_editorSaveQueued.store(false, std::memory_order_release);
+        delete req;
+        return false;
+    }
+    return true;
 }
 
 static AppState finishEditor(ScreenContext &ctx) {
@@ -2961,7 +3066,6 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     // 放在 handle/idle/init 三个入口而不是 drawEditor 一个地方：命中测试与绘制必须
     // 同源，而 handle 里到处是正文几何。
     FontScope body(editorBodyFontPx());
-    const auto& vrows = getVrows();
     s_vkAteCommitClick = false;
 
     if (g_editor.promptGenerating) {
@@ -3430,7 +3534,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         if (g_editor.cy >= 0 && g_editor.cy < (int)mi.size() && mi[g_editor.cy].headingLevel > 0) {
             if (!g_editor.foldedHeadings.erase(g_editor.cy))
                 g_editor.foldedHeadings.insert(g_editor.cy);
-            g_editor.vrowsDirty = true;  // 纯视图态,不进撤销快照
+            markLayoutDirty();  // 纯视图态,不进撤销快照
         }
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
@@ -3457,13 +3561,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                              key == KEY_RIGHT || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN)) {
         clearSelection();
         VerticalLayoutMetrics vm = editorVerticalVm();
-        bool mdOn = g_settings.markdownRender();
-        mdSetRenderEnabled(mdOn);
-        const auto &mdInfo = getMdInfo(mdOn);
-        auto hidden = mdFoldHiddenLines(g_editor.lines, mdOn ? &mdInfo : nullptr,
-                                        &g_editor.foldedHeadings);
-        auto data = buildVerticalData(g_editor.lines, vm.rows, &hidden,
-                                      mdOn ? &mdInfo : nullptr, &g_editor.foldedHeadings);
+        const auto &data = getVerticalData(vm);
         if (key == KEY_UP) {
             moveCursorVerticalInline(-1);
         } else if (key == KEY_DOWN) {
@@ -3508,6 +3606,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
     if (key == KEY_SHIFT_UP) {
+        const auto& vrows = getVrows();
         if (g_editor.cy > 0) {
             extendSelection();
         }
@@ -3522,6 +3621,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
     if (key == KEY_SHIFT_DOWN) {
+        const auto& vrows = getVrows();
         if (g_editor.cy < (int)g_editor.lines.size() - 1) {
             extendSelection();
         }
@@ -3634,6 +3734,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         }
         g_editor.targetX = -1;
     } else if (key == KEY_UP) {
+        const auto& vrows = getVrows();
         clearSelection();
         int curVR = -1;
         for (int vi = 0; vi < (int)vrows.size(); vi++) {
@@ -3643,6 +3744,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         }
         if (curVR > 0) editorCursorToVrow(curVR - 1, vrows);
     } else if (key == KEY_DOWN) {
+        const auto& vrows = getVrows();
         clearSelection();
         int curVR = -1;
         for (int vi = 0; vi < (int)vrows.size(); vi++) {
@@ -3660,9 +3762,11 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         imeFieldMoveEnd(editorLineField());
         g_editor.targetX = -1;
     } else if (key == KEY_PAGE_UP) {
+        const auto& vrows = getVrows();
         clearSelection();
         moveCursorVertical(-editorPageRows(), vrows);
     } else if (key == KEY_PAGE_DOWN) {
+        const auto& vrows = getVrows();
         clearSelection();
         moveCursorVertical(editorPageRows(), vrows);
     }
@@ -3725,7 +3829,7 @@ bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw) {
         g_editor.autoSaveTime = 0;
         bool shouldCommit = inQuickFileSession() || g_settings.autoSave();
         if (shouldCommit) {
-            if (saveCurrentContent(false)) {
+            if (queueAutoSaveContent(false)) {
                 g_editor.modifiedSinceSave = false;
             } else if (g_editor.modifiedSinceSave && g_settings.recoveryDraft()) {
                 saveRecoveryDraftIfChanged();

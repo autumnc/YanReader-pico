@@ -35,6 +35,9 @@
 // 再声明一遍就是 conflicting declaration；而且 read_pico 组件在本工程是无条件编译的，
 // GCC 看得见定义，`f != nullptr` 这种判空一律吃 -Werror=address。
 // "PCM 会话开不出来"这条退化路径由下面的 open 失败退避负责，与链接期无关。
+//
+// 某些 read_pico_firmware 版本还没有公开 PCM 会话 API。保持本文件可编译，并在
+// 缺接口时把按键音退化为 no-op；主 UI 不该因为一个可选反馈音卡住构建。
 
 namespace {
 
@@ -95,6 +98,29 @@ static portMUX_TYPE s_pend_mux = portMUX_INITIALIZER_UNLOCKED;
 static int s_pending = 0;              // 已排队待播的声数
 
 static int64_t s_open_retry_at_us = 0;  // 开会话失败后的退避截止时刻
+static bool s_pcm_missing_logged = false;
+static std::vector<int16_t> s_hit_cache;
+static int s_hit_cache_peak = -1;
+static int s_hit_cache_vol = -1;
+static std::vector<int16_t> s_gap_cache;
+
+#if defined(YAN_READER_ENABLE_BUZZER_PCM)
+esp_err_t buzzerPcmOpen(uint32_t sample_rate) { return read_pico_buzzer_pcm_open(sample_rate); }
+void buzzerPcmWrite(const int16_t *data, int n) { read_pico_buzzer_pcm_write(data, n); }
+void buzzerPcmClose() { read_pico_buzzer_pcm_close(); }
+void buzzerPcmCloseFade(int fade_ms) { read_pico_buzzer_pcm_close_fade(fade_ms); }
+#else
+esp_err_t buzzerPcmOpen(uint32_t) {
+    if (!s_pcm_missing_logged) {
+        ESP_LOGW(TAG, "read_pico buzzer PCM API not available; typing click disabled");
+        s_pcm_missing_logged = true;
+    }
+    return ESP_ERR_NOT_SUPPORTED;
+}
+void buzzerPcmWrite(const int16_t *, int) {}
+void buzzerPcmClose() {}
+void buzzerPcmCloseFade(int) {}
+#endif
 
 // 只看开关，不看输入模式：按键反馈音也是虚拟键盘的按键反馈，非打字机模式下同样该能开。
 bool enabled() {
@@ -196,6 +222,21 @@ void makeHit(int legal_peak, int vol, std::vector<int16_t> &out) {
         out[i] = (int16_t)clamp16(lround(buf[i] * scale));
 }
 
+const std::vector<int16_t>& hitWave(int legal_peak, int vol) {
+    if (s_hit_cache.empty() || s_hit_cache_peak != legal_peak || s_hit_cache_vol != vol) {
+        makeHit(legal_peak, vol, s_hit_cache);
+        s_hit_cache_peak = legal_peak;
+        s_hit_cache_vol = vol;
+    }
+    return s_hit_cache;
+}
+
+const std::vector<int16_t>& gapWave() {
+    const int gap_n = (int)(TC_GAP_MS * TC_SAMPLE_RATE / 1000);
+    if ((int)s_gap_cache.size() != gap_n) s_gap_cache.assign((size_t)gap_n, 0);
+    return s_gap_cache;
+}
+
 // 常驻线程：PCM 会话在此 open/保持/close。连续敲键共用同一会话，避免逐键
 // pwm_audio init/deinit(快速输入时 gptimer/LEDC/GPIO 反复重建是崩溃的主嫌)，也让
 // 上一声的尾音自然排空、下一声接得上。play() 只入队就返回，UI 线程不被阻塞。
@@ -210,7 +251,7 @@ void clickTask(void *) {
                 // 空闲收声。零偏置映射下这里已经没有直流要淡出，纯粹是把 gptimer/LEDC
                 // 还回去；记一笔方便对上"空闲后那声"到底还在不在(听不见就对了)。
                 ESP_LOGI(TAG, "会话关闭(空闲 %dms)", TC_IDLE_MS);
-                read_pico_buzzer_pcm_close_fade(TC_CLOSE_FADE_MS);
+                buzzerPcmCloseFade(TC_CLOSE_FADE_MS);
                 restoreMap();
                 open = false;
             }
@@ -228,7 +269,7 @@ void clickTask(void *) {
         const int vol = g_settings.typingClickVolume();
         if (vol <= 0) {  // 静音档
             if (open) {
-                read_pico_buzzer_pcm_close();
+                buzzerPcmClose();
                 restoreMap();
                 open = false;
             }
@@ -245,7 +286,7 @@ void clickTask(void *) {
             // 先换成零偏置映射再开会话：open 里那段 0→bias 的启始斜坡跟着新表走
             // (bias=0 时是空操作)，会话里所有 submit_pcm 也都按它算占空比。
             swapZeroBiasMap();
-            if (read_pico_buzzer_pcm_open(TC_SAMPLE_RATE) != ESP_OK) {
+            if (buzzerPcmOpen(TC_SAMPLE_RATE) != ESP_OK) {
                 restoreMap();  // 没开成，别把映射留在零偏置上
                 s_open_retry_at_us = now_us + (int64_t)TC_OPEN_RETRY_MS * 1000;
                 continue;  // 忙(曲谱/别的音在播)：丢弃这批，别阻塞
@@ -258,17 +299,16 @@ void clickTask(void *) {
 
         // 静音间隔写成 PCM 0：零偏置映射下就是占空比 0，线圈断电(甲类那张表里
         // PCM 0 才是占空比 50%，所以这个常数是跟着 swapZeroBiasMap 一起变的)。
-        const int gap_n = (int)(TC_GAP_MS * TC_SAMPLE_RATE / 1000);
-        std::vector<int16_t> gap((size_t)gap_n, 0);
-        std::vector<int16_t> hit;
+        const auto &gap = gapWave();
+        const int gap_n = (int)gap.size();
+        const auto &hit = hitWave(legal_peak, vol);
         int frames = 0;
         const int64_t t0 = esp_timer_get_time();
         for (int k = 0; k < n && !s_abort.load(std::memory_order_acquire); k++) {
-            makeHit(legal_peak, vol, hit);
-            read_pico_buzzer_pcm_write(hit.data(), (int)hit.size());
+            buzzerPcmWrite(hit.data(), (int)hit.size());
             frames += (int)hit.size();
             if (k + 1 < n && !s_abort.load(std::memory_order_acquire)) {
-                read_pico_buzzer_pcm_write(gap.data(), gap_n);
+                buzzerPcmWrite(gap.data(), gap_n);
                 frames += gap_n;
             }
         }
@@ -284,7 +324,7 @@ void clickTask(void *) {
         }
         // 被打断(typingClickRelease)：立刻关会话。
         if (s_abort.load(std::memory_order_acquire)) {
-            read_pico_buzzer_pcm_close();
+            buzzerPcmClose();
             restoreMap();
             open = false;
         }
