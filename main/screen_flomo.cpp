@@ -19,6 +19,7 @@
 #include "settings_manager.h"
 #include "ui_helpers.h"
 #include "ui/list_view.h"  // listPageStep：手写列表的翻页步长（一屏行数 / 没得翻 = 0）
+#include "ui/scroll_text.h"
 #include "wifi_manager.h"
 #include "hw/input.h"
 #include "editor_vk.h"   // 虚拟键盘：检索框没连蓝牙键盘时的唯一输入途径
@@ -558,6 +559,17 @@ static int flomoHelpVis() {
     return v < 1 ? 1 : v;
 }
 
+static ListView flomoListView(bool search) {
+    ListView lv;
+    lv.sel = g.sel;
+    lv.first = g.scroll;
+    lv.count = (int)g.filtered.size();
+    lv.rows = search ? flomoSearchVis() : flomoListVis();
+    lv.top = FONT_H + 4 + LINE_SPACING - FONT_H - 2;
+    lv.itemH = LINE_SPACING;
+    return lv;
+}
+
 static void drawListBody() {
     ui_clear();
     ui_draw_text_content(4, g_font.ascent(), "Flomo", false);
@@ -572,10 +584,11 @@ static void drawListBody() {
     u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
 
     int y = sepY + LINE_SPACING;
-    int vis = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
-    if (vis < 1) vis = 1;
-    if (g.sel < g.scroll) g.scroll = g.sel;
-    if (g.sel >= g.scroll + vis) g.scroll = g.sel - vis + 1;
+    ListView lv = flomoListView(false);
+    listViewFollow(lv);
+    g.sel = lv.sel;
+    g.scroll = lv.first;
+    const int vis = lv.rows;
 
     for (int i = 0; i < vis && g.scroll + i < (int)g.filtered.size(); i++) {
         int fi = g.scroll + i;
@@ -604,12 +617,9 @@ static void drawList() {
 
 // 反查鼠标点在哪一行（行高 = LINE_SPACING，首行基线 y）。
 static int listRowAtY(int ty) {
-    int y = FONT_H + 4 + LINE_SPACING;
-    int i = (ty - y + LINE_SPACING / 2) / LINE_SPACING;
-    if (i < 0) return -1;
-    int fi = g.scroll + i;
-    if (fi < 0 || fi >= (int)g.filtered.size()) return -1;
-    return fi;
+    ListView lv = flomoListView(g.mode == FM_SEARCH);
+    listViewFollow(lv);
+    return listViewHitAt(lv, ty);
 }
 
 // 详情的画面本体（不含提交）：确认框 / 长按菜单要盖在它上面。
@@ -788,13 +798,11 @@ static void drawSearch() {
     const bool vk = editorVkVisible();
     bool composing = g.searchIme && g_ime.composing() && !vk;
     int listY = sepY + LINE_SPACING;
-    // 列表底边：虚拟键盘弹着时裁到键盘面板顶边，否则照旧（候选条在时再让一让）。
-    int listMaxY = vk ? (editorVkTop() - LINE_SPACING)
-                      : (composing ? imeFullscreenPanelTopY() - LINE_SPACING : SCREEN_H);
-    int vis = (listMaxY - listY + LINE_SPACING - 1) / LINE_SPACING;
-    if (vis < 1) vis = 1;
-    if (g.sel < g.scroll) g.scroll = g.sel;
-    if (g.sel >= g.scroll + vis) g.scroll = g.sel - vis + 1;
+    ListView lv = flomoListView(true);
+    listViewFollow(lv);
+    g.sel = lv.sel;
+    g.scroll = lv.first;
+    const int vis = lv.rows;
 
     for (int i = 0; i < vis && g.scroll + i < (int)g.filtered.size(); i++) {
         const Memo &m = g.store.memos[g.filtered[g.scroll + i]];
@@ -1149,18 +1157,13 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
             g.mode = FM_DETAIL;
             g.detailScroll = 0;
             editorVkAutoHide();
-        } else if (key == KEY_UP) {
-            if (g.sel > 0) g.sel--;
-        } else if (key == KEY_DOWN) {
-            if (g.sel < (int)g.filtered.size() - 1) g.sel++;
-        } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-            // 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。
-            const int n = (int)g.filtered.size();
-            const int step = listPageStep(n, flomoSearchVis());
-            if (step > 0) {
-                g.sel += (key == KEY_PAGE_DOWN) ? step : -step;
-                if (g.sel < 0) g.sel = 0;
-                if (g.sel > n - 1) g.sel = n - 1;
+        } else if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+                   key == KEY_HOME || key == KEY_END) {
+            ListView lv = flomoListView(true);
+            if (listViewKey(lv, key)) {
+                listViewFollow(lv);
+                g.sel = lv.sel;
+                g.scroll = lv.first;
             }
         } else if (key == KEY_TOUCH_LONG) {
             g.searchIme = false;
@@ -1200,10 +1203,9 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
             }
         }
         if (key == 'd' || key == 'D') { g.mode = FM_CONFIRM_DELETE; drawConfirmDelete(); return APP_FLOMO; }
-        if (key == KEY_UP) { if (g.detailScroll > 0) g.detailScroll--; }
-        else if (key == KEY_DOWN) { g.detailScroll++; }
-        else if (key == KEY_PAGE_UP) { g.detailScroll -= flomoDetailVis(); if (g.detailScroll < 0) g.detailScroll = 0; }
-        else if (key == KEY_PAGE_DOWN) { g.detailScroll += flomoDetailVis(); }
+        if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+            scrollTextKey(key, g.detailScroll, flomoDetailVis(), 100000);
+        }
         else if (key == '\n') {
             // 触摸点按：右下角浮动按钮（编辑 / 删除）优先，点别处 = 返回列表
             // （笔记长时用上下键滚）。
@@ -1348,20 +1350,13 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
     if (key == 0x1B || key == 'q' || key == 'Q') {
         ctx.nextState = g.returnTo;
         return g.returnTo;
-    } else if (key == KEY_UP) {
-        if (g.sel > 0) g.sel--;
-        g.status.clear();
-    } else if (key == KEY_DOWN) {
-        if (g.sel < (int)g.filtered.size() - 1) g.sel++;
-        g.status.clear();
-    } else if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-        // 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。
-        const int n = (int)g.filtered.size();
-        const int step = listPageStep(n, flomoListVis());
-        if (step > 0) {
-            g.sel += (key == KEY_PAGE_DOWN) ? step : -step;
-            if (g.sel < 0) g.sel = 0;
-            if (g.sel > n - 1) g.sel = n - 1;
+    } else if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+               key == KEY_HOME || key == KEY_END) {
+        ListView lv = flomoListView(false);
+        if (listViewKey(lv, key)) {
+            listViewFollow(lv);
+            g.sel = lv.sel;
+            g.scroll = lv.first;
         }
         g.status.clear();
     } else if (key == 'n' || key == 'N') {

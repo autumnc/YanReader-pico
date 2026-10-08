@@ -12,6 +12,9 @@
 #include "vertical_layout.h"
 #include "input.h"
 #include "ui/list_view.h"  // listPageStep：手写列表的翻页步长（一屏行数 / 没得翻 = 0）
+#include "ui/scroll_text.h"
+#include "ui_feedback.h"
+#include "app_async.h"
 #include <cstdlib>
 #include <cstdio>
 #include <ctime>
@@ -54,6 +57,86 @@ static struct {
     bool mdInfoDirty = true;
     bool mdCachedOn = false;
 } g_history;
+
+static void loadHistoryPreviewText(const std::string &content);
+static void drawHistoryList();
+static void drawHistoryPreview();
+
+struct HistoryPreviewLoadArg {
+    std::string entry;
+    std::string version;
+};
+
+static AppAsyncJob s_historyPreviewJob;
+static SemaphoreHandle_t s_historyPreviewMutex = nullptr;
+static std::string s_historyPreviewContent;
+
+static void historyPreviewLock() {
+    if (!s_historyPreviewMutex) s_historyPreviewMutex = xSemaphoreCreateMutex();
+    if (s_historyPreviewMutex) xSemaphoreTake(s_historyPreviewMutex, portMAX_DELAY);
+}
+
+static void historyPreviewUnlock() {
+    if (s_historyPreviewMutex) xSemaphoreGive(s_historyPreviewMutex);
+}
+
+static void historyPreviewLoadTask(void *arg) {
+    HistoryPreviewLoadArg *job = static_cast<HistoryPreviewLoadArg *>(arg);
+    std::string content;
+    if (job && !s_historyPreviewJob.cancelled()) {
+        content = g_journal.readHistoryVersion(job->entry, job->version);
+    }
+    historyPreviewLock();
+    s_historyPreviewContent = content;
+    historyPreviewUnlock();
+    delete job;
+    s_historyPreviewJob.finish(s_historyPreviewJob.cancelled() ? "已取消" : "");
+    vTaskDelete(nullptr);
+}
+
+static void startHistoryPreviewLoad() {
+    if (s_historyPreviewJob.state() == AppAsyncState::Running || g_history.versions.empty()) return;
+    historyPreviewLock();
+    s_historyPreviewContent.clear();
+    historyPreviewUnlock();
+    s_historyPreviewJob.begin("历史版本", "正在读取...");
+    auto *arg = new HistoryPreviewLoadArg{g_history.filename, g_history.versions[g_history.selection].filename};
+    if (!s_historyPreviewJob.start(historyPreviewLoadTask, "hist_preview", 6144, arg)) {
+        delete arg;
+        s_historyPreviewJob.failToStart("任务启动失败");
+    }
+}
+
+static bool handleHistoryPreviewLoad(int key) {
+    const AppAsyncState state = s_historyPreviewJob.state();
+    if (state == AppAsyncState::Idle) return false;
+    if (state == AppAsyncState::Running) {
+        if (key == 'q' || key == 'Q' || key == 0x1B) {
+            s_historyPreviewJob.cancel();
+        }
+        if (!s_historyPreviewJob.drawn) {
+            ui_feedback_titled_message(s_historyPreviewJob.title().c_str(),
+                                       s_historyPreviewJob.busy().c_str(), 0);
+            s_historyPreviewJob.drawn = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(60));
+        return true;
+    }
+    std::string content;
+    historyPreviewLock();
+    content = s_historyPreviewContent;
+    historyPreviewUnlock();
+    const bool cancelled = s_historyPreviewJob.cancelled();
+    s_historyPreviewJob.reset();
+    if (!cancelled) {
+        loadHistoryPreviewText(content);
+        g_history.preview = true;
+        drawHistoryPreview();
+    } else {
+        drawHistoryList();
+    }
+    return true;
+}
 
 static const std::vector<VRow>& getViewerVrows() {
     bool firstLineIndent = g_settings.firstLineIndent();
@@ -525,12 +608,21 @@ static int brwVisibleRows() {
     const int visible = (STATUS_Y - brwRowBase() + LINE_SPACING - 1) / LINE_SPACING;
     return visible < 1 ? 1 : visible;
 }
+static ListView brwListView() {
+    ListView lv;
+    lv.sel = g_browser.selection;
+    lv.first = g_browser.scroll;
+    lv.count = (int)g_browser.entries.size();
+    lv.rows = brwVisibleRows();
+    lv.top = brwRowBase() - FONT_H - 2;
+    lv.itemH = LINE_SPACING;
+    return lv;
+}
 // 点在第几行（-1 = 点在标题或空白上）。
 static int brwRowAtY(int y) {
-    const int top = brwRowBase() - FONT_H - 2;   // 行带上沿：基线往上让出一个行高
-    if (y < top) return -1;
-    const int row = (y - top) / LINE_SPACING;
-    return row < brwVisibleRows() ? row : -1;
+    ListView lv = brwListView();
+    listViewFollow(lv);
+    return listViewHitAt(lv, y);
 }
 
 // 打开某一篇去编辑：列表的 e / 浮动按钮「编辑」、详情页的 e / 浮动按钮「编辑」都走这里
@@ -578,10 +670,11 @@ static void drawBrowser() {
     ui_draw_text(4, y, "过往日记", false, true);
     u8g2_DrawHLine(g_u8g2, 0, y + 4, SCREEN_W);
     y = brwRowBase();   // 与触摸命中同一个式子
-    const int visible = brwVisibleRows();
-    if (g_browser.selection < g_browser.scroll) g_browser.scroll = g_browser.selection;
-    if (g_browser.selection >= g_browser.scroll + visible)
-        g_browser.scroll = g_browser.selection - visible + 1;
+    ListView lv = brwListView();
+    listViewFollow(lv);
+    g_browser.selection = lv.sel;
+    g_browser.scroll = lv.first;
+    const int visible = lv.rows;
 
     for (int i = 0; i < visible && (g_browser.scroll + i) < (int)entries.size(); i++) {
         auto &e = entries[g_browser.scroll + i]; bool sel = (g_browser.scroll + i == g_browser.selection);
@@ -629,17 +722,15 @@ AppState screen_browser_handle(int key, ScreenContext &ctx) {
     }
 
     if (key == 'q' || key == 'Q' || key == 0x1B) { ctx.nextState = APP_MAIN; return APP_MAIN; }
-    if (key == 'j' || key == KEY_DOWN) { g_browser.selection++; if (g_browser.selection>=(int)entries.size()) g_browser.selection=(int)entries.size()-1; }
-    if (key == 'k' || key == KEY_UP) { g_browser.selection--; if (g_browser.selection<0) g_browser.selection=0; }
-    if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-        // 触摸上下滑 = 整页翻：一步一屏（brwVisibleRows：底部要给浮动按钮让一条），
-        // 高亮跟着页走；一屏放得下就没得翻（吃掉这一划）。窗口由绘制按选中项反推。
-        const int n = (int)entries.size();
-        const int step = listPageStep(n, brwVisibleRows());
-        if (step > 0) {
-            g_browser.selection += (key == KEY_PAGE_DOWN) ? step : -step;
-            if (g_browser.selection < 0) g_browser.selection = 0;
-            if (g_browser.selection > n - 1) g_browser.selection = n - 1;
+    if (key == 'j') key = KEY_DOWN;
+    else if (key == 'k') key = KEY_UP;
+    if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+        key == KEY_HOME || key == KEY_END) {
+        ListView lv = brwListView();
+        if (listViewKey(lv, key)) {
+            listViewFollow(lv);
+            g_browser.selection = lv.sel;
+            g_browser.scroll = lv.first;
         }
     }
     if (key == 0x0A || key == 0x0D) {
@@ -650,8 +741,7 @@ AppState screen_browser_handle(int key, ScreenContext &ctx) {
         const bool tapped = input_tap_xy(&tx, &ty);
         if (tapped) {
             const int row = brwRowAtY(ty);
-            if (row >= 0 && g_browser.scroll + row < (int)entries.size())
-                g_browser.selection = g_browser.scroll + row;
+            if (row >= 0) g_browser.selection = row;
         }
         ctx.selectedEntry = entries[g_browser.selection].filename;
         ctx.nextState = APP_VIEWER;
@@ -947,6 +1037,17 @@ static int historyListRows() {
     return v < 1 ? 1 : v;
 }
 
+static ListView historyListView() {
+    ListView lv;
+    lv.sel = g_history.selection;
+    lv.first = g_history.scroll;
+    lv.count = (int)g_history.versions.size();
+    lv.rows = historyListRows();
+    lv.top = FONT_H + LINE_SPACING - FONT_H - 2;
+    lv.itemH = LINE_SPACING;
+    return lv;
+}
+
 static void drawHistoryList() {
     ui_clear();
     const int rowH = LINE_SPACING;
@@ -957,14 +1058,12 @@ static void drawHistoryList() {
     u8g2_DrawHLine(g_u8g2, 4, FONT_H + g_font.descent(), SCREEN_W - 8);
 
     int y = FONT_H + rowH;
-    int visible = (STATUS_Y - y + rowH - 1) / rowH;
-    if (visible < 1) visible = 1;
     int total = (int)g_history.versions.size();
-    if (g_history.selection >= total) g_history.selection = total - 1;
-    if (g_history.selection < 0) g_history.selection = 0;
-    if (g_history.selection < g_history.scroll) g_history.scroll = g_history.selection;
-    if (g_history.selection >= g_history.scroll + visible)
-        g_history.scroll = g_history.selection - visible + 1;
+    ListView lv = historyListView();
+    listViewFollow(lv);
+    g_history.selection = lv.sel;
+    g_history.scroll = lv.first;
+    const int visible = lv.rows;
 
     if (total == 0) {
         ui_draw_text_centered(SCREEN_H / 2, "暂无历史版本");
@@ -1045,10 +1144,12 @@ static void drawHistoryPreview() {
 }
 
 AppState screen_history_handle(int key, ScreenContext &ctx) {
+    if (handleHistoryPreviewLoad(key)) return APP_HISTORY;
+
     if (g_history.confirmRestore) {
         if (key == 0x0A || key == 0x0D || key == 'y' || key == 'Y') {
             if (!g_history.versions.empty()) {
-                ui_clear(); ui_show_message_centered("正在恢复..."); ui_commit();
+                ui_feedback_message("正在恢复...", 0);
                 std::string hist = g_history.versions[g_history.selection].filename;
                 bool ok = g_journal.restoreHistoryVersion(g_history.filename, hist);
                 if (ok) {
@@ -1132,14 +1233,7 @@ AppState screen_history_handle(int key, ScreenContext &ctx) {
             drawHistoryList();
             return APP_HISTORY;
         }
-        if (key == 'j' || key == KEY_DOWN || (editorVertical() && key == KEY_LEFT)) {
-            if (g_history.previewScroll < maxScroll) g_history.previewScroll++;
-        }
-        if (key == 'k' || key == KEY_UP || (editorVertical() && key == KEY_RIGHT)) {
-            if (g_history.previewScroll > 0) g_history.previewScroll--;
-        }
-        if (key == KEY_PAGE_DOWN) { g_history.previewScroll += visible; if (g_history.previewScroll > maxScroll) g_history.previewScroll = maxScroll; }
-        if (key == KEY_PAGE_UP) { g_history.previewScroll -= visible; if (g_history.previewScroll < 0) g_history.previewScroll = 0; }
+        scrollTextKey(key, g_history.previewScroll, visible, maxScroll, editorVertical());
         if (key == 'r' || key == 'R') g_history.confirmRestore = true;
         if (key == 'd' || key == 'D') g_history.confirmDelete = true;
         drawHistoryPreview();
@@ -1151,23 +1245,19 @@ AppState screen_history_handle(int key, ScreenContext &ctx) {
 
     int total = (int)g_history.versions.size();
     if (key == 'q' || key == 'Q' || key == 0x1B) return historyReturn(ctx);
-    if (key == 'j' || key == KEY_DOWN) { if (g_history.selection < total - 1) g_history.selection++; }
-    if (key == 'k' || key == KEY_UP) { if (g_history.selection > 0) g_history.selection--; }
-    if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
-        // 触摸上下滑 = 整页翻：一步一屏，高亮跟着页走；一屏放得下就没得翻。
-        const int step = listPageStep(total, historyListRows());
-        if (step > 0) {
-            g_history.selection += (key == KEY_PAGE_DOWN) ? step : -step;
-            if (g_history.selection < 0) g_history.selection = 0;
-            if (g_history.selection > total - 1) g_history.selection = total - 1;
+    if (key == 'j') key = KEY_DOWN;
+    else if (key == 'k') key = KEY_UP;
+    if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+        key == KEY_HOME || key == KEY_END) {
+        ListView lv = historyListView();
+        if (listViewKey(lv, key)) {
+            listViewFollow(lv);
+            g_history.selection = lv.sel;
+            g_history.scroll = lv.first;
         }
     }
     if ((key == 0x0A || key == 0x0D) && total > 0) {
-        ui_clear(); ui_show_message_centered("正在读取..."); ui_commit();
-        std::string content = g_journal.readHistoryVersion(g_history.filename, g_history.versions[g_history.selection].filename);
-        loadHistoryPreviewText(content);
-        g_history.preview = true;
-        drawHistoryPreview();
+        startHistoryPreviewLoad();
         return APP_HISTORY;
     }
     if ((key == 'r' || key == 'R') && total > 0) g_history.confirmRestore = true;
