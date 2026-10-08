@@ -21,6 +21,7 @@
 #include "text_sel.h"   // 单行输入框的触摸选字 / 粘贴板（三模式共享底层件）
 
 #include "settings_manager.h"   // g_settings：计划模式独立方向（"gtd_orientation"）
+#include "hw/auto_orient.h"  // auto_orient_initial：本模式的「自适应」方向
 #include "hw/board.h"    // board_force_*/board_restore_orientation（模式方向切换）
 
 #include "esp_timer.h"
@@ -3720,6 +3721,16 @@ static void applyGtdOrientation() {
     const std::string o = g_settings.getString("gtd_orientation", "");
     if (o == "portrait") board_force_portrait();
     else if (o == "landscape") board_force_landscape();
+    else if (o == "auto") {
+        // 自适应：拿最近一次加速度采样现判一次（判不出就保持原样，仍是"跟随全局"）。
+        // 必须在这一帧排版**之前**：布局全按 SCREEN_W/H 现算，方向定了才排得对。
+        // 进模式之后由 main.cpp 每轮 auto_orient_tick() 接着跟。
+        bool portrait = false;
+        if (auto_orient_initial(&portrait)) {
+            if (portrait) board_force_portrait();
+            else board_force_landscape();
+        }
+    }
 }
 
 // 公开版：切模式回来时只重套方向、不重跑 init（init 会把当前 tab 清成收集箱首页）。

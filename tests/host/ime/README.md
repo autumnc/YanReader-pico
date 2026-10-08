@@ -17,6 +17,7 @@ tests/host/ime/run.sh --regress-only   # just the regression test (quiet on succ
 tests/host/ime/run.sh --verify-fix     # prove the regression FAILS on the pre-fix IME.cpp
 tests/host/ime/run.sh zhege 1          # ad-hoc: feed "zhege", commit page index 1
 tests/host/ime/run.sh --regress jiushi 就是
+tests/host/ime/run.sh --paging nihao   # 候选分页的行宽：横屏/竖屏各分一次页，比个数
 ```
 
 Exit status is non-zero when a regression case fails. Nothing is written outside
@@ -39,6 +40,11 @@ Exit status is non-zero when a regression case fails. Nothing is written outside
    `setActive(true)`.
    The diagnostic scenarios also run with **no** width callback (`--fixed`), which drops
    `buildPage()` into its fixed page-size fallback — both paging modes are covered.
+   Note it pins the width with the plain `setDisplayWidth()` even though `main.cpp` now
+   hands a *live callback* (`setDisplayWidthFn(imeCandidateLineWidth)`，宽度跟着横竖屏走)：
+   这个 harness 钉的是 IME 对"喂进来的行宽"的契约，而那是 IME.cpp 里的事 —— 用回老
+   API 才能继续拿 pre-fix 的 `IME.cpp` 编译（`--verify-fix`）。"谁来喂、喂得对不对"
+   在 IME.cpp 之外，见下节的 `--paging`。
 2. Feeds the key sequence **one key at a time** through `IME::handleKey()`. That matters:
    the bug is planted by the *intermediate* keystroke (`zheg` / `jiush`), whose lookup
    ends with an empty candidate table.
@@ -113,6 +119,32 @@ directly: `build/ime_driver --regress <letters> <word> [--fixed]`. The assertion
 "commits whole, in one step"; anything else (a live composition, a stale `_code`/
 `_prefix`, a wrong `out`) fails with rc=1.
 
+## `--paging <letters>`：候选分页的行宽（随方向变，一页 ≤ 9）
+
+候选行宽度是**方向相关**的（`SCREEN_W` = 当前方向的逻辑宽，面板物理 1216×684：
+横屏 1216−12=1204、竖屏 684−12=672），而分页（`_pageStarts`）是按像素宽切出来的。
+`--paging` 把同一个编码在两档宽度下各重放一次，断言三件事：
+
+1. 每页候选的实测总宽 ≤ 当次行宽（分页的契约：装不下就换页）；
+2. 每页 ≤ 9 个 —— 页内编号 1..9 就是给数字键的，第 10 个起数字键够不着
+   （`buildPage` 的 `pageCount >= 9`）；
+3. 横屏一页 ≥ 竖屏一页（宽的那一档不该反而装得少）。
+
+当前数字（host 用 22px 近似字体，设备上候选字号 45px，个数不同、关系一样）：
+
+```
+nihao   横屏 1204px: 9 个（页宽 869px）   竖屏 672px: 7 个（671px）
+zhege   横屏 1204px: 9 个（页宽 803px）   竖屏 672px: 7 个（605px）
+jiushi  横屏 1204px: 9 个（页宽 693px）   竖屏 672px: 8 个（616px）
+```
+
+横屏那 9 个是被**上限**卡住的（869px 只用掉 1204px 的七成），不是宽度 —— 想放到十几个
+得有新的选字办法（数字键只有 1–9），所以那条 `pageCount >= 9` 是刻意留着的。
+
+这条是**护栏**，不进 `run_regress`：那组是拿 pre-fix 的 `IME.cpp` 反证用的，而这条只钉
+IME 对"喂进来的行宽"的契约（只用 `setDisplayWidth`），两个版本都过。设备上真正出过的
+问题是 `main.cpp` 喂了个开机快照 —— 那在 `IME.cpp` 之外，靠这两行数字人工对一眼。
+
 ## Caveats
 
 - The user-dictionary paths in `IME.cpp` are the device's `/sdcard/settings/*.txt`. That
@@ -122,6 +154,6 @@ directly: `build/ime_driver --regress <letters> <word> [--fixed]`. The assertion
 - One scenario per process (`run.sh` starts a new process per case) so that in-memory
   learning from one commit cannot perturb the next case.
 - Width paging uses `hostime::textWidthApprox()` (ASCII 11px / other 22px, matching
-  `FontRenderer::charWidth` for the 22px content font) and a 1204px candidate line. It is
-  an approximation of the on-device font, but the bug is independent of paging — both
-  `--fixed` and width paging reproduce it.
+  `FontRenderer::charWidth` for the 22px content font) and the side's candidate line
+  (1204px 横屏 / 672px 竖屏，见 `--paging`). It is an approximation of the on-device font,
+  but the bug is independent of paging — both `--fixed` and width paging reproduce it.

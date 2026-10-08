@@ -38,6 +38,7 @@
 #include "display.h"
 #include "font_store.h"
 #include "read_pico_board.h"
+#include "hw/auto_orient.h"   // auto_orient_tick：自适应屏幕方向（写作/计划模式的「自适应」档）
 #include "read_pico_pmu.h"
 #include "read_pico_sd.h"
 #include "epdiy.h"
@@ -822,6 +823,39 @@ static void syncScreenLifecycle(AppState state, ScreenContext &ctx) {
     if (cur.enter) cur.enter(ctx);
 }
 
+// 现在这个界面允不允许自适应方向跟着转。
+//
+// **按界面点名，不按 appModeOfState 一刀切。** 那个映射把设置/主菜单/文件管理/历史
+// 这些也算进写作模式(1)（它们只是借道那个模式进出，见 pjournal_app.h），而设置界面
+// 自己就挂着「写作模式方向」这一项 —— 选完当场把这一屏也转过去，正是
+// pickerApply 里 _gtd_orientation 那条注释在躲的事。
+//
+// 点名的是"会打字、会摆出候选行的几个界面"：候选行分页跟着屏宽走（IME 那次改动）
+// 正是在这几个界面里生效，也是自适应真正有用的地方。阅读模式有自己那份方向设置
+// （屏幕上刻意竖屏），一律不跟；设置/文件管理/历史同理 —— 「自适应」是各模式自己的
+// 方向档，不是全局开关。
+//
+// **APP_MAIN 要点上**：它就是写作模式的主菜单（appModeOfState 把 APP_MAIN 算成模式 1，
+// 也就是"进这一屏 = 在写作模式里"），计划模式自己的那一屏 APP_GTD 一直在名单里 ——
+// 少了 APP_MAIN，两个模式的"进模式之后第一屏"就一个跟一个不跟（用户报的正是这个：
+// 计划模式转、写作模式不转）。
+static bool autoOrientWantedFor(AppState st) {
+    switch (st) {
+        case APP_MAIN:
+        case APP_EDITOR:
+        case APP_OUTLINE:
+        case APP_INSPIRATION:
+        case APP_POLISH:
+        case APP_POLISH_PROMPT:
+        case APP_FLOMO:
+            return g_settings.getString("writing_orientation", "") == "auto";
+        case APP_GTD:
+            return g_settings.getString("gtd_orientation", "") == "auto";
+        default:
+            return false;
+    }
+}
+
 // ── Application Main Loop ──────────────────────────────────────────────
 
 
@@ -1114,7 +1148,11 @@ extern "C" void app_main() {
     // 几个"和面板实际画得下几个，必须是同一份结论，否则大字号时最后一两个候选
     // 会被挤出候选行，看不见也点不到。
     ime.setWidthFn([](const char *s) -> int { return imeCandStrW(s); });
-    ime.setDisplayWidth(imeCandidateLineWidth());
+    // 候选行宽度**现取**(回调，不是常数)：SCREEN_W 是当前方向的逻辑宽 —— 本机开机是
+    // 横屏(1216−12)，而敲字的界面大多在竖屏(684−12)，开机取一次就钉死在横屏那一档上，
+    // 于是竖屏的候选页按 1204 切、行只有 672：一页里多出来的候选正是上面那句"看不见
+    // 也点不到"。回调在每次 buildPage 现取，横竖屏各按各的宽度切。
+    ime.setDisplayWidthFn(imeCandidateLineWidth);
 
     // Initialize Bluetooth keyboard in background (non-blocking, faster boot)
     spawnBtInit();
@@ -1177,6 +1215,20 @@ extern "C" void app_main() {
 
         // BLE 键盘输入视为活动,重置空闲休眠计时
         if (key > 0) s_last_activity_us = esp_timer_get_time();
+
+        // 自适应屏幕方向（写作/计划模式选「自适应」时）：判定在 input_poll 里的采样钩子
+        // 做（每 120ms 一拍，与"晃动机身=全刷"共用同一次 I2C 读），**落地只在这里** ——
+        // 转一次屏是 drain + 整屏 GC16（约 1.8s），不能从补采样那种上下文里发。
+        // s_last_activity_us 当"最近有没有按键/触摸"：打字、划列表期间不掉头。
+        //
+        // 转成了还得补两件事，都在下面：① 候选行按新宽度重分页（分页表只在 buildPage
+        // 里算，而它只在候选变化时被叫 —— 光转屏没人叫它）；② 让**编辑器**这一屏重画
+        // （它的空转 tick 按 drawnOnce 记账跳过重绘，方向换了它不会自己知道；别的界面
+        // 空转时本来就每拍 draw+commit，作废快照那一步已经在 tick 里做过了）。
+        if (auto_orient_tick(autoOrientWantedFor(currentState), s_last_activity_us)) {
+            ime.repaginateForWidthChange();
+            if (currentState == APP_EDITOR) screen_editor_reset_drawn();
+        }
 
         // TEMP 堆水位（定位内部 RAM 耗尽崩溃，见 bt_keyboard.cpp:947 的 fgets 锁 OOM）
         {

@@ -32,6 +32,18 @@ void board_force_portrait(void);
 // 退出阅读模式：恢复最近一次 board_apply_orientation 应用的方向设置。
 void board_restore_orientation(void);
 
+// ── 自适应方向（写作/计划模式的「自适应」档）─────────────────────────────
+// 当前是不是竖屏。按旋转后的逻辑宽高现算（684×1216 即竖屏），不维护影子变量 ——
+// 谁在什么时候把旋转改过都能问出真值。
+bool board_is_portrait(void);
+
+// 运行中临时转屏：与 board_apply_orientation 同一套时序 —— 先 ui_render_drain() 等
+// core1 把在飞的推屏收尾（否则"按旧旋转算的矩形、按新旋转送进驱动"会刷错地方），
+// 再改旋转；调用方随后 ui_invalidate_snapshot()，下一帧整屏 GC16 把画面拉正。
+// **不写 s_orientation**：那是"全局方向"，模式退出时要还原的目标，自适应中途转的屏
+// 不能把它改掉。已经是这一档就直接返回（连 drain 都不做）。
+void board_rotate_live(bool portrait);
+
 // 全设备夜间反色：翻 HalDisplay 的全局反色标志，推屏唯一出口据此逐帧取反。
 // 开机时按设置调一次；用户在设置里切换时由 screen_settings 直接调。
 void board_set_night(bool on);

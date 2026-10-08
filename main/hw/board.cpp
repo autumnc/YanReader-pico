@@ -101,3 +101,19 @@ void board_force_portrait() {
 void board_restore_orientation() {
     board_apply_orientation(s_orientation);
 }
+
+bool board_is_portrait() {
+    // 宽度说话：竖屏那一档的逻辑高 > 宽（684×1216）。不从 enum 值硬推 —— epd 那边
+    // PORTRAIT 与 INVERTED_PORTRAIT 都是竖屏，谁被设过都该问出"是竖屏"。
+    return epd_rotated_display_height() > epd_rotated_display_width();
+}
+
+void board_rotate_live(bool portrait) {
+    // 比"当前是不是竖屏"而不是比 enum 值：万一旋转是 PORTRAIT（非 INVERTED）那一档，
+    // 比 enum 会以为方向不对，于是把同一个竖屏 180° 翻过去。
+    if (board_is_portrait() == portrait) return;
+    ui_render_drain();
+    epd_set_rotation(portrait ? EPD_ROT_INVERTED_PORTRAIT : EPD_ROT_LANDSCAPE);
+    ESP_LOGI(TAG, "orientation=%s (auto) → logical %d×%d", portrait ? "portrait" : "landscape",
+             epd_rotated_display_width(), epd_rotated_display_height());
+}

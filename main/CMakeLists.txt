@@ -97,6 +97,7 @@ idf_component_register(SRCS
     # 硬件适配层
     "hw/board.cpp"
     "hw/input.cpp"
+    "hw/auto_orient.cpp"
     "gfx/u8g2_shim.c"
     "gfx/icon_font.c"
     "font/ttf_font.c"

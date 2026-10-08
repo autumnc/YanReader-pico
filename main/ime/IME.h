@@ -237,12 +237,33 @@ public:
 
     using WidthFn = int (*)(const char *text);
     void setWidthFn(WidthFn fn) { _widthFn = fn; }
-    // 候选行可用像素宽度(与各界面渲染 curW+partW+8>SCREEN_W 的 8px 余量一致)
-    void setDisplayWidth(int w) { _displayWidth = w; }
+    // 候选行可用像素宽度(与各界面渲染 curW+partW+8>SCREEN_W 的 8px 余量一致)。
+    // 宽度**随界面变**时别用这个：喂常数只在"宽度不随界面变"时才成立，见下面那个。
+    void setDisplayWidth(int w) { _displayWidth = w; _displayWidthFn = nullptr; }
+    // 候选行宽度"现问现答"的回调。SCREEN_W 是**当前方向**的逻辑宽(横屏 1216、竖屏 684)，
+    // 所以候选行宽度是方向相关的(1216−12 / 684−12)。分页(_pageStarts)是按像素宽切出来的
+    // —— 喂一个开机那一刻的快照进来，之后换向就一直是错的那一档：竖屏顶着横屏的宽度切，
+    // 一页里塞进候选行根本放不下的候选，多出来的那几个画不出来(绘制侧按真实 SCREEN_W
+    // 截断)、也就点不到。回调在每次 buildPage 现取，和 _widthFn 一个路子，不会过期。
+    using DisplayWidthFn = int (*)();
+    void setDisplayWidthFn(DisplayWidthFn fn) {
+        _displayWidthFn = fn;
+        if (fn) _displayWidth = fn();
+    }
     // 候选宽度是按字符串缓存的(_candidateWidths)。测宽回调本身可变时(虚拟键盘开的
     // 时候按"候选字大小"档位量、关掉时按界面字号量)，换量法就得把缓存清掉，否则
     // 沿用上一次的宽度，分页会按旧字号算——大了就截尾、小了就留空。
     void invalidateCandidateWidths() { _candidateWidths.clear(); }
+
+    // 屏幕方向变了(横↔竖，见 hw/auto_orient)之后调用：把分页表按新宽度重切一遍。
+    // 宽度回调虽然每次 buildPage 都现取(见上面 setDisplayWidthFn)，可 buildPage 只在
+    // **候选变化**时才被叫 —— 光转屏没人叫它，屏上就留着按旧方向切出来的那一页：
+    // 变窄那几位候选画不出来(绘制侧按真实 SCREEN_W 截断)也点不到，变宽则右边空一截。
+    // 锚定当前页首个候选，重建后仍停在同一批字上(与 setGridPaging 同一个套路)。
+    void repaginateForWidthChange() {
+        _pageAnchor = _pageStart;
+        buildPage();
+    }
 
     // T9 宫格用：宫格是 3×3 一整块，一页放 9 个；候选条是单行，按实测宽度分页在竖屏
     // 只放得下 5~7 个。展开面板期间切成"固定每页 9 个"，翻页按宫格整块换，编号 1..9
@@ -513,6 +534,7 @@ private:
     std::vector<int> _pageStarts;        // 每页起始候选索引; 按实测宽度分页时由 buildPage 重建
     int _pageAnchor = -1;                // 翻页时锚定目标候选, 宽度分页重建后仍停在包含它的页
     WidthFn _widthFn = nullptr;          // 候选文本宽度测量回调
+    DisplayWidthFn _displayWidthFn = nullptr;  // 候选行宽度回调(现取, 见 setDisplayWidthFn)
     int _displayWidth = 0;               // 候选行可用像素宽度(0=退化为固定 _pageSize 分页)
     bool _fixedCandidatePaging = false;  // 短辅音输入走固定分页, 避免热路径反复测字宽
     bool _gridPaging = false;            // T9 宫格展开中: 强制固定每页 _pageSize 个(见 setGridPaging)

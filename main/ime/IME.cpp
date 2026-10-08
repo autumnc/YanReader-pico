@@ -5391,6 +5391,10 @@ void IME::beginPredict(const std::string &text, bool afterSpaceCommit) {
 
 void IME::buildPage() {
     int64_t pageStartUs = IME_PERF_NOW();
+    // 页宽现取：候选行宽度跟着方向走(横屏/竖屏不是同一个数)，见 setDisplayWidthFn。
+    // 取回来就记进 _displayWidth —— 它此后是"这一页按多宽切的"，下面的分页和 perf
+    // 日志都读它。
+    if (_displayWidthFn) _displayWidth = _displayWidthFn();
     _page.clear();
     _sel = 0;  // 换页/重新查词后高亮回到首个候选
     if (_all.empty()) {
@@ -5418,6 +5422,9 @@ void IME::buildPage() {
             if (_candidateWidths[i] < 0) _candidateWidths[i] = _widthFn(_all[i].c_str());
             int partW = ((pageCount + 1 >= 1 && pageCount + 1 <= 9) ? numWidths[pageCount + 1] : _widthFn(num))
                       + _candidateWidths[i];
+            // 一页**两条**上限：宽度装得下 + 最多 9 个。后一条是给数字键留的 ——
+            // 页内编号 1..9，物理键盘/虚拟键盘的数字键刚好覆盖整页，超出的只能靠点选，
+            // 所以宁可空着右边那截也不放第 10 个（横屏 1204px 只用到 ~850px）。
             if (lineW > 0 && (pageCount >= 9 || lineW + partW > _displayWidth)) {
                 _pageStarts.push_back(i);
                 lineW = 0;

@@ -83,12 +83,35 @@ run_enter() {
     return $failed
 }
 
+# 候选分页的行宽：横屏一页装得下的 ≥ 竖屏（用户 2026-10-08：横屏空间大，候选该更多）。
+# 同 ENTER_CASES 一样是**回归护栏**，不进 run_regress：那组是拿 pre-fix 的 IME.cpp
+# 反证用的，而这条只钉 IME 对"喂进来的行宽"的契约（只用 setDisplayWidth），两个版本
+# 都过。设备上真正出过的问题是 main.cpp 喂了一个开机快照 —— 那不在这个 harness 的
+# 射程里，靠 --paging 打印出来的两行数字人工对一眼。
+PAGING_CASES=("nihao" "zhege" "jiushi")
+
+run_paging() {
+    local bin="$1" expect="$2" failed=0
+    for case in "${PAGING_CASES[@]}"; do
+        if "$bin" --paging "$case" > "$BUILD/paging.out" 2>&1; then
+            echo "  pass [$expect] --paging $case  $(sed -n 's/^  PASS: //p' "$BUILD/paging.out")"
+        else
+            echo "  FAIL [$expect] --paging $case"
+            sed -n '/=== 候选分页/,$p' "$BUILD/paging.out"
+            failed=1
+        fi
+    done
+    return $failed
+}
+
 case "${1:-}" in
     --regress-only)
         echo ">> regression test (current main/ime/IME.cpp)"
         run_regress "$BIN" "current"
         echo ">> Enter contract"
         run_enter "$BIN" "current"
+        echo ">> 候选行宽：横屏一页 ≥ 竖屏一页"
+        run_paging "$BIN" "current"
         echo ">> regression passed"
         exit 0
         ;;
@@ -147,4 +170,9 @@ echo "############################################################"
 echo "# 输入中按回车 = 编码原样上屏"
 echo "############################################################"
 run_enter "$BIN" "current"
+echo
+echo "############################################################"
+echo "# 候选分页的行宽：横屏一页装得下的 ≥ 竖屏"
+echo "############################################################"
+run_paging "$BIN" "current"
 echo ">> all regression cases passed"

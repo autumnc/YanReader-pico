@@ -9,6 +9,8 @@
 #include "quick_edit.h"
 #include "typing_click.h"
 #include "ui_helpers.h"
+#include "hw/auto_orient.h"   // auto_orient_initial：本模式的「自适应」方向
+#include "hw/board.h"         // board_force_*/board_restore_orientation（模式方向切换）
 #include "hw/input.h"
 #include "markdown_render.h"
 #include "vertical_layout.h"
@@ -3842,6 +3844,32 @@ static bool g_editorNeedsReinit = false;
 static bool s_editorInited = false;    // 本"进入会话"是否已经 init 过
 static bool s_keepOnReturn = false;    // 上一处离开是去浮层（灵感/润色/历史）
 
+// ── 写作模式独立方向 ─────────────────────────────────────────────────────
+// 与计划模式同一个套路（screen_gtd 的 applyGtdOrientation + 退出时
+// board_restore_orientation）：本模式有自己的一份方向设置，进模式时套用、退出时还给
+// 全局。设置项在「显示与版式」里（写作模式方向）—— **改的时候不立刻转屏**，否则设置
+// 界面自己会转过去。空串 = 跟随全局「屏幕方向」，这时不动旋转（与加这一项之前完全一致）。
+//
+// 别和 _editor_orientation（文字方向 横排/竖排）看混：那条管**正文的书写方向**，布局
+// 照旧按它算；这条管**整屏转不转**。
+static void applyEditorOrientation() {
+    const std::string o = g_settings.getString("writing_orientation", "");
+    if (o == "portrait") board_force_portrait();
+    else if (o == "landscape") board_force_landscape();
+    else if (o == "auto") {
+        // 自适应：拿最近一次加速度采样现判一次（判不出/采样太旧就保持原样 = 跟随全局）。
+        // 必须在第一帧排版**之前** —— 状态栏、正文、虚拟键盘全按 SCREEN_W/H 现算。
+        // 进模式之后由 main.cpp 每轮 auto_orient_tick() 接着跟。
+        bool portrait = false;
+        if (auto_orient_initial(&portrait)) {
+            if (portrait) board_force_portrait();
+            else board_force_landscape();
+        }
+    }
+}
+
+void screen_editor_apply_orientation() { applyEditorOrientation(); }
+
 void screen_editor_enter(ScreenContext &ctx) {
     // 本轮切换进编辑器时屏幕已被上一层盖过：置脏，这一帧必须整屏重绘（否则屏幕停在
     // 上一个界面画面上，直到按第一个键才动）。原来这一句在主循环里按 currentState 判，
@@ -3853,6 +3881,9 @@ void screen_editor_enter(ScreenContext &ctx) {
         s_keepOnReturn = false;
         return;
     }
+    // 方向要排在重建/排版之前：切模式出去过一趟的话（比如计划模式退出时已经把方向还给了
+    // 全局），这次进来必须重套一次本模式的方向，否则第一帧是按别人的方向排的。
+    applyEditorOrientation();
     // 其余来源一律重建。app_editor_needs_reinit() 是**显式**的重建信号（往编辑器里塞
     // 新内容时投递，调用点在别的界面：screen_flomo / screen_inspiration / history），
     // 而且全都发生在"返回 APP_EDITOR 之前"——所以在这里问一次和一帧一帧地问等价。
@@ -3878,6 +3909,9 @@ void screen_editor_leave(AppState next) {
         // （切回来是直接用留住的会话，不收就会挂上一次的选区）。这一句原来在 main.cpp
         // 的电源键分支里（cur==1 && currentState==APP_EDITOR）。
         app_editor_leave_cleanup();
+        // 把方向还给全局（与 screen_gtd_exit 对称）：自适应/强制的那一档不能跟到别的
+        // 模式去 —— 阅读/计划进来会各自套自己那份方向。
+        board_restore_orientation();
         return;
     }
     // 同模式内的离开（Esc 回写作菜单 / 去文件管理 / 设置…）才是真的走了：下次进来重跑

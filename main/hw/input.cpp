@@ -3,6 +3,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 
+#include "auto_orient.h"    // 自适应方向：同一次加速度采样喂它一份（见 shake_poll）
 #include "board_hw.h"
 #include "cst836u.h"
 #include "pjournal_app.h"  // KEY_UP/DOWN/LEFT/RIGHT/…
@@ -487,6 +488,16 @@ static bool shake_poll() {
 
     sc7a20h_sample_t s = {};
     if (sc7a20h_read(g_hw.sensor, &s) != ESP_OK) return false;
+    // 同一次读再喂一份给自适应方向（写作/计划模式那档「自适应」，见 hw/auto_orient.h）。
+    // 它要的是**设备帧**（平放屏幕朝上为 +Z，见 read_pico_init.h），而下面 shake 的判据
+    // 用的是合加速度的模 —— 与坐标系无关，所以这边原本读的是芯片原始帧。换算只改这一份
+    // 副本，不动 shake 的口径；一次 I2C 读两个消费者，没有额外开销。
+    // 放在这里等于两个调用点（input_poll 里触摸可用/不可用两条路）都接上了。
+    {
+        sc7a20h_sample_t ds = s;
+        read_pico_accel_to_device(&ds);
+        auto_orient_on_sample(ds.x_mg, ds.y_mg, ds.z_mg, now);
+    }
     // 量程 ±2g，单轴最大 2000mg，三轴平方和 ≤ 1.2e7，isqrt_i32 的 4096 上限够用。
     const int mag2 = (int)s.x_mg * s.x_mg + (int)s.y_mg * s.y_mg + (int)s.z_mg * s.z_mg;
     const uint32_t mag = (uint32_t)isqrt_i32(mag2);

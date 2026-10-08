@@ -129,6 +129,7 @@ struct Options {
     bool widthPaging = true;
     bool enter = false;      // --enter: 断言"输入中按回车直接编码上屏"
     bool highlight = false;  // --highlight: 打开「候选高亮」（回车改成上屏高亮候选）
+    bool paging = false;     // --paging: 同一个编码在横/竖屏两档行宽下各分一次页，比个数
 };
 
 static void initIme(IME &ime, bool widthPaging) {
@@ -169,12 +170,70 @@ static void feedKeys(IME &ime, const std::string &letters, std::vector<KeyTrace>
     }
 }
 
+// ── 候选分页的行宽：一页装得下的个数随方向变，且一页绝不超过 9 个 ──────────────
+// 候选行宽度是方向相关的（SCREEN_W 是当前方向的逻辑宽：横屏 1216−12=1204、竖屏
+// 684−12=672），而分页(_pageStarts)是按像素宽切出来的。同一个编码在这两档宽度下各
+// 分一次页，断言三件事：
+//   1) 每页候选的实测总宽 ≤ 当次行宽（分页的契约：装不下就换页）；
+//   2) 每页 ≤ 9 个 —— 页内编号 1..9，数字键刚好覆盖整页（用户 2026-10-08：横屏也
+//      别超过 9 个，不然数字键选不到第 10 个以后）；
+//   3) 横屏 ≥ 竖屏（宽的那一档不该反而装得少）。
+// 这是**护栏**，不是拿 pre-fix 反证的那种：设备上"一页里塞了放不下的候选"是因为
+// main.cpp 那时喂的是开机那一刻的快照（横屏），跟 IME 对"喂进来的宽度"的契约无关 ——
+// 所以这条只用 setDisplayWidth()，pre-fix 的 IME.cpp 一样编得过、也一样过。
+static void replay(IME &ime, const std::string &letters, int w) {
+    ime.reset();
+    ime.setDisplayWidth(w);   // = buildPage 每次现取到的那个行宽
+    for (char ch : letters) {
+        std::string out;
+        ime.handleKey((unsigned char)ch, out);
+    }
+}
+
+static int pagingMatrix(IME &ime, const std::string &letters) {
+    struct Row { const char *name; int w; };
+    const Row rows[] = {{"横屏", hostime::candidateLineWidth()},
+                        {"竖屏", hostime::candidateLineWidthPortrait()}};
+    int sizes[2] = {0, 0};
+    int rc = 0;
+    for (int r = 0; r < 2; r++) {
+        replay(ime, letters, rows[r].w);
+        // 与 buildPage 的分页口径逐字对齐：" N." 前缀（带前导空格）+ 候选文本，
+        // 编号是页内序号（1 起）。差一个像素都会让"页宽 ≤ 行宽"这条断言失去意义。
+        int pageW = 0;
+        std::string page;
+        for (size_t i = 0; i < ime._page.size(); i++) {
+            char num[16];
+            snprintf(num, sizeof(num), " %d.", (int)i + 1);
+            pageW += ime._widthFn(num) + ime._widthFn(ime._page[i].c_str());
+            if (!page.empty()) page += "  ";
+            page += ime._page[i];
+        }
+        sizes[r] = (int)ime._page.size();
+        const bool fits = pageW <= rows[r].w;
+        const bool numKeys = sizes[r] <= 9;   // 数字键 1..9 必须覆盖整页
+        if (!fits || !numKeys) rc = 1;
+        printf("  %s %4dpx: 一页 %d 个，页宽 %4dpx%s\n", rows[r].name, rows[r].w, sizes[r], pageW,
+               !fits ? "   ← 超出当次行宽"
+                     : (numKeys ? "" : "   ← 多于 9 个，数字键够不着"));
+        printf("           %s\n", page.c_str());
+    }
+    if (sizes[1] > sizes[0]) {
+        printf("  FAIL: 竖屏一页 %d 个 > 横屏 %d 个 —— 宽的那一档反而装得少\n", sizes[1], sizes[0]);
+        rc = 1;
+    } else {
+        printf("  PASS: 横屏 %d 个 ≥ 竖屏 %d 个，两页都 ≤ 9\n", sizes[0], sizes[1]);
+    }
+    return rc;
+}
+
 int main(int argc, char **argv) {
     Options opt;
     std::vector<std::string> pos;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--regress")) opt.regress = true;
         else if (!strcmp(argv[i], "--enter")) opt.enter = true;
+        else if (!strcmp(argv[i], "--paging")) opt.paging = true;
         else if (!strcmp(argv[i], "--highlight")) opt.highlight = true;
         else if (!strcmp(argv[i], "--fixed") || !strcmp(argv[i], "--no-width"))
             opt.widthPaging = false;
@@ -198,6 +257,7 @@ int main(int argc, char **argv) {
     }
     // _highlightSelectMode 是 begin() 里读的（IME.cpp:1356），必须赶在 initIme 之前设。
     hostime::setCandidateHighlight(opt.highlight);
+    if (opt.paging) opt.widthPaging = true;   // 分页矩阵要按宽度分页，--fixed 不适用
 
     std::string tag = " mode=regress word=" + opt.word;
     printf("=== ime_driver: letters='%s' commitIdx=%d paging=%s%s ===\n", opt.letters.c_str(),
@@ -207,6 +267,13 @@ int main(int argc, char **argv) {
     initIme(ime, opt.widthPaging);
     printf("begin(): loaded=%d scheme=%d\n", ime.loaded(), (int)ime.scheme());
     dumpState(ime, "after-init");
+
+    if (opt.paging) {
+        printf("\n=== 候选分页的宽度：横屏一页装得下的应当不少于竖屏 ===\n");
+        int rc = pagingMatrix(ime, opt.letters);
+        printf("=== done (rc=%d) ===\n", rc);
+        return rc;
+    }
 
     // The key sequence must be fed one key at a time: the stale _partialStart/_remainder
     // that this harness is about are planted by the *intermediate* keystroke whose

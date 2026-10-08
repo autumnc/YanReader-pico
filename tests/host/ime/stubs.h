@@ -14,9 +14,12 @@ namespace hostime {
 // line height. Reproduced here with the 22px content font that drawIMEUI uses.
 int textWidthApprox(const char *s);
 
-// The exact pixel width main.cpp hands the IME in landscape (SCREEN_W - 12, and
-// imeCandidateLineWidth() == SCREEN_W - 12 on the 1216px panel).
-int candidateLineWidth();
+// 候选行宽度 = SCREEN_W - 12，而 SCREEN_W 是**当前方向**的逻辑宽（面板物理
+// 1216×684）：横屏 1216-12、竖屏 684-12。main.cpp 现在把 imeCandidateLineWidth()
+// 这个函数本身作为"现取行宽"的回调交给 IME（setDisplayWidthFn），不再是开机一次的
+// 常数 —— 所以两档都要在这里量得到，见 ime_driver 的 --paging。
+int candidateLineWidth();          // 横屏：1216 - 12
+int candidateLineWidthPortrait();  // 竖屏：684  - 12
 
 // Settings the IME snapshots in begin() (see IME.cpp:1345-1349). Defaults mirror
 // settings_manager.cpp's real defaults.

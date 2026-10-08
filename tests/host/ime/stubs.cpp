@@ -88,6 +88,8 @@ int textWidthApprox(const char *s) {
     return w;
 }
 
-int candidateLineWidth() { return 1216 - 12; }  // imeCandidateLineWidth() @ 1216px panel
+// imeCandidateLineWidth() = SCREEN_W - 12，SCREEN_W 跟着当前方向走（面板 1216×684）。
+int candidateLineWidth() { return 1216 - 12; }          // 横屏
+int candidateLineWidthPortrait() { return 684 - 12; }   // 竖屏
 
 }  // namespace hostime

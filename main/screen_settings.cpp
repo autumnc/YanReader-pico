@@ -79,8 +79,12 @@ static const SettingField SETTINGS_FIELDS[] = {
     {"_font", "字体", false, true, CAT_DISPLAY},
     {"night_mode", "夜间模式", false, false, CAT_DISPLAY},
     // 「阅读器方向」不在这一屏：方向是各模式自己的事，阅读模式在自己的设置标签里
-    // 就有「阅读器方向」（screen_reader 的 Settings）；计划模式这一项是给它的。
+    // 就有「阅读器方向」（screen_reader 的 Settings）；计划模式和写作模式各自一项。
     {"_gtd_orientation", "计划模式方向", false, true, CAT_DISPLAY},
+    // 写作模式的**屏幕**方向。注意别和下面那个「文字方向」（_editor_orientation =
+    // 正文横排/竖排）看混：这条管整屏转不转，那条管正文的书写方向。
+    // 空串 = 跟随通用里的「屏幕方向」，进/出写作模式时套用/还原（screen_editor）。
+    {"_writing_orientation", "写作模式方向", false, true, CAT_DISPLAY},
     // 错相揭页：阅读器翻页时用 16 条带依次入相的"揭页"替代普通差分刷（约 1.1s）。
     // 开着更好看但更慢，所以给个开关，默认开。
     {"page_turn_anim", "翻页动画", false, false, CAT_DISPLAY},
@@ -322,6 +326,7 @@ static std::vector<PickerOpt> optsFromTable(const OptItem *t, int n) {
 static bool pickerFieldSupported(const char *key) {
     return strcmp(key, "_app_mode") == 0 || strcmp(key, "_home_view") == 0 ||
            strcmp(key, "_orientation") == 0 || strcmp(key, "_gtd_orientation") == 0 ||
+           strcmp(key, "_writing_orientation") == 0 ||
            strcmp(key, "_editor_orientation") == 0 || strcmp(key, "_clock_face") == 0 ||
            strcmp(key, "_font") == 0 || strcmp(key, "_input_mode") == 0 ||
            strcmp(key, "_kb_layout") == 0 || strcmp(key, "_ime_fuzzy") == 0 ||
@@ -338,8 +343,12 @@ static std::vector<PickerOpt> pickerOpts(const char *key) {
     if (strcmp(key, "_app_mode") == 0) return {{"quick", "快捷编辑"}, {"journal", "个人日记"}};
     if (strcmp(key, "_home_view") == 0) return {{"month", "月视图"}, {"week", "周视图"}};
     if (strcmp(key, "_orientation") == 0) return {{"portrait", "纵向"}, {"landscape", "横向"}};
+    // 「自适应」= 按加速度计的重力方向自己认横竖（见 hw/auto_orient.h）。**只在进入
+    // 这个模式之后跟着转**，模式外面不动 —— 它是各模式自己的方向设置，不是全局的。
     if (strcmp(key, "_gtd_orientation") == 0)
-        return {{"", "跟随屏幕方向"}, {"portrait", "纵向"}, {"landscape", "横向"}};
+        return {{"", "跟随屏幕方向"}, {"portrait", "纵向"}, {"landscape", "横向"}, {"auto", "自适应"}};
+    if (strcmp(key, "_writing_orientation") == 0)
+        return {{"", "跟随屏幕方向"}, {"portrait", "纵向"}, {"landscape", "横向"}, {"auto", "自适应"}};
     if (strcmp(key, "_editor_orientation") == 0) return {{"horizontal", "横排"}, {"vertical", "竖排"}};
     if (strcmp(key, "_clock_face") == 0) {
         std::vector<PickerOpt> v;
@@ -391,6 +400,8 @@ static std::string pickerCurValue(const char *key) {
     if (strcmp(key, "_home_view") == 0) return g_settings.homeView();
     if (strcmp(key, "_orientation") == 0) return g_settings.orientation();
     if (strcmp(key, "_gtd_orientation") == 0) return g_settings.getString("gtd_orientation", "");
+    if (strcmp(key, "_writing_orientation") == 0)
+        return g_settings.getString("writing_orientation", "");
     if (strcmp(key, "_editor_orientation") == 0) return g_settings.editorOrientation();
     if (strcmp(key, "_clock_face") == 0)
         return standbyFaceKey(standbyFaceFromKey(g_settings.getString("clock_face").c_str()));
@@ -555,6 +566,9 @@ static void pickerApply(const char *key, const std::string &value, ScreenContext
         // 只写键，**不调 board_force_***：在主界面里翻转屏幕会把设置界面自己也转过去。
         // 计划模式进/出时自己套用/还原（screen_gtd 的 applyGtdOrientation）。
         g_settings.setString("gtd_orientation", value);
+    } else if (strcmp(key, "_writing_orientation") == 0) {
+        // 同上：写作模式进/出时自己套用/还原（screen_editor 的 applyEditorOrientation）。
+        g_settings.setString("writing_orientation", value);
     } else if (strcmp(key, "_editor_orientation") == 0) {
         g_settings.setString("editor_orientation", value);
         // 竖排才显示的两行会跟着出现/消失，选中行可能落到列表外。
@@ -1855,6 +1869,17 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
     return APP_SETTINGS;
 }
 
+// 模式方向那一档的四个值在列表行上怎么写（与 pickerOpts 的字面量同一套）。
+// 两个方向项（计划模式方向 / 写作模式方向）共用：漏一处就会有一行**只剩标签、没有当前值**
+// —— 字段行那条 if 链的兜底是 "▶ 名字"，看着像坏了。
+static const char *modeOrientationLabel(const std::string &o) {
+    if (o.empty()) return "跟随屏幕方向";
+    if (o == "portrait") return "纵向";
+    if (o == "landscape") return "横向";
+    if (o == "auto") return "自适应";
+    return o.c_str();   // 不认识的值原样显示（设置文件被手改过也别显示成空）
+}
+
 // 当前分类的字段列表（弹层的底图，也是浏览态的主画面）。
 static void drawBrowseListBody() {
     ui_clear(); int y = FONT_H;
@@ -1886,9 +1911,11 @@ static void drawBrowseListBody() {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          g_settings.orientation() == "portrait" ? "纵向" : "横向");
             } else if (strcmp(f.key, "_gtd_orientation") == 0) {
-                const std::string o = g_settings.getString("gtd_orientation", "");
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
-                         o.empty() ? "跟随屏幕方向" : (o == "portrait" ? "纵向" : "横向"));
+                         modeOrientationLabel(g_settings.getString("gtd_orientation", "")));
+            } else if (strcmp(f.key, "_writing_orientation") == 0) {
+                snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
+                         modeOrientationLabel(g_settings.getString("writing_orientation", "")));
             } else if (strcmp(f.key, "_editor_orientation") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          g_settings.editorOrientation() == "vertical" ? "竖排" : "横排");

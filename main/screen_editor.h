@@ -12,6 +12,9 @@ AppState screen_editor_handle(int key, ScreenContext &ctx);
 void screen_editor_enter(ScreenContext &ctx);
 void screen_editor_leave(AppState next);
 
+// 重套本模式的屏幕方向（设置项「写作模式方向」，与 screen_gtd_apply_orientation 对称）。
+void screen_editor_apply_orientation();
+
 // Idle tick (no key): runs auto-save, repaints only if the screen is stale or
 // forceRedraw is set. Returns true if a repaint happened.
 bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw);
