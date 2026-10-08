@@ -787,8 +787,12 @@ static const Screen kScreens[APP_QUIT + 1] = {
                              .vk_host = true },
     /* APP_POLISH_PROMPT */ {.name = "polish_prompt",  .enter = polishPromptEnter,.handle = scrPolishPrompt,
                              .vk_host = true },
+    // local_only：这一屏是"翻列表 / 换选中行 / 滚长文"这一类，差分常超半屏（列表
+    // 整页翻就是整块列表在变），按默认那套"小变化局刷、大半屏整屏 GL16"会掉进整屏
+    // 刷（≈410ms 且整屏闪一下），每划一下闪一屏。和设置/写作主菜单同一处理由：
+    // 这里没有需要抢时间的输入，一律局刷，只驱动变化那块矩形、画质优先。
     /* APP_FLOMO         */ {.name = "flomo",          .enter = flomoEnter,       .handle = scrFlomo,
-                             .vk_host = true },
+                             .vk_host = true, .local_only = true },
     // 阅读模式**是**虚拟键盘宿主：它自己有一整套键盘的开关/命中/绘制（screen_reader
     // 里 20 多处翻 st.vkVisible）。这一列原来是 false —— 于是主循环每一轮都拿
     // editorVkSetVisible(false) 把阅读模式刚摆出来的键盘收掉，顺带把 s_userOverride

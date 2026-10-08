@@ -29,9 +29,13 @@
 #include <cstring>
 #include <ctime>
 #include <algorithm>
+#include <atomic>
 
+#include <esp_log.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include "u8g2_shim.h"
 
 extern "C" {
@@ -61,10 +65,6 @@ static struct {
 
     AppState returnTo = APP_MAIN;
 
-    // 同步态
-    bool syncing = false;
-    std::string syncMsg;
-
     // 编辑器交接：pendingTemp 是 journal 目录下的临时文件名，
     // pendingSlug 为空 = 新建，否则是正在编辑的那条笔记的 slug。
     std::string pendingTemp;
@@ -75,6 +75,14 @@ static struct {
     std::string searchBuf;
     int searchCur = 0;
     bool searchIme = false;
+
+    // ── 空转记账（见 screen_flomo_handle 开头那段）───────────────────────
+    // drawn = 这一屏当前这幅画已经提交过；drawnW/H = 画它时的屏幕几何
+    // （自适应转屏后几何一变就作废，得重画）；toastWas = 上一幅画上带着浮标，
+    // 浮标到点熄灭后要再画一帧把它擦掉。
+    bool drawn = false;
+    int drawnW = 0, drawnH = 0;
+    bool toastWas = false;
 } g;
 
 // 检索框的 ImeField 形态（带真实光标，可左右移）。
@@ -165,40 +173,73 @@ static std::string readTempFile(const std::string &path) {
     return out;
 }
 
-// ── 同步 ──────────────────────────────────────────────────────────────────
+// ── 同步：跑在后台任务里 ──────────────────────────────────────────────────
+//
+// 一趟同步要连 WiFi（最多 10 秒轮询）、可能还要登录，然后逐条推本地改动、逐页拉远端
+// —— 每次 HTTP 的墙钟上限是 45s（见 flomo_api.cpp 的 deadline_ms），整趟最坏几十秒。
+// 原来这一整套是在**主任务**里跑完才回来的：那段时间主循环根本出不来，触摸一个都采
+// 不到，屏上表现就是"按了云图标 / R 之后只剩进度，点哪儿都没反应"。现在整趟搬到
+// worker 任务（与 WebDAV 同步、发送到 flomo 同一套做法，见 main.cpp 的 webdavSyncTask
+// 与 AsyncUiState），本屏只负责把 worker 报上来的进度画出来。
+//
+// 两个任务之间**不共享库**：worker 自己从磁盘 load 一份 Store（flomoSyncWork 只碰它
+// 和磁盘），推拉完整体原子落盘（MemoDb::save → flomoSafeWriteFile），主任务在"结束"
+// 那一拍才把库重新读一遍（loadLocal）——所以不用给 g.store 加锁，也不会画到半路的库。
+// 共享的只有下面这把锁和两个字符串。
+//
+// 也因此这一屏**可以中途走人**（Esc）：worker 不依赖它，写的是磁盘，回来 loadLocal
+// 照样是新的。原来那条路是走不掉的 —— 同步整个卡在主任务里，按键轮不到处理。
+enum FlomoSyncState { FSYNC_IDLE = 0, FSYNC_RUNNING, FSYNC_DONE };
+static std::atomic<int> s_syncState{FSYNC_IDLE};
+static SemaphoreHandle_t s_syncMux = nullptr;
+static std::string s_syncMsg;      // 进度串（worker 写、主任务读来画）
+static std::string s_syncResult;   // 收尾文案：失败原因是它；成功时留空，条数由主任务数
+static bool s_syncOk = false;
 
-// 同步界面（居中一行提示），syncProgress 每换一段就重画一次，让用户看到进度。
-static void drawSync() {
-    ui_clear();
-    int base = (SCREEN_H - FONT_H) / 2;
-    ui_draw_text_content_centered(base, "Flomo 同步", false);
-    ui_draw_text_content_centered(base + FONT_H + 6, g.syncMsg.c_str());
-    ui_draw_text_content_centered(STATUS_Y, "请稍候…");
-    ui_commit();
+static void ensureSyncMux() {
+    if (!s_syncMux) s_syncMux = xSemaphoreCreateMutex();
+}
+static void syncLock()   { ensureSyncMux(); if (s_syncMux) xSemaphoreTake(s_syncMux, portMAX_DELAY); }
+static void syncUnlock() { if (s_syncMux) xSemaphoreGive(s_syncMux); }
+
+// 报一段进度（worker 侧）。这里只写串，画屏是主任务的事 —— worker 一行都不画，
+// 它没有帧缓冲的所有权，也不该有。
+static void syncPublish(const std::string &msg) {
+    syncLock();
+    s_syncMsg = msg;
+    syncUnlock();
 }
 
-static void syncProgress(const std::string &msg) {
-    g.syncing = true;
-    g.syncMsg = msg;
-    drawSync();
-}
-
-// 连 WiFi，同时把"正在连接"报出来（ensure_wifi_connected() 不回调，自己写一遍）。
-static bool ensureWifiProgress() {
+// 连 WiFi（worker 侧版：ensure_wifi_connected() 不回调，进度自己报；失败写 status）。
+static bool ensureWifiWork(std::string &status) {
     if (g_wifi.isConnected()) return true;
     std::string ssid = g_settings.wifiSsid();
     std::string pass = g_settings.wifiPassword();
-    if (ssid.empty()) { g.status = "未配置 WiFi（先到设置填写）"; return false; }
+    if (ssid.empty()) { status = "未配置 WiFi（先到设置填写）"; return false; }
     g_wifi.begin();
-    if (!g_wifi.connect(ssid.c_str(), pass.c_str())) { g.status = "WiFi 连接失败"; return false; }
+    if (!g_wifi.connect(ssid.c_str(), pass.c_str())) { status = "WiFi 连接失败"; return false; }
     for (int i = 0; i < 100; i++) {
         if (g_wifi.isConnected()) return true;
         static const char *dots[] = {"...", "....", ".....", ".."};
-        syncProgress(std::string("正在连接 WiFi") + dots[i % 4]);
+        syncPublish(std::string("正在连接 WiFi") + dots[i % 4]);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    g.status = "WiFi 连接超时";
+    status = "WiFi 连接超时";
     return false;
+}
+
+// 进度界面（主任务侧）：居中一行提示，每换一段就重画一次，让用户看到进度。
+static void drawSyncShared() {
+    std::string msg;
+    syncLock();
+    msg = s_syncMsg;
+    syncUnlock();
+    ui_clear();
+    int base = (SCREEN_H - FONT_H) / 2;
+    ui_draw_text_content_centered(base, "Flomo 同步", false);
+    ui_draw_text_content_centered(base + FONT_H + 6, msg.c_str());
+    ui_draw_text_content_centered(STATUS_Y, "请稍候…");
+    ui_commit();
 }
 
 // 从响应里挑出服务端返回的 memo（Flomo 不同接口包的层不一样）。
@@ -217,38 +258,43 @@ static void removeMemoBySlug(std::vector<Memo> &memos, const std::string &slug) 
                 memos.end());
 }
 
-// 手动同步：先把本地 dirty 的改动推上去，再逐页拉取远端较新的笔记。
-// 返回是否成功（失败时 g.status 里是原因）。
-static bool flomoSync() {
-    g.syncing = true;
+// 手动同步的实际工作：先把本地 dirty 的改动推上去，再逐页拉取远端较新的笔记。
+// **只碰传进来的 work、设置和磁盘** —— 不画屏、不碰 g.store、不碰主任务的任何状态，
+// 它就是给 worker 任务跑的（见下面 flomoSyncTask）。失败时 status 里是原因；成功时
+// status 留空（"同步完成 N 条"由主任务按重新过滤后的结果数生成）。
+static bool flomoSyncWork(Store &work, std::string &status) {
+    auto saveWork = [&]() {
+        MemoDb db(FLOMO_DIR);
+        db.save(work);
+    };
 
-    if (!ensureWifiProgress()) { g.syncing = false; return false; }
+    if (!ensureWifiWork(status)) return false;
 
     std::string token = g_settings.flomoToken();
     if (token.empty()) {
         std::string email = g_settings.flomoEmail();
         std::string pass = g_settings.flomoPassword();
         if (email.empty() || pass.empty()) {
-            g.syncing = false;
-            g.status = "未配置 Flomo 账号（进设置填写）";
+            status = "未配置 Flomo 账号（进设置填写）";
             return false;
         }
-        syncProgress("正在登录 Flomo…");
+        syncPublish("正在登录 Flomo…");
         ApiResult r = FlomoApi::login(email, pass);
-        if (!r.ok) { g.syncing = false; g.status = "登录失败: " + r.message; return false; }
+        if (!r.ok) { status = "登录失败: " + r.message; return false; }
         token = r.data["access_token"].asString();
-        if (token.empty()) { g.syncing = false; g.status = "登录未返回令牌"; return false; }
+        if (token.empty()) { status = "登录未返回令牌"; return false; }
+        // 单键一个文件、自带锁 + 原子写（settings_manager.cpp:52），从 worker 写安全。
         g_settings.setFlomoToken(token);
-        g.store.token = token;
+        work.token = token;
     }
 
     FlomoApi api(token);
 
     // ① 推送本地改动
     int dirtyTotal = 0;
-    for (auto &m : g.store.memos) if (m.dirty) dirtyTotal++;
+    for (auto &m : work.memos) if (m.dirty) dirtyTotal++;
     int dirtyDone = 0;
-    for (auto &m : g.store.memos) {
+    for (auto &m : work.memos) {
         if (!m.dirty) continue;
         dirtyDone++;
         ApiResult r;
@@ -263,15 +309,14 @@ static bool flomoSync() {
 
         char prog[64];
         snprintf(prog, sizeof(prog), "%s本地改动 %d/%d…", opName.c_str(), dirtyDone, dirtyTotal);
-        syncProgress(prog);
+        syncPublish(prog);
 
         if (!r.ok) {
-            saveLocal();
-            g.syncing = false;
-            g.status = opName + "失败: " + r.message;
-            // 失败也要重建索引：这一趟可能已经替换过若干 memo（m = remote），
-            // 索引表必须与 memos 对得上，否则调用方回来直接 drawList 会拿旧下标取元素。
-            rebuildFilter();
+            saveWork();
+            status = opName + "失败: " + r.message;
+            // 半路退出也要落盘：这一趟可能已经替换过若干 memo（m = remote）。库与主任务
+            // 的索引表对不上没关系 —— 主任务收工时才 loadLocal + rebuildFilter，它看到的
+            // 永远是磁盘上这份完整的库。
             return false;
         }
         if (m.pendingOp == "create") {
@@ -294,48 +339,102 @@ static bool flomoSync() {
     }
 
     // 已删且没有未同步标记的本地条目真正丢掉。
-    g.store.memos.erase(std::remove_if(g.store.memos.begin(), g.store.memos.end(),
-                                       [](const Memo &m) { return m.deleted && !m.dirty; }),
-                        g.store.memos.end());
+    work.memos.erase(std::remove_if(work.memos.begin(), work.memos.end(),
+                                    [](const Memo &m) { return m.deleted && !m.dirty; }),
+                     work.memos.end());
 
     // ② 拉取远端（分页，最多 30 页兜底）
     std::string slug, updated;
     for (int page = 1; page <= 30; ++page) {
         char prog[48];
         snprintf(prog, sizeof(prog), "拉取笔记 第 %d 页…", page);
-        syncProgress(prog);
+        syncPublish(prog);
         ApiResult r = api.listPage(slug, updated);
         if (!r.ok) {
-            saveLocal();
-            g.syncing = false;
-            g.status = "刷新失败: " + r.message;
-            // 关键：上面已经 erase 掉「已删且无标记」的本地条目、也可能 removeMemoBySlug
-            // 过，memos 比进来时短了。不重建 g.filtered 就返回，调用方的 drawList 会拿
-            // 旧下标去 memos[g.filtered[fi]] 越界读 → 崩。
-            rebuildFilter();
+            saveWork();
+            status = "刷新失败: " + r.message;
+            // 上面已经 erase 掉「已删且无标记」的本地条目、也可能 removeMemoBySlug 过，
+            // 库比进来时短了 —— 落盘就是落下这一版。主任务收工时按它重建索引，不会
+            // 拿旧下标去 memos[] 越界（原来在主任务里跑，靠的正是返回前 rebuildFilter
+            // 那一句；现在这一步搬到收工那一拍，见 screen_flomo_handle）。
             return false;
         }
         if (!r.data.isArray() || r.data.size() == 0) break;
         for (size_t i = 0; i < r.data.size(); ++i) {
             Memo m = memoFromJson(r.data[i]);
-            if (m.deleted) removeMemoBySlug(g.store.memos, m.slug);
-            else upsertMemo(g.store.memos, m);
+            if (m.deleted) removeMemoBySlug(work.memos, m.slug);
+            else upsertMemo(work.memos, m);
             slug = m.slug;
             updated = m.updatedAt;
         }
         if (r.data.size() < 200) break;
     }
 
-    g.store.lastSync = nowStamp();
-    sortMemos(g.store.memos);
-    saveLocal();
-    rebuildFilter();
-
-    char buf[64];
-    snprintf(buf, sizeof(buf), "同步完成 %d 条", (int)g.filtered.size());
-    g.status = buf;
-    g.syncing = false;
+    work.lastSync = nowStamp();
+    sortMemos(work.memos);
+    saveWork();
     return true;
+}
+
+// worker 任务：自己 load 一份库 → 干活 → 落盘 → 发结果。全程不画屏。
+static void flomoSyncTask(void *arg) {
+    (void)arg;
+    const char *TAG = "FlomoSync";
+    const int64_t t0 = esp_timer_get_time();
+    ESP_LOGI(TAG, "同步开始");
+
+    Store work;
+    {
+        MemoDb db(FLOMO_DIR);
+        db.load(work);
+        if (work.token.empty()) work.token = g_settings.flomoToken();
+    }
+    syncPublish("正在准备…");
+
+    std::string status;
+    const bool ok = flomoSyncWork(work, status);
+    // 栈余量一起打：这个任务的栈是照着 webdav_sync 抄的 12288，而它比那边多做一件
+    // 事 —— load 整个库（主任务上这一步跑在 16K 栈里）。余量太薄就得往上加。
+    ESP_LOGI(TAG, "同步结束 ok=%d 耗时 %d ms 栈余 %u %s", (int)ok,
+             (int)((esp_timer_get_time() - t0) / 1000),
+             (unsigned)uxTaskGetStackHighWaterMark(nullptr), status.c_str());
+
+    syncLock();
+    s_syncResult = status;
+    s_syncOk = ok;
+    syncUnlock();
+    s_syncState.store(FSYNC_DONE, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
+// 手动同步的入口（云图标 / R 键）：只起任务，这一拍就回来 —— 主循环下一拍照常轮询触摸。
+static void flomoTriggerSync() {
+    if (s_syncState.load(std::memory_order_acquire) != FSYNC_IDLE) return;   // 已经在跑了
+    ensureSyncMux();
+    syncLock();
+    s_syncMsg.clear();
+    s_syncResult.clear();
+    s_syncOk = false;
+    syncUnlock();
+    s_syncState.store(FSYNC_RUNNING, std::memory_order_release);
+
+    TaskHandle_t h = nullptr;
+    // 优先级 1（与 webdav_sync / flomo_send 一致：让主循环同优先级轮转，别抢它的键）。
+    //
+    // 栈 8192 **不能照抄 webdav_sync 的 12288**：那个数落在内部 RAM 上，而这块内存常态
+    // 就是"最大空闲块 ~10KB"（见 ui_render.cpp 那段注释和启动后的 Heap 行：
+    // `int free=20407 largest=10240`）—— 12288 连分配都过不去，同步会直接报"系统繁忙"。
+    // 8192 是 flomo_send 那个任务的值（同样走 FlomoApi / HTTPS，网络这一头的开销是同
+    // 一份），本任务多出来的是整个库的 load/save，而那个解析器是浅递归 + 堆上 DOM
+    // （flomo_json.cpp 的 parseValue 只按嵌套层数递归，一层一个栈帧），1~2KB 的量级。
+    // 实际余量看任务收尾打的那行"栈余 N"：低于 1KB 就得回来重算。
+    if (xTaskCreate(flomoSyncTask, "flomo_sync", 8192, nullptr, 1, &h) != pdPASS) {
+        syncLock();
+        s_syncResult = "系统繁忙,请重试";
+        s_syncOk = false;
+        syncUnlock();
+        s_syncState.store(FSYNC_DONE, std::memory_order_release);
+    }
 }
 
 // ── 绘制 ──────────────────────────────────────────────────────────────────
@@ -529,7 +628,21 @@ static void drawDetailBody() {
     int sepY = FONT_H + 4;
     u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
 
-    std::vector<std::string> lines = wrapText(m.contentText, SCREEN_W - 16);
+    // 折行结果按「正文 + 折行宽度」缓存。详情页每一拍都重画（滚一行、按一下键、
+    // 转屏…），而同一篇笔记同一宽度下的折行结果当然一样 —— 以前每帧重新折一遍整篇，
+    // wrapText 是逐字符推进、每一步都 para.substr() 新分配一个 std::string（改不了它，
+    // 那是它量宽的方式），主机上量过：4KB 笔记一帧 1600 多次堆分配 / 54KB 拷贝。
+    // 命中缓存时只比一次字符串（O(n) 比较、零分配），比重新折便宜一个量级。
+    static std::string s_wrapSrc;
+    static int s_wrapW = -1;
+    static std::vector<std::string> s_wrapLines;
+    const int wrapW = SCREEN_W - 16;
+    if (s_wrapW != wrapW || s_wrapSrc != m.contentText) {
+        s_wrapSrc = m.contentText;
+        s_wrapW = wrapW;
+        s_wrapLines = wrapText(s_wrapSrc, wrapW);
+    }
+    const std::vector<std::string> &lines = s_wrapLines;
     int top = sepY + LINE_SPACING;
     // 右下角那列浮动按钮占掉的竖向空间要扣掉：正文不往按钮底下铺，否则末尾几行
     // 的右端会被不透明的按钮压住。按钮列锚在 STATUS_BAR_Y 上（不是 STATUS_Y，
@@ -707,7 +820,7 @@ static const char *HELP_LINES[] = {
     "D     删除当前笔记",
     "R     手动同步（连 WiFi）",
     "/     搜索",
-    "Esc   返回",
+    "Esc   返回（列表里横划也返回）",
     "",
     "触摸：右下角 + 新建、云同步；",
     "详情页右下角 = 编辑 / 删除；",
@@ -761,58 +874,75 @@ static AppState openEditorFor(ScreenContext &ctx, const std::string &slug, const
 
 // ── 初始化 / 事件 ─────────────────────────────────────────────────────────
 
+// 「从编辑器回来」那一拍：把临时文件里的正文落进库（新建一条，或改一条），返回是否
+// 真落了东西。抽出来是因为它有两个调用点 —— 进屏那一刻（screen_flomo_init），以及
+// 后台同步收工那一拍：同步在跑的时候进屏这一拍不能碰库（见 init 开头那段），编辑
+// 结果得攒到 worker 收工之后再补。
+static bool applyPendingEdit() {
+    if (g.pendingTemp.empty()) return false;
+
+    std::string path = std::string("/sdcard/pjournal/") + g.pendingTemp;
+    std::string content = readTempFile(path);
+    remove(path.c_str());
+    std::string slug = g.pendingSlug;
+    g.pendingTemp.clear();
+    g.pendingSlug.clear();
+
+    if (content.empty()) return false;
+    std::string body = extractBody(content);
+    if (body.empty()) body = content;
+    while (!body.empty() && (body.back() == '\n' || body.back() == '\r')) body.pop_back();
+    if (body.empty()) return false;
+
+    if (slug.empty()) {
+        // 新建
+        Memo m;
+        m.slug = "local-" + std::to_string((long long)std::time(nullptr));
+        m.createdAt = nowStamp();
+        m.updatedAt = m.createdAt;
+        m.contentText = body;
+        m.contentHtml = textToHtml(body);
+        m.tags = extractTags(body);
+        m.dirty = true;
+        m.pendingOp = "create";
+        g.store.memos.push_back(m);
+        sortMemos(g.store.memos);
+        g.status = "已保存到本地（按 R 同步）";
+    } else {
+        for (auto &m : g.store.memos) {
+            if (m.slug != slug) continue;
+            m.contentText = body;
+            m.contentHtml = textToHtml(body);
+            m.tags = extractTags(body);
+            m.updatedAt = nowStamp();
+            m.dirty = true;
+            m.pendingOp = isLocalOnly(m) ? "create" : "update";
+            g.status = "已保存到本地（按 R 同步）";
+            break;
+        }
+        sortMemos(g.store.memos);
+    }
+    saveLocal();
+    rebuildFilter();
+    return true;
+}
+
 void screen_flomo_init(AppState returnTo) {
     g.returnTo = returnTo;
+    g.drawn = false;   // 进屏第一拍（或从编辑器回来那一拍）必须画一次，见下面的空转记账
+
+    // 后台同步正在跑（Esc 走开、又回来了）：worker 手里那份库快照是它开始那一刻的，
+    // 这会儿读库/写库都会和它抢 —— 它最后整库落盘，谁后写谁赢，另一边白干。所以这
+    // 一拍什么都不碰：不 load、不落编辑结果，全攒到它收工那一拍再补（见 handle 里的
+    // FSYNC_DONE 分支）。这期间屏上是上一次读进来的旧库，符合预期。
+    if (s_syncState.load(std::memory_order_acquire) == FSYNC_RUNNING) return;
+
     loadLocal();
 
-    // 从编辑器回来：读临时文件，落库。
+    // 从编辑器回来：读临时文件、落库，并保留列表位置。
     if (!g.pendingTemp.empty()) {
-        std::string path = std::string("/sdcard/pjournal/") + g.pendingTemp;
-        std::string content = readTempFile(path);
-        remove(path.c_str());
-        std::string temp = g.pendingTemp;
-        std::string slug = g.pendingSlug;
-        g.pendingTemp.clear();
-        g.pendingSlug.clear();
-
-        if (!content.empty()) {
-            std::string body = extractBody(content);
-            if (body.empty()) body = content;
-            while (!body.empty() && (body.back() == '\n' || body.back() == '\r')) body.pop_back();
-            if (!body.empty()) {
-                if (slug.empty()) {
-                    // 新建
-                    Memo m;
-                    m.slug = "local-" + std::to_string((long long)std::time(nullptr));
-                    m.createdAt = nowStamp();
-                    m.updatedAt = m.createdAt;
-                    m.contentText = body;
-                    m.contentHtml = textToHtml(body);
-                    m.tags = extractTags(body);
-                    m.dirty = true;
-                    m.pendingOp = "create";
-                    g.store.memos.push_back(m);
-                    sortMemos(g.store.memos);
-                    g.status = "已保存到本地（按 R 同步）";
-                } else {
-                    for (auto &m : g.store.memos) {
-                        if (m.slug != slug) continue;
-                        m.contentText = body;
-                        m.contentHtml = textToHtml(body);
-                        m.tags = extractTags(body);
-                        m.updatedAt = nowStamp();
-                        m.dirty = true;
-                        m.pendingOp = isLocalOnly(m) ? "create" : "update";
-                        g.status = "已保存到本地（按 R 同步）";
-                        break;
-                    }
-                    sortMemos(g.store.memos);
-                }
-                saveLocal();
-                rebuildFilter();
-            }
-        }
-        return;   // 保留列表位置
+        applyPendingEdit();
+        return;
     }
 
     g.sel = 0;
@@ -821,8 +951,66 @@ void screen_flomo_init(AppState returnTo) {
 }
 
 AppState screen_flomo_handle(int key, ScreenContext &ctx) {
-    // 同步进行中是阻塞的（在 flomoSync 里跑完才回来），这里只是兜底。
-    if (g.syncing) { drawSync(); return APP_FLOMO; }
+    // ── 后台同步的两个状态（见上面「同步：跑在后台任务里」那段）──────────
+    const int syncNow = s_syncState.load(std::memory_order_acquire);
+    if (syncNow == FSYNC_RUNNING) {
+        // Esc 放行：worker 写的是磁盘，不依赖这一屏 —— 走开。回来（或下次进 flomo
+        // loadLocal）看到的照样是新的库。原来这条路走不掉：同步整个卡在主任务里，
+        // 键根本轮不到处理。
+        if (key == 0x1B) { ctx.nextState = g.returnTo; return g.returnTo; }
+        drawSyncShared();
+        return APP_FLOMO;
+    }
+    if (syncNow == FSYNC_DONE) {   // worker 收工：把库和结果收进来
+        s_syncState.store(FSYNC_IDLE, std::memory_order_release);
+        syncLock();
+        const std::string res = s_syncResult;
+        const bool ok = s_syncOk;
+        s_syncResult.clear();
+        syncUnlock();
+
+        loadLocal();   // worker 只碰了磁盘（MemoDb::save 落盘后才置 DONE），这里读回来
+        // 同步期间在编辑器里写的那条（进屏那一拍被攒下了，见 screen_flomo_init）：
+        // 现在库安静了，补进这份刚读回来的库。
+        if (!g.pendingTemp.empty()) applyPendingEdit();
+        rebuildFilter();
+        // 库可能比进来时短（远端删过、或这一趟真删了）：高亮下标夹回范围内，否则
+        // 下面各处的 g.filtered[g.sel] 会越界读。原来在主任务里跑时靠"返回前重建索引"
+        // 躲过这一条，现在重建搬到这一拍，夹一下更稳。
+        if (g.sel >= (int)g.filtered.size()) g.sel = (int)g.filtered.size() - 1;
+        if (g.sel < 0) g.sel = 0;
+        if (ok) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "同步完成 %d 条", (int)g.filtered.size());
+            g.status = buf;
+        } else {
+            g.status = res.empty() ? "同步失败" : res;
+        }
+        g.drawn = false;    // 内容换了：这一拍照画（见下面空转记账）
+    }
+
+    // ── 空转不重画 ────────────────────────────────────────────────────────
+    // 本屏每一处状态变化都发生在**按键那一拍**，而且那一拍自己就画了（下面每个分支
+    // 末尾都有 drawXxx + return），所以空转这一趟要画的永远和上一幅一模一样。以前它
+    // 每 100ms（idle_ms 默认值）重画一次整屏再 ui_commit：白烧一遍绘制 + 一次全帧
+    // 差分扫描，详情页还要把整篇笔记重新折行（见 drawDetailBody）。更要紧的是每次
+    // commit 都要占一块帧缓冲（就 2 块），而渲染任务那边一次整屏刷要 400 多毫秒 ——
+    // 攒起来主循环就会卡在 acquire_buffer 里，卡住期间触摸根本没被轮询，屏上表现
+    // 就是"点哪条笔记都没反应"。
+    //
+    // 两个例外照画：① 屏幕几何变了（自适应转屏把方向转过去了，屏宽高一变这幅画就
+    // 作废，和编辑器那边 screen_editor_reset_drawn 是同一件事，只是这边自己看得出来，
+    // 不必让主循环知道 flomo）；② 浮标还亮着或刚灭（要把它画出来 / 擦掉）。
+    // 进屏、从编辑器回来那一拍由 screen_flomo_init 把 drawn 清掉，照画。
+    const bool toastNow = ui_toast_active();
+    if (key == 0 && g.drawn && g.drawnW == SCREEN_W && g.drawnH == SCREEN_H &&
+        !toastNow && !g.toastWas) {
+        return APP_FLOMO;
+    }
+    g.drawn = true;
+    g.drawnW = SCREEN_W;
+    g.drawnH = SCREEN_H;
+    g.toastWas = toastNow;
 
     // 触摸上下滑的翻页键（主循环不再替写作界面回退成单步）：**列表和长文**按屏翻
     // ——下面的 FM_LIST / FM_SEARCH / FM_DETAIL / FM_HELP 各自接 KEY_PAGE_*；
@@ -1115,9 +1303,9 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
             // 浮动按钮优先于行命中：顺序即优先级。
             if (flomoFabHit(1, tx, ty)) return openEditorFor(ctx, "", "");   // ＋ 新建
             if (flomoFabHit(0, tx, ty)) {                                    // 云 同步
-                flomoSync();
                 g.mode = FM_LIST;
-                drawList();
+                flomoTriggerSync();
+                drawSyncShared();   // 立刻把进度画出来，别先在列表上闪一下
                 return APP_FLOMO;
             }
             int fi = listRowAtY(ty);
@@ -1138,6 +1326,23 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
         }
         drawList();
         return APP_FLOMO;
+    }
+
+    // 划动返回（列表页）：手指在**屏幕中间**横划一下 = 退出到写作模式（g.returnTo，
+    // 与 Esc 同一个去处）。从屏边 80px 带里起划的那种不走这里 —— hw/input 直接发
+    // KEY_BACK，主循环把它翻成 0x1B，落进下面那条 Esc 分支，两条路同一结果。
+    //
+    // 以前这一划是"什么都不做"：横划抬手只产生 KEY_LEFT/KEY_RIGHT，本函数没人接，
+    // 一路落到末尾的 drawList() 白重画一帧。
+    //
+    // 用按下点把**触摸划动**和蓝牙键盘的 ←/→ 分开：只有触摸手势的按键带按下点
+    // （hw/input 的 s_press_origin_valid 每帧开头就清，见 input_poll 首行那段注释
+    // ——"本帧没有新手势抬手就不该有值"就是为了防这种误读）。实体键盘的方向键在
+    // 列表里保持原来的"什么都不做"。方向不挑：左起划、右起划都算返回，和屏边
+    // 那条（from_left / from_right 都发 KEY_BACK）一致。
+    if ((key == KEY_LEFT || key == KEY_RIGHT) && input_press_xy(nullptr, nullptr)) {
+        ctx.nextState = g.returnTo;
+        return g.returnTo;
     }
 
     if (key == 0x1B || key == 'q' || key == 'Q') {
@@ -1174,9 +1379,9 @@ AppState screen_flomo_handle(int key, ScreenContext &ctx) {
         drawDetail();
         return APP_FLOMO;
     } else if (key == 'r' || key == 'R') {
-        flomoSync();
         g.mode = FM_LIST;
-        drawList();
+        flomoTriggerSync();
+        drawSyncShared();   // 同上：这一拍就出进度界面
         return APP_FLOMO;
     } else if (key == '/') {
         g.searchBuf = g.query;
