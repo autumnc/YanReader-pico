@@ -12,6 +12,7 @@
 #include "flomo_api.h"
 #include "flomo_db.h"
 #include "font_renderer.h"
+#include "font_store.h"   // font_store_get_path：折行缓存键要带"当前内容字体"
 #include "icon_font.h"
 #include "ime/IME.h"
 #include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划/阅读共用一份）
@@ -638,18 +639,29 @@ static void drawDetailBody() {
     int sepY = FONT_H + 4;
     u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
 
-    // 折行结果按「正文 + 折行宽度」缓存。详情页每一拍都重画（滚一行、按一下键、
+    // 折行结果按「正文 + 折行宽度 + 当前字体」缓存。详情页每一拍都重画（滚一行、按一下键、
     // 转屏…），而同一篇笔记同一宽度下的折行结果当然一样 —— 以前每帧重新折一遍整篇，
     // wrapText 是逐字符推进、每一步都 para.substr() 新分配一个 std::string（改不了它，
     // 那是它量宽的方式），主机上量过：4KB 笔记一帧 1600 多次堆分配 / 54KB 拷贝。
     // 命中缓存时只比一次字符串（O(n) 比较、零分配），比重新折便宜一个量级。
     static std::string s_wrapSrc;
     static int s_wrapW = -1;
+    static int s_wrapPx = -1;
+    static std::string s_wrapFont;
     static std::vector<std::string> s_wrapLines;
     const int wrapW = SCREEN_W - 16;
-    if (s_wrapW != wrapW || s_wrapSrc != m.contentText) {
+    // 键还得带上**当前字体**：wrapText 逐字符量宽（g_font.textWidth），而量宽由共享格子的
+    // px 高 + 用户选的外置字体面（拉丁步进）共同决定。只认「正文 + 宽度」的话，在设置里
+    // 换过字号/字体再回到同一篇笔记，会拿旧折行结果去画 → 该折的行溢出、右边被切。
+    // （CJK 步进恒等于格子 px，不受字体面影响；受影响的是中英混排里的拉丁。）
+    const char *fp = font_store_get_path();
+    const std::string fontPath = fp ? fp : "";
+    if (s_wrapW != wrapW || s_wrapPx != g_font.pxHeight() || s_wrapFont != fontPath ||
+        s_wrapSrc != m.contentText) {
         s_wrapSrc = m.contentText;
         s_wrapW = wrapW;
+        s_wrapPx = g_font.pxHeight();
+        s_wrapFont = fontPath;
         s_wrapLines = wrapText(s_wrapSrc, wrapW);
     }
     const std::vector<std::string> &lines = s_wrapLines;

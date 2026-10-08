@@ -1260,10 +1260,11 @@ static bool settingsAsyncHandle(int key) {
             s_settingsAsync.cancel();
         }
         if (!s_settingsAsync.drawn) {
-            ui_clear();
-            ui_draw_text_centered(FONT_H, s_settingsAsync.title().c_str(), false, true);
-            ui_show_message_centered(s_settingsAsync.busy().c_str());
-            ui_commit();
+            // 走公共件：这里原来自己画了一遍，顺序是"先标题后 ui_show_message_centered"，
+            // 而后者内部会 ui_clear() —— 标题被清掉，busy 画面只剩一行 "正在xx..."。
+            // ui_feedback_titled_message 用的就是正确顺序（先框后标题），别再抄第二份。
+            ui_feedback_titled_message(s_settingsAsync.title().c_str(),
+                                       s_settingsAsync.busy().c_str(), 0);
             s_settingsAsync.drawn = true;
         }
         vTaskDelay(pdMS_TO_TICKS(80));

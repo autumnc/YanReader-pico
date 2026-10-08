@@ -1302,7 +1302,10 @@ struct RdStandbyCoverJob {
 static std::atomic<bool> s_rdStandbyCoverTaskRunning{false};
 
 static void rdStandbyCoverTask(void *arg) {
-  std::unique_ptr<RdStandbyCoverJob> job(static_cast<RdStandbyCoverJob *>(arg));
+  // 裸指针 + 手工 delete：本任务以 vTaskDelete 结束，FreeRTOS 不做 C++ 栈回卷，
+  // unique_ptr 的析构不会跑 —— 原来这里每开一本书漏一个 job（见 screen_editor 的
+  // editorAsyncSaveTask 同一处坑）。
+  RdStandbyCoverJob *job = static_cast<RdStandbyCoverJob *>(arg);
   const std::string out = standbyCoverPathFor(job->path, job->kind);
   if (!Storage.exists(out.c_str())) {
     const int64_t t0 = esp_timer_get_time();
@@ -1320,6 +1323,7 @@ static void rdStandbyCoverTask(void *arg) {
                (long long)((esp_timer_get_time() - t0) / 1000));
     }
   }
+  delete job;
   s_rdStandbyCoverTaskRunning.store(false, std::memory_order_release);
   vTaskDelete(nullptr);
 }

@@ -26,7 +26,17 @@ struct PendingSettingWrite {
 static std::map<std::string, PendingSettingWrite> s_pendingWrites;
 static bool s_flushTaskRunning = false;
 
+// 串行化"真正落盘"那一段（取 pending + 逐个写文件）。两条 flush 路径 —— 700ms 后台
+// 任务 settingsFlushTask 与显式 SettingsManager::flush()（备份/恢复/关机前调用）——
+// 会并发走到这里；没有它就会同时写同一个 `<key>.tmp`，safeWriteFile 的 .tmp→rename
+// 就不再原子（改前那份串行性来自 s_cacheMutex 一把锁盖住内存+落盘，拆成两段后漏了）。
+// 顺带让 flush() 真的**等**：后台任务正在写时它堵在这儿，写完才回去取剩余 pending，
+// 于是"备份前 flush()"不再只堵一半（原来后台已把 pending 抽走、还在写文件，flush()
+// 看到空 pending 就返回，备份到卡上的仍是旧值）。
+static std::mutex s_flushIOMutex;
+
 static void settingsFlushPendingNow() {
+    std::lock_guard<std::mutex> io(s_flushIOMutex);
     std::map<std::string, PendingSettingWrite> writes;
     {
         std::lock_guard<std::mutex> lock(s_cacheMutex);
@@ -68,7 +78,7 @@ static void settingsScheduleFlush() {
     }
     if (!shouldStart) return;
     TaskHandle_t h = nullptr;
-    if (xTaskCreate(settingsFlushTask, "settings_flush", 4096, nullptr, 1, &h) != pdPASS) {
+    if (xTaskCreate(settingsFlushTask, "settings_flush", 6144, nullptr, 1, &h) != pdPASS) {
         {
             std::lock_guard<std::mutex> lock(s_cacheMutex);
             s_flushTaskRunning = false;

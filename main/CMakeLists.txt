@@ -15,6 +15,11 @@ option(PJOURNAL_IME_ENABLE_WUBI "Build optional wubi IME support" OFF)
 option(PJOURNAL_IME_ENABLE_SHUANGPIN "Build optional shuangpin IME support" OFF)
 option(PJOURNAL_IME_PERF_LOG "Enable slow IME lookup timing logs" OFF)
 
+# 按键音（打字机点击声）走 read_pico 的蜂鸣器 PCM 接口。这套接口只在带蜂鸣器的
+# read_pico_firmware 里导出（本机那份 export 了 read_pico_buzzer_pcm_*）——对着没有它的
+# 那份编译时设 OFF，typing_click.cpp 会退化成静音空桩而不是编译失败。
+option(YAN_READER_ENABLE_BUZZER_PCM "Typing click sound via read_pico buzzer PCM" ON)
+
 # 嵌入资源。IME 的 ime_table_pinyin.bin / liangfen.bin 是构建期生成的字库产物，
 # 不在源码仓库里（gitignore），构建前须由上游工具生成或手工放置到 ime/ 下。
 set(PJOURNAL_EMBED_FILES
@@ -154,3 +159,8 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PJOURNAL_IME_ENABLE_SHUANGPIN=$<BOOL:${PJOURNAL_IME_ENABLE_SHUANGPIN}>
     PJOURNAL_IME_PERF_LOG=$<BOOL:${PJOURNAL_IME_PERF_LOG}>
 )
+# 注意：typing_click.cpp 用的是 `#if defined(...)`，所以 OFF 时**不定义**这个宏，
+# 不能写成 `=$<BOOL:...>`（那样 OFF 会变成 `#define X 0`，defined() 仍为真）。
+if(YAN_READER_ENABLE_BUZZER_PCM)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE YAN_READER_ENABLE_BUZZER_PCM=1)
+endif()

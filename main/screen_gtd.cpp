@@ -5897,8 +5897,14 @@ static AppState gtdHandleBrowse(int key, ScreenContext &ctx) {
         ListView lv;
         lv.sel = g.sel;
         lv.first = g.scroll;
-        lv.count = (int)g.filtered.size();
-        lv.rows = gtdListRows();
+        // count/rows 要跟 drawList 画的是同一份：项目列表视图画的是 g.projectList、
+        // 下钻画的是 g_visibleTreeIdx，都不是 g.filtered（旧写法用 filtered.size() 当上界，
+        // 在这两个视图下会把选中夹到错的长度）。gtdListRows() 就是"当前视图总行数"，
+        // 与 gtdScrollByPage/滚动条口径一致；rows 必须是**可见行数** —— 传成总行数会让
+        // listViewFollow 的 maxFirst 恒为 0，窗口再也滚不动（这正是"统一走 ListView"那笔
+        // 引入的：四个键都吃掉、sel 动、scroll 不动）。
+        lv.count = gtdListRows();
+        lv.rows = gtdListVisibleRows();
         if (listViewKey(lv, key)) {
             listViewFollow(lv);
             g.sel = lv.sel;

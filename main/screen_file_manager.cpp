@@ -98,6 +98,11 @@ done:
 
 void screen_file_manager_init() {
     if (!s_fileMgrMutex) s_fileMgrMutex = xSemaphoreCreateMutex();
+    // 已经在跑了（启动任务还没结束就又进来一次）：直接复用现有任务，别 begin()。
+    // begin() 会把 cancel_ 清回去并重新挂一个任务 → 两个 file_mgr_start 同时写
+    // g_fileMgrState，且之前那次 cancel() 白取消。护栏同 startSettingsAsync
+    // （screen_settings.cpp:1226）那一句。
+    if (s_fileMgrJob.state() == AppAsyncState::Running) return;
     s_fileMgrJob.begin("文件管理", "正在连接WiFi...");
     fileMgrLock();
     g_fileMgrState.serverRunning = false;

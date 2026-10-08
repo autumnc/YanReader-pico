@@ -346,6 +346,10 @@ static void enterLightSleep(void);
 // 盖掉。等 PMU 断电就行。真等到超时（用户提前松了手）就作废快照，让下一帧把界面重画。
 static void powerOffWithNotice() {
     const int64_t t0 = esp_timer_get_time();
+    // 关机 = 信息闸门：设置写入现在是"改内存 + 延后 700ms 落盘"，那一笔可能还在窗口里。
+    // PMU 满 10s 会自己拉 EN **硬断电**，主机拿不到任何通知，不在这儿收尾就丢改动
+    // （erase 的键还会复活）。趁 SD 还挂着，先落盘再 sync。
+    g_settings.flush();
     standbyShutdownDraw();   // 铺页 + 整屏 GC16（内部推完才返回）
     const esp_err_t se = read_pico_sd_sync();
     if (se != ESP_OK && se != ESP_ERR_NOT_FINISHED) {
@@ -363,6 +367,10 @@ void app_enterStandby() { enterLightSleep(); }
 
 static void enterLightSleep(void) {
     IME::getInstance().flushUserDictSavesNow();
+    // 同 powerOffWithNotice：设置写入延后 700ms 落盘，睡下去之前必须收尾，否则
+    // 睡前的最后一次改设置（含 erase）会跟着丢失。就放在 IME 那句旁边——同属
+    // "睡前把延后写的东西落地"这一类。
+    g_settings.flush();
 
     // 待机画面：设置里可选「简约时钟 / 老黄历 / 书籍封面」整屏表盘，或「关闭」——关闭时
     // 什么都不画，屏上原样保留休眠前的画面。墨水屏双稳态，无论哪种画面都在整个休眠

@@ -1813,8 +1813,10 @@ static bool olHandleBookmarkMgr(int &key, AppState &out) {
         } else if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
                    key == KEY_HOME || key == KEY_END || key == 'j' || key == 'k') {
             int scroll = 0;
-            if (key == 'j') key = KEY_UP;
-            else if (key == 'k') key = KEY_DOWN;
+            // j = 下、k = 上，与全仓其余列表一致；原来这里是反的（j→UP/k→DOWN），
+            // 从书签管理切到别的列表手会打结。
+            if (key == 'j') key = KEY_DOWN;
+            else if (key == 'k') key = KEY_UP;
             olApplyListKey(key, g.bmMgrSel, scroll, bmCount, olBookmarkRows(),
                            FONT_H + 8 + LINE_SPACING - g_font.ascent());
         } else if (key == 0x0A || key == 0x0D) {

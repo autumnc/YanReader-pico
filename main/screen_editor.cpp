@@ -2353,15 +2353,20 @@ struct EditorAsyncSaveReq {
     std::string content;
 };
 static std::atomic<bool> s_editorSaveRunning{false};
-static std::atomic<bool> s_editorSaveQueued{false};
+// 上一次后台保存的结局：0 = 还没收尾，1 = 成功，2 = 失败。worker 写、主任务在空闲拍取走
+// （与 s_promptTaskDone 同一套）。成败都不在 worker 里直接动 g_editor / 恢复草稿：那两样
+// 归主任务，而且"这份草稿还该不该留"要看主任务期间有没有新的改动。
+static std::atomic<int> s_editorSaveResult{0};
 
 static void editorAsyncSaveTask(void *arg) {
-    std::unique_ptr<EditorAsyncSaveReq> req(static_cast<EditorAsyncSaveReq *>(arg));
+    // 手工 delete，不用 unique_ptr：本任务以 vTaskDelete 结束，而 FreeRTOS 删任务**不做
+    // C++ 栈回卷** —— 局部对象的析构不会执行，这块请求（含整篇正文）会每存一次漏一次。
+    EditorAsyncSaveReq *req = static_cast<EditorAsyncSaveReq *>(arg);
     bool ok = false;
     if (req->quick) ok = quickEditSave(req->quickIndex, req->content, req->createHistory);
     else ok = g_journal.saveEntryRaw(req->filename, req->content, req->createHistory);
-    if (ok) g_journal.clearRecoveryDraft();
-    s_editorSaveQueued.store(false, std::memory_order_release);
+    delete req;
+    s_editorSaveResult.store(ok ? 1 : 2, std::memory_order_release);
     s_editorSaveRunning.store(false, std::memory_order_release);
     vTaskDelete(nullptr);
 }
@@ -2394,10 +2399,8 @@ static bool queueAutoSaveContent(bool createHistory = false) {
         req->filename = g_editor.savedFilename;
     }
     s_editorSaveRunning.store(true, std::memory_order_release);
-    s_editorSaveQueued.store(true, std::memory_order_release);
     if (xTaskCreate(editorAsyncSaveTask, "editor_save", 8192, req, 1, nullptr) != pdPASS) {
         s_editorSaveRunning.store(false, std::memory_order_release);
-        s_editorSaveQueued.store(false, std::memory_order_release);
         delete req;
         return false;
     }
@@ -3823,6 +3826,21 @@ bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw) {
             return true;
         }
         return false;
+    }
+    // 上一次后台保存的收尾（worker 只写结局，动作都在这里做）。
+    {
+        const int res = s_editorSaveResult.exchange(0, std::memory_order_acq_rel);
+        if (res == 2) {
+            // 写盘失败：入队时就把 modifiedSinceSave 清掉了（见 queueAutoSaveContent），
+            // 这里必须捡回来 —— 否则下面恢复草稿那条分支永远不触发，接着打十分钟字
+            // 一旦掉电就全没了。捡回来还能让下一拍重试。
+            g_editor.modifiedSinceSave = true;
+            if (g_settings.recoveryDraft()) saveRecoveryDraftIfChanged();
+        } else if (res == 1 && !g_editor.modifiedSinceSave) {
+            // 存成功了，且这期间没再改动 —— 恢复草稿成了冗余，删掉。反过来说：如果有新
+            // 改动，那份草稿比刚落盘的这份新，不能删（worker 自己删就会踩这一条）。
+            g_journal.clearRecoveryDraft();
+        }
     }
     // Auto-save on idle ticks (快捷编辑始终自动保存)
     if (g_editor.autoSaveTime > 0 && esp_timer_get_time() > g_editor.autoSaveTime) {

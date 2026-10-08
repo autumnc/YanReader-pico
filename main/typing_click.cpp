@@ -98,7 +98,9 @@ static portMUX_TYPE s_pend_mux = portMUX_INITIALIZER_UNLOCKED;
 static int s_pending = 0;              // 已排队待播的声数
 
 static int64_t s_open_retry_at_us = 0;  // 开会话失败后的退避截止时刻
-static bool s_pcm_missing_logged = false;
+#if !defined(YAN_READER_ENABLE_BUZZER_PCM)
+static bool s_pcm_missing_logged = false;   // 只有下面的空桩分支用到（见 CMakeLists 的 option）
+#endif
 static std::vector<int16_t> s_hit_cache;
 static int s_hit_cache_peak = -1;
 static int s_hit_cache_vol = -1;
