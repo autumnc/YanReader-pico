@@ -40,6 +40,7 @@ idf_component_register(SRCS
     "app_async.cpp"
     "app_services.cpp"
     "ui_helpers.cpp"
+    "ui_feedback.cpp"
     "ui_render.cpp"
     "safe_file.cpp"
     "clipboard.cpp"

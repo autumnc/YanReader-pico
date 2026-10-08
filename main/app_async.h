@@ -21,6 +21,8 @@ public:
                UBaseType_t priority = 1);
     void finish(const std::string &result);
     void failToStart(const std::string &result);
+    void cancel();
+    bool cancelled() const;
     void reset();
 
     AppAsyncState state() const;
@@ -37,6 +39,7 @@ private:
     void unlock();
 
     std::atomic<AppAsyncState> state_{AppAsyncState::Idle};
+    std::atomic<bool> cancel_{false};
     SemaphoreHandle_t mutex_ = nullptr;
     std::string title_;
     std::string busy_;

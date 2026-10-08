@@ -10,6 +10,7 @@
 
 #include "ui_helpers.h"
 #include "ui_render.h"
+#include "ui/list_view.h"
 
 #include "ime/IME.h"
 #include "ui/ime_field.h"   // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/阅读共用一份）
@@ -5892,16 +5893,18 @@ static AppState gtdHandleBrowse(int key, ScreenContext &ctx) {
 
 
 
-    if (key == KEY_UP) {
-
-        if (g.sel > 0) g.sel--;
-
-    }
-
-    if (key == KEY_DOWN) {
-
-        if (g.sel < (int)g.filtered.size() - 1) g.sel++;
-
+    if (key == KEY_UP || key == KEY_DOWN || key == KEY_HOME || key == KEY_END) {
+        ListView lv;
+        lv.sel = g.sel;
+        lv.first = g.scroll;
+        lv.count = (int)g.filtered.size();
+        lv.rows = gtdListRows();
+        if (listViewKey(lv, key)) {
+            listViewFollow(lv);
+            g.sel = lv.sel;
+            g.scroll = lv.first;
+            g.scrollFrac = 0;
+        }
     }
 
     // Shift+↑/↓ 连续多选(仅平铺列表; 项目列表/项目树显示顺序与 filtered 不一致)

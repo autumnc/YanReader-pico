@@ -8,6 +8,7 @@ public:
     std::string getString(const std::string &key, const std::string &def = "");
     void setString(const std::string &key, const std::string &val);
     void erase(const std::string &key);
+    void flush();
 
     // Convenience accessors
     std::string flomoEmail();

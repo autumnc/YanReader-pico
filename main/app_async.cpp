@@ -14,6 +14,7 @@ void AppAsyncJob::unlock() {
 }
 
 void AppAsyncJob::begin(const std::string &title, const std::string &busy) {
+    cancel_.store(false, std::memory_order_release);
     lock();
     title_ = title;
     busy_ = busy;
@@ -42,7 +43,16 @@ void AppAsyncJob::failToStart(const std::string &result) {
     finish(result);
 }
 
+void AppAsyncJob::cancel() {
+    cancel_.store(true, std::memory_order_release);
+}
+
+bool AppAsyncJob::cancelled() const {
+    return cancel_.load(std::memory_order_acquire);
+}
+
 void AppAsyncJob::reset() {
+    cancel_.store(false, std::memory_order_release);
     lock();
     result_.clear();
     unlock();

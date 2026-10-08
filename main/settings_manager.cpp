@@ -7,6 +7,8 @@
 #include <mutex>
 #include <sys/stat.h>
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 static const char *TAG = "Settings";
 static const char *BASE_DIR = "/sdcard/settings";
@@ -15,6 +17,65 @@ SettingsManager g_settings;
 
 static std::map<std::string, std::string> s_cache;
 static std::mutex s_cacheMutex;
+
+struct PendingSettingWrite {
+    bool erase = false;
+    std::string value;
+};
+
+static std::map<std::string, PendingSettingWrite> s_pendingWrites;
+static bool s_flushTaskRunning = false;
+
+static void settingsFlushPendingNow() {
+    std::map<std::string, PendingSettingWrite> writes;
+    {
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        writes.swap(s_pendingWrites);
+    }
+    if (writes.empty()) return;
+    mkdir(BASE_DIR, 0777);
+    for (const auto &kv : writes) {
+        const std::string path = std::string(BASE_DIR) + "/" + kv.first;
+        if (kv.second.erase) {
+            remove(path.c_str());
+        } else if (!safeWriteFile(path, kv.second.value)) {
+            ESP_LOGE(TAG, "Failed to write %s", path.c_str());
+        }
+    }
+}
+
+static void settingsFlushTask(void *) {
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(700));
+        settingsFlushPendingNow();
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        if (s_pendingWrites.empty()) {
+            s_flushTaskRunning = false;
+            break;
+        }
+    }
+    vTaskDelete(nullptr);
+}
+
+static void settingsScheduleFlush() {
+    bool shouldStart = false;
+    {
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        if (!s_flushTaskRunning) {
+            s_flushTaskRunning = true;
+            shouldStart = true;
+        }
+    }
+    if (!shouldStart) return;
+    TaskHandle_t h = nullptr;
+    if (xTaskCreate(settingsFlushTask, "settings_flush", 4096, nullptr, 1, &h) != pdPASS) {
+        {
+            std::lock_guard<std::mutex> lock(s_cacheMutex);
+            s_flushTaskRunning = false;
+        }
+        settingsFlushPendingNow();
+    }
+}
 
 bool SettingsManager::begin() {
     mkdir(BASE_DIR, 0777);
@@ -50,14 +111,12 @@ std::string SettingsManager::get(const std::string &key) {
 }
 
 void SettingsManager::set(const std::string &key, const std::string &val) {
-    std::lock_guard<std::mutex> lock(s_cacheMutex);
-    mkdir(BASE_DIR, 0777);
-    std::string path = std::string(BASE_DIR) + "/" + key;
-    if (!safeWriteFile(path, val)) {
-        ESP_LOGE(TAG, "Failed to write %s", path.c_str());
-        return;
+    {
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        s_cache[key] = val;
+        s_pendingWrites[key] = PendingSettingWrite{false, val};
     }
-    s_cache[key] = val;
+    settingsScheduleFlush();
 }
 
 std::string SettingsManager::getString(const std::string &key, const std::string &def) {
@@ -70,10 +129,16 @@ void SettingsManager::setString(const std::string &key, const std::string &val) 
 }
 
 void SettingsManager::erase(const std::string &key) {
-    std::lock_guard<std::mutex> lock(s_cacheMutex);
-    s_cache.erase(key);
-    std::string path = std::string(BASE_DIR) + "/" + key;
-    remove(path.c_str());
+    {
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        s_cache[key] = "";
+        s_pendingWrites[key] = PendingSettingWrite{true, ""};
+    }
+    settingsScheduleFlush();
+}
+
+void SettingsManager::flush() {
+    settingsFlushPendingNow();
 }
 
 // Convenience accessors

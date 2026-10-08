@@ -22,8 +22,11 @@ static struct {
 } g_fileMgrState;
 
 static AppAsyncJob s_fileMgrJob;
-static std::atomic<bool> s_fileMgrAbort{false};
 static SemaphoreHandle_t s_fileMgrMutex = nullptr;
+
+static bool fileMgrCancelled() {
+    return s_fileMgrJob.cancelled();
+}
 
 static void fileMgrLock() {
     if (!s_fileMgrMutex) s_fileMgrMutex = xSemaphoreCreateMutex();
@@ -53,10 +56,10 @@ static void fileMgrStartTask(void *arg) {
         goto done;
     }
     if (!wifiWasConnected) vTaskDelay(pdMS_TO_TICKS(500));
-    if (s_fileMgrAbort.load(std::memory_order_acquire)) goto done;
+    if (fileMgrCancelled()) goto done;
 
     fileMgrSetStatus("正在获取IP...");
-    for (int i = 0; i < 10 && !s_fileMgrAbort.load(std::memory_order_acquire); i++) {
+    for (int i = 0; i < 10 && !fileMgrCancelled(); i++) {
         ip = g_wifi.getIp();
         if (!ip.empty()) break;
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -65,7 +68,7 @@ static void fileMgrStartTask(void *arg) {
         fileMgrSetStatus("获取IP失败");
         goto done;
     }
-    if (s_fileMgrAbort.load(std::memory_order_acquire)) goto done;
+    if (fileMgrCancelled()) goto done;
 
     fileMgrSetStatus("正在启动服务...");
     if (file_manager_server_start(80)) {
@@ -76,11 +79,11 @@ static void fileMgrStartTask(void *arg) {
     }
 
 done:
-    if (s_fileMgrAbort.load(std::memory_order_acquire) && ok) {
+    if (fileMgrCancelled() && ok) {
         file_manager_server_stop();
         ok = false;
     }
-    if (s_fileMgrAbort.load(std::memory_order_acquire)) app_disconnect_wifi_if_needed(wifiWasConnected);
+    if (fileMgrCancelled()) app_disconnect_wifi_if_needed(wifiWasConnected);
     fileMgrLock();
     g_fileMgrState.wifiWasConnected = wifiWasConnected;
     g_fileMgrState.serverRunning = ok;
@@ -95,7 +98,6 @@ done:
 
 void screen_file_manager_init() {
     if (!s_fileMgrMutex) s_fileMgrMutex = xSemaphoreCreateMutex();
-    s_fileMgrAbort.store(false, std::memory_order_release);
     s_fileMgrJob.begin("文件管理", "正在连接WiFi...");
     fileMgrLock();
     g_fileMgrState.serverRunning = false;
@@ -114,7 +116,7 @@ void screen_file_manager_init() {
 AppState screen_file_manager_handle(int key, ScreenContext &ctx) {
     (void)ctx;
     if (key == 'q' || key == 'Q' || key == 0x1B) {
-        s_fileMgrAbort.store(true, std::memory_order_release);
+        s_fileMgrJob.cancel();
         fileMgrLock();
         bool running = g_fileMgrState.serverRunning;
         bool wifiWasConnected = g_fileMgrState.wifiWasConnected;

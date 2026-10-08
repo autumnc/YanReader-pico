@@ -20,6 +20,7 @@
 #include "read_pico_sd.h"      // 卡在不在（恢复前的提示要分开说）
 #include "typing_click.h"
 #include "ui_helpers.h"
+#include "ui_feedback.h"
 #include "input.h"
 #include "board.h"
 #include <HalDisplay.h>  // 夜间模式：翻全局反色标志
@@ -1126,6 +1127,8 @@ static void settingsFlomoTokenTask(void *) {
     bool ok = app_connect_wifi_from_settings(&wifiWas);
     if (!ok) {
         s_settingsAsync.finish("WiFi连接失败");
+    } else if (s_settingsAsync.cancelled()) {
+        s_settingsAsync.finish("已取消");
     } else {
         g_flomo.configure(email, pass);
         std::string token = g_flomo.login();
@@ -1150,6 +1153,12 @@ static void settingsSyncTimeTask(void *) {
         return;
     }
     if (!wifiWas) vTaskDelay(pdMS_TO_TICKS(500));
+    if (s_settingsAsync.cancelled()) {
+        s_settingsAsync.finish("已取消");
+        app_disconnect_wifi_if_needed(wifiWas);
+        vTaskDelete(nullptr);
+        return;
+    }
     std::string ntp = g_settings.ntpServer();
     std::string tz = g_settings.timezone();
     if (tz.empty()) tz = "CST-8";
@@ -1165,6 +1174,7 @@ static void settingsSyncTimeTask(void *) {
         tzset();
         time_t now = 0;
         for (int i = 0; i < 100; i++) {
+            if (s_settingsAsync.cancelled()) break;
             vTaskDelay(pdMS_TO_TICKS(200));
             if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
                 time(&now);
@@ -1172,7 +1182,9 @@ static void settingsSyncTimeTask(void *) {
             }
         }
         esp_sntp_stop();
-        if (now > 1704067200) {
+        if (s_settingsAsync.cancelled()) {
+            s_settingsAsync.finish("已取消");
+        } else if (now > 1704067200) {
             struct tm tmv;
             localtime_r(&now, &tmv);
             char ts[64];
@@ -1188,6 +1200,7 @@ static void settingsSyncTimeTask(void *) {
 }
 
 static void settingsBackupTask(void *) {
+    g_settings.flush();
     const esp_err_t err = settings_backup_save();
     s_settingsAsync.finish(
         err == ESP_OK ? "已备份到 TF 卡 settings_backup/"
@@ -1197,6 +1210,7 @@ static void settingsBackupTask(void *) {
 }
 
 static void settingsRestoreTask(void *) {
+    g_settings.flush();
     const esp_err_t err = settings_backup_restore();
     if (err == ESP_OK) {
         s_settingsAsyncRestart = true;
@@ -1242,6 +1256,9 @@ static bool settingsAsyncHandle(int key) {
     AppAsyncState state = s_settingsAsync.state();
     if (state == AppAsyncState::Idle) return false;
     if (state == AppAsyncState::Running) {
+        if (key == 'q' || key == 'Q' || key == 0x1B) {
+            s_settingsAsync.cancel();
+        }
         if (!s_settingsAsync.drawn) {
             ui_clear();
             ui_draw_text_centered(FONT_H, s_settingsAsync.title().c_str(), false, true);
@@ -1253,9 +1270,7 @@ static bool settingsAsyncHandle(int key) {
         return true;
     }
     if (s_settingsAsync.untilUs == 0 || key > 0) {
-        ui_clear();
-        ui_show_message_centered(s_settingsAsync.result().c_str());
-        ui_commit();
+        ui_feedback_message(s_settingsAsync.result().c_str(), 0);
         s_settingsAsync.untilUs = esp_timer_get_time() + 1800LL * 1000;
         return true;
     }
@@ -1856,8 +1871,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             if (strcmp(f.key, "_clock_preview") == 0) {
                 StandbyFace face = standbyFaceFromKey(g_settings.getString("clock_face").c_str());
                 if (face == StandbyFace::Off) {
-                    ui_clear(); ui_show_message_centered("请先选择待机表盘"); ui_commit();
-                    vTaskDelay(pdMS_TO_TICKS(1500));
+                    ui_feedback_message("请先选择待机表盘", 1500);
                 } else {
                     standbyClockPreview(face, 3000);
                 }
@@ -1899,17 +1913,15 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                     // 插卡，后者去备份。
                     read_pico_sd_info_t sd = {};
                     const bool card = (read_pico_sd_get_info(&sd) == ESP_OK && sd.mounted);
-                    ui_show_message_centered(card ? "TF 卡上没有备份"
-                                                  : "未识别到 TF 卡，请插卡后重试");
-                    vTaskDelay(pdMS_TO_TICKS(1800));
+                    ui_feedback_message(card ? "TF 卡上没有备份"
+                                             : "未识别到 TF 卡，请插卡后重试");
                     return APP_SETTINGS;
                 }
                 // 覆盖当前设置是不可逆的（恢复**不删**备份里没有的文件，但被覆盖的那些
                 // 旧值就没了），所以再点一次才动手。
                 if (!s_cfgRestoreConfirm) {
                     s_cfgRestoreConfirm = true;
-                    ui_show_message_centered("恢复会覆盖当前设置，请再点一次确认");
-                    vTaskDelay(pdMS_TO_TICKS(1800));
+                    ui_feedback_message("恢复会覆盖当前设置，请再点一次确认");
                     return APP_SETTINGS;
                 }
                 s_cfgRestoreConfirm = false;
