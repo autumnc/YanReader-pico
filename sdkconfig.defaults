@@ -93,8 +93,14 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # 代价（评估过，可接受）：本机每次握手只哈希几 KB（<10ms），AES 只用在 WebDAV/词典
 # 这类几 MB 传输上（软件 AES 约 2~4MB/s，多花几秒）。RSA/ECC 的证书验签仍走硬件 MPI
 # —— bignum 端口全文件零分配（只 include 了 malloc.h），不吃这口池子，没必要关。
-# 若日后要换回硬件：先解决这口池的碎片化（真正的根在蓝牙/WiFi 的内部 DMA 占用，
-# 见 CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST），再删掉下面两行。
+# 若日后要换回硬件：先让这口池在 WiFi+蓝牙同时活动时也留得下连续小块（真正的根是
+# 蓝牙/WiFi 吃掉的内部 RAM 总量），再删掉下面两行。**注意别指望
+# CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST** —— 本机 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+# 让 malloc() 本来就先走 PSRAM（heap_caps.c:117：阈值 0 → 所有非零大小都走
+# MALLOC_CAP_SPIRAM），而 Bluedroid 的 osi_malloc/osi_calloc 就是 malloc/calloc ——
+# 那条开关只是换个写法表达同一种偏好；它也管不到控制器（控制器内存 caps 写死在
+# controller/esp32c3/bt.c 的 BLE_CONTROLLER_MALLOC_CAPS，无任何 PSRAM 选项）。
+# 真正能让出内部 RAM 的是下面那条 BT_CTRL_BLE_MAX_ACT。
 # CONFIG_MBEDTLS_HARDWARE_SHA is not set
 # CONFIG_MBEDTLS_HARDWARE_AES is not set
 
@@ -112,6 +118,17 @@ CONFIG_BT_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=y
 CONFIG_BT_BTU_TASK_STACK_SIZE=4096
 CONFIG_BT_BTC_TASK_STACK_SIZE=4096
+# 控制器为"活动"(连接/扫描/同步/广播)预分配的实例数，Kconfig 原文："Each instance
+# needs to consume 828 bytes"。这台机器只当一把 BLE HID 键盘的 host：活动数最多是
+# 「扫描」+「已建连接」两种，而 bt_keyboard.cpp 的 connect_task 在 gattc_open 之前
+# 先 stop_ext_scan（并等 500ms），实际不会同时用到两个 —— 取 2 是留一点余量，
+# 别取 1（范围下限本来就是 1，但踩线会让键盘连不上，症状难定位）。
+# 6 → 2 从内部 RAM 让出 4×828 = 3312 字节，而且这是控制器直接要的
+# MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA，正是逼死硬件 SHA/AES 的那口池。
+# EFF 是控制器实际读的那个值，它 default 跟 MAX_ACT，但 sdkconfig 里存着旧值不会自己跟，
+# 所以要一起写。
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+CONFIG_BT_CTRL_BLE_MAX_ACT_EFF=2
 # 键盘 HID 报告(键盘+consumer+system+vendor)的 CCC 通知注册数；默认 5 不够，
 # 会报 "Max Notification Reached" 导致连上后收不到按键。
 CONFIG_BT_GATTC_NOTIF_REG_MAX=20
