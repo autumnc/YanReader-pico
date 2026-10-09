@@ -60,13 +60,20 @@ struct StandbyCoverLayout {
 };
 void readerStandbyCoverLayout(StandbyCoverLayout &out);
 
-// 把封面按"装进 boxW×boxH"缩放成 0..15 灰度（15=白）写进调用方给的 out，并回吐实际
-// 尺寸 dw/dh 与在框内的居中偏移 ox/oy。out 至少要 boxW*boxH 字节 —— 一张整屏封面约
-// 300KB，**必须取自 PSRAM**（内部 RAM 挤不出这么大一块，见 internal-ram-squeeze）。
+// 逐行输出回调：把 dw 个 0..15 的像素画到屏上 (x, y) 起的一行。x/y 已是**绝对坐标**
+// （已含目标框原点与居中偏移），调用方只管往 framebuffer 写。
+using ReaderPixelRowSink = void (*)(void *ctx, int x, int y, const uint8_t *row, int dw);
+
+// 把封面按"装进 boxW×boxH"缩放成 0..15 灰度，逐行回调 sink，框的原点在 (bx, by)。
+// 回吐实际尺寸 dw/dh 与在框内的居中偏移 ox/oy。
+// **不再需要调用方准备一块 boxW*boxH 的 PSRAM 缓冲**：那块缓冲要**一整块连续** PSRAM
+// （封面框 593×890 = 515KB、横屏整屏图 684×1216 = 812KB），而实测最大连续块只有 516KB
+// （碎片化，见 psram-fragmentation-font-io-cache）——「书籍封面」表盘因此只能画
+// 「暂无封面」。逐行产出之后待机侧一个字节都不分配（见 screen_reader.cpp
+// rdBuildCoverThumbTo 的头注释）。
 // **只缩不放**：源图比框小的那一边按原尺寸来（dw/dh 就是源尺寸），多出来的框留白。
-// 只读只算不画，像素由调用方自己 blit。
-bool readerCoverScale(const std::string &bmpPath, int boxW, int boxH, uint8_t *out, size_t outCap,
-                      int &dw, int &dh, int &ox, int &oy);
+bool readerCoverScaleTo(const std::string &bmpPath, int boxW, int boxH, int bx, int by,
+                        ReaderPixelRowSink sink, void *ctx, int &dw, int &dh, int &ox, int &oy);
 
 // ── 待机表盘「图片」的两个出口 ───────────────────────────────────────────
 // 用户在文件管理里选中的那张图（设置键 standby_image，存的是 SD 上的**原图**路径）。

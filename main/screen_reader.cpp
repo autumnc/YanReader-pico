@@ -1416,7 +1416,7 @@ static bool rdBuildStandbyImageCache(const std::string &src, std::string &err) {
   if (!isPng && !isJpg) { err = "只支持 JPG / PNG"; return false; }
 
   // fit（crop=false）+ 整屏盒子：待机要的是"整张图都看得见"，裁掉两边去填满会把
-  // 画面切掉一块。留白由绘制端居中处理（readerCoverScale 的 ox/oy）。
+  // 画面切掉一块。留白由绘制端居中处理（readerCoverScaleTo 的 ox/oy）。
   const int w = SCREEN_W, h = SCREEN_H;
   const std::string out = standbyImageCacheFor(src, w, h);
   Storage.mkdir((std::string(CACHE_DIR) + "/standby").c_str(), true);
@@ -3823,9 +3823,18 @@ static DitherMode rdCoverDitherMode() { return ImageBlock::ditherModeEnabled(); 
 // 把 bmp 缩放成 dw×dh 的 0..15 灰度写进 out（行优先，dw*dh 字节）。**只算不画** ——
 // 画（drawGrayscale16Pixel）交给调用方，因为结果要进 PSRAM 缓存复用（见
 // drawCoverThumb）。以前这个函数直接画到帧缓冲，也就没法缓存。
-static bool rdBuildCoverThumb(Bitmap &bmp, int dw, int dh, uint8_t *out) {
+// 逐行输出回调：dw 个 0..15 的像素，y 是输出行号（0 = 目标框第一行）。ctx 由调用方定。
+using CoverRowSink = void (*)(void *ctx, int y, const uint8_t *row, int dw);
+
+// 缩放管线本体。**逐行把结果交给 sink**，而不是先落进一整块 dw×dh 的缓冲：输出本来
+// 就只往 y 递增的方向写（put() 只被 nextDy 递增地调），那一整块是白要的。这一点很要紧
+// —— 待机那两块中转缓冲（封面框 593×890 = 515KB、整屏图 684×1216 = 812KB）曾经各要
+// **一整块连续 PSRAM**，而实测最大连续块只有 516KB（碎片化，见
+// psram-fragmentation-font-io-cache），于是「书籍封面」表盘只能画「暂无封面」。
+// 流式之后待机侧一个字节都不分配。
+static bool rdBuildCoverThumbTo(Bitmap &bmp, int dw, int dh, CoverRowSink sink, void *ctx) {
   const int sw = bmp.getWidth(), sh = bmp.getHeight();
-  if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return false;
+  if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 || sink == nullptr) return false;
   const int rowBytes = bmp.getRowBytes();
   std::vector<uint8_t> rowBuf(rowBytes);
   std::vector<uint8_t> data(sw);
@@ -3864,17 +3873,18 @@ static bool rdBuildCoverThumb(Bitmap &bmp, int dw, int dh, uint8_t *out) {
   int nRaw = 0;    // 已算出的源行组数（= ring 里的行号）
   int nextDy = 0;  // 下一个待画的输出行
   std::vector<uint8_t> prevOut(dw, 255);  // 最近画出去的那一行（gap 要用它补）
+  std::vector<uint8_t> lineBuf(dw);       // 逐行量化结果（交给 sink，dw 个字节，可忽略）
 
   auto put = [&](int y, const std::vector<uint8_t> &row) {
-    uint8_t *dst = out + static_cast<size_t>(y) * dw;
     const DitherMode dm = rdCoverDitherMode();
     DitherRowState ds;
     for (int x = 0; x < dw; x++) {
       // 抖动就落在这里：此时 row[x] 还是 0..255（提对比之后、量化之前），
       // 再往后就没得抖了。put() 逐行、x 从左到右且 y 递增，行扩散档也是对的用法。
       // y 放大时同一 row 会填几个 dy，Ordered 按各自 y 取图案（本来就应该这样）。
-      dst[x] = grayToLevel16(row[x], x, y, dm, ds);
+      lineBuf[x] = grayToLevel16(row[x], x, y, dm, ds);
     }
+    sink(ctx, y, lineBuf.data(), dw);
   };
 
   // 画第 k 组源行：它上/下邻居已在 ring 里。hasDown=false 只出现在最后一行。
@@ -3944,6 +3954,25 @@ static bool rdBuildCoverThumb(Bitmap &bmp, int dw, int dh, uint8_t *out) {
   if (nRaw > 0) emit(nRaw - 1, false);  // 最后一行没有下邻居，按它自己补
   for (; nextDy < dh; nextDy++) put(nextDy, prevOut);
   return true;
+}
+
+// 逐行写进一块连续缓冲：书架缩略图缓存要的是"整块像素"（rdThumbSave 落盘 + 之后 blit
+// 到格子里），所以那条路维持原来的接口，sink 就是一次 memcpy。
+static bool rdBuildCoverThumb(Bitmap &bmp, int dw, int dh, uint8_t *out) {
+  if (out == nullptr) return false;
+  struct Ctx {
+    uint8_t *out;
+    int dw;
+  };
+  Ctx c{out, dw};
+  return rdBuildCoverThumbTo(
+      bmp, dw, dh,
+      [](void *p, int y, const uint8_t *row, int n) {
+        Ctx *c = static_cast<Ctx *>(p);
+        memcpy(c->out + static_cast<size_t>(y) * static_cast<size_t>(c->dw), row,
+               static_cast<size_t>(n));
+      },
+      &c);
 }
 
 // ── 书架封面缩略图缓存 ────────────────────────────────────────────────────
@@ -5894,10 +5923,13 @@ bool readerLastBookInfo(StandbyBookInfo &out) {
   return true;
 }
 
-bool readerCoverScale(const std::string &bmpPath, int boxW, int boxH, uint8_t *out, size_t outCap,
-                      int &dw, int &dh, int &ox, int &oy) {
+// 流式版：把 bmp 缩成 0..15 灰度，逐行回调 sink —— 坐标已经是**屏上绝对**坐标
+// （bx + ox、by + oy + y）。不再需要调用方准备 boxW*boxH 的缓冲，见 rdBuildCoverThumbTo
+// 的头注释（待机封面框 515KB / 整屏图 812KB 都要一整块连续 PSRAM，实测最大只有 516KB）。
+bool readerCoverScaleTo(const std::string &bmpPath, int boxW, int boxH, int bx, int by,
+                        ReaderPixelRowSink sink, void *ctx, int &dw, int &dh, int &ox, int &oy) {
   dw = dh = ox = oy = 0;
-  if (bmpPath.empty() || boxW <= 0 || boxH <= 0 || out == nullptr) return false;
+  if (bmpPath.empty() || boxW <= 0 || boxH <= 0 || sink == nullptr) return false;
   if (!Storage.exists(bmpPath.c_str())) return false;
   HalFile f;
   if (!Storage.openFileForRead(TAG, bmpPath, f)) return false;
@@ -5907,42 +5939,54 @@ bool readerCoverScale(const std::string &bmpPath, int boxW, int boxH, uint8_t *o
   float scale = std::min(static_cast<float>(boxW) / sw, static_cast<float>(boxH) / sh);
   // **只缩不放**：源图比框小就按原尺寸画（下面 ox/oy 照样把它居中）。
   // 放大出来的像素要么是复制的、要么是插值的，细节全是编的 —— 待机封面表盘要的是
-  // "最清晰的那一版"，留白居中比糊掉强。（rdBuildCoverThumb 在放大时是按最近源像素
+  // "最清晰的那一版"，留白居中比糊掉强。（缩放管线在放大时是按最近源像素
   // 取样再上锐化，方块会被锐化放大，尤其难看。）
   if (scale > 1.0f) scale = 1.0f;
   int w = static_cast<int>(sw * scale), h = static_cast<int>(sh * scale);
   if (w < 1) w = 1;
   if (h < 1) h = 1;
-  if (static_cast<size_t>(w) * h > outCap) return false;
-  // 1:1（源图正好是这个尺寸）→ 逐行直拷，**不走 rdBuildCoverThumb**。
+  dw = w;
+  dh = h;
+  ox = (boxW - w) / 2;
+  oy = (boxH - h) / 2;
+  const int x0 = bx + ox, y0 = by + oy;
+  // 1:1（源图正好是这个尺寸）→ 逐行直拷，**不走缩放管线**。
   // 待机那张缓存就是按这个框解出来的原图，再经一遍 3×3 盒式平均 + 非锐化纯属白糊：
   // 面积比 = 1 时 kSharpen 仍然会加 2/8 的拉普拉斯，等于把刚解出来的像素又抹一遍。
   // 这里只做"提对比 + 量化到 0..15"，和缩放路径的最后一步同一个口径。
-  // / 1:1 source → straight row copy. Running it through rdBuildCoverThumb would apply
+  // / 1:1 source → straight row copy. Running it through the scaling pipeline would apply
   // a 3×3 box blur and a 2/8 Laplacian to pixels that were just decoded at this exact
   // size. Contrast + quantization only, same as the tail of the scaling path.
   if (w == sw && h == sh) {
     const int rowBytes = bmp.getRowBytes();
     std::vector<uint8_t> rowBuf(rowBytes), data(sw), opacity(sw);
+    std::vector<uint8_t> line(static_cast<size_t>(w));
     for (int y = 0; y < sh; y++) {
       if (bmp.readNextRow(data.data(), rowBuf.data(), opacity.data(), Bitmap::RowOutput::Gray8) != BmpReaderError::Ok)
         return false;
-      uint8_t *dst = out + static_cast<size_t>(y) * w;
       const DitherMode dm = rdCoverDitherMode();
       DitherRowState ds;
       for (int x = 0; x < sw; x++) {
-        if (opacity[x] == 0) { dst[x] = 15; continue; }   // 透明 = 纸白
-        dst[x] = grayToLevel16(rdCoverContrast(data[x]), x, y, dm, ds);
+        if (opacity[x] == 0) { line[x] = 15; continue; }   // 透明 = 纸白
+        line[x] = grayToLevel16(rdCoverContrast(data[x]), x, y, dm, ds);
       }
+      sink(ctx, x0, y0 + y, line.data(), w);
     }
-  } else if (!rdBuildCoverThumb(bmp, w, h, out)) {
-    return false;
+    return true;
   }
-  dw = w;
-  dh = h;
-  ox = (boxW - w) / 2;
-  oy = (boxH - h) / 2;
-  return true;
+  struct Ctx {
+    ReaderPixelRowSink sink;
+    void *ctx;
+    int x0, y0;
+  };
+  Ctx c{sink, ctx, x0, y0};
+  return rdBuildCoverThumbTo(
+      bmp, w, h,
+      [](void *p, int y, const uint8_t *row, int n) {
+        Ctx *c = static_cast<Ctx *>(p);
+        c->sink(c->ctx, c->x0, c->y0 + y, row, n);
+      },
+      &c);
 }
 
 // 把"现在读到哪"记进表。位置没变就整个返回，不碰 SD——所以翻目录、重绘、按键空转

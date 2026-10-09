@@ -7,7 +7,7 @@
 #include "font_renderer.h"
 #include "pcf85063.h"
 #include "ttf_font.h"       // 「关闭」表盘的提示页：按像素高直绘大字
-#include "screen_reader.h"  // readerLastBookInfo / readerStandbyCoverLayout / readerCoverScale
+#include "screen_reader.h"  // readerLastBookInfo / readerStandbyCoverLayout / readerCoverScaleTo
 #include "ui_helpers.h"
 #include "ui_render.h"      // ui_render_keep_frame（留一份休眠前画面）
 
@@ -394,7 +394,7 @@ static void drawAlmanacFace(bool valid) {
 // 清晰度靠两件事，都不在绘制这一层：
 //   1) 封面框取常见封面的 2:3：同一张图下采样比更小，丢的细节更少；待机封面缓存就是
 //      按这个框解出来的（standby_v5.bmp），绘制端与它 1:1；
-//   2) readerCoverScale 里**只缩不放**（scale ≤ 1）：源图比框小就按原尺寸画。
+//   2) readerCoverScaleTo 里**只缩不放**（scale ≤ 1）：源图比框小就按原尺寸画。
 //      放大要么复制像素、要么插值，画出来的细节都是编的，只会更糊。
 // 封面像素用 fb_fast 直写（0..15 灰阶），不走 g_rd.drawGrayscale16Pixel：g_rd 绑的是
 // front_fb，而待机表盘画在 ui_render 的工作缓冲上（见 ui_render.cpp 那条不变式）。
@@ -416,6 +416,16 @@ static std::string ellipsizeToWidth(const std::string &s, int maxW) {
     return out + kEll;
 }
 
+// readerCoverScaleTo 的 sink：逐行把 0..15 灰阶写进 framebuffer。x/y 已经是屏上绝对坐标，
+// ctx 只需要 framebuffer 指针。封面与整屏图两处共用（两边的 blit 本来就是同一行代码）。
+struct CoverBlitCtx {
+    uint8_t *fb;
+};
+static void coverRowToFb(void *ctx, int x, int y, const uint8_t *row, int w) {
+    uint8_t *fb = static_cast<CoverBlitCtx *>(ctx)->fb;
+    for (int i = 0; i < w; i++) fb_fast_set_gray(fb, x + i, y, row[i]);
+}
+
 static void drawCoverFace(const struct tm &tm, bool valid) {
     // 版式（封面框 + 信息区）只有一份，在 screen_reader 的 readerStandbyCoverLayout：待机
     // 封面的缓存文件就是按那个框解的，两边算出来必须一样，1:1 直拷那条快路径才命中得了。
@@ -431,23 +441,15 @@ static void drawCoverFace(const struct tm &tm, bool valid) {
 
     bool drew = false;
     if (hasBook) {
-        const size_t cap = static_cast<size_t>(lay.boxW) * static_cast<size_t>(lay.boxH);
-        // 一张封面约 200KB：**必须 PSRAM**（内部 RAM 挤不出这么大一块，见
-        // internal-ram-squeeze）。拿不到就退占位框 —— 表盘本身还是要出来的。
-        uint8_t *buf = static_cast<uint8_t *>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (buf) {
-            int dw = 0, dh = 0, ox = 0, oy = 0;
-            if (readerCoverScale(info.coverBmp, lay.boxW, lay.boxH, buf, cap, dw, dh, ox, oy)) {
-                fb_fast_sync();  // 每帧入口同步一次旋转/尺寸（见 fb_fast.h）
-                uint8_t *fb = u8g2_GetBufferPtr(g_u8g2);
-                const int bx = lay.boxX + ox, by = lay.boxY + oy;
-                for (int y = 0; y < dh; y++) {
-                    const uint8_t *row = buf + static_cast<size_t>(y) * static_cast<size_t>(dw);
-                    for (int x = 0; x < dw; x++) fb_fast_set_gray(fb, bx + x, by + y, row[x]);
-                }
-                drew = true;
-            }
-            heap_caps_free(buf);
+        // 封面像素**逐行直接画进 framebuffer**，不再先解进一块 515KB 的中转缓冲 ——
+        // 那块缓冲要**一整块连续** PSRAM，而实测最大连续块只有 516KB（PSRAM 碎片化），
+        // 于是封面永远分配不到、表盘只能画「暂无封面」。sink 拿到的是绝对坐标。
+        fb_fast_sync();  // 每帧入口同步一次旋转/尺寸（见 fb_fast.h）
+        CoverBlitCtx bc{u8g2_GetBufferPtr(g_u8g2)};
+        int dw = 0, dh = 0, ox = 0, oy = 0;
+        if (readerCoverScaleTo(info.coverBmp, lay.boxW, lay.boxH, lay.boxX, lay.boxY,
+                               coverRowToFb, &bc, dw, dh, ox, oy)) {
+            drew = true;
         }
     }
     u8g2_SetDrawColor(g_u8g2, 0);
@@ -560,23 +562,14 @@ static void drawImageFace() {
 
     bool drew = false;
     if (hasCache) {
-        const size_t cap = static_cast<size_t>(W) * static_cast<size_t>(H);
-        // 整屏 ~800KB：**必须 PSRAM**（内部 RAM 挤不出这么大一块，见 internal-ram-squeeze）。
-        uint8_t *buf = static_cast<uint8_t *>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (buf) {
-            int dw = 0, dh = 0, ox = 0, oy = 0;
-            // **只缩不放**（readerCoverScale 的口径）：缓存本来就是按这个屏尺寸 fit 出来
-            // 的，所以正常情况下是 1:1 直拷；比屏小的那张也不放大，居中留白。
-            if (readerCoverScale(bmp, W, H, buf, cap, dw, dh, ox, oy)) {
-                fb_fast_sync();  // 每帧入口同步一次旋转/尺寸（见 fb_fast.h）
-                uint8_t *fb = u8g2_GetBufferPtr(g_u8g2);
-                for (int y = 0; y < dh; y++) {
-                    const uint8_t *row = buf + static_cast<size_t>(y) * static_cast<size_t>(dw);
-                    for (int x = 0; x < dw; x++) fb_fast_set_gray(fb, ox + x, oy + y, row[x]);
-                }
-                drew = true;
-            }
-            heap_caps_free(buf);
+        // 与封面表盘同一条路子：逐行直接画进 framebuffer，不落中转缓冲（整屏那 812KB
+        // 连续块一样要不到，见 readerCoverScaleTo 的说明）。**只缩不放**：缓存本来就是按
+        // 这个屏尺寸 fit 出来的，所以正常情况下是 1:1 直拷；比屏小的那张也不放大，居中留白。
+        fb_fast_sync();  // 每帧入口同步一次旋转/尺寸（见 fb_fast.h）
+        CoverBlitCtx bc{u8g2_GetBufferPtr(g_u8g2)};
+        int dw = 0, dh = 0, ox = 0, oy = 0;
+        if (readerCoverScaleTo(bmp, W, H, 0, 0, coverRowToFb, &bc, dw, dh, ox, oy)) {
+            drew = true;
         }
     }
 
