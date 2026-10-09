@@ -10,6 +10,7 @@
 #include "quick_edit.h"
 #include "typing_click.h"
 #include "ui_helpers.h"
+#include "selection_handle.h"  // 选区手柄的形状（与阅读模式共用同一份几何）
 #include "hw/auto_orient.h"   // auto_orient_initial：本模式的「自适应」方向
 #include "hw/board.h"         // board_force_*/board_restore_orientation（模式方向切换）
 #include "hw/input.h"
@@ -1761,8 +1762,14 @@ static bool editorTapOnGlyph(int x, int y, TextPos &p) {
 
 // 选区两端的柄，画在反白块的**外面**（头柄在首行上方、尾柄在末行下方），
 // 于是是白底黑块——落在反白块里会被 XOR 搅成一团，也分不出是哪一端。
-// 24×24：原来是 10×10，两次被反馈"太小、按不准"，一路放大到 24。
-static const int ED_SEL_HANDLE = 12;  // 半边长；成品 24×24
+// 形状与阅读模式**同一份**（见 selection_handle.h）：空心圆环=没抓，实心圆饼=抓了 ——
+// 原来这边画的是方块，两个模式的选字手柄长得不一样，改成一圆一方的都收圆。
+// 半径 12（成品 ⌀24）：原来是 10×10 的方块，两次被反馈"太小、按不准"，一路放大到 24；
+// 这次只换形状，尺寸不动。
+// 往上/往下能长多少受行距限制：正文行距≈行高，上一行的字就贴在反白块上沿，所以柄有多
+// 高就压上一行多少 —— 放大只能往横里放，或者接受这点压字（阅读模式那边同一条注释）。
+static const int ED_SEL_HANDLE = 12;       // 半径；成品 ⌀24
+static const int ED_SEL_HANDLE_RING = 4;   // 空心时那一圈的宽度
 
 // 两个柄的左上角。*sPin / *ePin 告诉调用方这一端**其实在视口外**、被钉在视口边上了
 // （画成空心框，不给"抓/拖"以外的含义）。整段两端都取不到位置时（*sx = -1）不画。
@@ -2004,17 +2011,29 @@ static void drawEditorSelHandles() {
     bool sPin = false, ePin = false;
     editorSelHandleBoxes(&sx, &sy, &ex, &ey, &sPin, &ePin);
     if (sx < 0 || ex < 0) return;
-    const int hs = ED_SEL_HANDLE * 2;
-    // 抓着的那一端画成空心（黑框白心），跟"没抓"的实心块区分开：用户能看出下一次
-    // 点词会挪哪一端。正在被拖的那一端同样算"抓着"。被钉在视口边上的那端也是空心
-    // ——它其实在屏幕外，实心块会让人以为选区的这一头就画在这儿。
-    const bool gs = (g_editor.selGrab == 0 || g_editor.selDrag == 0 || sPin);
-    const bool ge = (g_editor.selGrab == 1 || g_editor.selDrag == 1 || ePin);
+    // 三态（阅读模式是两态，多出来的就是"钉在视口边上"这一种）：
+    //   空心环 = 没抓；实心饼 = 抓着（或正在拖）；
+    //   空心环 + 中心一点 = 这一端其实在**屏幕外**，被钉在视口边上了。
+    // 最后这一种必须和"没抓"分开：画成一样的环，用户会以为选区的这一头就画在这儿、
+    // 不再往屏幕外拖了（原来靠"钉住的也是空心框"区分，现在空心给了"没抓"，就得另起
+    // 一个记号——环心里那一点既不改外形、又一眼看出"这头不在此处"）。
+    const bool gs = (g_editor.selGrab == 0 || g_editor.selDrag == 0);
+    const bool ge = (g_editor.selGrab == 1 || g_editor.selDrag == 1);
     u8g2_SetDrawColor(g_u8g2, 0);
-    if (gs) u8g2_DrawFrame(g_u8g2, sx, sy, hs, hs);
-    else u8g2_DrawBox(g_u8g2, sx, sy, hs, hs);
-    if (ge) u8g2_DrawFrame(g_u8g2, ex, ey, hs, hs);
-    else u8g2_DrawBox(g_u8g2, ex, ey, hs, hs);
+    // 画一条横线。u8g2 的坐标是无符号的，越界的 x 会绕成天文数字（虽然会被窗口裁掉，
+    // 但该露在屏内的那半截也一起丢了），所以自己先把这一段夹进屏内。
+    auto put = [](int x, int y, int w) {
+        if (x < 0) { w += x; x = 0; }
+        if (w <= 0 || y < 0 || y >= SCREEN_H) return;
+        u8g2_DrawHLine(g_u8g2, x, y, w);
+    };
+    selHandleRaster(sx + ED_SEL_HANDLE, sy + ED_SEL_HANDLE, ED_SEL_HANDLE, ED_SEL_HANDLE_RING,
+                    gs, put);
+    selHandleRaster(ex + ED_SEL_HANDLE, ey + ED_SEL_HANDLE, ED_SEL_HANDLE, ED_SEL_HANDLE_RING,
+                    ge, put);
+    const int PIN_DOT = ED_SEL_HANDLE / 3;   // ⌀8：环心那一点（环孔 ⌀16，留得下）
+    if (sPin) selHandleRaster(sx + ED_SEL_HANDLE, sy + ED_SEL_HANDLE, PIN_DOT, 0, true, put);
+    if (ePin) selHandleRaster(ex + ED_SEL_HANDLE, ey + ED_SEL_HANDLE, PIN_DOT, 0, true, put);
     u8g2_SetDrawColor(g_u8g2, 1);
 }
 

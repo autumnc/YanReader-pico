@@ -59,10 +59,11 @@ inline void writeString(HalFile& file, const std::string& s) {
 [[nodiscard]] inline bool readString(HalFile& file, std::string& s, const uint32_t maxLength) {
   uint32_t len = 0;
   if (!readPod(file, len) || len > maxLength) return false;
-  const size_t position = file.position();
-  const size_t fileSize = file.size();
-  if (position > fileSize || len > fileSize - position) return false;
-
+  // 别在这里问 file.position()/file.size()。HalFile::size() 是 ftell → fseek(END) → ftell →
+  // fseek(回)，一次就把 stdio 的读缓冲打掉；这个函数在 TextBlock::deserialize 里是**逐词**
+  // 调的（一页几百个词，逐词读 ruby 数据），于是每词都退化成一次随机扇区读，一页白花 300~615ms。
+  // 那个边界检查本来也是冗余的：长度上限 maxLength 已经挡住畸形值，截断则被 file.read 的短读
+  // 返回值抓住（它返回实际读到的字节数）。
   std::string next;
   next.resize(len);
   if (len > 0 && file.read(next.data(), len) != static_cast<int>(len)) return false;

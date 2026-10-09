@@ -4,10 +4,12 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <sys/stat.h>
 #ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
 #include "esp_vfs_fat.h"
 #else
 #include <sys/statvfs.h>
@@ -38,6 +40,20 @@ static const char* toFopenMode(oflag_t oflag) {
 // 仍处于打开状态的 SD 文件数（FATFS VFS 槽位占用）。见 HalStorage::liveFileCount()。
 static int s_liveFiles = 0;
 
+// stdio 读缓冲的大小，见 HalFile::Impl::attachStdioBuffer()。一页正文约 3.5KB，
+// 16KB 够一页一次 refill；比 FATFS 的 4KB 扇区大，顺带把跨扇区的连续读也并进来。
+static constexpr size_t kStdioBufBytes = 16 * 1024;
+
+// attachStdioBuffer 拿到的缓冲要按来时那条路还回去。
+static void freeStdioBuf(char* p) {
+  if (!p) return;
+#ifdef ESP_PLATFORM
+  heap_caps_free(p);
+#else
+  free(p);
+#endif
+}
+
 int HalStorage::liveFileCount() { return s_liveFiles; }
 
 // HalFile 的 pimpl：必须在 HalStorage::open 之前定义，保证 new HalFile::Impl(...) 时类型完整。
@@ -58,8 +74,36 @@ class HalFile::Impl {
       --s_liveFiles;   // 与 open() 里的 ++ 配对（close() 已置空 fp 时不会重复减）
     }
     if (dp) closedir(dp);
+    // 缓冲是我们自己给的，picolibc 只会 free 它自己 calloc 的那份（带 __BALL 标志），
+    // 所以必须在这里收掉，否则每开一个文件漏 16KB PSRAM。
+    freeStdioBuf(rbuf);
   }
+
+  // 把 stdio 的默认缓冲换成一大块。为什么必须换：picolibc 给新 FILE 挂的默认缓冲是
+  // fstat() 报的 st_blksize，报 0 就回落到 BLKSIZ=128 字节（见 FATFS 的
+  // CONFIG_FATFS_VFS_FSTAT_BLKSIZE，sdkconfig 里是 0），而 FatFs 的逻辑扇区是
+  // CONFIG_FATFS_SECTOR_4096=4KB。128B 的缓冲碰上 4KB 的扇区 = 32 倍读放大：读一页
+  // 约 3.5KB 要 28 次 refill，每次 refill 都把整个 4KB 扇区从卡上重读一遍（实测
+  // 「取页拆账」里一页 127ms，其中约 118ms 就是这 28 次物理读）。
+  //
+  // 换成 16KB 之后一页只落一次 refill。setvbuf 只能在任何 I/O 之前调用（picolibc 的
+  // __bufio_setvbuf 一看 bf->size != -1 就直接返回），这里紧跟 fopen，是安全的。
+  void attachStdioBuffer() {
+#ifdef ESP_PLATFORM
+    // PSRAM：内部堆只剩几十 KB，这里让开。拿不到就退回默认的 128B —— 只是慢，不是错。
+    rbuf = static_cast<char*>(heap_caps_malloc(kStdioBufBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#else
+    rbuf = static_cast<char*>(malloc(kStdioBufBytes));
+#endif
+    if (!rbuf) return;
+    if (setvbuf(fp, rbuf, _IOFBF, kStdioBufBytes) != 0) {
+      freeStdioBuf(rbuf);
+      rbuf = nullptr;
+    }
+  }
+
   FILE* fp = nullptr;
+  char* rbuf = nullptr;   // attachStdioBuffer 给 stdio 的读缓冲（PSRAM），由 ~Impl 释放
   DIR* dp = nullptr;   // 非空 = 这是个可枚举的目录（此时 fp 恒为空，不占 VFS 槽位）
   std::string path;
   bool isDir = false;
@@ -130,6 +174,9 @@ HalFile HalStorage::open(const char* path, const oflag_t oflag) {
     fclose(fp);
     return {};
   }
+  // 会读的文件（含 crossmux 那个 w+b 的回读句柄）才搭大缓冲：纯写文件保持 128B 不动，
+  // 免得把写路径的 flush 时机也一起改了。
+  if (oflag & (FS_RDONLY | FS_RDWR)) impl->attachStdioBuffer();
   ++s_liveFiles;
   return HalFile(std::move(impl));
 }

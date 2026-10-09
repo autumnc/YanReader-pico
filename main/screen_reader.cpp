@@ -18,6 +18,7 @@
 #include "screen_reader_internal.h"  // RdState/共享原语（P3b 拆文件后的内部层）
 #include "reader_page_turn.h"  // 揭页提示：只有裸声明，不会拖进 epdiy.h
 #include "reader_refresh_bridge.h"  // 白底纪律记账 / 自检页自推屏（同样只有裸声明）
+#include "selection_handle.h"  // 选区手柄的形状（与写作模式共用同一份几何）
 #include "ui_render.h"   // ui_render_drain：进阅读器前等在飞的 UI 推屏收尾
 #include "ui_helpers.h"  // drawIMEUI / imeBarPanelH：实体键盘打字时的输入法条（见 drawRdImeBar）
 #include "usb_msc.h"     // U盘模式：SD 卡整卡经 TinyUSB MSC 暴露给电脑
@@ -31,6 +32,7 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/idf_additions.h>  // xTaskCreatePinnedToCoreWithCaps：推屏任务的栈放 PSRAM
 
 #include <HalDisplay.h>
 #include <HalStorage.h>
@@ -1846,6 +1848,39 @@ static bool rdPrebuildShouldYield() {
          (s_rdPrebuildDeadlineUs > 0 && esp_timer_get_time() >= s_rdPrebuildDeadlineUs);
 }
 
+// ── 字形预热自己的预算 ──────────────────────────────────────────────────
+// 上面那份预算从**空闲帧开头**起算，而这个空闲帧的第一笔就是排版留档（rdAheadFill，
+// 实测 172~346ms、不可中断）—— 排完预算早就超了几十倍，于是"排版那一帧字形一个字都
+// 暖不了"，进度全压到下一帧去。实测后果（2026-10-09 抓串口）：每个空闲帧只啃**一块**
+// 字形（55~451ms），一页要排在后面两三个帧才暖得完，而翻页比这快 —— 预热永远追不上，
+// 于是每一翻都在重画里现暖（实测 346~1099ms，占翻页耗时的一半以上）。
+//
+// 所以预热自己起算一份预算：排版花掉的不算在它头上，每个空闲帧就都真的暖满一小段。
+// 取 300ms 而不是"整套空闲时间"：稳态下一页的预热约 7 块 × 15~40ms ≈ 300ms，一帧刚好
+// 收工（加上重排那一帧，两帧 ≈ 630ms < 一次翻页的间隔 1.2s，追得上）；而留档一旦暖齐
+// （glyphsWarm）这一趟就是空操作，重帧只在"落后了要追"的时候出现，自限。
+// 帧可以长到什么程度不伤手感，取决于让位的粒度而不是预算大小 —— 见 rdWarmStringResume
+// 里"块切 96 字节、检查放在块之前"那一段：有点按时一块之内（约 15~40ms）就收手。
+static int64_t s_rdWarmDeadlineUs = 0;
+static const int64_t kWarmFrameBudgetUs = 300 * 1000;
+// 「这一趟已经认准了要干完，见键也别让开」。只在推屏后那段、且排队等着的正是朝
+// s_turnDir 这一侧的翻页时打开（见 renderCurrent 收尾与 rdPrerenderTurnPage）。
+// 那一下子让开等于永远备不齐 —— 下一拍又得现画 ~720ms；干完它那一指就只剩 memcpy。
+// 默认关着：别的路上"见键让位"是老规矩。**预建（rdPrebuildAhead）也算在内**：
+// 实测有一整段连续 4 拍吃不到预渲染，就是因为预建在入口看到待发键就整趟缩了，
+// 连排版留档都没建出来，于是后面那几道闸全卡在"留档没这份"。
+static bool s_rdCommitted = false;
+
+static bool rdWarmShouldYield() {
+  // 无条件取一次待发键：它顺手补采一次触摸（input_pending_key 内部就调 input_tick，
+  // 见 input.h）。**别把它短路掉** —— 认准了要干完的那一趟会连着跑一秒多，而推屏那一拍
+  // 之后主循环一次触摸都不采（阅读器整条路都在这个任务里同步跑），这期间"按下又抬手"
+  // 的整个点按没人采到就没了。让位与否是下一句的事，采不采是这一句的事。
+  const int k = input_pending_key();
+  return (!s_rdCommitted && k != 0) ||
+         (s_rdWarmDeadlineUs > 0 && esp_timer_get_time() >= s_rdWarmDeadlineUs);
+}
+
 // 「这本书的待机封面已经试过了吗」——见 rdPrebuildAhead 开头那一段。换书时路径变了
 // 自然失效，所以不用显式清。
 static std::string s_rdSbTriedPath;
@@ -1874,7 +1909,10 @@ static void rdPrebuildAhead() {
   // 的排版余量同一个道理：把"翻页那一拍要付的钱"提前。放在这里（而不是下面 bookKind==0
   // 那段里）是因为 TXT 也要备，而下面那条分支把非 EPUB 全都早退了。它自己判 mode/bookKind，
   // 且两份留档都带键去重，重复调是空操作。
-  if (!rdPrebuildShouldYield()) rdPrepareAheadPages();
+  // 认准了要干完的那一趟（s_rdCommitted）连"待发键"这道也放开：这一趟的价值全押在
+  // 排版留档上，缩掉它后面几道闸就全成了"留档没这份"（见 s_rdCommitted 的说明）。
+  // 只放开这一句：下面的弹注/链接/本节续排照旧按 10ms 预算来。
+  if (s_rdCommitted || !rdPrebuildShouldYield()) rdPrepareAheadPages();
   if (st.bookKind != 0 || !st.section) { s_rdPrebuildDeadlineUs = 0; return; }
   // 挂起的弹注排在最前面：它要的是**锚点那一页**，可能远在几十页之外（注文常整块压在
   // 章末），比"领先读者 kPrebuildAhead 页"要紧得多。它自己带预算，也在里面把结果弹出来。
@@ -2280,8 +2318,32 @@ struct RdBodyInkScope {
 // 必须在内容字面下调用：角色不同，loca/glyf 的基址就不同，拿错字面等于白读一遍。
 // 内建字体/已整表映射时 ttf_warm_text_px 直接返回，这里是空操作。
 // 传的是去重前的整段文本，去重与"已缓存则跳过"都在 font 侧做。
-static bool rdWarmStrings(int role, const std::string &all, bool yieldToKey) {
-  if (all.empty()) return true;
+// 块大小按**谁来调**分两档，理由见下面那一大段：
+//   · 翻页那一帧（yieldToKey=false）用大块 —— 它不怕被打断，块越大 io_flush_touches
+//     并得越狠；
+//   · 空闲帧（yieldToKey=true）用小的一块 —— 让位的粒度就是"一块"。
+static const size_t kChunkTurn = 384;
+static const size_t kChunkIdle = 96;
+
+// 字形预热的**唯一**实现：把 text[offset..] 按块"读块 → 栅格化"喂完，返回"喂完了"。
+// offset 是进/出参：中途让位时停在一块边界上，下一次从这儿接着喂 —— 空闲帧正是靠它
+// 把一页的预热摊到好几拍上（进度记在 rdWarmAheadPage 的 warmStage/warmOffset 里）。
+//
+// 分块喂、每块"读块 → 栅格化"成对做完再走下一块：块缓存只有 128 块（512KB，ttf_font.c
+// 的 TTF_IO_SLOTS），一整页的字形块远超它 —— 若先整页读、再整页栅格化，前面读进来的块
+// 在栅格化到后面时早被挤出去，等于白读。配对做，块缓存只需装下当前这一块。
+// 块边界不能落在多字节字符中间（往后推到下一个 UTF-8 起始字节）。
+//
+// **让位粒度就是块大小**：一块是两段不可中断的调用（读 + 栅格化），所以"有点按之后要等
+// 多久"≈"一块要多久"。实测一大块（384 字节）要 55~451ms，而一次点按只有 60~120ms
+// —— 整个落进一块里，"按下"和"抬手"都采不到（见 main/hw/input.cpp 的 input_tick），
+// 用户侧就是"点了没反应，得再点一次"。空闲帧切成 1/4 块（96 字节 ≈ 32 个汉字，实测
+// 约 15~40ms）才配得上手指；多付的开销只是每 384 字节多 3 次 seek（相邻字形的字形块
+// 本来就挨着，io_flush_touches 照样能并成顺序读），整页算下来是个位数毫秒。
+// 检查放在块**之前**：放在块后等于每次都先啃完一块才看得见有人要点，白等一整块。
+// 翻页那一帧不怕打断（这一页马上要画，半途而废只会更慢），所以由调用方给 false。
+static bool rdWarmStringResume(int role, const std::string &text, size_t &offset, bool yieldToKey) {
+  if (offset >= text.size()) return true;
   ttf_set_role(role);
   // 栅格化出来的字形是按「字重 / 合成加粗」记进缓存的（cache_lookup 拿 current_weight
   // 与 synth_dw 判同），而正文字重只由排版设定决定、由 RdBodyInkScope 打开。预热必须在
@@ -2289,32 +2351,28 @@ static bool rdWarmStrings(int role, const std::string &all, bool yieldToKey) {
   // 页挤出去。绘制那边在同一个作用域里画，于是预热与绘制**只有一套字形**。
   RdBodyInkScope ink;
   const int px = kBodyPx[st.fontLevel];
-  // 分块（384 字节）喂，每块"读块 → 栅格化"成对做完再走下一块：块缓存只有 128 块
-  // （512KB，ttf_font.c 的 TTF_IO_SLOTS），一整页的字形块远超它 —— 若先整页读、再整页
-  // 栅格化，前面读进来的块在栅格化到后面时早被挤出去，等于白读。配对做，块缓存只需装下
-  // 当前这一块。384 字节对一整页（~700 字节）大约切两三刀，采样间隔 ~40~100ms。
-  // 块边界不能落在多字节字符中间（往后推到下一个 UTF-8 起始字节）。
-  const size_t kChunk = 384;
-  char buf[kChunk + 4];  // 让位对齐到 UTF-8 边界最多要再多 3 字节
-  size_t i = 0;
-  while (i < all.size()) {
-    size_t n = std::min(kChunk, all.size() - i);
-    while (i + n < all.size() && (static_cast<unsigned char>(all[i + n]) & 0xC0) == 0x80) n++;
-    memcpy(buf, all.data() + i, n);
+  const size_t kChunk = yieldToKey ? kChunkIdle : kChunkTurn;
+  char buf[kChunkTurn + 4];   // 让位对齐到 UTF-8 边界最多要再多 3 字节
+  while (offset < text.size()) {
+    // 真有点按在排队就立刻收手、返回"没做完"，让那一拍去翻页，下一次空闲帧从 offset
+    // 接着喂（预算见 rdWarmShouldYield）。用户要翻页时，多半秒的等待比少暖几个字重要得多。
+    if (yieldToKey && rdWarmShouldYield()) return false;
+    size_t n = std::min(kChunk, text.size() - offset);
+    while (offset + n < text.size() && (static_cast<unsigned char>(text[offset + n]) & 0xC0) == 0x80) n++;
+    memcpy(buf, text.data() + offset, n);
     buf[n] = '\0';
     ttf_warm_text_px(px, buf);     // 这一块的字形块读进块缓存（IO）
     ttf_raster_text_px(px, buf);   // 立刻解析成位图（读的就是刚进来的那几块）
-    i += n;
-    if (i >= all.size()) break;
-    // 块间补采一次输入。预热是一段同步阻塞（一页数百毫秒），期间主循环一次都不采触摸
-    // —— 而点按必须"按下"和"抬手"各被采到一次，整段落在里面的点按一点痕迹都不留
-    // （用户侧："点了要等一会儿才翻页，这期间怎么点都一样"）。
-    // yieldToKey：空闲帧预热传 true —— 真有点按在排队就立刻收手、返回"没做完"，让那
-    // 一拍去翻页，下一次空闲帧从头重来。用户要翻页时，多半秒的等待比少暖几个字重要得多。
-    // 翻页那一帧自己不能这么干（这一页马上要画），所以由调用方给 false。
-    if (yieldToKey && rdPrebuildShouldYield()) return false;
+    offset += n;
   }
   return true;
+}
+
+// 整页一次性喂完（没有可续的进度条）：排版刚建好、这一页马上就画的那几处用它。
+// 分段喂、要能续的走 rdWarmStringResume。
+static bool rdWarmStrings(int role, const std::string &all, bool yieldToKey) {
+  size_t offset = 0;
+  return rdWarmStringResume(role, all, offset, yieldToKey);
 }
 
 // 整页预热（IO + 栅格化，两拨都见 rdWarmStrings）。返回"两拨都做完了"：空闲帧那一趟
@@ -2348,27 +2406,6 @@ static bool rdWarmPageText(const RdPageText &pt, bool yieldToKey) {
     return false;
   }
   if (!rdWarmStrings(TTF_ROLE_CONTENT, main, yieldToKey)) return false;  // 同上，角色已在内容面
-  return true;
-}
-
-static bool rdWarmStringResume(int role, const std::string &text, size_t &offset, bool yieldToKey) {
-  if (offset >= text.size()) return true;
-  ttf_set_role(role);
-  RdBodyInkScope ink;
-  const int px = kBodyPx[st.fontLevel];
-  const size_t kChunk = 384;
-  char buf[kChunk + 4];
-  while (offset < text.size()) {
-    size_t n = std::min(kChunk, text.size() - offset);
-    while (offset + n < text.size() && (static_cast<unsigned char>(text[offset + n]) & 0xC0) == 0x80) n++;
-    memcpy(buf, text.data() + offset, n);
-    buf[n] = '\0';
-    ttf_warm_text_px(px, buf);
-    ttf_raster_text_px(px, buf);
-    offset += n;
-    if (offset >= text.size()) break;
-    if (yieldToKey && rdPrebuildShouldYield()) return false;
-  }
   return true;
 }
 
@@ -2537,7 +2574,10 @@ static bool rdWarmAheadPage(RdAheadPage &dst, bool yieldToKey) {
     }
     dst.warmStage++;
     dst.warmOffset = 0;
-    if (yieldToKey && rdPrebuildShouldYield()) {
+    // 段之间也看一眼 —— 用**预热自己**那份预算（rdWarmShouldYield），不是空闲帧那份：
+    // 帧预算在排版那一笔之后早就超了，拿它判等于每次都在第一段就收手、一个字不暖
+    // （warmAlt2/warmAlt 常是空的，第一段瞬间返回，正好撞上这个检查）。
+    if (yieldToKey && rdWarmShouldYield()) {
       ttf_set_role(TTF_ROLE_CONTENT);
       return false;
     }
@@ -2603,9 +2643,15 @@ static void rdPrepareAheadPages() {
   if (st.bookKind != 0 && st.bookKind != 1) return;   // XTC 是整页位图，没有字形
   if (st.bookKind == 0 && !st.section) return;
   // 用户正要点：这一趟一个活都别开。最长的一段是方向那一侧的字形预热（实测 89~654ms），
-  // 它自己会在块间让位（见 rdWarmStrings），但开头的排版留档（~150~250ms）不可中断，
+  // 它自己会在块间让位（见 rdWarmStringResume），但开头的排版留档（~150~250ms）不可中断，
   // 所以先在这里看一眼 —— 有人要点就去翻页，别让他在留档上等。
-  if (rdPrebuildShouldYield()) return;
+  // 判据只用**点按**，不用空闲帧那份预算：那份预算从帧首起算、只有 10ms，拿它判等于
+  // 除了第一趟以外所有空闲帧都被挡在门外（排版留档根本没机会做，也就没东西可暖）。
+  // 例外：s_rdCommitted（推屏后认准了"等着的正是朝我这一侧的翻页"）——那一趟的全部价值
+  // 就押在这份留档上，缩掉它后面几道闸全是"留档没这份"。这是本文件里最后一道、也是最
+  // 隐蔽的一道"见键就让开"：它在 rdPrebuildAhead 那道之外，实测 12:8/12:9 两拍就是
+  // 卡在这里（外面放行了，里面又缩了）。
+  if (!s_rdCommitted && input_pending_key() != 0) return;
 
   const bool epub = (st.bookKind == 0);
   const int spine = epub ? st.spineIndex : -1;
@@ -2630,17 +2676,36 @@ static void rdPrepareAheadPages() {
       const int64_t t = esp_timer_get_time();
       if (rdAheadFill(dp, key, *slot)) fwdLayoutMs = static_cast<int>((esp_timer_get_time() - t) / 1000);
     }
-    if (rdPrebuildShouldYield()) bailed = true;
+    // 同上：判据是**点按**。原来这里判空闲帧预算，而排版那一笔（~200ms）必然把它超掉 →
+    // 几乎每一趟都在这里置位 bailed，下面"另一侧"的排版跟着白等一帧（日志里
+    // 「[上一页 N]排版 -1」多半是这么来的，不是没活干）。
+    if (input_pending_key() != 0) bailed = true;
     if (slot->key == key && !slot->glyphsWarm) {
       const int64_t t = esp_timer_get_time();
+      // 这一趟给字形预热一份**自己的**预算（见 rdWarmShouldYield）：预算从排版之后起算，
+      // 所以每个空闲帧都真能暖满一小段 —— 追得上翻页的手速，下一翻才不用在重画里现暖。
+      // 有点按时它仍是一块之内收手（见 rdWarmStringResume）。
+      s_rdWarmDeadlineUs = t + kWarmFrameBudgetUs;
       rdWarmAheadPage(*slot, true);
+      s_rdWarmDeadlineUs = 0;
       fwdWarmMs = static_cast<int>((esp_timer_get_time() - t) / 1000);
-      // 让位给用户的点按（见 rdWarmStrings 的 yieldToKey）：没暖完就到此为止 —— 排版的账
+      // 让位给用户的点按（见 rdWarmStringResume 的 yieldToKey）：没暖完就到此为止 —— 排版的账
       // 已经记下了，下一次空闲帧只补字形这一栏（看 slot->glyphsWarm 就知道）。
       if (!slot->glyphsWarm) bailed = true;
     }
   }
   // （2）另一侧：只备排版，见 s_prev 的说明。
+  //
+  // 这里**再查一次**待发键。上面那一次（方向侧排版之后）位置太靠前：它到这一栏之间还夹着
+  // 一整段字形预热，实测 210ms —— 手指正好落在预热那一段里的话，那一次早就跑完了，这一栏
+  // 照样开工。12:59 那一拍就是：手指 388710 锁存，而「[上一页 57]排版」388818 才开始，
+  // 216ms 整段花在用户此刻根本不要的一页上，这一帧也因此晚了 216ms 才收尾。
+  //
+  // 为什么只有这一栏"让开"是净省：方向那一侧的排版/字形，下一拍真的会用到 —— 让它让开
+  // 只是把同一份活挪给下一拍现付（总账不变，还害得那一拍现暖）；另一侧的排版下一拍多半
+  // 用不上，让开就是真省下来。旁边那几道闸（rdWarmShouldYield / 3125 行）在 s_rdCommitted
+  // 那一趟里是故意放开的，理由同上 —— 那几栏都不是投机，这一栏是。
+  if (!bailed && input_pending_key() != 0) bailed = true;
   if (!bailed && op >= 0 && op < total) {
     const std::string key = rdLayoutKey(spine, op);
     if (other->key != key) {
@@ -2759,12 +2824,37 @@ static void rdHoldClear() {
   s_hold.links.clear();
 }
 
+// 画面上有没有"跟着用户的手在变、且画在**正文层里**的层"。留档/预渲染存下的都是
+// "干净的一页"（两个生产侧就是照这个条件跳过的），所以**消费侧（贴回来之前）也得问
+// 同一句**：选区是画在正文层里的（renderEpubPage 里的 rdDrawOverlays），整块贴回旧像素
+// 就等于把这一帧的反白块/手柄/动作条全抹掉 —— 真机踩过：长按进选字态，屏幕"闪了一下
+// 却没有反白"，之后每一点按贴的都是同一张干净图，看着就是"卡住不动了"。
+static bool rdLiveLayerUp() { return st.selActive || st.vkVisible; }
+
+// 整帧留档的键 = 版式键 + "画进这一层像素里、又不改版式"的那些档。
+//
+// 版式键（rdLayoutKey）只管字体/行距/边距/缩进/页。可正文层像素还取决于另外几条：
+//   · 标注条数 —— 加一条删一条，版式键一点没变（新加的标注得翻一页才看得见）；
+//   · 字重 / 对比度 —— 逐像素查的墨表（rdDrawSpan 之外，正文每一行都要走
+//     RdBodyInkScope），
+//   · 阅读线 —— renderEpubPage 里在正文之后叠的那几条线，
+//   · 图片抖动 —— 插图那一块怎么量化。
+// 后四条正是 `applyRdPick` 里**刻意不 reopenBook** 的那批（只重画当前页），于是版式键
+// 完全不动 —— 真机症状就是"改完字重/对比度/阅读线，画面纹丝不动，翻一页才变"。
+// 全是廉价标量，进了键就把这几条都变成"键不符 → 照原路现画"，代价只是一次本该发生的
+// 重画。**以后再加"只重画不重排"的档，必须往这儿补一位**，否则就是这个 bug 的新一份拷贝。
+static std::string rdHoldKey(int spine, int page) {
+  return rdLayoutKey(spine, page) + "|n" + std::to_string(st.notes.size()) + "|w" +
+         std::to_string(st.fontWeight) + "|c" + std::to_string(st.contrast) + "|l" +
+         std::to_string(st.readingLine) + "|d" + std::to_string(st.imageDither);
+}
+
 // 生产侧（renderCurrent 里正文层画完、浮层之前那一点调）。
 static void rdHoldCapture() {
   if (st.mode != RdMode::Reading) return;
   if (st.bookKind != 0 && st.bookKind != 1) return;   // 只做 EPUB/TXT 的正文页
   if (s_imgPresentSkipped) return;                    // 图片解码被打断，帧缓冲里是半张图
-  if (st.vkVisible || st.selActive) return;           // 有跟着手在变的层
+  if (rdLiveLayerUp()) return;                        // 有跟着手在变的层（见 rdLiveLayerUp）
   const size_t n = g_rd.getBufferSize();
   if (n == 0) return;
   if (!s_holdAllocTried) {
@@ -2789,7 +2879,7 @@ static void rdHoldCapture() {
   memcpy(s_holdFb, g_rd.getFrameBuffer(), n);
   const int spine = (st.bookKind == 0) ? st.spineIndex : -1;
   const int page = (st.bookKind == 0) ? st.page : st.txtPage;
-  s_hold.key = rdLayoutKey(spine, page);
+  s_hold.key = rdHoldKey(spine, page);
   s_hold.text = g_pageText;
   s_hold.links = st.pageLinks;
   s_hold.footnotes = st.pageInfoFootnotes;
@@ -2806,10 +2896,11 @@ static void rdHoldCapture() {
 static bool rdHoldTake() {
   if (s_holdFb == nullptr || s_hold.key.empty()) return false;
   if (st.bookKind != 0 && st.bookKind != 1) return false;
+  if (rdLiveLayerUp()) return false;   // 见 rdLiveLayerUp：这一帧要画选区/键盘，不能贴旧像素
   if (g_rd.getScreenWidth() != s_hold.w || g_rd.getScreenHeight() != s_hold.h) return false;
   const int spine = (st.bookKind == 0) ? st.spineIndex : -1;
   const int page = (st.bookKind == 0) ? st.page : st.txtPage;
-  if (s_hold.key != rdLayoutKey(spine, page)) return false;
+  if (s_hold.key != rdHoldKey(spine, page)) return false;
   const size_t n = g_rd.getBufferSize();
   if (n == 0 || n > s_holdFbSize) return false;
   // 派生信息只能从留档来（同 rdPreBlit 那一段，一字不差）：点链接要 st.pageLinks，
@@ -2839,6 +2930,9 @@ static bool rdHoldTake() {
 // 装上（跳过的是**像素**，不是状态）。返回 true = 这一帧已经画好了，renderReading 直接返回。
 static bool rdPreBlit() {
   if (rdHoldTake()) return true;
+  // 预渲染那块 scratch 也存的是**干净的一页**（生产侧同样按 rdLiveLayerUp 跳过），
+  // 所以这一路一样要问：进选字/起键盘之后，贴回来等于把反白块/手柄/动作条抹掉。
+  if (rdLiveLayerUp()) return false;
   if (s_preKey.empty() || s_preFb == nullptr) return false;
   if (st.bookKind != 0 && st.bookKind != 1) return false;
   const int spine = (st.bookKind == 0) ? st.spineIndex : -1;
@@ -2871,10 +2965,47 @@ static bool rdPreBlit() {
   return true;
 }
 
-// 生产侧（空闲帧调）：把 s_turnDir 那一侧的整帧画进 scratch。不做任何上屏、不改任何对外状态。
-static void rdPrerenderTurnPage() {
-  if (!rdPrerenderOn()) return;
+// 「已经排队、还没被取走的那一个键」如果是"朝某一侧翻页"，返回它的方向；
+// 返回 0 = 没有待取按键，2 = 有待取按键但认不出方向（长按/中间点按/蓝牙回车/电容键…）。
+// 语义必须与 handleReading 的分发**一模一样**（那边是权威）：'\n' 看落点三分区
+// （左 1/3 往前、右 1/3 往后、中间 1/3 开菜单），滑动那几种键是哪个就随哪个。
+// 取的是待发键自己的坐标（input_pending_tap_xy）：阅读器整帧绘制期间采到的点按只能
+// 排队，input_tap_xy() 那一份还没轮到它。
+//
+// 唯一用途见 rdPrerenderTurnPage 的 afterTurn 与 renderCurrent 收尾：判断"要不要把手上的
+// 预渲染干完"。认错了的代价是白干一趟（最多 ~1s 的不可中断时段），所以宁可保守 ——
+// 认不出就当"不是"。
+static int rdPendingTurnDir() {
+  const int k = input_pending_key();
+  if (k == 0) return 0;
+  if (k == KEY_DOWN || k == KEY_RIGHT || k == KEY_PAGE_DOWN) return +1;
+  if (k == KEY_UP || k == KEY_LEFT || k == KEY_PAGE_UP) return -1;
+  if (k == '\n') {
+    int x = 0;
+    if (input_pending_tap_xy(&x, nullptr)) {
+      const int w = g_rd.getScreenWidth();
+      if (x < w / 3) return -1;
+      if (x > w * 2 / 3) return +1;
+    }
+  }
+  return 2;
+}
+
+// 生产侧：把 s_turnDir 那一侧的整帧画进 scratch。不做任何上屏、不改任何对外状态。
+//
+// 两个调用点，差别只在"缺东西时等不等"（afterTurn）：
+//   · 空闲帧（afterTurn=false）：闸门链照旧 —— 排版与字形都得由预建备齐了才动手。空闲帧
+//     是慢节奏下的节拍源，一趟只做一小口，不能拿一段更长的不可中断时段去换。
+//   · **推屏之后那段空档**（afterTurn=true，见 renderCurrent 收尾）：这是快翻时"翻页那一拍"
+//     唯一的喘息处，也是唯一能翻盘的地方 —— 快翻的循环里**根本没有空闲帧**（实测抓 16 拍，
+//     预建把空档整段吃掉，闸门链只被叫到 1 次），所以等预建永远等不到。这条路上缺什么就
+//     自己现补：现补的正是翻页那一拍本来要付的钱（排版 ~350ms / 字形 ~340ms），补上了
+//     下一拍就只剩 memcpy。安静闸在这条路上没有意义（那一拍刚刚才有过按键）。
+//   兜底的仍然是点按：字形预热在块边界（15~40ms）让位、绘制前再查一次，所以点按最多
+//   多等"半个预热块 + 一次绘制"，不会真的卡住。
+static void rdPrerenderTurnPage(bool afterTurn = false) {
   if (st.mode != RdMode::Reading) return;
+  if (!rdPrerenderOn()) return;
   if (st.bookKind != 0 && st.bookKind != 1) return;   // XTC 是整页位图，绘制本来就不贵
   if (st.bookKind == 0 && !st.section) return;
   // 画面上有跟着用户的手在变的层（虚拟键盘、选区标注）时整帧预测画不准，这一趟不做。
@@ -2892,15 +3023,58 @@ static void rdPrerenderTurnPage() {
   const std::string key = rdLayoutKey(spine, np);
   if (np < 0 || np >= total) return;   // 方向那一侧的边界（末页/首页）要跨节，那是翻页那一拍的活
   if (s_preKey == key) return;   // 已经备好，正等着被翻页取走
+  // 日志里的页号（st 下面要被借去当"目标页"用，画完才还回来）。
+  const std::string where = epub ? std::to_string(spine) + ":" + std::to_string(np) : std::to_string(np);
   // 留档（排版 + 整页字形）必须**已经备齐**：没备齐就先让上面那趟去备 —— 这一趟画的
   // 时候现排一页（或现栅格化整页字形）会比绘制贵得多，等于把一段更长的不可中断时段搬到
   // 这里，得不偿失。等它备齐，下一趟空闲帧再来画。
+  // 排版那一栏（留档本身）两条路都不补：现排一页不仅是 350ms，还会**换掉留档**（rdAheadFill），
+  // 那是预建那一趟的活儿；推屏后那条路能指望它，是因为它就在本函数**之前**刚跑过。
   const RdAheadPage *h = rdAheadFind(spine, np);
-  if (h != slot || !h->glyphsWarm) return;
-  if (input_pending_key() != 0) { s_preQuiet = 0; return; }   // 有人要点：先让开
-  if (++s_preQuiet < kPreQuietFrames) return;
-  // 日志里的页号（st 下面要被借去当"目标页"用，画完才还回来）。
-  const std::string where = epub ? std::to_string(spine) + ":" + std::to_string(np) : std::to_string(np);
+  if (h != slot) return;
+  // ── "这一趟要不要干完" ──────────────────────────────────────────────
+  // 推屏后这条路（afterTurn）是快翻时唯一的喘息处，而用户的下一指差不多正落在这趟里
+  // （实测：抬手离推屏结束只有 0~700ms，而排版+预热+绘制要 ~1s）。见键就让开的话这一趟
+  // 永远做不成 —— 实测 15 拍只画成 2 拍，其余全折在"让开"上，下一拍照样 720ms 现画。
+  //
+  // 所以：只要排队等着的是一个**朝 s_turnDir 这一侧的翻页**，这一趟就不再让开。那一指
+  // 多等几百 ms，换来的是它自己那一拍只剩 memcpy（~10ms），而且这一趟画成之后空档就宽了
+  // （一整圈 = memcpy 10 + 推屏 470 + 备页 ~1s ≈ 1.5s < 抬手间隔 1.7~1.9s），之后每拍都
+  // 跟得上。好均衡是稳的，缺的只是这第一脚 —— 这就是那一脚。
+  // 反向的键、认不出方向的键（长按/中间点按/蓝牙回车）照旧让开：那种情况干完也是白干。
+  //
+  // **"没有人按键"（pd == 0）也算认准**（推屏搬去 rdPushTask 之后补的一条）：这一趟现在
+  // 起跑得比推屏结束还早，而抬手差不多要等推屏结束之后 0~700ms 才来 —— 实测在尾巴开头
+  // 取一次待发键，有一半的拍是 0。那种帧原样进不去 committed，而等它走到下面的留档那一关，
+  // 键已经来了 → 整趟缩掉 → 下一拍"留档没这份"，重画 500~1100ms（实测 15 拍里 7 拍）。
+  // 而这一趟本来就是在面板扫相位的那段白地里跑的活，没人按键时更该干完。
+  bool committed = false;
+  if (afterTurn) {
+    const int pd = rdPendingTurnDir();
+    const int want = (s_turnDir >= 0) ? 1 : -1;
+    if (pd == 0 || pd == want) committed = true;
+    else return;
+  }
+  if (!h->glyphsWarm) {
+    if (!afterTurn) return;
+    // 推屏后那条路：缺的字形**在这儿暖完**（rdWarmAheadPage 从上一次的 warmOffset 接着做）。
+    // 这一趟不给它设时限 —— 目标就是把 N+1 备齐，省下的正是下一拍重画里那 200~530ms。
+    // 点按仍然在块边界（15~40ms）让位；被打断就留档记着进度，下一趟接着来。
+    // 例外见上面 committed：认准了是自己这一侧的翻页就一路暖到底，中途不再采样。
+    const bool savedCommit = s_rdCommitted;
+    s_rdCommitted = committed;
+    s_rdWarmDeadlineUs = 0;   // 0 = 不限时（见 rdWarmShouldYield：只剩"有人要点"这一条）
+    const bool warmDone = rdWarmAheadPage(*slot, true);
+    s_rdWarmDeadlineUs = 0;
+    s_rdCommitted = savedCommit;
+    if (!warmDone) return;   // 只暖了一半：留档记着进度，下一趟接着来
+  }
+  if (!committed && input_pending_key() != 0) {   // 有人要点：先让开
+    s_preQuiet = 0;
+    return;
+  }
+  // 安静闸只给空闲帧那条路：推屏后这一趟本来就是"刚刚才翻过页"，拿它判等于永远不动手。
+  if (!afterTurn && ++s_preQuiet < kPreQuietFrames) return;
 
   if (!s_preAllocTried) {
     s_preAllocTried = true;
@@ -2916,6 +3090,7 @@ static void rdPrerenderTurnPage() {
     s_preFbSize = n;
     ESP_LOGI(TAG, "预渲染: 备用帧缓冲 %u 字节（PSRAM）", static_cast<unsigned>(n));
   }
+  if (s_preFb == nullptr) return;   // 分配关了这个功能（上面那条日志只打一次）
 
   // 现场：下面这一趟把 st 当成"已经在目标页"来画。画完**原样**还回去 —— 这一帧不上屏，
   // 除了那块 scratch 之外任何状态都不该被它改动，包括 st.dirty（它只属于上屏那一帧）。
@@ -3285,18 +3460,25 @@ static void rdDrawSelPopup(const RdPageText &pt, int fontId) {
 // 选区两端的"手柄"：手指点不准字边，给两个看得见也抓得着的端点。
 // 都画在反白块**外面**（起点手柄在首行上沿之上、终点手柄在末行下沿之下），所以是
 // 白底黑块——落在反白块里就会被白字搅成一团，也分不出是哪一端。
-static constexpr int RD_SEL_HANDLE = 5;   // 手柄半边长（像素），成品是 10×10
+//
+// **半径就是唯一的那一个数**：外形（⌀2R 的圆）和命中靶（同尺寸的方框 + SLOP）都从它
+// 推，改大小只有这一个地方，不会出现"看着大了、判中还是原来那么点"。
+// 注意往上/往下能长多少受行距限制：正文行距≈行高，**上一行的字就贴在反白块上沿**，
+// 所以手柄有多高就压上一行多少——放大只能往横里放，或者接受这点压字。
+static constexpr int RD_SEL_HANDLE = 10;       // 手柄半径（像素），成品是 ⌀20 的圆
+static constexpr int RD_SEL_HANDLE_RING = 4;   // 空心时那一圈的宽度
 
 static void rdSelHandleBoxes(const RdPageText &pt, int fontId, int *sx, int *sy, int *ex,
                              int *ey) {
-  // 返回两个手柄的左上角坐标；调用前必须确认选区有效。
+  // 返回两个手柄的**外接方框**（边长 2R）左上角；调用前必须确认选区有效。
+  // 圆心横向对着词边（起点=首词左沿、终点=末词右沿），比贴着边放更能指出"从哪儿断"。
   const int asc = g_rd.getFontAscenderSize(fontId);
   const int lh = g_rd.getLineHeight(fontId);
   const RdWordHit &a = pt.words[st.selStart];
   const RdWordHit &b = pt.words[st.selEnd];
-  *sx = a.x - 1;
+  *sx = a.x - RD_SEL_HANDLE;
   *sy = a.y - asc - 2 - RD_SEL_HANDLE * 2;   // 首行上沿再往上一个手柄高
-  *ex = b.x + b.w - RD_SEL_HANDLE * 2 + 1;
+  *ex = b.x + b.w - RD_SEL_HANDLE;
   *ey = b.y + (lh - asc) + 2;                // 末行下沿再往下一个手柄高
 }
 
@@ -3308,11 +3490,18 @@ static int rdSelHandleAt(const RdPageText &pt, int fontId, int x, int y) {
     return -1;
   int sx, sy, ex, ey;
   rdSelHandleBoxes(pt, fontId, &sx, &sy, &ex, &ey);
-  constexpr int SLOP = 8;
+  constexpr int SLOP = 10;
   const int hs = RD_SEL_HANDLE * 2;
   if (x >= sx - SLOP && x <= sx + hs + SLOP && y >= sy - SLOP && y <= sy + hs + SLOP) return 0;
   if (x >= ex - SLOP && x <= ex + hs + SLOP && y >= ey - SLOP && y <= ey + hs + SLOP) return 1;
   return -1;
+}
+
+// 一颗手柄：实心圆饼，或空心圆环（环宽 RD_SEL_HANDLE_RING）。形状本身与写作模式共用
+// （见 selection_handle.h），这里只把"画一条横线"接到 GfxRenderer 上。
+static void rdDrawSelHandle(int cx, int cy, bool solid) {
+  selHandleRaster(cx, cy, RD_SEL_HANDLE, RD_SEL_HANDLE_RING, solid,
+                  [](int x, int y, int w) { g_rd.fillRect(x, y, w, 1, true); });
 }
 
 static void rdDrawSelHandles(const RdPageText &pt, int fontId) {
@@ -3320,14 +3509,12 @@ static void rdDrawSelHandles(const RdPageText &pt, int fontId) {
   if (st.selStart < 0 || st.selEnd >= n || st.selStart > st.selEnd) return;
   int sx, sy, ex, ey;
   rdSelHandleBoxes(pt, fontId, &sx, &sy, &ex, &ey);
-  const int hs = RD_SEL_HANDLE * 2;
-  // 抓着的那一端画成空心（黑框白心）——跟"没抓"的实心块区分开，用户能看出`下一次
-  // 点词会挪哪一端`。正在被拖的那一端同样算"抓着"。
+  // 抓着的那一端画成**实心**（黑饼），没抓的是空心环 —— 跟原来 10×10 方块那套约定
+  // 反过来是因为"实心=沉=抓住了"比"空心=抓住了"更直观（原来那个空心方块在白底上
+  // 只剩一圈 1px 线，看着像没画出来）。正在被拖的那一端同样算"抓着"。
   const bool gs = (st.selGrab == 0 || st.selDrag == 0), ge = (st.selGrab == 1 || st.selDrag == 1);
-  g_rd.fillRect(sx, sy, hs, hs, !gs);
-  if (gs) g_rd.drawRect(sx, sy, hs, hs, true);
-  g_rd.fillRect(ex, ey, hs, hs, !ge);
-  if (ge) g_rd.drawRect(ex, ey, hs, hs, true);
+  rdDrawSelHandle(sx + RD_SEL_HANDLE, sy + RD_SEL_HANDLE, gs);
+  rdDrawSelHandle(ex + RD_SEL_HANDLE, ey + RD_SEL_HANDLE, ge);
 }
 
 // 按住的那一下抓的是哪一端：先认"手指就在手柄上/旁边"，再认"手指落在反白块里"
@@ -6560,6 +6747,87 @@ static void rdPinShimFb() {
   if (g_u8g2) u8g2_set_fb(g_u8g2, g_rd.getFrameBuffer());
 }
 
+// ── 推屏任务：把面板扫描那 ~470ms 挪出主任务 ──────────────────────────────
+// 翻页那一帧的推屏实测 471ms，而这 471ms 里主任务一件事都没干 —— 它只是在 lcd_do_update
+// 的相位循环里等面板把每一相扫完（阻塞在 frame_done 信号量上，见 read_pico 的
+// render_lcd.c），而面板每相要扫多久是硬件定死的。与此同时主任务手边压着 ~1.1s 的备页活
+// （排版留档 + 字形预热 + 整帧预渲染，见 rdPrerenderTurnPage），那才是"点下去到屏幕开始变"
+// 真正在等的东西 —— 实测抬手就落在这段里，等的正是它剩下的部分。
+// 于是把推屏交给这个任务：主任务交完就去备页，两条路并行，主任务的等待里就少了推屏那 470ms。
+//
+// 为什么不塞进 core1 那个 ui_render 任务：阅读器整条路都在 core0 上直画直推（见
+// screen_reader_init 的说明），core1 在阅读模式下不碰面板。新任务的边界因此特别干净 ——
+// 只在"提交了、还没收尾"这一小段里它是面板唯一的主人，而这期间主任务一根手指都不碰显示层
+// （备页画的是 s_preFb 那块 scratch，不碰面板正在读的 front_fb）。epdiy 只有一份全局
+// render_context，这条"同一时刻只有一个推屏者"的规矩两边都守着。
+//
+// 两条硬规矩：
+//   1) **挂揭页动画的那一帧不走这条路**。动画期间 e0470 会回调 input_tick 补采触摸（见
+//      reader_page_turn_set_tick_hook），而 cst836u 只能在主循环那个任务里读 —— 动画必须
+//      留在主任务上同步跑。判据就是调用方手里那个 turnAnim。
+//   2) 栈放 PSRAM（同 ui_render 的做法：内部 RAM 只剩几十 KB 的连续块）。代价是这个任务
+//      绝不能写 flash/NVS —— 写 flash 会临时关 cache，那一刻栈就读不到了。本任务只推屏，
+//      没有 NVS/SD/flash 操作，符合。
+#define RD_PUSH_STACK 8192
+#define RD_PUSH_PRIO 6      // 与 ui_render 同档：提交后立刻抢过去开第一相
+#define RD_PUSH_CORE 0      // 阅读器就在 core0；贴着它才好抢在它前面开相位
+
+static SemaphoreHandle_t s_pushGo = nullptr;    // 主 → 推屏任务："该你推了"
+static SemaphoreHandle_t s_pushDone = nullptr;  // 推屏任务 → 主："推完了"
+static HalDisplay::RefreshMode s_pushMode = HalDisplay::HALF_REFRESH;
+static int s_pushMs = 0;                        // 面板自己那一趟的墙钟（收尾那行日志要用）
+static bool s_pushOn = false;                   // 任务活着
+// "这一帧交出去了一趟、还没收"。收尾那句 rdPushWait 靠它判断该不该等 —— 走了同步推屏
+// 的那几帧（揭页动画/虚拟键盘/列表/自检页，以及任务建不出来时）这个位是 false，不能等，
+// 否则会挂在一个永远不会来的信号量上。
+static bool s_pushPending = false;
+
+static void rdPushTask(void *) {
+  for (;;) {
+    if (xSemaphoreTake(s_pushGo, portMAX_DELAY) != pdTRUE) continue;
+    const int64_t t0 = esp_timer_get_time();
+    g_rd.displayBuffer(s_pushMode);
+    s_pushMs = static_cast<int>((esp_timer_get_time() - t0) / 1000);
+    xSemaphoreGive(s_pushDone);
+  }
+}
+
+// 懒建（第一次翻页那一拍建，之后常驻）。建不出来就退回同步推屏 —— 慢，但不错。
+static bool rdPushEnsure() {
+  if (s_pushOn) return true;
+  if (!s_pushGo) s_pushGo = xSemaphoreCreateBinary();
+  if (!s_pushDone) s_pushDone = xSemaphoreCreateBinary();
+  if (!s_pushGo || !s_pushDone) return false;
+  if (xTaskCreatePinnedToCoreWithCaps(rdPushTask, "rd_push", RD_PUSH_STACK, nullptr, RD_PUSH_PRIO,
+                                      nullptr, RD_PUSH_CORE,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+    ESP_LOGW(TAG, "推屏任务创建失败，退回同步推屏（备页不再和面板并行）");
+    return false;
+  }
+  s_pushOn = true;
+  ESP_LOGI(TAG, "推屏任务已启动（core%d, prio %d, 栈 %d B PSRAM）", RD_PUSH_CORE, RD_PUSH_PRIO,
+           RD_PUSH_STACK);
+  return true;
+}
+
+// 提交一次推屏，立刻返回。接不了（任务建不出来）返回 false，调用方自己同步推。
+static bool rdPushSubmit(HalDisplay::RefreshMode m) {
+  if (!rdPushEnsure()) return false;
+  s_pushMode = m;
+  s_pushPending = true;
+  xSemaphoreGive(s_pushGo);
+  return true;
+}
+
+// 等这一趟推完（主任务在这之前先把备页做完）。返回面板那一趟自己的墙钟毫秒；
+// -1 = 这一帧没走异步（同步推屏，或者任务没建起来），没什么可等。
+static int rdPushWait() {
+  if (!s_pushPending) return -1;
+  s_pushPending = false;
+  xSemaphoreTake(s_pushDone, portMAX_DELAY);
+  return s_pushMs;
+}
+
 void renderCurrent() {
   rdPinShimFb();
   // 一帧分两段计时：**重画**（排版命中 + 字形栅格化 + 绘制，到推屏调用为止）与
@@ -6864,8 +7132,12 @@ void renderCurrent() {
     // 整屏全刷（翻页全刷/换章/进界面首帧）把每个像素都驱动了一遍，虚拟键盘快档
     // 欠的那块正文已经干净了，把账销掉，免得停手时再白闪一次。
     if (m == HalDisplay::FULL_REFRESH) ui_render_reader_vk_settle_forget();
-    g_rd.displayBuffer(m);
+    // 交给推屏任务（见 rdPushTask 上面那段）。两条不走异步：
+    //   · 挂揭页动画的这一帧 —— 动画里会回调 input_tick，那是主任务才能干的事；
+    //   · 任务建不出来 —— 退回同步推屏，慢但不错。
+    if (turnAnim || !rdPushSubmit(m)) g_rd.displayBuffer(m);
   }
+  // 异步时这里只是"交出去"的时刻，面板还没扫完（收尾那行日志的推屏毫秒由推屏任务自己报）。
   const int64_t tPushEndUs = esp_timer_get_time();
   // 白底参考帧纪律：**推屏之后**记下"面板上现在是不是中灰"（语义是面板现状，放在
   // 渲染入口记会让同一页的下一帧被自己置位 → 每帧白闪）。下一次走差分档的推屏会先
@@ -6876,7 +7148,38 @@ void renderCurrent() {
   // 自检页自推的那一帧：再画一次把刚测出的耗时显示出来（那一帧内容只差一行小字，
   // 差分刷很便宜）。放在 st.dirty = 0 之后，否则会被上面那行清掉。
   if (rtPresented) st.dirty = 1;
-  // 翻页那一帧把两段拆开记（见函数开头的计时说明）。只记翻页帧：菜单/列表那些帧
+  const int64_t tTailStartUs = esp_timer_get_time();
+  // 这一帧已经推出去了，用户正盯着新页看 —— 正是把排版余量补回来的空档。
+  // 但如果按键/触摸已经排队，先把控制权还给主循环；连续翻页时这 30ms 比预建更值钱。
+  //
+  // 一个例外：排队等着的那一指**正是朝 s_turnDir 这一侧的翻页**时不再让开 —— 让开的话
+  // 它下一拍照样要现画 ~720ms，而把这一趟干完它就只剩 memcpy（见 rdPrerenderTurnPage
+  // 里 committed 那一段）。这是快翻死锁唯一的突破口，所以入口也得放行。
+  if (!g_bt.waitKey(0)) {
+    const int want = (s_turnDir >= 0) ? 1 : -1;
+    int pd = rdPendingTurnDir();
+    if (pd == 0 || pd == want) {
+      const bool savedCommit = s_rdCommitted;
+      // 进了这道门就是"认准"：待发的键要么没有（这一趟是面板扫相位那片白地，更该干完），
+      // 要么正朝这一侧翻。预建那一趟也不许见键就缩 —— 留档建不出来，下面几道闸全是
+      // "留档没这份"（见 s_rdCommitted 与 rdPrerenderTurnPage 里 pd == 0 那一段）。
+      s_rdCommitted = true;
+      rdPrebuildAhead();
+      s_rdCommitted = savedCommit;
+      // 紧接着把"下一帧"整帧画出来（afterTurn：字形没暖齐就自己现补）。
+      // **这是快翻时唯一的翻盘机会**：那种节奏下循环里没有空闲帧（实测：这一整段空档被上面
+      // 那句预建吃光，预渲染的闸门链 16 拍只被叫到 1 次），而这一趟付掉的正是下一拍重画要
+      // 现付的排版/预热。付一次，下一拍就只剩 memcpy，空档随之变大，之后自己跟得上。
+      // 放在预建**之后**是硬要求：它要的排版留档正是上一句刚建好的（本函数不自己现排）。
+      pd = rdPendingTurnDir();   // 上面那趟预建（几百 ms）里可能刚冒出来一个键
+      if (pd == 0 || pd == want) rdPrerenderTurnPage(true);
+    }
+  }
+  // 面板真的推完了才收尾。异步那一趟在这之前一直和上面的备页并行跑 —— 备页通常更长
+  // （~1s vs ~470ms），所以这一等基本是零头。
+  const int panelMs = rdPushWait();
+  const int tailMs = static_cast<int>((esp_timer_get_time() - tTailStartUs) / 1000);
+  // 翻页那一帧把几段拆开记（见函数开头的计时说明）。只记翻页帧：菜单/列表那些帧
   // 一帧一次会把日志淹掉，而这条要回答的问题只在翻页上。动画内部的账（相数、每拍
   // 扫描耗时、墙钟）由 e0470_page_turn 自己打：`dir=… 梯=… ticks=… wall=…`。
   // 判据是"用户按了翻页"（turn != 0），不是"动画挂上了" —— 换章那一帧动画会被跳过、
@@ -6884,9 +7187,17 @@ void renderCurrent() {
   // 变化量也打出来：它决定档位（≥300‰ 走"局刷"而非"8灰阶正文刷"，也就是下面有没有
   // 揭页动画），而 `自适应` 档之外它不打日志，曾经一整场会话每页都被判成"图片页"却
   // 无从看出 —— 翻页这事上它是因，得记。它**不再**决定用哪条梯子（只剩一条了）。
+  //
+  // **推屏与备页是并行的**（推屏任务那条路，见 rdPushTask），所以这一行给的是
+  // `max(推屏, 备页)` 而不是它们的和 —— 改之前是"重画 + 推屏 = 本帧"串着算的，
+  // 现在备页那 1s 就压在推屏那 470ms 上。哪个大就是哪一个在定这一帧的时长。
   if (turn != 0 && rdPerfLogOn()) {
-    const int renderMs = (int)((tPushStartUs - tDrawStartUs) / 1000);
-    const int pushMs = (int)((tPushEndUs - tPushStartUs) / 1000);
+    const int renderMs = static_cast<int>((tPushStartUs - tDrawStartUs) / 1000);
+    // 本帧的墙钟：从进函数到面板推完。它跟 `重画 + max(...)` 的差就是"两件事到底并行
+    // 到什么程度" —— 若备页真压在推屏上，本帧 ≈ 重画 + max；若是串着跑，就接近两者之和。
+    const int frameMs = static_cast<int>((esp_timer_get_time() - tDrawStartUs) / 1000);
+    const int pushMs = panelMs >= 0 ? panelMs
+                                    : static_cast<int>((tPushEndUs - tPushStartUs) / 1000);
     // 档位也用名字打（"无动画"那一支尤其要看得出它是不是掉到了全刷）。
     const char *modeName = m == HalDisplay::FULL_REFRESH           ? "全刷"
                            : m == HalDisplay::GRAY8_REFRESH        ? "全刷8灰阶"
@@ -6894,9 +7205,9 @@ void renderCurrent() {
                            : m == HalDisplay::FAST_REFRESH         ? "极速"
                            : m == HalDisplay::STATUS_REFRESH       ? "过渡屏"
                                                                    : "局刷";
-    ESP_LOGI(TAG, "翻页耗时: 变化 %d‰ + 重画 %d ms + 推屏 %d ms = %d ms（%s，%s，跳相 %d）", frameChange,
-             renderMs, pushMs, renderMs + pushMs, modeName,
-             turnAnim ? "揭页·GL16 37相" : "无动画", reader_leading_skip());
+    ESP_LOGI(TAG, "翻页耗时: 变化 %d‰ + 重画 %d + max(推屏 %d, 备页 %d) = %d｜本帧 %d ms（%s，%s，跳相 %d）",
+             frameChange, renderMs, pushMs, tailMs, renderMs + (pushMs > tailMs ? pushMs : tailMs),
+             frameMs, modeName, turnAnim ? "揭页·GL16 37相" : "无动画", reader_leading_skip());
     // 重画三段拆账。方案（空闲帧留档邻页排版 + 预热下一页字形）唯一的成功判据：
     // **排版**与**预热**这两栏在翻页这一拍上都该只剩零头 —— 排版来自留档（0ms），字形
     // 在上一页的空档里备好了。哪一栏没降就是哪一栏没接上：排版"现读现建"= 键没对上
@@ -6918,9 +7229,6 @@ void renderCurrent() {
              rdLogPage().c_str(), turn > 0 ? "下一" : "上一", s_subLayoutMs, s_subWarmMs,
              renderMs - s_subLayoutMs - s_subWarmMs, src);
   }
-  // 这一帧已经推出去了，用户正盯着新页看 —— 正是把排版余量补回来的空档。
-  // 但如果按键/触摸已经排队，先把控制权还给主循环；连续翻页时这 30ms 比预建更值钱。
-  if (!g_bt.waitKey(0) && input_pending_key() == 0) rdPrebuildAhead();
 }
 
 // 先刷一帧"正在…"（当前界面 + 居中浮层）再进阻塞段。openBook 会建元数据、解 zip、
@@ -7734,6 +8042,11 @@ static void handleReading(int key) {
       if (input_tap_xy(&x, &y)) {
         const int btn = rdPopupButtonAt(x, y);
         if (btn >= 0) { st.selMenuSel = btn; rdSelActivate(); return; }
+        // 浮层那一条整块（含抬头行、按钮之间的缝）归浮层自己：点抬头不该掉到下面的
+        // 翻页/微调上去。按钮行已经在上一步返回了，走到这儿还在条内的只剩抬头行。
+        int pbx, pby, pbw, pbh;
+        rdPopupRect(&pbx, &pby, &pbw, &pbh);
+        if (y >= pby && y < pby + pbh) return;
         // ① 点到手柄：抓起那一段（再点同一个 = 放下）。手柄画在行外，rdWordAtPoint
         //    在那里量不到任何词，所以必须单独判、判中就直接返回。
         const int h = rdSelHandleAt(g_pageText, fontId, x, y);
@@ -7746,6 +8059,8 @@ static void handleReading(int key) {
         //    在选区左 → 起点，右 → 终点，落在选区**里面** → 近的那一端（用来往里收）。
         //    两端始终 clamp 住不交叉，区间可双向伸缩（原来只动终点、起点钉死，
         //    用户侧就是"起始位置是固定的，只能选结束位置"）。
+        //    **判词必须放在“三分之一”前面**：一行正文十来个字，左右三分之一里全是字，
+        //    先判分区就等于把"点词选字"这条主力手势废掉（试过，用户立刻报"没法选中文字"）。
         const int wi = rdWordAtPoint(g_pageText, fontId, x, y);
         if (wi >= 0) {
           if (st.selGrab == 0) st.selStart = std::min(wi, st.selEnd);
@@ -7756,7 +8071,22 @@ static void handleReading(int key) {
           else st.selEnd = wi;
           st.selGrab = -1;
           st.dirty = 1;
+          return;
         }
+        // ③ 点到**空白**（行间、页边）：这一下以前什么都不做 —— 于是"只想翻页"的人
+        //    戳在空白上就像卡死（真实来电：长按误进选中态后点哪都没反应）。现在：
+        //    · 左/右三分之一 = 照常翻页（普通模式下这一下就是翻页），turnBook 开头
+        //      那句 `selActive = false` 就是"翻页即放弃选区"；
+        //    · 中间三分之一、或翻不动（书首/书尾）= 放掉选区，下一次点按恢复成翻页
+        //      （脚注弹注"点框外收起"是同一条约定）。
+        //    空白是唯一"不可能是选字"的地方，所以退出判据钉在这儿不会误伤选字。
+        if (x < w / 3 || x > w * 2 / 3) {
+          if (turnBook(x < w / 3 ? -1 : +1)) return;
+        }
+        st.selActive = false;
+        st.selDrag = -1;
+        st.selDragActive = false;
+        st.dirty = 1;
         return;
       }
       // 无坐标回车（KEY2）：展开动作条

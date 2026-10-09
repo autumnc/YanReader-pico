@@ -445,6 +445,13 @@ int input_pending_key() {
     return s_pend_key;
 }
 
+bool input_pending_tap_xy(int *x, int *y) {
+    if (s_pend_key == 0 || !s_pend_tap) return false;
+    if (x) *x = s_pend_tx;
+    if (y) *y = s_pend_ty;
+    return true;
+}
+
 // ── 晃动机身 = 一次全刷 ──────────────────────────────────────────────────
 // SC7A20H 平时是掉电的（read_pico_init 校验完就 power_down），这里重新上电、常驻在
 // ODR 12.5Hz 的低功耗档（~2µA），每 ~120ms 读一次三轴。
