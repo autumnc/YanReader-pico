@@ -80,6 +80,15 @@ void ui_set_fast_partial(bool enable);
 // 周期 GC16 兜底同样挂起(见 ui_set_fast_partial)：局刷每 8 次本会升级一次整屏
 // GC16，落在输入法上就是"敲几个字闪一屏"，这正是要避免的。
 void ui_set_local_only(bool enable);
+// 菜单型界面(设置各页、写作/计划主界面、清单)：翻列表 / 换选中行 / 切子页那一类屏，
+// **一律不记残影账**。它们借 ui_set_local_only 那条 arm 只是为了"一律局刷"(差分常超
+// 半屏，按老规则会整屏 GL16 闪一下)，并不是在打字，所以"攒够 N 拍清一次"的那笔账在
+// 这里全是副作用：「计数清」档按拍记账，翻列表按几下方向键就攒够一次 → 停顿处闪一下；
+// 面板跟随 DU 攒出的 pending 在这类屏上永远当场落不了地(local_only 一直开着)，会跟着
+// 用户走到下一个开关全关的界面才炸成整屏 GC16。菜单的局刷是 GL16 全像素，区域内每个
+// 像素都被驱动到目标灰阶，本来就不自攒残影——那笔账是空的。
+// 用户侧原话(2026-10-09)："连蓝牙键盘时进设置就别计数了，闪得厉害"。
+void ui_set_menu_only(bool enable);
 int  ui_text_width(const char *text);
 void ui_draw_text(int x, int y, const char *text, bool invert = false, bool bold = false);
 void ui_draw_text_centered(int y, const char *text, bool invert = false, bool bold = false);

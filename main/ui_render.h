@@ -91,6 +91,9 @@ void ui_render_restore_kept(void);
 
 void ui_render_set_fast_partial(bool enable);
 void ui_render_set_local_only(bool enable);
+// 菜单型界面（设置各页 / 写作·计划主界面 / 清单）：一律不记残影账，见实现里的说明。
+// 只在"这一屏不是打字界面"时置位（main.cpp 按 kScreens 的 local_only 列 + 计划模式浏览态算）。
+void ui_render_set_menu_only(bool enable);
 
 // 阅读模式**虚拟键盘打字帧**的区域推屏。注册进 crossmux 的 vk_present 钩子（见 main.cpp
 // 与 crossmux_platform.h），由 HalDisplay::displayBufferVk 调用。panel_top = 键盘面板顶边
@@ -109,8 +112,9 @@ void reader_list_present(void);
 // 阅读器虚拟键盘的"清残影欠账"：**口径与编辑器那套一一对齐**（设置项 ime_clean，
 // 见 ui_render.cpp 里 reader_vk_present 上面那张表）。快档（上屏刷法=快）欠下的正文那块
 // （跟随 DU 推的、发灰又带残影的）在停手 IME_CLEAN_PAUSE_US 之后由阅读器自己的帧循环
-// （core0，每轮都调，空转帧也算）做一次区域 GC16 坐实；句读档则在句读那一拍当场清，
-// 不来这里。稳档只有"上屏那一拍记账"（同样由 ime_clean 的 commit 位定）。
+// （core0，每轮都调，空转帧也算）做一次区域 GC16 坐实。四档都只是**记账的时机**不同
+// （句读后 / 上屏后 / 计数清 / 从不清），真正那一次区域 GC16 一律在这里做
+// —— 2026-10-09 起句读档也不再当场清（当场清要并上本帧差分，正文一重排就是整块黑闪）。
 // 整屏全刷过的那些帧（翻页全刷/换章/进界面首帧）调 forget 销账，免得停顿时再白闪一次。
 // 两份账都在 core0，和渲染任务里那套 ime_clean 互不相干（各记各的，不共用计数器）。
 void ui_render_reader_vk_settle_tick(void);

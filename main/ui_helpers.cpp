@@ -739,6 +739,7 @@ void ui_invalidate_snapshot() { ui_render_invalidate(); }
 
 void ui_set_fast_partial(bool enable) { ui_render_set_fast_partial(enable); }
 void ui_set_local_only(bool enable) { ui_render_set_local_only(enable); }
+void ui_set_menu_only(bool enable) { ui_render_set_menu_only(enable); }
 
 int ui_text_width(const char *text) { return g_font.textWidth(text); }
 

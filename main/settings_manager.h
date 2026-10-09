@@ -56,8 +56,9 @@ public:
     std::string verticalReferenceLineStyle();  // "solid"(实线) / "dash"(虚线) / "dot"(点状虚线)
     bool typingClickEnabled();  // 是否播放按键反馈音
     // 输入法那两行（编码区+候选区）什么时候清残影："punct"(句读后,默认) / "commit"(上屏后)
-    // / "both" / "off"。清一次 = 一次区域 GC16（≈330ms，见 ui_render.cpp），所以默认只挑
-    // 句读——那是用户天然停手看结果的时刻，不会同一句话里连清两遍。
+    // / "count"(计数清) / "never"(从不清)。清一次 = 一次区域 GC16（≈330ms，见 ui_render.cpp），
+    // 四档都只是**记账的时机**不同，真正那一次一律在打字停顿时做。默认只挑句读——那是用户
+    // 天然停手看结果的时刻，不会同一句话里连清两遍。（"off" 是 count 的旧键名，兼容留着。）
     std::string imeCleanMode();
     // 实体键盘打字时，**正文那一拍的推屏方式**："solid"(默认，整屏阈值 DU，墨实但每拍
     // 约 220ms) / "fast"(只推差分矩形的跟随 DU，约 56ms，但跟随表推力只有阈值表的

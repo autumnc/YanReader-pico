@@ -1943,6 +1943,13 @@ extern "C" void app_main() {
         // 本来就没有抢时间的输入，走默认规则。
         const bool gtdBrowsing = (currentState == APP_GTD) && !typingHere;
         ui_set_local_only((vkHost && vkHere) || activeScr.local_only || gtdBrowsing);
+        // 菜单型界面：**一律不记残影账**（见 ui_set_menu_only 的说明）。名单就是上面那条
+        // 局刷名单里"不是打字"的那一半 —— 设置各页、写作/计划主界面、计划模式浏览态。
+        // 打字界面（编辑器、GTD 打字态）不在此列：那里的账是真在打字，要留。
+        // 用户 2026-10-09 报的"连蓝牙键盘时进设置就别计数了，闪得厉害"就是这一条：
+        // 蓝牙键盘连着时 vkHere 是 false，设置页照样在翻列表，可那些拍数原来全被记成
+        // 打字账，攒出来的那次清残影就落在用户翻列表的中间。
+        ui_set_menu_only((activeScr.local_only || gtdBrowsing) && !typingHere);
 
         // 蓝牙键盘低电提示：电量是 HID 异步上报的（bt_keyboard 的事件回调），这里
         // 把待发标记取出来，借现成的居中提示通道报 1.5s。状态栏那个蓝牙图标只表示
