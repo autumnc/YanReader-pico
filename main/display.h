@@ -43,6 +43,14 @@ void display_init(void);
 void rails_keepalive(void);
 void rails_idle_check(int64_t now_ms);
 
+/// 面板此刻是否正在扫描（推屏互斥锁被持有，present_begin → rails_keepalive）。
+/// **会长时间关中断的重活**（heap_caps_* 的 largest 遍历、SD 卡文件事务）动手前先问
+/// 一句、是就让路：epdiy 的供数线程是最高优先级，唯一能挡住它的是别人关中断，被挡
+/// ~1ms 就够把行队列抽干 → 欠载 → 整屏重刷（用户眼里的"大清屏"）。只读一眼，不阻塞。
+/// / True while a present is driving the panel. Interrupt-disabling heavy work should
+/// check this and step aside; never blocks (try-lock only).
+bool display_scan_busy(void);
+
 /// 面板总线收线 / 接线回来。面板下电后总线脚还挂着最后一帧的残余电平，会给断电源极线
 /// 一个漂移偏置（"放着不动自己发灰发花"）。**每次下电都要收**：本文件的空闲下电路径
 /// 自己会调它，main.cpp 的浅睡前也调 —— 两处走同一份状态，混着调 epd_lcd_bus_* 会让
@@ -111,6 +119,15 @@ enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind);
 enum EpdDrawError update_display_with(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode
 );
+
+/// 写作模式实体键打字那一拍（"上屏刷法=稳"）的整屏阈值 DU：与 update_display_with
+/// 同一条刷法（整页、MODE_DU、默认表），但**不记残影预算、也不升级**。那条路每按一次键
+/// 就记一次整页软刷，攒够 APP_GC16_EVERY 被升成整屏 GC16 —— 打字一秒三四拍，几秒钟就
+/// "全屏黑白闪一下"，且与 ime_clean 四个档无关（"从不清"也拦不住，那不是输入法那笔账）。
+/// / Writing-mode keystroke present ("commit mode = solid"): the same whole-page threshold DU
+/// as update_display_with but without the ghost budget — a keystroke every few hundred ms would
+/// otherwise be promoted to a full-screen GC16 within seconds.
+enum EpdDrawError update_display_typing_du(EpdiyHighlevelState* hl);
 /// 灰阶图还在屏上时置位：菜单盖上来或离页先刷白，避免从中间灰差分。
 /// Set while a gray image is still on panel: wipe to white before the menu or leave so the next update is not a mid-gray differential.
 void display_hold_white_exit(bool hold);

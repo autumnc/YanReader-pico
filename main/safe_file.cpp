@@ -6,6 +6,19 @@
 #include <unistd.h>
 #include <esp_log.h>
 
+#include "longop.h"
+
+// 原子写（.tmp → fsync → rename 那一串文件事务）也在欠载嫌疑名单里：写卡期间驱动那一侧
+// 有它自己的锁与事务，落盘又是毫秒级。挂个 RAII 把名字记进探针环，欠载日志就能点名
+// "当时正在写 <文件名>"（见 longop.h）。开销是两次微秒级临界区，写文件本身贵得多。
+// / Wrap atomic file writes into the longop ring so an underrun can name the file.
+namespace {
+struct LongOpFile {
+    explicit LongOpFile(const std::string &path) { longop_begin(path.c_str()); }
+    ~LongOpFile() { longop_end(); }
+};
+}  // namespace
+
 static const char *TAG = "SafeFile";
 
 bool fileExists(const std::string &path) {
@@ -134,6 +147,7 @@ static bool commitTmpFile(const std::string &path, const std::string &tmp, const
 }
 
 bool safeWriteFile(const std::string &path, const std::string &content) {
+    LongOpFile _probe(path);
     std::string tmp, bak;
     FILE *f = openTmpForWrite(path, tmp, bak);
     if (!f) return false;
@@ -151,6 +165,7 @@ bool safeWriteFile(const std::string &path, const std::string &content) {
 bool safeWriteFileStream(const std::string &path,
                          bool (*writeChunk)(FILE *tmp, void *ctx),
                          void *ctx) {
+    LongOpFile _probe(path);
     std::string tmp, bak;
     FILE *f = openTmpForWrite(path, tmp, bak);
     if (!f) return false;

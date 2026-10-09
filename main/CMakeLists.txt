@@ -48,6 +48,7 @@ idf_component_register(SRCS
     "ui_feedback.cpp"
     "ui_render.cpp"
     "safe_file.cpp"
+    "longop.cpp"           # 欠载探针：记录关中断的重活，guard_draw_result 在欠载日志里点名
     "clipboard.cpp"
     "edit_menu.cpp"
     "text_sel.cpp"

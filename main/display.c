@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "hw/board_hw.h"  // board_hl()：自检页自推屏要自己拿 epdiy 句柄
+#include "longop.h"       // 欠载探针：把"当时谁在关中断"打进欠载日志
 #include "reader_page_turn.h"
 #include "reader_refresh_bridge.h"
 
@@ -132,6 +133,26 @@ void rails_idle_check(int64_t now_ms) {
     xSemaphoreGive(s_rail_mtx);
 }
 
+// 面板此刻是否正在扫描（电泳驱动中）。判据就是那把推屏互斥锁：present_begin 拿、
+// rails_keepalive 放，一次推屏一次配对。
+//
+// 给谁用：**会长时间关中断的重活**（heap_caps_get_largest_free_block 要走 TLSF 空闲链、
+// 写 SD 卡那类文件事务）应该先问一句、是就别做。理由见 longop.h 的注释：epdiy 的供数
+// 线程跑在最高优先级，唯一能挡住它的是"别人关中断"，而它被挡 ~1ms 就够把行队列抽干 →
+// 欠载 → 整屏重刷（用户眼里的"大清屏"）。已对上号：5 次欠载的 E 行全部紧跟在每 2 秒
+// 一次的堆水位日志之后 1~2ms。
+// / True while a present is driving the panel (the rail mutex is held from present_begin
+// to rails_keepalive). Interrupt-disabling heavy work — heap walks, SD file transactions —
+// should check this first: the epdiy feeder is the highest-priority task and only an
+// interrupt-disabled stretch can starve it (1 ms is enough to drain the line queue).
+bool display_scan_busy(void) {
+    if (s_rail_mtx == NULL) return false;
+    // 试拿即放：只为读一眼"谁持有"，不能真等（本函数可能被主循环每个 2 秒调一次）。
+    if (xSemaphoreTake(s_rail_mtx, 0) != pdTRUE) return true;
+    xSemaphoreGive(s_rail_mtx);
+    return false;
+}
+
 // ── 全设备夜间反色 ───────────────────────────────────────────────────────
 // 反色的**唯一实施点**是这里，不是 HalDisplay。原因：本文件才是所有推屏的落地点 ——
 // 阅读器经 HalDisplay::displayBuffer → s_mode_refresh → update_display_reader 到这里；
@@ -229,12 +250,14 @@ bool display_soft_refresh_due(void) {
 }
 void display_soft_refresh_reset(void) { s_soft_refreshes = 0; }
 
-static enum EpdDrawError hl_update(
+// count = false 的那些出口**不记残影预算、也不升级**（区域刷本来就由 area != NULL 走这条路，
+// 另外还有写作模式打字那一拍：见 update_display_typing_du）。
+static enum EpdDrawError hl_update_ex(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode, bool full,
-    const EpdRect* area
+    const EpdRect* area, bool count
 ) {
     full = full || (mode & 0xF) == MODE_GL16;
-    if (waveform != &E0470_FOLLOW_WAVEFORM && area == NULL) {
+    if (count && waveform != &E0470_FOLLOW_WAVEFORM && area == NULL) {
         if ((mode & 0xF) == MODE_GC16) {
             s_soft_refreshes = 0;
         } else if (APP_GC16_EVERY > 0 && ++s_soft_refreshes >= APP_GC16_EVERY) {
@@ -256,6 +279,14 @@ static enum EpdDrawError hl_update(
     r = full ? epd_hl_update_screen_full(hl, mode, 25) : epd_hl_update_screen(hl, mode, 25);
     night_leave(hl);
     return r;
+}
+
+// 常规出口：照旧记那份共享残影预算（区域刷自己会走 area != NULL 那条免记账的路）。
+static enum EpdDrawError hl_update(
+    EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode, bool full,
+    const EpdRect* area
+) {
+    return hl_update_ex(hl, waveform, mode, full, area, true);
 }
 
 enum EpdDrawError update_display_mode(
@@ -594,6 +625,35 @@ enum EpdDrawError update_display_with(
     return result;
 }
 
+// 写作模式实体键打字那一拍（"上屏刷法=稳"）的整屏阈值 DU：**与 update_display_with
+// 完全是同一条刷法，区别只在不记残影预算、也不升级**（与上面的 update_display_gray8_status
+// 同一个理由）。区域/波形/驱动范围一点没变，只是跳过预算那一格。
+//
+// 那一拍原来就是 update_display_with(hl, &E0470_WAVEFORM, MODE_DU)：整页 + 非跟随波形，
+// 于是**每按一次键**就替共享预算 +1，攒够 APP_GC16_EVERY(=14) 就把这一拍整个升成整屏 GC16
+// —— 用户侧就是"打着打着（或按几下方向键）突然全屏黑白闪一下"。它跟 ime_clean（清残影
+// 时机）四个档**一点关系都没有**，选"从不清"照样闪，因为花的是 display.c 这份共享预算、
+// 不是输入法那笔账。
+//
+// 那份预算的尺度是给**菜单、翻页、换界面**那类低频整页刷定的（14 拍 = 用户点了十几下），
+// 而打字一秒三四拍，14 拍只有几秒钟。所以打字这条高频路不参与：残影交给快档那套账
+// （ime_clean 的策略，见 ui_render.cpp）以及进出界面时的整屏 GC16（它本来就清全屏）。
+// / Writing-mode keystroke present ("commit mode = solid"): byte-for-byte the same whole-page
+// threshold DU as update_display_with, only without the ghost budget (same reasoning as
+// update_display_gray8_status above). As a whole-page, non-FOLLOW push it used to bump the
+// shared counter on every key press and get promoted to a full-screen GC16 every
+// APP_GC16_EVERY(=14) frames — a black-white strobe mid-typing, in *every* ime_clean policy
+// including "never", because that budget is display.c's, not the IME account. That budget is
+// sized for menus and page turns (14 taps), not for a path that pushes three or four frames
+// a second.
+enum EpdDrawError update_display_typing_du(EpdiyHighlevelState* hl) {
+    use_scan_for(&E0470_WAVEFORM, MODE_DU);
+    present_begin();
+    enum EpdDrawError result = hl_update_ex(hl, &E0470_WAVEFORM, MODE_DU, false, NULL, false);
+    rails_keepalive();
+    return result;
+}
+
 enum EpdDrawError update_display_area_with(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode,
     EpdRect area
@@ -714,8 +774,25 @@ enum EpdDrawError update_display_area_clean(EpdiyHighlevelState* hl, EpdRect are
     return result;
 }
 
-// 供数不足时的兜底：把频率退回安全值，整屏白一次，让后面的差分刷有干净参考帧。
-// Underrun fallback: drop to the safe clock and wipe the panel white so later differentials have a clean reference.
+// 供数不足时的兜底。
+//
+// **不要 epd_clear()。** 它原来是 `epd_clear()` + 从白底整屏 GC16：那是 3 轮黑白摆动
+// （实测 ~900ms）加一记整屏全刷（404ms），合计 ~1.3s，而且中途**整屏是白的**。用户
+// 2026-10-09 报的"打字打着大清屏一下"就是这一段（帧只有一次被漏驱，代价却是一屏翻白）。
+//
+// 现在只做一件事：**从现在手里的内容整屏全像素 GC16 重推一遍**。理由是欠载不脏内容 ——
+// 漏驱的行由 retrieve_line_isr 补 0（1ppB 编码里 0 = 不驱动 = 保持），highlevel 又只在
+// 成功时把 front_fb 回写，所以 back_fb 里的目标帧始终是完整的；而 GC16 的每一格都是完整
+// 梯子（连 15→15 都走 10 黑 + 10 白），面板不管停在什么状态都会落到目标灰阶 —— 被漏驱的
+// 那条带子自己就正过来了。代价从 ~1.3s + 一屏白变成 404ms 一次普通整屏刷，内容不丢。
+// （"从白底出下一屏"那条纪律是给差分刷当**参考帧**用的，整屏 GC16 重推后面板 = back_fb
+// 本身就是干净参考帧，不再需要白底那一步。）
+// / On underrun: no epd_clear() — that was ~900 ms of black/white wiping plus a full
+// pass (~1.3 s, screen white in between), which is exactly the "big wipe" the user
+// reported. An underrun does not corrupt the content (missed lines are fed as 0 =
+// hold, and highlevel only writes back on success), so one whole-screen full-pixel
+// GC16 from the frame we already hold repairs it: every GC16 cell is a complete
+// ladder, so the panel lands on the target gray whatever state it was left in.
 static int s_pclk_mhz = DISPLAY_PCLK_DEFAULT_MHZ;
 
 int display_pclk_mhz(void) { return s_pclk_mhz; }
@@ -724,15 +801,15 @@ void guard_draw_result(EpdiyHighlevelState* hl, enum EpdDrawError result) {
     if (!(result & EPD_DRAW_EMPTY_LINE_QUEUE)) return;
     s_pclk_mhz = DISPLAY_PCLK_SAFE_MHZ;
     read_pico_epd_set_pclk(DISPLAY_PCLK_SAFE_MHZ);
-    use_scan_for(&E0470_WAVEFORM, MODE_GC16);
-    present_begin();
-    epd_clear();
-    // 清物理屏后仅重置旧帧基准，保留目标页；否则局部刷新会留下整页白屏。
-    // Reset only the old-frame baseline after clearing; preserving the target prevents blank pages after partial updates.
-    night_enter(hl);
-    epd_hl_update_screen_from_white(hl, MODE_GC16, 25);
-    night_leave(hl);
+    // 先回答"是谁把供数线程挡住了"：见 longop.h。这一句比恢复本身值钱 —— 它把
+    // "对时间戳猜"换成"日志直接点名"。
+    longop_dump("line queue underrun");
+    // 手里这份内容就是目标帧，要的是**全像素**（只标脏行的话，被漏驱的那些行根本不驱动，
+    // 带子还在）→ update_display_full（E0470_WAVEFORM + MODE_GC16 + full）。
+    // 波形显式装回默认表：失败的这次推屏可能是 8 灰阶表那条路（area_clean / gray8_text）。
+    epd_hl_waveform(hl, &E0470_WAVEFORM);
+    enum EpdDrawError r2 = update_display_full(hl);
     s_soft_refreshes = 0;
-    rails_keepalive();
-    ESP_LOGW(TAG, "line queue underrun, pclk back to %d MHz", DISPLAY_PCLK_SAFE_MHZ);
+    ESP_LOGW(TAG, "line queue underrun, pclk back to %d MHz（整屏 GC16 重推 result=%d）",
+             DISPLAY_PCLK_SAFE_MHZ, (int)r2);
 }

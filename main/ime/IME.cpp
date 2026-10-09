@@ -4,6 +4,7 @@
 #include "trad_table.h"
 #include "s2t_table.h"
 #include "kaomoji_table.h"
+#include "longop.h"  // 欠载探针：词库落盘也是"顺手写卡"的名录之一
 #include "settings_manager.h"
 #include <cstring>
 #include <cstdio>
@@ -1486,10 +1487,14 @@ bool IME::compactUserEntries(std::vector<UserEntry> &entries, size_t limit) {
 
 void IME::saveUserDictFile(const char *path, std::vector<UserEntry> &entries, bool &dirty) {
     if (!dirty) return;
+    // 上屏/学词之后顺手落盘这一条：写的是 SD 卡，整表重写 + fclose 的毫秒级事务。
+    // 它发生的时机恰好就在"刚上屏 → 下一记推屏"之间，所以进探针名录（见 longop.h）。
+    longop_begin(path);
     mkdir("/sdcard/settings", 0777);
     FILE *f = fopen(path, "w");
     if (!f) {
         ESP_LOGE(IME_TAG, "failed to open userdict file %s", path);
+        longop_end();
         return;
     }
 
@@ -1511,9 +1516,11 @@ void IME::saveUserDictFile(const char *path, std::vector<UserEntry> &entries, bo
 
     if (fclose(f) != 0) {
         ESP_LOGE(IME_TAG, "failed to flush userdict file");
+        longop_end();
         return;
     }
     clearUserDictJournal(path);
+    longop_end();
     dirty = false;
 }
 

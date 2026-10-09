@@ -36,6 +36,7 @@
 #include "hw/input.h"
 #include "crossmux_platform.h"
 #include "display.h"
+#include "longop.h"  // 欠载探针（堆遍历/落盘这类"关中断的重活"记名，见 longop.h）
 #include "font_store.h"
 #include "read_pico_board.h"
 #include "hw/auto_orient.h"   // auto_orient_tick：自适应屏幕方向（写作/计划模式的「自适应」档）
@@ -1415,8 +1416,19 @@ extern "C" void app_main() {
             static int64_t s_heap_log_us = 0;
             static int64_t s_heap_info_us = 0;
             int64_t nowh = esp_timer_get_time();
-            if (nowh - s_heap_log_us > 2000000) {
+            // 面板正在扫描就跳过这一拍（500ms 后再看），别在推屏途中做堆遍历。
+            //
+            // 这不是洁癖，是 2026-10-09 "打字打着大清屏" 的根因：`largest` 那两个
+            // heap_caps_* 要遍历 TLSF 空闲链，期间 MULTI_HEAP_LOCK 关中断；而 epdiy 的
+            // 供数线程在**最高优先级**上，唯一能挡住它的就是别人关中断 —— 挡 1ms 就够
+            // 把 62 行的行队列抽干，欠载一次 = 整屏重刷（以前还多一屏白）。对上过号：
+            // 5 次欠载的 `epdiy: line buffer underrun` 全部紧跟某条 `Heap:` 之后 1~2ms。
+            // 堆水位本来是定位 OOM 的临时日志，让路不吃亏：推屏最长也就 404ms 一记。
+            if (display_scan_busy()) {
+                s_heap_log_us = nowh - 500000;   // 已攒到 2s 的账只差 0.5s，等价于 0.5s 后再试
+            } else if (nowh - s_heap_log_us > 2000000) {
                 s_heap_log_us = nowh;
+                longop_begin("heap-walk");       // 给欠载探针留个名（见 longop.h）
                 unsigned intFree = (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
                 unsigned intLargest = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
                 // psram 带上 largest：字体工作缓冲/整表映射要的都是**一整块连续**
@@ -1428,6 +1440,7 @@ extern "C" void app_main() {
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                          (unsigned)heap_caps_get_largest_free_block(
                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                longop_end();
                 // 提前预警：内堆见底时刷屏/网络一步就 OOM。留出 4KB 余量当红线——
                 // 到这一步还没崩，说明是在哪次大分配前后擦边，先报警好定位。
                 if (intFree < 4096 || intLargest < 3072) {
@@ -1442,11 +1455,15 @@ extern "C" void app_main() {
                              (unsigned)s_oom_caps.load(std::memory_order_relaxed), fn ? fn : "?");
                 }
             }
-            // 每 60s 打一次内部堆分区详情（含为 DMA 预留的那块）
-            if (s_heap_info_us != 0 && nowh - s_heap_info_us > 60000000) {
+            // 每 60s 打一次内部堆分区详情（含为 DMA 预留的那块）。同一个理由要避让推屏：
+            // 它也是整片堆的遍历（且会刷十几行串口）。跳过时不动时间戳，下一拍再来。
+            if (s_heap_info_us != 0 && nowh - s_heap_info_us > 60000000 &&
+                !display_scan_busy()) {
                 s_heap_info_us = nowh;
+                longop_begin("heap-print");
                 ESP_LOGI("Heap", "---- internal regions ----");
                 heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
+                longop_end();
             } else if (s_heap_info_us == 0) {
                 s_heap_info_us = nowh;
             }
