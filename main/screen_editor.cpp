@@ -1501,31 +1501,31 @@ static std::vector<std::pair<const char *, const char *>> promptWrappedRowRanges
     return rows;
 }
 
+// 正文区底边：虚拟键盘在时贴键盘顶（按钮条就落在键盘上面那条），否则让给
+// IME 候选条 / 状态栏。**竖排与横排共用这一份**——两边的底边必须逐像素一致，
+// 否则竖排切列按一个底、绘制按另一个底，列边界错位、光标跳行。
+static int editorBodyBottomY() {
+    // 整条算式都是**界面字号**下的量(键盘面板顶 / 候选条上沿 / 状态栏上沿),与正文字号
+    // 无关。本函数会被正文作用域调到,所以自己钉一次界面字号,谁调用都拿到同一个底边。
+    FontScope ui(FontRenderer::uiPxHeight());
+    if (editorVkActive()) return editorVkTop();
+    if (g_editor.imeActive) return imeStatusPanelTopY();
+    return STATUS_Y;
+}
+
 // 竖排布局度量。draw 与左右/PageUp/PageDown 导航必须用同一套参数,否则
 // 导航按 STATUS_Y 全高切列、绘制按候选条保留高度切列,列边界错位导致光标跳行。
+//
+// 底边**直接取 editorBodyBottomY()**，与横排同源。这里原来手写了一条"锚定分割线(276)
+// 倒推编码行上沿"的算式（265 - 2*字号 ≈ 221~232）：那是候选条还贴在 y≈276 那版版式下
+// 的量。横屏（1216×684）下候选条贴的是 STATUS_BAR_Y(633) 往上、面板顶在 ~527，于是
+// 竖排正文只切到 225 —— 一列只落得下三四个字，面板以上空出一大片。改成与横排同一个
+// 底边后，正文一列排满到候选条上沿（"该让多少让多少"）。
 static VerticalLayoutMetrics editorVerticalVm() {
     int y = FONT_H;
     int pRows = (int)promptWrappedRowRanges().size();
     if (pRows > 0) y += (pRows + 1) * LINE_SPACING;
-    bool reserveIME = g_editor.imeActive;
-    int contentEndY;
-    {
-        // 底边这一组(键盘面板顶 / 候选条上沿 / 状态栏上沿)全是**界面字号**下的量,
-        // 正文字号改了不该带着它们跑。行高那半边(上面的 y)才是正文字号。
-        FontScope ui(FontRenderer::uiPxHeight());
-        if (editorVkActive()) {
-            // 虚拟键盘面板比 IME 候选条高得多,且自带候选条,正文直接裁到面板顶边。
-            contentEndY = editorVkTop();
-        } else if (reserveIME) {
-            // 候选条底边锚定分割线(276)后,编码行白框上沿 = 265 - 2*字号
-            // (22pt:221 / 20pt:225 / 18pt:229,18pt 实测再 +3)。竖排正文下探到编码行上沿
-            // 附近,行数随之变化(锚定 STATUS_Y 时更多)。
-            const int fs = g_font.fontSize();
-            contentEndY = (fs == 18) ? 232 : (265 - 2 * fs);
-        } else {
-            contentEndY = STATUS_Y;
-        }
-    }
+    const int contentEndY = editorBodyBottomY();
     // 竖排首字墨迹顶边与横排首行对齐(横排首行基线 y,顶边 y-ascent);
     // 竖排基线 = vm.y + ascent,故 vm.y 取 y-ascent,顶部不留整行空白
     int vTop = y - g_font.ascent();
@@ -1534,7 +1534,8 @@ static VerticalLayoutMetrics editorVerticalVm() {
 
 // ── 触摸选区的几何 ──────────────────────────────────────────────────────
 // 命中测试必须与 drawEditor 的排布逐项对齐（提示词表头占几行、虚拟键盘把正文裁到
-// 哪儿），否则手指点到的字和反白出来的字会差一行。两侧共用下面这两个函数。
+// 哪儿），否则手指点到的字和反白出来的字会差一行。两侧共用 editorBodyTopY() 与
+// editorBodyBottomY()（后者定义在上面，竖排布局也用同一份，见 editorVerticalVm）。
 
 // 正文第一行的**基线** y（提示词表头之后）。
 static int editorBodyTopY() {
@@ -1544,23 +1545,6 @@ static int editorBodyTopY() {
         if (pRows > 0) y += (pRows + 1) * LINE_SPACING;
     }
     return y;
-}
-
-// 正文区底边：虚拟键盘在时贴键盘顶（按钮条就落在键盘上面那条），否则让给
-// IME 候选条 / 状态栏。与 drawEditor 里 contentEndY 的算法一致。
-static int editorBodyBottomY() {
-    // 整条算式都是**界面字号**下的量(键盘面板顶 / 候选条上沿 / 状态栏上沿),与正文字号
-    // 无关。本函数会被正文作用域调到,所以自己钉一次界面字号,谁调用都拿到同一个底边。
-    FontScope ui(FontRenderer::uiPxHeight());
-    if (editorVkActive()) return editorVkTop();
-    if (g_editor.imeActive) {
-        if (editorVertical()) {
-            const int fs = g_font.fontSize();
-            return (fs == 18) ? 232 : (265 - 2 * fs);
-        }
-        return imeStatusPanelTopY();
-    }
-    return STATUS_Y;
 }
 
 // 正文区一屏能放几行（与 drawEditor 的 visibleVrows 同式）。
