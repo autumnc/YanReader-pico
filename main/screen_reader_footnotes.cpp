@@ -97,14 +97,31 @@ std::optional<Section::AnchorPos> rdFindFootnotePage(const std::string &anchor,
 
 // 弹注的三种结果。
 //   Opened  —— 正文取到了，浮层已经就位。
-//   NotHere —— 这条注释不在本章（calibre 那种 notes.xhtml#fn1 跨文件引用），调用方
-//              退回"按锚点直接跳过去"的老路。
+//   NotHere —— 本章和别的节里都取不到这条注释，调用方走退路（列表那条路是"按锚点
+//              直接跳过去"）。跨文件的书走到这里基本就是书本身坏了个引用。
 //   Pending —— 锚点还没排到。allowBuild=false 那一趟（按键处理里）**不会**去排，
 //              只把这条挂在 st.fnWait* 上、起一个浮层就返回；空闲帧接着把它排出来
 //              （见 rdFootnoteWaitTick）。这是"弹注很慢"的正面解法：原来这里同步排
 //              2.5 秒，屏幕整个冻住；大书注文压在章末，动辄要排几十页。
+//              跨文件那一支（注文在别的 spine）同理，只是排的是**目标节另开的那一份**
+//              Section —— 见 st.fnWaitAltSpine。
 enum class FnPop { Opened, NotHere, Pending };
 static FnPop openFootnotePopup(int idx, bool allowBuild);
+
+// 跨文件弹注为**目标节**另开的那一份 Section（见 RdState::fnWaitAltSpine / rdMakeAltSection）。
+// 只在"挂起期间 + 取文那一刻"活着：取到文（或这一支作废）就放掉。放掉不丢活 —— 析构会
+// suspendBuild 把已经排出来的页落成 sections/N.bin 的 partial，下一注走磁盘那条快路；
+// 而排出来的整章 .bin 更是下次直接复用的。放在 TU 静态里而不是 st 里：它是一份**额外**的
+// Section（st.section 是读者的那一份，两者必须互不干扰），没有任何别的 TU 该看见它。
+static std::unique_ptr<Section> s_fnAltSec;
+static int s_fnAltSpine = -1;
+
+// 放掉目标节那一份。挂起作废的几条路（换章/换书/超时/取到文）都要走它，否则一份排了大半
+// 的 Section 会一直挂着不放（PSRAM 是这台机器上最紧的东西，见内存那几笔）。
+static void dropAltSection() {
+  s_fnAltSec.reset();   // ~Section → suspendBuild：已排的页落成 partial，不丢
+  s_fnAltSpine = -1;
+}
 
 void jumpToFootnote(int idx) {
   if (idx < 0 || idx >= static_cast<int>(st.footnoteHrefs.size())) return;
@@ -116,7 +133,14 @@ void jumpToFootnote(int idx) {
   if (hash == std::string::npos || !st.section) return;
   std::string anchor = href.substr(hash + 1);
   auto pg = rdFindFootnotePage(anchor);
-  if (!pg) return;
+  if (!pg) {
+    // 本节没有这条锚点 → 注文在**别的节**里（calibre 把整本注释拆成 notes.xhtml 的书
+    // 全是这样，href = "notes.xhtml#fn1"）。交给跨节延迟落页那一套（与点跨文件链接是
+    // 同一条路）：目标节排过的直接落页，没排过的开过去 + 空闲帧排到再落页。
+    // 返回点上面已经记好（rdRememberNoteRef，以及 rdJumpAcrossSpine 里的 footnoteRet*）。
+    rdJumpAcrossSpine(href, anchor);
+    return;
+  }
   st.footnoteRetSpine = st.spineIndex;
   st.footnoteRetPage = st.page;
   st.footnoteRetValid = true;
@@ -783,10 +807,21 @@ static FnPop openFootnotePopup(int idx, bool allowBuild) {
 
   std::string text;
   bool truncated = false;  // 注文跨页、而下一页还没排完 → text 是半截（见 rdNoteText）
-  auto pg = rdFindFootnotePage(anchor, allowBuild ? 2500 * 1000 : 0);
-  if (pg)
-    text = rdNoteText(*st.section, pg->page, pg->element, BODY_FONT_ID_BASE + st.fontLevel,
-                      st.footnoteNums[idx], &truncated);
+  // 上一次**跨文件**挂起还没结束、用户又点了别的注（点按是穿透浮层的）→ 先把旧的作废：
+  // 它的 fnWait* 会一直挂着，最后弹出来的会是他已经不想要的那一条。同一节那一支不用管，
+  // 下面几行本来就是覆盖式地写 fnWait*。
+  if (st.fnWaitAltSpine >= 0 && (st.fnWaitIdx != idx || st.fnWaitAnchor != anchor))
+    rdFootnoteWaitCancel();
+  // 已经在跨文件挂起里（st.fnWaitAltSpine 记着目标节）：本节早就问过了、答案是没有，
+  // 这一趟直接去问目标节那一份 Section。**不能**再去 rdFindFootnotePage 本节 —— 那会
+  // 按 2.5 秒预算去排本章，白排，而且与"注文在别的节"这件事正好相反。
+  const bool crossFile = (st.fnWaitAltSpine >= 0);
+  if (!crossFile) {
+    auto pg = rdFindFootnotePage(anchor, allowBuild ? 2500 * 1000 : 0);
+    if (pg)
+      text = rdNoteText(*st.section, pg->page, pg->element, BODY_FONT_ID_BASE + st.fontLevel,
+                        st.footnoteNums[idx], &truncated);
+  }
 
   // **"锚点登记了" ≠ "正文取得到"**，这一条是晋书"点注号一直报取不到注文"的根子：
   // 锚点在 startNewTextBlock 里、**块刚要排版那一刻**就登记了（flushPendingAnchor），
@@ -800,27 +835,59 @@ static FnPop openFootnotePopup(int idx, bool allowBuild) {
   // rdNoteText 那时只能交回当前页的半截注文（它置 truncated）。它同样是"慢了一页"，
   // 不是"就这样了"，所以一起挂起。用户侧的症状正是"注文有时被截断、有时又完整"：
   // 截不截断取决于点的那一下撞没撞上排版窗口。
-  if ((text.empty() || truncated) && st.section->isBuilding() && !st.section->isBuildComplete()) {
+  if (!crossFile && (text.empty() || truncated) && st.section->isBuilding() &&
+      !st.section->isBuildComplete()) {
     st.fnWaitIdx = idx;
     st.fnWaitSpine = st.spineIndex;
     st.fnWaitAnchor = anchor;
+    st.fnWaitAltSpine = -1;  // 本节那一支，不是跨文件
     ESP_LOGI(TAG, "弹注计时: 第%d条 锚点 '%s' %s → 继续挂起", idx, anchor.c_str(),
              text.empty() ? "在表里但正文还取不出" : "注文跨页但下一页还没排完");
     return FnPop::Pending;
   }
 
-  // 本章查不到 → 注释可能在**别的 spine**（calibre 常见的 notes.xhtml#fn1 那种）。
-  // 用现成的 resolveHrefToSpineIndex（它只对"带文件名"的跨文件 href 返回有效值，
-  // 纯 #anchor 的同文件引用返回 -1）定位，单独开一节把锚点取回来。这条只在本节
-  // 失败时才走，所以既慢不了日常阅读，也不会碰到用户的三种书。
-  if (text.empty() && st.epub) {
+  // 跨文件那一支：本节没有这条锚点，注文在**别的 spine** 里（calibre 常见的
+  // notes.xhtml#fn1 那种）。resolveHrefToSpineIndex 只对"带文件名"的跨文件 href 返回
+  // 有效值（纯 #anchor 的同文件引用返回 -1）。
+  if (crossFile) {
+    // 目标节那一份 Section 由空闲帧建（见 rdFootnoteWaitTick）—— 建它 = 解压 + 起排版，
+    // 那是"点下去到屏幕开始变"那一拍不能干的事。这里只管取文：排到了就弹，没排到就接着
+    // 挂起。真建不出来（文件没了/内存不够）由 tick 收尾报错，这里不越权。
+    if (s_fnAltSec && s_fnAltSpine == st.fnWaitAltSpine && allowBuild) {
+      if (const auto pg2 = s_fnAltSec->findAnchorPos(anchor))  // 活构建优先，其次磁盘
+        text = rdNoteText(*s_fnAltSec, pg2->page, pg2->element, BODY_FONT_ID_BASE + st.fontLevel,
+                          st.footnoteNums[idx], &truncated);
+      // 与本节同一个道理：锚点登记了不等于正文取得到（锚点页还没排完），注文也可能跨页
+      // 而下一页还没排 —— 两种都是"慢了一页"，不是"就这样了"。
+      if ((text.empty() || truncated) && s_fnAltSec->isBuilding() && !s_fnAltSec->isBuildComplete())
+        return FnPop::Pending;
+    } else if (text.empty()) {
+      return FnPop::Pending;
+    }
+  } else if (text.empty() && st.epub) {
     const int target = st.epub->resolveHrefToSpineIndex(href);
     if (target >= 0 && target != st.spineIndex) {
-      auto sec = std::make_unique<Section>(st.epub, target, g_rd);
-      auto pg2 = sec->getAnchorPosForAnchor(anchor);
-      if (pg2)
-        text = rdNoteText(*sec, pg2->page, pg2->element, BODY_FONT_ID_BASE + st.fontLevel,
-                          st.footnoteNums[idx]);
+      // ① 目标节的 .bin 里已经有锚点表（读者读过那一节、或已经弹过它的注）→ **纯读盘**
+      //    取文，就地弹出来。构造 Section 不排版，所以这一拍仍然是立即的。
+      {
+        Section probe(st.epub, target, g_rd);
+        if (const auto pg2 = probe.getAnchorPosForAnchor(anchor))
+          text = rdNoteText(probe, pg2->page, pg2->element, BODY_FONT_ID_BASE + st.fontLevel,
+                            st.footnoteNums[idx], &truncated);
+      }
+      // ② 探空：那一节读者从没读到过（sections/N.bin 还不存在）。挂起，把"去开那一节、
+      //    把它排到锚点"整个交给空闲帧 —— 排一整节要几秒，按键那一拍绝不排。
+      //    注意这里**不建 Section**：连 openSpine 那一下解压都不在这一拍做。
+      if (text.empty()) {
+        st.fnWaitIdx = idx;
+        st.fnWaitSpine = st.spineIndex;   // 校验"用户没翻走"用的仍是**当前**章
+        st.fnWaitAnchor = anchor;
+        st.fnWaitAltSpine = target;
+        st.fnWaitAltBook = st.bookPath;
+        ESP_LOGI(TAG, "弹注计时: 第%d条 注文在跨节 %d（'%s' 还没排到）→ 挂起", idx, target,
+                 anchor.c_str());
+        return FnPop::Pending;
+      }
     }
   }
   if (text.empty()) {
@@ -865,6 +932,9 @@ void rdFootnoteWaitCancel() {
   st.fnWaitIdx = -1;
   st.fnWaitSpine = -1;
   st.fnWaitAnchor.clear();
+  st.fnWaitAltSpine = -1;
+  st.fnWaitAltBook.clear();
+  dropAltSection();   // 跨文件那一支的目标节：挂起结束就还回去（见 dropAltSection）
   if (!st.busyMsg.empty()) {
     st.busyMsg.clear();
     st.busySub.clear();
@@ -883,16 +953,42 @@ void rdFootnoteWaitCancel() {
 void rdFootnoteWaitTick() {
   if (st.fnWaitIdx < 0) return;
   if (st.bookKind != 0 || !st.section || st.spineIndex != st.fnWaitSpine ||
-      st.fnWaitIdx >= static_cast<int>(st.footnoteNums.size())) {
+      st.fnWaitIdx >= static_cast<int>(st.footnoteNums.size()) ||
+      (st.fnWaitAltSpine >= 0 && st.bookPath != st.fnWaitAltBook)) {
     rdFootnoteWaitCancel();
     return;
   }
-  if (rdFindFootnotePage(st.fnWaitAnchor, 0)) {  // 只查不排
+  // 该查/该排的是哪一节。本节那一支用读者的 Section；跨文件那一支用**目标节另开的那一份**
+  // ——那一节的锚点只有把它排出来才有，而本节从一开始就知道没有这条锚点（openFootnotePopup
+  // 的跨文件分支），接着排本章纯属白排。
+  Section *sec = st.section.get();
+  if (st.fnWaitAltSpine >= 0) {
+    if (!s_fnAltSec || s_fnAltSpine != st.fnWaitAltSpine) {
+      // 建它 = 解压 + 起排版（openSpine 的那一套）。空闲帧干这个是可以的：屏幕上正盖着
+      // "正在取注…"，而这几百毫秒本来就是空转等键的时间。
+      auto s = rdMakeAltSection(st.fnWaitAltSpine);
+      if (!s) {
+        rdFootnoteWaitCancel();
+        rdShowFloat("取不到注文", std::string(), 1500);
+        st.dirty = 1;
+        renderCurrent();
+        return;
+      }
+      s_fnAltSec = std::move(s);
+      s_fnAltSpine = st.fnWaitAltSpine;
+    }
+    sec = s_fnAltSec.get();
+  }
+  const bool inTable = (sec == st.section.get())
+                           ? static_cast<bool>(rdFindFootnotePage(st.fnWaitAnchor, 0))  // 只查不排
+                           : static_cast<bool>(sec->findAnchorPos(st.fnWaitAnchor));
+  if (inTable) {
     const std::string anchor = st.fnWaitAnchor;
     const FnPop r = openFootnotePopup(st.fnWaitIdx, true);
     if (r != FnPop::Pending) {
+      const bool opened = (r == FnPop::Opened);
       rdFootnoteWaitCancel();
-      if (r == FnPop::Opened) {
+      if (opened) {
         ESP_LOGI(TAG, "挂起弹注: 锚点 '%s' 排到了 → 弹出", anchor.c_str());
         rdOverlayRefresh();
       } else {
@@ -904,10 +1000,10 @@ void rdFootnoteWaitTick() {
     }
     // Pending：锚点在表里，但正文这一刻还取不出来（锚点页还没排完，见 openFootnotePopup）。
     // **不能在这里 cancel** —— 那会把挂起状态连同"正在取注…"浮层一起清掉。落到下面接着排，
-    // 下一空闲帧再试。openFootnotePopup 只在"本节还在排"时才返回 Pending，排完那一帧它会
+    // 下一空闲帧再试。openFootnotePopup 只在那一节还在排时才返回 Pending，排完那一帧它会
     // 改口成 Opened 或 NotHere，所以这里不会无限等下去。
   }
-  if (st.section->isBuildComplete() || !st.section->isBuilding()) {
+  if (sec->isBuildComplete() || !sec->isBuilding()) {
     rdFootnoteWaitCancel();
     rdShowFloat("没有找到这条注文", std::string(), 1500);
     st.dirty = 1;
@@ -918,8 +1014,8 @@ void rdFootnoteWaitTick() {
   // 80ms（main.cpp 的 idleWaitWithTouch(80)），留一点余量给下一次触摸轮询。
   const int64_t deadline = esp_timer_get_time() + 60 * 1000;
   do {
-    st.section->buildSomeMore(1);
-  } while (!st.section->isBuildComplete() && esp_timer_get_time() < deadline);
+    sec->buildSomeMore(1);
+  } while (!sec->isBuildComplete() && esp_timer_get_time() < deadline);
 }
 
 // ── 跨文件链接的延迟落页 ─────────────────────────────────────────────────

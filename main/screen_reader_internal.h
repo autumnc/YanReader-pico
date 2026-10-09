@@ -350,6 +350,14 @@ struct RdState {
   int fnWaitIdx = -1;        // 待弹的脚注在本页脚注表里的下标，-1 = 无
   int fnWaitSpine = -1;      // 挂起时在第几章；换章即作废
   std::string fnWaitAnchor;  // 要等的锚点 id
+  // 挂起弹注的**跨文件那一支**：注文不在本章，而在另一个 spine 里（calibre 把整本注释
+  // 拆成 notes.xhtml 的书全是这样，href = "notes.xhtml#fn1"）。那种书本章的锚点表里
+  // **永远**没有这个锚点，所以不能像本节那样"接着排本章" —— 得为目标节另开一份 Section
+  // 把它排出来（见 rdMakeAltSection，**不动 st.section**：弹注是盖在当前页上的浮层，
+  // 底下的正文页不能换，换了就落进"返回脚注跳转前"）。排整节要几秒，照样挂给空闲帧。
+  // -1 = 挂起的不是跨文件那一支。
+  int fnWaitAltSpine = -1;
+  std::string fnWaitAltBook;  // 换书后 spine 号可能撞上，书路径也得进键
   // 挂起的**跨文件链接**落页（异步）。指向别的节的链接（calibre 的 notes.xhtml#fn1）
   // 要先开过去、再排到那个锚点才落页，而目标节常常从没排过 —— 几秒的排版绝不能塞进
   // "点下去到屏幕开始变"那一拍。与上面挂起弹注同一个套路：按键只开过节省下的交给
@@ -800,6 +808,15 @@ void closeFootnotePopup();
 void applyNightMode();
 void buildToPage(int target);
 bool openSpine(int idx);
+// 跨文件弹注为**目标节**另开一份 Section（与 openSpine 同一套 spec 与字号梯子），
+// **不碰 st.section**（见 RdState::fnWaitAltSpine）。失败返回 nullptr；调用方持有它，
+// 排到锚点就把正文取出来，然后放掉 —— 析构会自动 suspendBuild（把已排的页落成
+// partial），所以半途放掉不丢活。
+std::unique_ptr<Section> rdMakeAltSection(int spine);
+// 跳到**别的节**里的一个锚点（href 是带文件名的跨文件引用，如 notes.xhtml#fn1）。
+// 命中就开过去落页，还没排过就开过去 + 挂给空闲帧（rdLinkWaitTick）；返回点在两支里
+// 都记好。返回 false = 这个 href 指不到任何**别的**节。点跨文件链接与脚注的"→"共用。
+bool rdJumpAcrossSpine(const std::string &href, const std::string &anchor);
 std::string rdNormalizeNoteNumber(const std::string &s);
 void rdOverlayRefresh();
 int rdUtf8Len(unsigned char c);

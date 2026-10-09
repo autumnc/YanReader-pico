@@ -869,6 +869,75 @@ bool openSpine(int idx) {
   return true;
 }
 
+// 跨文件弹注的目标节：一份**不属于 st.section 的** Section，只为把那一节的锚点排出来。
+// 存在的理由是弹注的整个卖点"就地看一眼、不跳走"—— 若照跨文件链接那条路（openSpine）
+// 走过去，底下的正文页就换成 notes.xhtml 了，弹注盖在它上面，关掉还得"返回脚注跳转前"。
+// 所以：spec / 字号梯子照抄 openSpine（缺了它排出来的页与章节那份对不上），但 st 不动。
+std::unique_ptr<Section> rdMakeAltSection(int spine) {
+  if (!st.epub || st.bookKind != 0) return nullptr;
+  const int n = st.epub->getSpineItemsCount();
+  if (spine < 0 || spine >= n) return nullptr;
+  auto sec = std::make_unique<Section>(st.epub, spine, g_rd);
+  // 字号梯子必须在 startBuild 之前灌（与 openSpine 同序，理由见那里的注释）。
+  applyCssFontLadder();
+  const ReaderRenderSpec spec = makeSpec();
+  // 读者可能已经读过这一节：磁盘上有整章/partial 就直接用，一行都不用重排。
+  const bool resumed = sec->loadSectionFile(spec);
+  if (!resumed || sec->isPartial()) {
+    if (!sec->startBuild(spec)) return nullptr;
+  }
+  if (!resumed) sec->buildSomeMore(2);
+  return sec;
+}
+
+// 跳到**别的节**里的一个锚点。本节锚点表里没有时才走这里（calibre 把整本注释拆成
+// notes.xhtml 的书，正文里全是 notes.xhtml#fn1）。
+//   · 目标节的锚点表已经落盘（读者读过那一节、或之前弹过它的注）→ 开过去直接落页；
+//   · 还没排过（sections/N.bin 不存在）→ 开过去（openSpine 起排版，立刻能显示第 0 页）
+//     并把锚点挂起，交给空闲帧排到再落页（rdLinkWaitTick）。**不在这里排**：排一整节要
+//     几秒，而这是"点下去到屏幕开始变"那一拍。
+// 返回点在两支里都记好（footnoteRet*），读者按返回键回到原来的页。
+// 返回 false = 这个 href 指不到任何**别的**节，调用方自己报未命中。
+// 点跨文件链接与脚注列表的"→ 跳到注文原文"共用这一份 —— 同一套异步落页写两遍迟早走偏。
+bool rdJumpAcrossSpine(const std::string &href, const std::string &anchor) {
+  if (!st.epub || anchor.empty()) return false;
+  const int target = st.epub->resolveHrefToSpineIndex(href);
+  if (target < 0 || target == st.spineIndex) return false;
+  // 先纯读盘探一次目标节的锚点表（只有**排过**的节才有那份 .bin）。命中就直接跳；
+  // 探空说明那一节读者还没读到过，走下面的延迟落页。
+  {
+    Section probe(st.epub, target, g_rd);   // 构造不排版，只为了读盘上的锚点表
+    if (const auto pg = probe.getAnchorPosForAnchor(anchor)) {
+      st.footnoteRetSpine = st.spineIndex;
+      st.footnoteRetPage = st.page;
+      st.footnoteRetValid = true;
+      openSpine(target);
+      buildToPage(static_cast<int>(pg->page));
+      st.mode = RdMode::Reading;
+      st.fullRefresh = true;
+      st.dirty = 1;
+      ESP_LOGI(TAG, "跨节落页: '%s' → 节 %d 第 %d 页", href.c_str(), target, (int)pg->page);
+      return true;
+    }
+  }
+  const int fromSpine = st.spineIndex, fromPage = st.page;   // openSpine 会改掉它们
+  if (!openSpine(target)) return false;
+  st.footnoteRetSpine = fromSpine;
+  st.footnoteRetPage = fromPage;
+  st.footnoteRetValid = true;
+  st.page = 0;
+  st.linkWaitSpine = target;
+  st.linkWaitAnchor = anchor;
+  st.linkWaitBook = st.bookPath;
+  st.linkWaitUntilUs = esp_timer_get_time() + 8 * 1000 * 1000;
+  st.mode = RdMode::Reading;
+  st.fullRefresh = true;
+  st.dirty = 1;
+  ESP_LOGI(TAG, "跨节落页: '%s' → 节 %d（锚点 '%s' 还没排到，空闲帧排到再落页）", href.c_str(), target,
+           anchor.c_str());
+  return true;
+}
+
 // 打开 spine 并落到它最后一页（回翻上一章、跳书末用）。openSpine 之后只排出了前几页
 // （增量排版），pageCount 是水位不是章总页数 —— 直接 pageCount-1 会落在章首附近，而不是
 // 末页。这里排完整章再取末页；buildSomeMore 有 32KB 源字节上界所以要循环到 isBuildComplete，
@@ -4766,16 +4835,28 @@ static ListView tocListView(int count, int sel) {
   return titleListView(count, sel, uiLineHeight() + 6, statusTop(), tocRowsPerPage());
 }
 
+// 目录层级缩进：每级右移 2/3 行高（用行高作单位，字号/字面变了缩进跟着变），最深
+// 缩到第 6 级就不再右移（再深的目录页共就那么点宽度，缩过头反而看不清）。
+static constexpr int kTocMaxIndent = 6;
+static int tocIndentStep() {
+  const int s = uiLineHeight() * 2 / 3;
+  return s > 0 ? s : 1;
+}
+
 static void renderToc() {
   g_rd.clearScreen();
   drawTitle("目录");
   std::vector<std::string> items;
+  std::vector<uint8_t> levels;   // 与 items 一一对应；TXT 章节表是平的，全 0
   if (st.bookKind == 0 && st.epub) {
     for (int i = 0; i < st.epub->getTocItemsCount(); i++) {
-      items.push_back(st.epub->getTocItem(i).title);
+      const auto &e = st.epub->getTocItem(i);   // 按值返回：const 引用绑上去是延长临时量寿命，不额外拷一份
+      items.push_back(e.title);
+      levels.push_back(e.level);
     }
   } else if (st.bookKind == 1) {
     items = st.txtChapterTitles;
+    levels.assign(items.size(), 0);
   }
   if (items.empty()) {
     drawCenteredLine(g_rd.getScreenHeight() / 2, "本书无目录");
@@ -4790,14 +4871,30 @@ static void renderToc() {
     // 字体时是用户所选字体，两者覆盖都远好于 builtin。
     // id 20 与 id 0 度量完全一致（同一个 g_uiFont.data），所以 itemH/maxRows/缩进全都
     // 不用动，只换字面；抬头「目录」「本书无目录」和底部提示仍是外壳词，照旧走 builtin。
+    // level 是 nav/ncx 里 <ol>/navPoint 的**嵌套深度**（1 起，已随 book.bin v11 落盘，
+    // 所以这里不读任何新东西）。先按最浅的条目归一化——有的书写死从 2 起，不归一化就
+    // 整屏白缩一级。
+    int minLevel = 255;
+    for (uint8_t lv : levels) minLevel = std::min<int>(minLevel, lv);
+    if (minLevel == 255) minLevel = 0;
+    const int indentStep = tocIndentStep();
+    const int screenW = g_rd.getScreenWidth();
     for (int i = 0; i < maxRows && start + i < static_cast<int>(items.size()); i++) {
       int idx = start + i;
       int y = lv.top + i * itemH;
+      int lvl = (idx < static_cast<int>(levels.size())) ? (static_cast<int>(levels[idx]) - minLevel) : 0;
+      lvl = clampI(lvl, 0, kTocMaxIndent);
+      const int x = MARGIN + lvl * indentStep;
+      // 缩进之后按剩余宽度截断：不截的话深一级的长标题会顶到屏幕右边缘（原来是贴边
+      // 裁掉，缩进后可见的就更少了）。
+      int maxW = screenW - x - MARGIN;
+      if (maxW < 40) maxW = 40;
+      const std::string txt = g_rd.truncatedText(CONTENT_UI_FONT_ID, items[idx].c_str(), maxW);
       if (idx == st.tocSel) {
-        g_rd.fillRect(0, y, g_rd.getScreenWidth(), itemH, true);
-        drawLineText(MARGIN, y + 3, items[idx].c_str(), false, CONTENT_UI_FONT_ID);
+        g_rd.fillRect(0, y, screenW, itemH, true);
+        drawLineText(x, y + 3, txt.c_str(), false, CONTENT_UI_FONT_ID);
       } else {
-        drawLineText(MARGIN, y + 3, items[idx].c_str(), true, CONTENT_UI_FONT_ID);
+        drawLineText(x, y + 3, txt.c_str(), true, CONTENT_UI_FONT_ID);
       }
     }
   }
@@ -6235,7 +6332,8 @@ static void handleFootnotes(int key) {
       if (row >= 0) st.footnoteSel = row;
     }
     // 默认真弹注：在书里就地看一眼注释，不跳走（跳走再回来得走"返回脚注跳转前"）。
-    // 注释不在本章（跨文件的 notes.xhtml）时弹不出来，退回老行为直接跳。
+    // 注释不在本章（跨文件的 notes.xhtml）也一样弹 —— 那一路会挂起，由空闲帧把目标节
+    // 排到锚点再补上（见 rdFootnoteWaitTick），所以这里不再需要"弹不出就跳"的退路。
     const int sel = st.footnoteSel;
     if (!rdOpenFootnote(sel, false)) jumpToFootnote(sel);
     st.dirty = 1;
@@ -7201,47 +7299,9 @@ static bool rdTapOnLink(int x, int y) {
   }
   // 跨文件：本节锚点表里没有，按文件名定位到别的 spine 再查一次（calibre 常见的
   // notes.xhtml#fn1 那种）。查不到就老实认输，交给下面更老的兜底。
-  if (st.epub) {
-    const int target = st.epub->resolveHrefToSpineIndex(href);
-    if (target >= 0 && target != st.spineIndex) {
-      // 先纯读盘探一次目标节的锚点表（只有**排过**的节才有那份 .bin）。命中就直接跳；
-      // 探空说明那一节读者还没读到过（把注释整块拆成 notes.xhtml 的书都是这样），
-      // 走下面的延迟落页。见 rdLinkWaitTick。
-      {
-        auto sec = std::make_unique<Section>(st.epub, target, g_rd);
-        if (auto pg = sec->getAnchorPosForAnchor(anchor)) {
-          st.footnoteRetSpine = st.spineIndex;
-          st.footnoteRetPage = st.page;
-          st.footnoteRetValid = true;
-          openSpine(target);
-          buildToPage(static_cast<int>(pg->page));
-          st.mode = RdMode::Reading;
-          st.fullRefresh = true;
-          st.dirty = 1;
-          ESP_LOGI(TAG, "点链接: '%s' → 跨节 %d 第 %d 页", href.c_str(), target, (int)pg->page);
-          return true;
-        }
-      }
-      // 探空：开过去（openSpine 起排版，立刻能显示第 0 页），把锚点挂起。
-      // **不能在这里排**：排一整节要几秒，而这是"点下去到屏幕开始变"那一拍。
-      const int fromSpine = st.spineIndex, fromPage = st.page;   // openSpine 会改掉它们
-      if (!openSpine(target)) return false;
-      st.footnoteRetSpine = fromSpine;
-      st.footnoteRetPage = fromPage;
-      st.footnoteRetValid = true;
-      st.page = 0;
-      st.linkWaitSpine = target;
-      st.linkWaitAnchor = anchor;
-      st.linkWaitBook = st.bookPath;
-      st.linkWaitUntilUs = esp_timer_get_time() + 8 * 1000 * 1000;
-      st.mode = RdMode::Reading;
-      st.fullRefresh = true;
-      st.dirty = 1;
-      ESP_LOGI(TAG, "点链接: '%s' → 跨节 %d（锚点 '%s' 还没排到，空闲帧排到再落页）",
-               href.c_str(), target, anchor.c_str());
-      return true;
-    }
-  }
+  // 这一整套（读盘探一次 → 命中就开过去落页 → 探空就开过去挂起）现在只有一份实现，
+  // 脚注列表的"→ 跳到注文原文"也调它，见 rdJumpAcrossSpine。
+  if (rdJumpAcrossSpine(href, anchor)) return true;
   ESP_LOGW(TAG, "点链接: '%s' 命中了链接框但解析不出目标", href.c_str());
   return false;
 }
@@ -8739,7 +8799,14 @@ static void applyRdPick(int act, const std::string &value) {
       if (ttf_font_open(value.c_str()) != 0) {
         ESP_LOGW(TAG, "字体打开失败，回落内建: %s", value.c_str());
         (void)ttf_font_open_builtin();
-        font_store_set_path("");
+        // **不再把用户的选择抹掉**。原来这里跟一句 font_store_set_path("")，于是
+        // 「打不开」= 设置回内建 = 下次开书照旧不试了 —— 用户看到的是「选完还是内建、
+        // 怎么点都换不动」，明明只是这一次没装上（PSRAM 碎片化时字体工作缓冲要一整块
+        // 连续 PSRAM，同一次开机不同时刻的成败都可能不同）。留着路径，下次开书/下次
+        // 开机 applyUserContentFont() 会再试一次；试不上也只是这次按内建显示。
+        // SD 被挂起时 face_open 会提前 ESP_ERR_INVALID_STATE 返回、**不走**内部那条
+        // 回落内建的路，所以上面那句 ttf_font_open_builtin() 得留着。
+        rdShowFloat("字体装载失败，先按内建显示", "选择已保留，下次开书会再试", 2600);
       }
       reopenBook();
       st.fullRefresh = true;
