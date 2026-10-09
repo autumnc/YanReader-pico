@@ -589,6 +589,57 @@ static bool io_ensure(void) {
     return true;
 }
 
+// 放掉一个字面的预取块缓存。这几块**全是可重建的缓存**：释放之后 io_ensure 会重新
+// 分配，分配不到就走逐次直读（那条路本来就写着"不致命"）。返回实际放掉的字节数。
+static size_t ttf_face_purge_io(ttf_face_t* f) {
+    size_t freed = 0;
+    if (f->f_io_data) {
+        freed += (size_t)(f->f_io_slots ? f->f_io_slots : TTF_IO_SLOTS) * TTF_IO_BLOCK;
+        heap_caps_free(f->f_io_data);
+        f->f_io_data = NULL;
+    }
+    if (f->f_io_run_buf) {
+        freed += (size_t)(f->f_io_run_max ? f->f_io_run_max : TTF_IO_RUN_MAX) * TTF_IO_BLOCK;
+        heap_caps_free(f->f_io_run_buf);
+        f->f_io_run_buf = NULL;
+    }
+    if (f->f_touch_blocks) {
+        freed += (size_t)TTF_PREFETCH_MAX * sizeof(uint32_t);
+        heap_caps_free(f->f_touch_blocks);
+        f->f_touch_blocks = NULL;
+    }
+    if (f->f_warm_cps) {
+        freed += (size_t)TTF_GATHER_MAX * sizeof(uint32_t);
+        heap_caps_free(f->f_warm_cps);
+        f->f_warm_cps = NULL;
+    }
+    // 槽位表跟着作废：留着旧块号，下一次分配回来时会拿它当"已经在缓存里"用。
+    f->f_touch_n = 0;
+    f->f_io_clock = 0;
+    for (int i = 0; i < TTF_IO_SLOTS; i++) {
+        f->f_io_base[i] = UINT32_MAX;
+        f->f_io_fill[i] = 0;
+        f->f_io_age[i] = 0;
+    }
+    return freed;
+}
+
+// 放掉**全部**字面的预取缓存，返回放掉的字节数（0 = 本来就没有）。
+//
+// 为什么需要它：这几块是 PSRAM 里最大的一批常驻块（内容面 512KB+128KB，两个次字面
+// 各 192KB+32KB，一本带内嵌字体的书合计 ~1.06MB），而且**一次分配、永不释放**
+// （见 io_ensure 的注释）。它们各自要一整块连续 PSRAM，于是把空闲区切成
+// 512/415/192/128KB 的碎块 —— 实测开过几本书之后，PSRAM 还空着 1.5MB，最大连续块
+// 却塌到 272KB。那块 494KB 的字体工作缓冲（大 CJK 字体）就要不到了，字体只能回落
+// 内建，用户看到的是"排版设定里的字体锁死在内建"。
+//
+// 谁丢得起一目了然：预取缓存丢了是"SD 读慢一点"，字体丢了是"字不能换"。
+static size_t ttf_purge_io_caches(void) {
+    size_t freed = 0;
+    for (int i = 0; i < TTF_ROLE_COUNT; i++) freed += ttf_face_purge_io(&s_faces[i]);
+    return freed;
+}
+
 static bool io_from_map(uint32_t off, size_t n, void* dst) {
     if (glyf_ram != NULL && off >= glyf_ram_off
         && off + n <= glyf_ram_off + glyf_ram_len) {
@@ -1818,6 +1869,19 @@ static uint8_t* build_working_font(const uint8_t* header, size_t header_len) {
     const uint32_t total = (uint32_t)total64;
 
     uint8_t* data = heap_caps_calloc(1, total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (data == NULL) {
+        // 这一块要**连续** total 字节（大 CJK 字体几百 KB），而 PSRAM 碎片化之后
+        // 明明还空着一两 MB 却要不到 —— 占着坑的正是各字面那几块永不释放的预取缓存
+        // （见 ttf_purge_io_caches）。它们丢得起，字体丢不起：放掉再试一次。
+        const size_t freed = ttf_purge_io_caches();
+        if (freed > 0) {
+            ESP_LOGW(
+                TAG, "字体工作缓冲 %u KB 要不到连续 PSRAM，先放掉 %u KB 预取缓存再试",
+                (unsigned)(total / 1024), (unsigned)(freed / 1024)
+            );
+            data = heap_caps_calloc(1, total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+    }
     if (data == NULL) return NULL;
 
     put_be32(data, 0x00010000);
@@ -2488,12 +2552,20 @@ static esp_err_t load_opened_font(void) {
         return ESP_ERR_NO_MEM;
     }
 
-    try_map_table(
-        file_glyf_off, file_glyf_len, &glyf_ram, &glyf_ram_off, &glyf_ram_len, "glyf"
-    );
+    // 整表映射只对**SD 上的**字体有意义（把 glyf 搬进 PSRAM 是为了免掉一页几百次的
+    // 小读 + lseek）。内建字体在 flash rodata 里（font_mem != NULL），io_read_raw 走的
+    // 就是内存直读，映射一份进 PSRAM 一点好处都没有 —— 却在开机那一刻**随机**吃掉最多
+    // 1927KB（内建的 glyf 表），而且它能不能进来只看当时 largest 够不够 4487KB
+    // （TTF_MAP_RESERVE）。这是 PSRAM 里最大的一笔可变占用，也是"这次开机宽裕、下次
+    // 开机就紧"的来源，白给。跳过。（下面那处 4KB 的小表同理。）
+    if (font_mem == NULL) {
+        try_map_table(
+            file_glyf_off, file_glyf_len, &glyf_ram, &glyf_ram_off, &glyf_ram_len, "glyf"
+        );
+    }
 
     load_variation(header, sizeof(header));
-    if (gvar_ready && file_gvar_len > 0) {
+    if (font_mem == NULL && gvar_ready && file_gvar_len > 0) {
         try_map_table(
             file_gvar_off, file_gvar_len,
             &gvar_ram, &gvar_ram_off, &gvar_ram_len, "gvar"

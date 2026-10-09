@@ -1419,10 +1419,15 @@ extern "C" void app_main() {
                 s_heap_log_us = nowh;
                 unsigned intFree = (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
                 unsigned intLargest = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-                ESP_LOGI("Heap", "int free=%u largest=%u min=%u psram free=%u",
+                // psram 带上 largest：字体工作缓冲/整表映射要的都是**一整块连续**
+                // PSRAM，只看 free 会以为还宽裕（实测空着 1.5MB 却要不到 494KB，
+                // 最大块已塌到 272KB）。判"字体为什么回落到内建"就看这个数。
+                ESP_LOGI("Heap", "int free=%u largest=%u min=%u psram free=%u largest=%u",
                          intFree, intLargest,
                          (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                         (unsigned)heap_caps_get_largest_free_block(
+                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
                 // 提前预警：内堆见底时刷屏/网络一步就 OOM。留出 4KB 余量当红线——
                 // 到这一步还没崩，说明是在哪次大分配前后擦边，先报警好定位。
                 if (intFree < 4096 || intLargest < 3072) {
