@@ -7714,6 +7714,65 @@ static void handleReading(int key) {
   if (key == 0x1B) { openMenu(); return; }
 }
 
+// 目录条目跳转（原来是 `openSpine(getSpineIndexForTocIndex(sel)); st.page = 0;`）。
+//
+// 老实现只取节号、把锚点丢了，于是**同一源文件里的多条目录**全落在那个文件的开头 ——
+// 用户看到的正是"点子目录跳到大层级目录的位置"（莊子校詮：Chapter_0006.html 一条 +
+// #sigil_toc_id_1..6 六条，七条目录全跳到第 0 页）。同族的书还有祖堂集（424/450 条
+// 带锚点）、玄鵺小说集（234/324）。
+//
+// 锚点其实一直都在，而且不用改任何缓存格式：
+//   · TocEntry 自带 anchor，且写进了 book.bin（BookMetadataCache.cpp:44 writeTocEntryTo
+//     三个字符串都写；版本 11，现有缓存直接有）；
+//   · 锚点表也必收 TOC 用到的 id —— ChapterHtmlSlimParser.cpp:1066 的 tocAnchors 是特例：
+//     哪怕 id 挂在 <span> 这种"不可导航行内元素"上（通常为省堆是不收的）也照收。
+// 所以这里只是把丢掉的锚点捡回来，形状与跨节链接（rdTapOnLink 第③条）逐条对应：
+//   ① 就在本节 → 锚点表在手边，查到就翻过去
+//   ② 别的节、盘上 .bin 查得到 → 开过去直接落页
+//   ③ 别的节、还没排到 → 开过去 + 挂起，空闲帧排到锚点再落（rdLinkWaitTick）
+// 空锚点（整条目录就指文件头，晋书/春秋左传注全是这样）仍走老路 page 0，一行没变。
+static void rdTocJump(int tocIndex) {
+  if (!st.epub) return;
+  const auto e = st.epub->getTocItem(tocIndex);
+  const int target = e.spineIndex >= 0 ? e.spineIndex : st.epub->getSpineIndexForTocIndex(tocIndex);
+  const std::string anchor = e.anchor;
+  if (anchor.empty()) {
+    openSpine(target);
+    st.page = 0;
+    return;
+  }
+  if (target == st.spineIndex && st.section) {
+    if (const auto pg = rdFindFootnotePage(anchor, 0)) {   // 只查不排
+      buildToPage(static_cast<int>(pg->page));
+      ESP_LOGI(TAG, "目录跳转: '%s' → 本节第 %d 页（锚点 '%s'）", e.title.c_str(),
+               static_cast<int>(pg->page), anchor.c_str());
+      return;
+    }
+  } else {
+    // 别的节：拿一个**只读盘**的临时 Section 探一次锚点表（sections/N.bin 里有）
+    auto sec = std::make_unique<Section>(st.epub, target, g_rd);
+    if (const auto pg = sec->getAnchorPosForAnchor(anchor)) {
+      openSpine(target);
+      buildToPage(static_cast<int>(pg->page));
+      ESP_LOGI(TAG, "目录跳转: '%s' → 第 %d 节第 %d 页（锚点 '%s'）", e.title.c_str(), target,
+               static_cast<int>(pg->page), anchor.c_str());
+      return;
+    }
+  }
+  // 锚点还没排出来：先按老样子落在本页开头，把"排到锚点再落页"挂给空闲帧。
+  // 8 秒是跨节链接那条同一个上限；用户中途按任何键就作废（见 screen_reader 的按键分支）。
+  if (target != st.spineIndex || !st.section) {
+    if (!openSpine(target)) return;
+  }
+  st.page = 0;
+  st.linkWaitSpine = target;
+  st.linkWaitAnchor = anchor;
+  st.linkWaitBook = st.bookPath;
+  st.linkWaitUntilUs = esp_timer_get_time() + 8 * 1000 * 1000;
+  ESP_LOGI(TAG, "目录跳转: '%s' → 第 %d 节（锚点 '%s' 还没排到，空闲帧排到再落页）",
+           e.title.c_str(), target, anchor.c_str());
+}
+
 static void handleToc(int key) {
   const int n = (st.bookKind == 1) ? static_cast<int>(st.txtChapterTitles.size())
                                    : (st.epub ? st.epub->getTocItemsCount() : 0);
@@ -7735,8 +7794,7 @@ static void handleToc(int key) {
       if (st.bookKind == 1) {
         st.txtPage = txtPageForOffset(st.txtChapterOffsets[static_cast<size_t>(st.tocSel)]);
       } else if (st.epub) {
-        openSpine(st.epub->getSpineIndexForTocIndex(st.tocSel));
-        st.page = 0;
+        rdTocJump(st.tocSel);
       }
       st.mode = RdMode::Reading;
       st.fullRefresh = true;
