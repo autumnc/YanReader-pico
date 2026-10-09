@@ -1810,6 +1810,9 @@ static void rdPrebuildAhead() {
   // 挂起的弹注排在最前面：它要的是**锚点那一页**，可能远在几十页之外（注文常整块压在
   // 章末），比"领先读者 kPrebuildAhead 页"要紧得多。它自己带预算，也在里面把结果弹出来。
   if (!rdPrebuildShouldYield() && st.fnWaitIdx >= 0) rdFootnoteWaitTick();
+  // 挂起的跨文件链接（点了一个指向还没排过的节的链接）：它等的是**目标节里的锚点**，
+  // 与挂起弹注同一个道理 —— 排到那儿再落页，见 rdLinkWaitTick。
+  if (!rdPrebuildShouldYield() && st.linkWaitSpine >= 0) rdLinkWaitTick();
   if (st.section->isBuildComplete()) { s_rdPrebuildDeadlineUs = 0; return; }
   // 单次调用有界：一次空闲帧只啃很小一口，超了就留给下一帧。电子墨水屏推屏本来慢，
   // 但输入采样不能跟着慢；预算小一点，连续翻页的手感更稳。
@@ -7157,19 +7160,42 @@ static bool rdTapOnLink(int x, int y) {
   if (st.epub) {
     const int target = st.epub->resolveHrefToSpineIndex(href);
     if (target >= 0 && target != st.spineIndex) {
-      auto sec = std::make_unique<Section>(st.epub, target, g_rd);
-      if (auto pg = sec->getAnchorPosForAnchor(anchor)) {
-        st.footnoteRetSpine = st.spineIndex;
-        st.footnoteRetPage = st.page;
-        st.footnoteRetValid = true;
-        openSpine(target);
-        buildToPage(static_cast<int>(pg->page));
-        st.mode = RdMode::Reading;
-        st.fullRefresh = true;
-        st.dirty = 1;
-        ESP_LOGI(TAG, "点链接: '%s' → 跨节 %d 第 %d 页", href.c_str(), target, (int)pg->page);
-        return true;
+      // 先纯读盘探一次目标节的锚点表（只有**排过**的节才有那份 .bin）。命中就直接跳；
+      // 探空说明那一节读者还没读到过（把注释整块拆成 notes.xhtml 的书都是这样），
+      // 走下面的延迟落页。见 rdLinkWaitTick。
+      {
+        auto sec = std::make_unique<Section>(st.epub, target, g_rd);
+        if (auto pg = sec->getAnchorPosForAnchor(anchor)) {
+          st.footnoteRetSpine = st.spineIndex;
+          st.footnoteRetPage = st.page;
+          st.footnoteRetValid = true;
+          openSpine(target);
+          buildToPage(static_cast<int>(pg->page));
+          st.mode = RdMode::Reading;
+          st.fullRefresh = true;
+          st.dirty = 1;
+          ESP_LOGI(TAG, "点链接: '%s' → 跨节 %d 第 %d 页", href.c_str(), target, (int)pg->page);
+          return true;
+        }
       }
+      // 探空：开过去（openSpine 起排版，立刻能显示第 0 页），把锚点挂起。
+      // **不能在这里排**：排一整节要几秒，而这是"点下去到屏幕开始变"那一拍。
+      const int fromSpine = st.spineIndex, fromPage = st.page;   // openSpine 会改掉它们
+      if (!openSpine(target)) return false;
+      st.footnoteRetSpine = fromSpine;
+      st.footnoteRetPage = fromPage;
+      st.footnoteRetValid = true;
+      st.page = 0;
+      st.linkWaitSpine = target;
+      st.linkWaitAnchor = anchor;
+      st.linkWaitBook = st.bookPath;
+      st.linkWaitUntilUs = esp_timer_get_time() + 8 * 1000 * 1000;
+      st.mode = RdMode::Reading;
+      st.fullRefresh = true;
+      st.dirty = 1;
+      ESP_LOGI(TAG, "点链接: '%s' → 跨节 %d（锚点 '%s' 还没排到，空闲帧排到再落页）",
+               href.c_str(), target, anchor.c_str());
+      return true;
     }
   }
   ESP_LOGW(TAG, "点链接: '%s' 命中了链接框但解析不出目标", href.c_str());
@@ -10559,6 +10585,9 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     // 用户又动手了 → 挂起的弹注作废（他多半是等不及、点了别处）。挂起态只活在
     // "没人按键"的那些空闲帧里，这样它绝不会在用户已经翻到别处之后突然弹出来。
     if (st.fnWaitIdx >= 0) rdFootnoteWaitCancel();
+    // 挂起的跨文件链接落页同理：只在"没人按键"的空闲帧里等，这样它绝不会在用户已经
+    // 翻到别处之后突然把他拽走。这一帧自己设下的挂起不受影响——取消在上面，设在下面。
+    if (st.linkWaitSpine >= 0) rdLinkWaitCancel();
   }
 
   // 微信读书任务在跑时独占输入：空转 tick（key==0）推进状态机，其余按键里

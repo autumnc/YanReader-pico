@@ -922,6 +922,62 @@ void rdFootnoteWaitTick() {
   } while (!st.section->isBuildComplete() && esp_timer_get_time() < deadline);
 }
 
+// ── 跨文件链接的延迟落页 ─────────────────────────────────────────────────
+// 指向**别的节**的链接（calibre 爱把整本注释拆成 notes.xhtml，正文里全是
+// notes.xhtml#fn1）在 rdTapOnLink 第③条处理。那一节的排版产物 sections/N.bin 只有
+// **排过**的节才有，而锚点表只存在 .bin 里 —— 读者一路读过来从没碰过那一节，于是
+// 纯读盘探一次必然探空（真机日志：`open failed: .../sections/17.bin (errno=2)` 紧跟
+// 一句"命中了链接框但解析不出目标"，跳不过去，按键还落进左右 1/3 翻页）。
+//
+// 排一整节要几秒（解压 + 逐页排版），而用户在意的是"点下去到屏幕开始变"那一段，
+// 不能塞进按键那一拍。所以按键只做两件便宜的事：把 reader 开过去（openSpine 起排版，
+// 立刻能显示第 0 页）并记下锚点；剩下的交给空闲帧 —— 与挂起弹注
+// （rdFootnoteWaitTick）完全同一个套路，只是这条挂起的是"落页"而不是"弹注"。
+void rdLinkWaitCancel() {
+  st.linkWaitSpine = -1;
+  st.linkWaitAnchor.clear();
+  st.linkWaitBook.clear();
+  st.linkWaitUntilUs = 0;
+}
+
+// 空闲帧推进一步挂起的跨文件链接。
+//   ① 状态对不上（换书/换了章/超时）→ 作废，这是"用户已经翻走了"。
+//   ② 锚点排到了 → 落页（buildToPage），并且**自己重绘一次** —— 空闲帧没人推屏。
+//   ③ 整章排完仍没有这个锚点 → 说一句，停在目标节的开头（总比什么都不做强），作废。
+//   ④ 还没到 → 限时接着排，下一空闲帧再来。
+void rdLinkWaitTick() {
+  if (st.linkWaitSpine < 0) return;
+  if (st.bookKind != 0 || !st.section || st.spineIndex != st.linkWaitSpine ||
+      st.bookPath != st.linkWaitBook || esp_timer_get_time() > st.linkWaitUntilUs) {
+    rdLinkWaitCancel();
+    return;
+  }
+  // 只查不排（budgetUs=0）：排活由下面那一段带预算地干，这样这一步永远是 O(1)。
+  if (const auto pg = rdFindFootnotePage(st.linkWaitAnchor, 0)) {
+    const std::string anchor = st.linkWaitAnchor;
+    const int page = static_cast<int>(pg->page);
+    rdLinkWaitCancel();
+    buildToPage(page);
+    st.fullRefresh = true;
+    st.dirty = 1;
+    ESP_LOGI(TAG, "跨节链接: 锚点 '%s' 排到了 → 第 %d 页", anchor.c_str(), page);
+    renderCurrent();
+    return;
+  }
+  if (st.section->isBuildComplete() || !st.section->isBuilding()) {
+    rdLinkWaitCancel();
+    rdShowFloat("这一节里没有那个目标", std::string(), 1500);
+    st.dirty = 1;
+    renderCurrent();
+    return;
+  }
+  // 与 rdFootnoteWaitTick 同一个节拍：一次 60ms（空闲帧的轮询周期是 80ms）。
+  const int64_t deadline = esp_timer_get_time() + 60 * 1000;
+  do {
+    st.section->buildSomeMore(1);
+  } while (!st.section->isBuildComplete() && esp_timer_get_time() < deadline);
+}
+
 // 弹注浮层。画在正文页之上、busy/瞬时浮层之下（后两个都在正中间，优先级更高），
 // 且在 applyNightMode() 之前 —— 夜间模式连它一起反色，不会留一块刺眼的白。
 // 白底 + 双线边框 + 现行宽现断行，非交互部分全在这里，滚动窗口由 fnPopScroll 定。

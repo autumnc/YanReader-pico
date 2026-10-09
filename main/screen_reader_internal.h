@@ -350,6 +350,14 @@ struct RdState {
   int fnWaitIdx = -1;        // 待弹的脚注在本页脚注表里的下标，-1 = 无
   int fnWaitSpine = -1;      // 挂起时在第几章；换章即作废
   std::string fnWaitAnchor;  // 要等的锚点 id
+  // 挂起的**跨文件链接**落页（异步）。指向别的节的链接（calibre 的 notes.xhtml#fn1）
+  // 要先开过去、再排到那个锚点才落页，而目标节常常从没排过 —— 几秒的排版绝不能塞进
+  // "点下去到屏幕开始变"那一拍。与上面挂起弹注同一个套路：按键只开过节省下的交给
+  // 空闲帧，见 rdLinkWaitTick。spineIndex = -1 = 无挂起。
+  int linkWaitSpine = -1;      // 已经开过去的那一节；换章即作废
+  std::string linkWaitAnchor;  // 要等的锚点 id
+  std::string linkWaitBook;    // 换书后 spine 号可能撞上，书路径也得进键
+  int64_t linkWaitUntilUs = 0; // 到点还没排到就放弃（用户早已翻走，别突然跳）
   // 本页的链接矩形（Page::links 抄过来的，坐标已加渲染偏移）。点按命中的**第一依据**：
   // 拿到 href 就能直接查到锚点 id，不必再去比注号（注号是猜出来的，href 是书里写死的）。
   // 数组小（每页最多 32 条，多数页 0~2 条），且是纯数据，跟着页重建。
@@ -783,6 +791,8 @@ bool rdHeadBracketClosed(const std::string &text);
 bool rdOpenFootnote(int idx, bool allowBuild);
 void rdFootnoteWaitCancel();
 void rdFootnoteWaitTick();
+void rdLinkWaitCancel();
+void rdLinkWaitTick();
 void drawFootnotePopup();
 void closeFootnotePopup();
 
