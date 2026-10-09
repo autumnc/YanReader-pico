@@ -61,6 +61,12 @@ void ui_render_restore(void);
 // 双缓冲下必须显式取回上一帧 —— 那是它们以前依赖同一块缓冲的隐含前提。
 void ui_render_begin_overlay(void);
 
+// 同上的"接着上一帧画"，但底取 **core0 自己最后画过的那一帧**，不是渲染任务最后
+// 认领的那一帧 —— 提交完到认领之间差一帧，拿错底会把旧正文铺回去（编辑器打字用）。
+// 返回 true = 已开帧且底已铺好；false = **没开帧**，调用方必须退回 ui_clear() + 整屏重画。
+// 判 false 的情形：双缓冲没起来、已经开着帧、还没画过任何一帧、取不到缓冲。
+bool ui_render_begin_frame_seeded(void);
+
 // 把"屏上现在的画面"留一份副本（占住一块工作缓冲），供 ui_render_restore_kept() 推回。
 // 待机时钟/休眠前调一次。重复调用只有第一次生效。
 void ui_render_keep_frame(void);

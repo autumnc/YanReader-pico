@@ -80,7 +80,10 @@ static bool uiPerfLogOn() {
 // 而正文那点灰用户看下来"能接受"，全是白闪。
 #define FAST_SETTLE_EVERY 8
 // IME 候选/编码条局刷的合并窗口：窗口内的连续输入只推最后一次。
-#define IME_DEFER_US 5000
+// 收到 0（原来 5000）：实测人类连打间隔 150~200ms、键盘自动重复 50ms，这个窗口
+// **从不合并任何东西**，每键白等 5ms。defer 分支本身留着 —— 它同时是"面板内的差分
+// 走 8 相 FOLLOW DU（90ms）"的路由，拆掉会让面板差分落进整屏 GL16 那条 400ms 的路。
+#define IME_DEFER_US 0
 // "清编码区+候选区这两行"的停顿阈值：距离最后一次**输入法动作**（按键落在输入法条内的
 // 那一帧，或一次上屏/句读）超过这么久，才把这两行过一遍区域 GC16。
 // 清一遍 = 30 相，**耗时由相位数决定、与区域大小无关**（高层刷新 min_y 恒为 0，
@@ -137,6 +140,9 @@ struct UiJob {
     // 坐实 —— 见 render_present 第 2 条路与 note_ime_clean 的 extra 参数）。
     bool ime_commit_fast;
     bool force_full; // 强制整屏 GC16
+    // core0 提交这一刻的时间戳。只为计时：渲染任务拿它算"提交 → 推屏开始"之间
+    // 排了多久（队列 + 合并窗口）。不用跨模块全局，是因为提交点本来就在 core0。
+    int64_t stamp_us;
 };
 
 // 设置项 ime_clean → 位掩码。**只在 core0 侧调**（两个 job 组装点），渲染任务不碰 g_settings
@@ -168,6 +174,12 @@ static portMUX_TYPE s_free_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t s_q;
 static SemaphoreHandle_t s_free;  // 计数信号量（初值 2）
 static int s_last_idx = -1;       // 渲染任务：最后一次推上屏的缓冲
+// core0 自己**最后画过**的那块（在 ui_render_submit 里记 job.idx）。
+// 与 s_last_idx 的区别是"谁认领"：s_last_idx 要等渲染任务进 render_present 才更新，
+// 队列里压着上一次 90ms 推屏时它会落后一帧。想拿"上一帧的像素"当绘制底，
+// 必须用这一块 —— 它从 core0 提交那一刻起就确定，之后没人再往里写过
+// （渲染任务只读工作缓冲，别的帧只写自己 acquire 到的那块）。
+static int s_last_drawn_idx = -1;
 static std::atomic<bool> s_active{false};    // init 完成
 
 // ── 渲染任务私有状态（core0 只写三个开关）────────────────────────────────
@@ -185,6 +197,7 @@ static uint8_t *s_defer_cur;
 static EpdRect s_defer_rect;
 static EpdRect s_defer_cand;   // 本次合并窗口的编码区候选区矩形（core0 提交时带上来的）
 static bool s_defer_commit;    // 本次合并窗口是"上屏"那一拍（要顺手清一遍候选区）
+static int64_t s_defer_stamp_us;  // 扣住那一帧的提交时刻（只为计时）
 static std::atomic<bool> s_fast_partial{false};
 static std::atomic<bool> s_fast_partial_first{false};
 static std::atomic<bool> s_local_only{false};
@@ -482,6 +495,7 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
         s_defer_cur = cur;
         s_defer_rect = d;
         s_defer_cand = job.cand;      // flush 时顺手把这一帧的候选行一起写出去
+        s_defer_stamp_us = job.stamp_us;   // 只为计时（见 UiJob.stamp_us）
         // 上屏那一拍 flush 时把区域扩到候选区、换 8 灰阶正文表。**这不是清残影**
         // （GL16 白→白不驱动，见 display.c），清残影一律走 ime_clean_tick 的区域 GC16。
         s_defer_commit = job.ime_commit;
@@ -670,11 +684,23 @@ static void flush_deferred() {
     EpdiyHighlevelState *hl = board_hl();
     copy_to_front(hl, cur);
 
+    const int64_t t0 = esp_timer_get_time();
     if (commit && cand.width > 0 && cand.height > 0) {
         const EpdRect r = rect_union(s_defer_rect, cand);
         guard_draw_result(hl, update_display_area_with(hl, &E0470_GRAY8_TEXT_WAVEFORM, MODE_GL16, r));
+        if (uiPerfLogOn())
+            ESP_LOGI(TAG, "打字帧: 上屏 %d,%d %dx%d 刷屏 %lldms（提交→推屏 %lldms）", r.x, r.y,
+                     r.width, r.height, (long long)((esp_timer_get_time() - t0) / 1000),
+                     (long long)((t0 - s_defer_stamp_us) / 1000));
     } else {
         guard_draw_result(hl, update_display_area_with(hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, s_defer_rect));
+        // "提交→推屏"就是队列 + 那 5ms 合并窗口。刷屏那一截是面板的物理时间（8 相 @FAST），
+        // 和区域大小无关；要判断"还能不能快"看的是**提交之前**那段（见编辑器的「打字耗时」）。
+        if (uiPerfLogOn())
+            ESP_LOGI(TAG, "打字帧: 输入法条 %d,%d %dx%d 刷屏 %lldms（提交→推屏 %lldms）",
+                     s_defer_rect.x, s_defer_rect.y, s_defer_rect.width, s_defer_rect.height,
+                     (long long)((esp_timer_get_time() - t0) / 1000),
+                     (long long)((t0 - s_defer_stamp_us) / 1000));
     }
     if (++s_follow_partials >= FOLLOW_GC16_EVERY) {
         s_follow_partials = 0;
@@ -1000,7 +1026,7 @@ static void ui_render_task(void *) {
         if (s_ime_deferred) {
             int64_t left_us = s_ime_defer_until - esp_timer_get_time();
             int left_ms = (int)((left_us + 999) / 1000);
-            if (left_ms < 1) left_ms = 1;
+            if (left_ms < 0) left_ms = 0;  // 到点就立刻推（窗口已收到 0，见 IME_DEFER_US）
             wait = pdMS_TO_TICKS(left_ms);
         }
         if (s_clean_dirty) {
@@ -1245,7 +1271,9 @@ void ui_render_submit(bool force_full) {
     job.ime_clean_commit = (pol & IME_CLEAN_ON_COMMIT) != 0;
     job.ime_no_clean = (pol & IME_CLEAN_NO_GC16) != 0;
     job.ime_commit_fast = ime_commit_fast_policy();
+    job.stamp_us = esp_timer_get_time();
     const int idx = s_taken;
+    s_last_drawn_idx = idx;   // 供 ui_render_begin_frame_seeded 取"上一帧的像素"（见其声明处）
     s_taken = -1;
     if (xQueueSend(s_q, &job, pdMS_TO_TICKS(UI_RENDER_TAKE_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "推屏队列满，丢弃本帧");
@@ -1327,6 +1355,29 @@ static void post_last_frame(int kind) {
         return;
     }
     ui_render_drain();
+}
+
+bool ui_render_begin_frame_seeded(void) {
+    // "接着上一帧往下画"：把 **core0 自己最后画过的那帧** 拷进一块空闲缓冲当绘制目标，
+    // 于是只改其中一小块的界面（编辑器组合期的输入法条）不必整屏重画。
+    //
+    // 与 ui_render_begin_overlay 的差别只在底从哪来：那边取 s_last_idx（渲染任务最后
+    // **认领**的帧），提交完到认领之间有个窗口，队里压着上一次推屏时最大能差一帧 ——
+    // 拿它打底会把上屏前的旧正文铺回去。这里取 s_last_drawn_idx，提交那一刻就定死。
+    //
+    // 返回 true = 已开帧且以上一帧打底；false = **没开帧**，调用方按老路走
+    // ui_clear() + 整屏重画。宁可返回 false 也绝不能让调用方在没打底的缓冲上"只画一小块"
+    // —— 那会画出一张正文全白的帧。
+    if (!g_u8g2 || !s_active.load(std::memory_order_acquire)) return false;
+    if (s_taken >= 0 || s_sync_fb) return false;  // 已经开着帧：交给老路（它会沿用同一块）
+    const int src = s_last_drawn_idx;
+    if (src < 0) return false;  // 还没画过任何一帧（首帧）：没有底可打
+    const int idx = acquire_buffer(pdMS_TO_TICKS(UI_RENDER_TAKE_MS));
+    if (idx < 0) return false;  // 取不到缓冲：老路的 begin_frame 会去做宽限/重启那套
+    if (src != idx) memcpy(s_fb[idx], s_fb[src], s_fb_size);
+    s_taken = idx;
+    u8g2_set_fb(g_u8g2, s_fb[idx]);
+    return true;
 }
 
 void ui_render_begin_overlay(void) {

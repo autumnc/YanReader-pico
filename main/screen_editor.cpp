@@ -10,6 +10,7 @@
 #include "quick_edit.h"
 #include "typing_click.h"
 #include "ui_helpers.h"
+#include "ui_render.h"  // ui_render_begin_frame_seeded：组合期只重画输入法条时打底用
 #include "selection_handle.h"  // 选区手柄的形状（与阅读模式共用同一份几何）
 #include "hw/auto_orient.h"   // auto_orient_initial：本模式的「自适应」方向
 #include "hw/board.h"         // board_force_*/board_restore_orientation（模式方向切换）
@@ -3091,7 +3092,14 @@ static int64_t s_lastTapUs = 0;
 static int s_lastTapX = -1000;
 static int s_lastTapY = -1000;
 
+// 「打字耗时」开关：与 ui_render 的 ui_perf_log 同一个键（那边只覆盖阅读器键盘与
+// render_present，编辑器这条实体键/蓝牙键的路一个点都没打）。
+static bool edPerfLogOn() { return g_settings.getString("ui_perf_log", "0") == "1"; }
+
 AppState screen_editor_handle(int key, ScreenContext &ctx) {
+    // 「打字耗时」直插那一支的起点（见函数末尾的记账）：ASCII 直插 / Enter / 退格 /
+    // 方向键走的就是那条路，它们和中文组合一样每键整屏重画，只是没有"查找"那一段。
+    const int64_t edT0 = esp_timer_get_time();
     // ── 编辑器的字号切分 ────────────────────────────────────────────────────
     // 「显示与版式 → 正文字号」只管**正文那一块**。做法是把 FontRenderer 的共享格子
     // 在**整个编辑器界面**上换成正文的 px，出去自动还原——这样正文的排版、换行、光标、
@@ -3434,8 +3442,20 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     }
 
     if (g_editor.imeActive && key != 0) {
+        // 「打字耗时」：实体键/蓝牙键这一支的记账。旋钮是 ui_perf_log（同 ui_render 那条）。
+        // 起点钉在**进入这一支**：这之前的键分发只做了几步整数比较，可以忽略。四段的分工：
+        //   查找 = g_ime.handleKey（词库扫描 + 组候选）
+        //   清屏 = ui_clear（整屏 memset，还要取一条空闲缓冲，取不到就阻塞）
+        //   重画 = drawEditor（正文 + 输入法条 + 状态栏，整屏）
+        //   提交 = ui_commit 返回到手（只入队，不等推屏）
+        const int64_t tKey = esp_timer_get_time();
+        // 「组合期只重画输入法条」的判据之一：这一键不能把组合开始/结束掉。
+        // 组合刚翻转那一拍，drawEditor 里打字机模式的防跳 clamp（见其字段说明）会跟
+        // 着翻，scroll 一变正文像素就变 —— 那种拍必须整屏重画。
+        const bool composingBefore = g_ime.composing();
         std::string imeOut;
         if (g_ime.handleKey(key, imeOut)) {
+            const int64_t tLookup = esp_timer_get_time();
             std::string imeStatus = g_ime.takeStatusMessage();
             if (!imeStatus.empty()) {
                 ctx.statusMessage = imeStatus;
@@ -3465,8 +3485,53 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             // 刚上屏的词要立刻进文档上下文: 同一篇里再次输入同一个人名/术语时它就该
             // 排在前面。空串(取消组合等)不必重扫。
             if (!imeOut.empty()) g_ime.setDocumentContext(editorImeContextText());
-            ui_clear(); drawEditor();
+
+            // 组合期这一键只动了输入法条：正文/光标/选区/字数/滚动一个都没变
+            // （editorInsertText("") 首行就 return），而这键又整屏重画一遍要 41ms
+            // —— 实测占「按键→提交」的 80%，还常和推屏抢 PSRAM 涨到 126ms。
+            // 改成拿上一帧打底、只重画那条。drawIMEUI 自己会把整块矩形填白后完整重画
+            // （ui_helpers.cpp 里的 DrawBox），所以那条是自洽的，不必连周围一起画。
+            //
+            // 判据（缺一不可）：
+            //   imeOut   空 = 没上屏（上屏要落字、滚动、改字数，必须整屏）
+            //   imeStatus 空 = 没弹居中提示（删词上屏、空格「无候选」这两支 out 为空
+            //                  但会整屏弹一条消息，见 main.cpp 的状态消息处理）
+            //   drawnOnce  = 屏上这一帧**确实是编辑器画的整帧**：任何非本快路的帧都走
+            //                  ui_clear()+drawEditor()，所以它成立时打底打到的必是完整正文
+            //   composing 前后都真 = 组合没翻转（翻转会带 scroll 跳，见上面 composingBefore）
+            //   !vkOn      = 虚拟键盘在时面板归 editorVkDraw 管，不是 drawIMEUI
+            const bool barOnly = imeOut.empty() && imeStatus.empty() && g_editor.drawnOnce &&
+                                 composingBefore && g_ime.composing() && !editorVkVisible();
+            // 计时两桶在两条路上口径一致：清屏 = 把底铺白/铺上一帧，重画 = 往底上写字。
+            int64_t tClear, tDraw;
+            if (!(barOnly && ui_render_begin_frame_seeded())) {
+                ui_clear();   // 老路：整屏清白 + 整屏重画
+                tClear = esp_timer_get_time();
+                drawEditor();
+                tDraw = esp_timer_get_time();
+            } else {
+                // begin_frame_seeded 已经把上一帧铺进来了（那次 memcpy 落在"清屏"桶里），
+                // 这里只补画输入法条。画笔色的收尾与 ui_clear 一致（那边 memset 白底后
+                // 把笔设成"墨"）。
+                tClear = esp_timer_get_time();
+                u8g2_SetDrawColor(g_u8g2, 0);
+                drawIMEUIWithStatusBar();
+                tDraw = esp_timer_get_time();
+                // drawnOnce 保持 true 不动：跳过 drawEditor 正好让它维持原值，
+                // 空闲帧照旧不重画（见 screen_editor_idle 的判据）。
+            }
             ui_commit();
+            if (edPerfLogOn()) {
+                const int64_t tEnd = esp_timer_get_time();
+                ESP_LOGI("EdIme",
+                         "打字耗时: 查找 %lld + 清屏 %lld + 重画 %lld + 提交 %lld = %lld ms（%s）",
+                         (long long)((tLookup - tKey) / 1000),
+                         (long long)((tClear - tLookup) / 1000),
+                         (long long)((tDraw - tClear) / 1000),
+                         (long long)((tEnd - tDraw) / 1000),
+                         (long long)((tEnd - tKey) / 1000),
+                         !imeOut.empty() ? "上屏" : (barOnly ? "组合(只条)" : "组合"));
+            }
             return APP_EDITOR;
         }
     }
@@ -3812,7 +3877,19 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         moveCursorVertical(editorPageRows(), vrows);
     }
 
-    ui_clear(); drawEditor(); ui_commit();
+    ui_clear();
+    const int64_t edT1 = esp_timer_get_time();
+    drawEditor();
+    const int64_t edT2 = esp_timer_get_time();
+    ui_commit();
+    if (edPerfLogOn()) {
+        // 非输入法的编辑键（ASCII 直插 / Enter / 退格 / 方向键）都落到这一句。
+        // 记它是为了和中文那支对账："英文顺手"常被当成"英文更省"，其实同一句整屏重画。
+        const int64_t edT3 = esp_timer_get_time();
+        ESP_LOGI("EdIme", "打字耗时: 清屏 %lld + 重画 %lld + 提交 %lld = %lld ms（直插 键=%d）",
+                 (long long)((edT1 - edT0) / 1000), (long long)((edT2 - edT1) / 1000),
+                 (long long)((edT3 - edT2) / 1000), (long long)((edT3 - edT0) / 1000), key);
+    }
     return APP_EDITOR;
 }
 
