@@ -2017,7 +2017,9 @@ static bool olHandleConfirm(int &key, AppState &out, ScreenContext &ctx) {
                 if (g.sel < 0) g.sel = 0;
                 saveOutline();
                 rebuildFilter();
-                ctx.statusMessage = "已删除";
+                // 浮动提示（不清屏、不阻塞），与写作模式里删日记同一套：
+                // 删完屏上就是列表、被删项已不在，浮在列表上正好（见 ui_helpers.h）。
+                ui_toast_show("已删除");
             } else if (g.confirmAction == 2 && g.confirmIdx >= 0 && g.confirmIdx < (int)g.projects.size()) {
                 // Delete project
                 std::string dir = std::string(OUTLINE_DIR) + "/" + g.projects[g.confirmIdx];
@@ -2035,7 +2037,7 @@ static bool olHandleConfirm(int &key, AppState &out, ScreenContext &ctx) {
                 g.projects.erase(g.projects.begin() + g.confirmIdx);
                 if (g.sel >= (int)g.projects.size()) g.sel = (int)g.projects.size() - 1;
                 if (g.sel < 0) g.sel = 0;
-                ctx.statusMessage = "已删除项目";
+                ui_toast_show("已删除项目");
             } else if (g.confirmAction == 3 && g.confirmIdx >= 0 && g.nodes && (size_t)g.confirmIdx < g.nodeCount) {
                 // Clear file association
                 auto &node = (*g.nodes)[g.confirmIdx];
@@ -2046,7 +2048,7 @@ static bool olHandleConfirm(int &key, AppState &out, ScreenContext &ctx) {
                 }
                 node.set("file", "");
                 saveOutline();
-                ctx.statusMessage = "已清除关联";
+                ui_toast_show("已清除关联");
             }
             g.mode = M_BROWSE;
         } else if (key == 0x1B) {

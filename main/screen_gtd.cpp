@@ -3949,7 +3949,8 @@ static bool gtdBeginDelete(ScreenContext &ctx) {
         buildProjectList();
         if (g.sel >= (int)g.projectList.size()) g.sel = (int)g.projectList.size() - 1;
         if (g.sel < 0) g.sel = 0;
-        ctx.statusMessage = "已删除项目";
+        // 浮动提示（不清屏、不阻塞），与写作模式里删日记同一套（见 ui_helpers.h）。
+        ui_toast_show("已删除项目");
         return false;   // 没有确认框要弹，调用方回到列表即可
     }
     if (g.sel < 0 || g.sel >= (int)g.filtered.size()) return false;
@@ -4427,7 +4428,7 @@ static AppState gtdHandleConfirm(int key, ScreenContext &ctx) {
                 clearMultiSel();
                 if (g.sel >= (int)g.filtered.size()) g.sel = (int)g.filtered.size() - 1;
                 if (g.sel < 0) g.sel = 0;
-                ctx.statusMessage = "已删除";
+                ui_toast_show("已删除");
                 g.confirmIdxs.clear();
 
             } else if (g.confirmIdx >= 0 && g.confirmIdx < (int)tasks.size()) {
@@ -4438,7 +4439,7 @@ static AppState gtdHandleConfirm(int key, ScreenContext &ctx) {
 
                 rebuildFilter();
 
-                ctx.statusMessage = "已删除";
+                ui_toast_show("已删除");
 
             }
 

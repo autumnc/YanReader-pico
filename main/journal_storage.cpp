@@ -387,7 +387,18 @@ std::vector<JournalEntry> JournalStorage::listEntries() {
                         if (nl == std::string::npos) break;
                         start = nl + 1;
                     }
-                    e.preview = preview_text.substr(0, 40);
+                    // 预览留够"横屏一行还富余"的量：列表行是**单行铺满**的（日期 +
+                    // 预览吃掉其余宽度，见 pjournal_app 的 drawBrowser），横屏 1216px
+                    // 一行 ≈ 54 个汉字 ≈ 165 字节 —— 原来的 40 字节（≈13 字）只够占住
+                    // 左边一小段，右边整块空着。真正的裁剪交给绘制方按当前宽度做。
+                    // 截在整字边界上：substr(0,N) 会切出半个汉字，画出来是乱码。
+                    const size_t kPreviewBytes = 192;
+                    if (preview_text.size() > kPreviewBytes) {
+                        size_t cut = kPreviewBytes;
+                        while (cut > 0 && ((unsigned char)preview_text[cut] & 0xC0) == 0x80) cut--;
+                        preview_text.resize(cut);
+                    }
+                    e.preview = preview_text;
                 }
             }
         }

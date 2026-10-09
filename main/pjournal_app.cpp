@@ -723,9 +723,15 @@ static bool beginEditEntry(const std::string &filename, AppState returnTo, Scree
 
 // 删一篇（按文件名）+ 刷新列表缓存 + 把列表选中项夹回范围内。列表的 d、详情页的 d、
 // 两处的浮动按钮「删除」共用同一份。
-static void deleteEntryByFilename(const std::string &filename, ScreenContext &ctx) {
+//
+// 提示走**浮动轻提示**（ui_toast_show）而不是 ctx.statusMessage：后者是
+// ui_show_message_centered，会**整屏清屏 + 阻塞 1.5s 只显示一行字**（见 ui_helpers.cpp），
+// 删一篇日记要为此闪一屏、还得等它 1.5s。删完屏上就是列表（详情页删完会切回列表），
+// 被删那一行已不在，浮在列表上正好。用户原话（2026-10-10）："删除时，已删除提示直接
+// 浮动显示就行，不需要另起一个满屏显示"。
+static void deleteEntryByFilename(const std::string &filename) {
     const bool ok = g_journal.deleteEntry(filename);
-    ctx.statusMessage = ok ? "已删除" : "删除失败";
+    ui_toast_show(ok ? "已删除" : "删除失败");
     refreshBrowserCache();
     auto &entries = g_browser.entries;
     if (g_browser.selection >= (int)entries.size()) g_browser.selection = (int)entries.size() - 1;
@@ -737,7 +743,31 @@ static void deleteEntryByFilename(const std::string &filename, ScreenContext &ct
 static void browserDeleteSelected(ScreenContext &ctx) {
     auto &entries = g_browser.entries;
     if (g_browser.selection < 0 || g_browser.selection >= (int)entries.size()) return;
-    deleteEntryByFilename(entries[g_browser.selection].filename, ctx);
+    deleteEntryByFilename(entries[g_browser.selection].filename);
+}
+
+// 列表行是**单行铺满**的：日期 + 预览，预览吃掉右边剩下的宽度。两件事逼着这里按
+// 像素裁：① ui_draw_text 不做裁剪，超宽的字会画到屏幕外；② 预览在存储侧只有几十个
+// 字节（见 journal_storage 的 listEntries），横屏一行（1216px）排得下的比那还多。
+// 裁到整字边界（切出半个汉字画出来是乱码），裁短了补省略号。
+static std::string brwClipPx(const std::string &s, int maxPx) {
+    if (maxPx <= 0) return std::string();
+    if (ui_text_width(s.c_str()) <= maxPx) return s;
+    const std::string dots = "…";
+    const int dotsW = ui_text_width(dots.c_str());
+    std::string out;
+    int w = 0;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        const size_t len = (c < 0x80) ? 1 : ((c & 0xE0) == 0xC0) ? 2 : ((c & 0xF0) == 0xE0) ? 3 : 4;
+        if (i + len > s.size()) break;   // 尾部残字节：丢掉
+        const int cw = ui_text_width(s.substr(i, len).c_str());
+        if (w + cw + dotsW > maxPx) break;
+        out.append(s, i, len);
+        w += cw;
+        i += len;
+    }
+    return out + dots;   // 一个字都放不下（窄屏+长日期）也留个省略号，别画成空行
 }
 
 // 整屏：标题 + 列表（+ 键盘 d 的确认框）。确认框也在这里叠——确认期间它每帧都要跟着
@@ -756,15 +786,17 @@ static void drawBrowser() {
     g_browser.scroll = lv.first;
     const int visible = lv.rows;
 
+    const int rowX = 8;
+    const int rowMaxPx = SCREEN_W - rowX - 8;   // 右边留 8，免得墨迹贴着屏边
     for (int i = 0; i < visible && (g_browser.scroll + i) < (int)entries.size(); i++) {
         auto &e = entries[g_browser.scroll + i]; bool sel = (g_browser.scroll + i == g_browser.selection);
         std::string dateDisplay;
         if (e.filename.length() >= 10) dateDisplay = e.filename.substr(0, 10);
         else dateDisplay = e.date;
+        const std::string head = dateDisplay + " ";
         std::string preview = e.preview.empty() ? e.title : e.preview;
-        char buf[80];
-        snprintf(buf, sizeof(buf), "%s %s", dateDisplay.c_str(), preview.c_str());
-        ui_draw_text(8, y + i * LINE_SPACING, buf, sel);
+        std::string row = head + brwClipPx(preview, rowMaxPx - ui_text_width(head.c_str()));
+        ui_draw_text(rowX, y + i * LINE_SPACING, row.c_str(), sel);
     }
 
     // 不再有浮动按钮：编辑/删除在详情页（点一行进去）——键盘的 d 还是在这里直接可用，
@@ -929,7 +961,7 @@ AppState screen_viewer_handle(int key, ScreenContext &ctx) {
     // 历史版本那几处删除确认同一套规矩。
     if (g_viewer.confirmDelete) {
         if (key == 0x0A || key == 0x0D || key == 'y' || key == 'Y') {
-            deleteEntryByFilename(g_viewer.filename, ctx);
+            deleteEntryByFilename(g_viewer.filename);
             g_viewer.confirmDelete = false;
             // 删完回列表（列表的 enter 会重新扫一遍；删空了它自己会退回主菜单）。
             ctx.nextState = APP_BROWSER;
@@ -1264,7 +1296,7 @@ AppState screen_history_handle(int key, ScreenContext &ctx) {
                     g_history.selection = (int)g_history.versions.size() - 1;
                 if (g_history.selection < 0) g_history.selection = 0;
                 g_history.preview = false;
-                ctx.statusMessage = ok ? "已删除历史版本" : "删除失败";
+                ui_toast_show(ok ? "已删除历史版本" : "删除失败");
             }
             g_history.confirmDelete = false;
             drawHistoryList();
