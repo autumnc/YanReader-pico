@@ -61,6 +61,10 @@ static int64_t s_consumer_press_us = 0;
 #define KEY_SEARCH     0xA2
 #define KEY_HELP       0xA3
 #define KEY_REDO       0xA4
+// 晃动机身 = 一次全刷（清残影）。蓝牙键盘上由 Alt+R 产生（见下面的修饰键分支），
+// 主机在 main.cpp 的非阅读界面兜底分支里把它翻成 ui_full_refresh_now()。
+// 必须与 pjournal_app.h 的同名宏一致。
+#define KEY_SHAKE      0xAF
 // Ctrl+0-9 → 快捷编辑文件切换 (0x90-0x99)
 #define KEY_FILE_BASE 0x90
 
@@ -358,6 +362,17 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                 // Ctrl modifier handling
                 bool ctrl = (mod & 0x11) != 0;
                 bool shift = (mod & 0x22) != 0;
+                bool alt = (mod & 0x44) != 0;   // 左/右 Alt（HID 修饰位 2、3，见 hid_to_ascii）
+                if (alt && kc == 21) {
+                    // Alt+R → 手动来一次大刷新（把残影一次刷掉）。复用 KEY_SHAKE 那个键码：
+                    // main.cpp 对非阅读界面的兜底分支拿到它就调 ui_full_refresh_now()，
+                    // 阅读器自己那一档另有处理。HID usage 21 = 'r'。
+                    // **必须排在下面通用字母映射之前**，否则同一个 r 还会被当正文插进去。
+                    // 虚拟键盘没有 Alt，这条只对蓝牙键盘生效。
+                    uint8_t fr = KEY_SHAKE;
+                    pushKey(fr);
+                    continue;
+                }
                 if (ctrl && shift && kc == 9) {
                     // Ctrl+Shift+F → simplified/traditional toggle (before generic Ctrl+letter)
                     uint8_t tt = KEY_TRAD_TOGGLE;
@@ -957,7 +972,10 @@ void BtKeyboard::checkKeyRepeat() {
             if (now >= s_last_repeat_time[i] + interval_us) {
                 // Ctrl modifier handling for repeat
                 bool ctrl = (s_last_mod & 0x11) != 0;
-                if (ctrl && (s_last_mod & 0x22) && kc == 9) {
+                if ((s_last_mod & 0x44) && kc == 21) {
+                    // Alt+R → 全刷；按住不自动重复（免得一直整屏刷）。不消费的话
+                    // 下面 hid_to_ascii 会把它当普通 'r'，正文字符会连成一串。
+                } else if (ctrl && (s_last_mod & 0x22) && kc == 9) {
                     // Ctrl+Shift+F → trad toggle; consume repeat
                 } else if (ctrl && kc == 12) {
                     uint8_t ci = KEY_CTRL_I;
