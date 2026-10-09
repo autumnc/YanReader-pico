@@ -35,6 +35,9 @@ public:
     bool firstLineIndent();
     bool versionHistory();
     bool recoveryDraft();
+    // 全局蓝牙开关，默认开。关 = 协议栈与射频整个拆掉、不再有任何连接尝试
+    // （界面入口在蓝牙管理页最上面那一行，见 app_bt_set_enabled）。
+    bool btEnabled();
     bool verticalReferenceLine();
     int fontSize();
     std::string appMode();  // "journal"(个人日记) 或 "quick"(快捷编辑)

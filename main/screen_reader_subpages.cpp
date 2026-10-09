@@ -1030,6 +1030,8 @@ void renderKeyMap() {
   std::string status;
   if (st.keyMapCapture >= 0) status = "请按遥控器/键盘上要绑定的键…（Esc 取消）";
   else if (!st.keyMapStatus.empty()) status = st.keyMapStatus;
+  // 关掉总开关和"没配对/没连上"是两回事：前者要去那一页把开关打开，后者才是配对。
+  else if (!app_bt_enabled()) status = "蓝牙已关闭（到「蓝牙管理」打开总开关）";
   else if (!g_bt.isConnected()) status = "未连接蓝牙设备（先到「蓝牙管理」配对）";
   else status = "选中一行按 Enter，再按要绑定的键";
   drawLineText(MARGIN, top, fitWidth(status, w - 2 * MARGIN).c_str(), true);

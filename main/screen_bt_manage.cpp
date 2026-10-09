@@ -35,10 +35,27 @@ static struct {
 
 bool screen_bt_manage_scan_mode() { return g_btState.mode == BT_SCAN; }
 
-// ── 几何：列表行 / 浮动按钮 / 长按菜单 ────────────────────────────────────
+// ── 几何：开关行 / 列表行 / 浮动按钮 / 长按菜单 ──────────────────────────
+// 全局蓝牙开关那一行的基线：标题分隔线下面第一行，固定在列表**上面**。
+// 做成独立一行而不是列表里的一项，是因为关掉蓝牙后列表必然是空的 —— 那一屏就只剩
+// 这一件事可做，位置必须固定、显眼，也不能随列表滚动跑掉。
+static int btSwitchRowY() { return FONT_H + 8 + LINE_SPACING; }
+// 开关行的触摸命中带（文字基线上下各留一点，整行都给）。
+static bool btSwitchRowHit(int y) {
+    const int top = btSwitchRowY() - g_font.ascent() - 2;
+    return y >= top && y < top + FONT_H + 4;
+}
+// 开/关药丸的几何（绘制与命中共用，虽然现在只有绘制用）。贴右边缘。
+static void btSwitchPill(int *x, int *y, int *w, int *h) {
+    *w = g_font.textWidth("开") + 24;
+    *h = FONT_H + 4;
+    *x = SCREEN_W - *w - 10;
+    *y = btSwitchRowY() - g_font.ascent() - 2;
+}
+
 // 列表首行的**基线**。绘制与长按命中必须用同一个式子，否则"按哪行弹哪行"会错位。
 static int manageRowBase() {
-    int y = FONT_H + 8 + LINE_SPACING;
+    int y = btSwitchRowY() + FONT_H;         // 开关行下面一行起
     if (g_btState.connecting) y += FONT_H;   // 连接中的状态行占掉一行，列表整体下移
     return y;
 }
@@ -88,6 +105,7 @@ static ListView btPairedListView() {
     return lv;
 }
 static bool fabHit(int x, int y) {
+    if (!app_bt_enabled()) return false;   // 蓝牙关着时这个按钮不存在，别让它接点击
     return x >= fabX() && x < fabX() + fabW() && y >= fabY() && y < fabY() + fabH();
 }
 
@@ -128,6 +146,31 @@ static int btMenuRowAt(int x, int y) {
 }
 
 // ── 动作（键盘与长按菜单共用）────────────────────────────────────────────
+
+// 全局蓝牙开关：拆栈/起栈在 app_bt_set_enabled 里（main.cpp，可能阻塞到几秒，
+// 见那边的注释）。这里只负责把本界面的临时态收干净 —— 扫描页依赖协议栈，关的时候
+// 必须退回管理页；连接/扫描的进行中标记也一并清掉，否则再打开时界面会停在
+// "正在连接…" 那种假状态上。
+static void btToggleEnabled() {
+    const bool on = !app_bt_enabled();
+    // 开回来时先把名单读好，**再**起栈：起栈后的 bt_init 任务也会读这份名单，而
+    // loadPairedDevices 直接写 s_paired/s_paired_count（没上锁），两个线程同时写会
+    // 写出半新半旧的列表。读在起栈之前，就永远撞不上那个任务。
+    if (on) g_bt.loadPairedDevices();
+    app_bt_set_enabled(on);
+    if (g_btState.mode == BT_SCAN) {
+        g_btState.mode = BT_MANAGE;
+        g_btState.scanning = false;
+    }
+    g_btState.connecting = false;
+    g_btState.conn_start_ms = 0;
+    g_btState.statusMsg[0] = '\0';
+    g_btState.selection = 0;
+    g_btState.scroll = 0;
+    g_btState.menuOpen = false;
+    g_btState.menuTarget = -1;
+}
+
 static void btStartScan() {
     g_btState.mode = BT_SCAN;
     g_btState.connecting = false;
@@ -163,11 +206,48 @@ static void btDeletePairedAt(int idx) {
 // ── 绘制 ─────────────────────────────────────────────────────────────────
 // 整屏：标题 + 提示行 + 列表 + 浮动按钮 + 状态栏。**不含推屏**——长按菜单要在
 // 这张底图上再叠浮层，一次提交只能有一个绘制目标，所以 commit 交给调用方。
+// 全局蓝牙开关那一行：左"蓝牙"，右侧一枚开/关药丸。与浮动按钮同一套样子 ——
+// 黑底白字 = 开（活的），白底黑框黑字 = 关（死的），一眼能看出状态。
+static void drawBtSwitchRow() {
+    const bool on = app_bt_enabled();
+    ui_draw_text(8, btSwitchRowY(), "蓝牙", false);
+    const char *t = on ? "开" : "关";
+    int x, y, w, h;
+    btSwitchPill(&x, &y, &w, &h);
+    const int tw = g_font.textWidth(t);
+    const int ty = y + (h - FONT_H) / 2 + g_font.ascent();
+    if (on) {
+        u8g2_SetDrawColor(g_u8g2, 0);
+        u8g2_DrawBox(g_u8g2, x, y, w, h);
+        u8g2_SetDrawColor(g_u8g2, 1);
+        u8g2_DrawFrame(g_u8g2, x + 2, y + 2, w - 4, h - 4);   // 内描边：按钮而不是色块
+        g_font.drawText(x + (w - tw) / 2, ty, t, true);
+        u8g2_SetDrawColor(g_u8g2, 0);
+    } else {
+        u8g2_SetDrawColor(g_u8g2, 0);
+        u8g2_DrawFrame(g_u8g2, x, y, w, h);
+        g_font.drawText(x + (w - tw) / 2, ty, t, false);
+    }
+}
+
 static void drawManageBase(const char *statusLeft) {
     ui_clear();
     ui_draw_text_centered(g_font.ascent(), "蓝牙设备管理", false, true);
     u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
+    const bool btOn = app_bt_enabled();
+    drawBtSwitchRow();
     int y = manageRowBase();
+
+    // 关着的时候列表必然是空的（协议栈拆了，什么都不连）：别画成"暂无已配对设备"，
+    // 那会让人以为设备丢了。直说关着，并指路怎么开。
+    if (!btOn) {
+        y += FONT_H / 2;
+        ui_draw_text_centered(y, "蓝牙已关闭", true); y += FONT_H + 4;
+        ui_draw_text_centered(y, "键盘/遥控器不可用"); y += FONT_H;
+        ui_draw_text_centered(y, "点上面那一行或按 B 打开");
+        ui_draw_status(statusLeft, "?:帮助");
+        return;
+    }
 
     if (g_btState.connecting) {
         ui_draw_text_centered(y, g_btState.statusMsg, true); y += FONT_H;
@@ -215,7 +295,12 @@ static void drawManageBase(const char *statusLeft) {
 }
 
 static void drawManage() {
-    drawManageBase(g_btState.menuOpen ? "Enter:确定 Esc:关闭" : "长按设备:菜单 Enter:连接");
+    const char *sl;
+    if (!app_bt_enabled())
+        sl = "B:打开蓝牙 q/Esc:返回";
+    else
+        sl = g_btState.menuOpen ? "Enter:确定 Esc:关闭" : "长按设备:菜单 Enter:连接";
+    drawManageBase(sl);
     ui_commit();
 }
 
@@ -314,6 +399,8 @@ static void drawScan() {
 // ── 快捷键帮助对话框 ─────────────────────────────────────────────────────
 static const char *BT_HELP_LINES[] = {
     "── 已配对设备管理 ──",
+    "蓝牙    最上面一行,开/关总开关",
+    "B      同上(关 = 不再连任何设备)",
     "长按设备  弹出菜单(连接/删除)",
     "+添加设备 右下角浮动按钮",
     "a      扫描添加设备",
@@ -404,6 +491,48 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
             g_btState.showHelp = false;
         }
         drawHelp();
+        return APP_BT_MANAGE;
+    }
+
+    // ── 全局蓝牙开关 ──
+    // 放在扫描分支**前面**：在扫描页里按 B 也应该是"把蓝牙关掉"（顺手退回管理页），
+    // 而不是留在那个连协议栈都没了的页面上。触摸点法见下面那一段注释。
+    if (key == 'b' || key == 'B') {
+        btToggleEnabled();
+        drawManage();
+        return APP_BT_MANAGE;
+    }
+    // 点开关那一行 = 切换。**必须拦在下面"点哪行连哪行"之前**——那一段对落在列表
+    // 上方的点是"没点中行"，然后照样拿旧 selection 去连，于是点开关会顺手连上设备。
+    // 先 peek：input_tap_xy 是取走即清，没点在这一行的话落点要原样留给下面那一段，
+    // 否则"点哪行连哪行"会因为落点被人先取走而退化成"连当前选中项"。
+    if (key == 0x0A || key == 0x0D) {
+        int tx = 0, ty = 0;
+        if (input_tap_peek_xy(&tx, &ty) && btSwitchRowHit(ty)) {
+            input_tap_xy(&tx, &ty);   // 命中开关行：这颗落点归我，吃掉
+            btToggleEnabled();
+            drawManage();
+            return APP_BT_MANAGE;
+        }
+    }
+
+    // 关着的时候，设备那一套动作（连接/删除/扫描/列表导航）全不接：协议栈已经拆了，
+    // 列表也不画。只剩开关、返回和帮助。
+    if (!app_bt_enabled()) {
+        if (key == '?') {
+            g_btState.helpScroll = 0;
+            g_btState.showHelp = true;
+            drawHelp();
+            return APP_BT_MANAGE;
+        }
+        if (key == 'q' || key == 'Q' || key == 0x1B) {
+            ctx.nextState = g_quickEdit ? APP_SETTINGS : APP_MAIN;
+            return ctx.nextState;
+        }
+        // 关着时点哪儿都不动作，但落点照吞（input_tap_xy 取走即清）：留着不取，
+        // 下一帧换别的键进来时它还在，会变成一颗不知哪来的"幽灵点按"。
+        if (key == 0x0A || key == 0x0D) { int tx, ty; input_tap_xy(&tx, &ty); }
+        drawManage();
         return APP_BT_MANAGE;
     }
 

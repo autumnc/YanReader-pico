@@ -218,6 +218,11 @@ static void ntpSyncTask(void *arg) {
     vTaskDelete(nullptr);
 }
 
+// 最近一次用户输入(BLE 键或按键)的时间,0 表示启动后尚未记录。
+// 放在这一段上面（而不是下面待机那一段）是因为 btInitBody 的重连循环也要看它：
+// "用户刚回来动过机器"是重连退避退回快节奏的唯一信号，见下面的 btInitBody。
+static int64_t s_last_activity_us = 0;
+
 // BLE stack init + auto-connect in a background task so the main UI
 // renders immediately instead of waiting ~1s for the BT controller.
 //
@@ -232,26 +237,57 @@ static std::atomic<bool> s_btManageActive{false};
 
 static void btInitBody() {
     ESP_LOGI(TAG, "Starting Bluetooth...");
-    if (g_bt.init() != ESP_OK) {
-        ESP_LOGE(TAG, "Bluetooth init failed");
+    // init 失败要再试，不能一次就放弃。
+    // 撞得最准的一种：上一次拆除没走完（关蓝牙开关/进待机时正好有一趟连接尝试在飞），
+    // 残骸让 esp_hidh_init 报 "Already initialized" —— 而**这次失败本身**就把残骸收掉了
+    // （BtKeyboard::init 的 fail(stage 6) 会先 esp_hidh_deinit 再关 bluedroid），紧接着
+    // 再来一次就能成。原来失败直接 return，那句"需下个 init 周期自愈"就成了空话：
+    // 没有任何人再起下一个周期，蓝牙一直瘫到重启（2026-10-09 实测：关开关再打开，
+    // stage 6 失败后就再没动静了）。
+    esp_err_t initRet = ESP_FAIL;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        initRet = g_bt.init();
+        if (initRet == ESP_OK) break;
+        ESP_LOGW(TAG, "BT init 失败(%s)，第 %d/3 次", esp_err_to_name(initRet), attempt + 1);
+        if (attempt < 2) vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (initRet != ESP_OK) {
+        ESP_LOGE(TAG, "蓝牙初始化失败，本次不再重连（关一次开关再打开可再试）");
         return;
     }
     int64_t lastReloadUs = 0;
-    int64_t lastRetryUs = 0;
+    int64_t nextTryUs = 0;         // 下一次允许发起连接的时刻；0 = 立刻
+    int64_t lastGapUs = 0;         // 上一次排出来的留空（只给日志看）
     int tryIdx = 0;
     bool listLoaded = false;
     bool wasConnected = false;
+    bool reloadWanted = false;     // 刚从蓝牙管理页出来 → 名单可能变过
+    bool attemptInFlight = false;  // 已发起、还没有结果的连接尝试
+    int misses = 0;                // 连续"试了没连上"的轮数 → 退避档位
+    int64_t activitySeenUs = 0;    // 上次看到的用户活动时刻（用来认"跳变"，见下）
+    // 退避表：连续未连上 1/2/3/4/5+ 轮 → 两次尝试之间**留空** 2/5/10/30/60 秒。
+    // 注意是"留空"，不是"两次发起相隔"：esp_hidh_dev_open 对不在场的设备要**同步
+    // 阻塞 30 秒**才认输，从发起时起算的话这 30 秒会把 2/5/10 这几档整档吃掉，
+    // 退避表在前三档等于没写（实测过：发起时刻间隔一律 30.2 秒，一直到第 4 档
+    // 才第一次真的多等了 30 秒）。所以下一次允许尝试的时刻在**失败那一刻**排。
+    static const int64_t kRetryGapUs[] = {2000000LL, 5000000LL, 10000000LL,
+                                          30000000LL, 60000000LL};
     while (!s_btInitStop.load(std::memory_order_relaxed)) {
         if (s_btManageActive.load(std::memory_order_relaxed)) {
             wasConnected = false;
-            lastRetryUs = 0;
+            nextTryUs = 0;
+            misses = 0;        // 用户就站在蓝牙那一屏，按最快节奏来
+            tryIdx = 0;
+            reloadWanted = true;
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
         if (g_bt.isConnected()) {
             if (!wasConnected) ESP_LOGI(TAG, "Bluetooth connected, stopping retry logic");
             wasConnected = true;
-            lastRetryUs = 0;
+            nextTryUs = 0;
+            misses = 0;
+            attemptInFlight = false;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -260,22 +296,65 @@ static void btInitBody() {
             wasConnected = false;
         }
         const int64_t nowUs = esp_timer_get_time();
-        if (!listLoaded || nowUs - lastReloadUs > 30000000) {
-            lastReloadUs = nowUs;
-            g_bt.loadPairedDevices();
-            listLoaded = g_bt.pairedDeviceCount() > 0;
-            tryIdx = 0;
-            if (listLoaded) ESP_LOGI(TAG, "Loaded %d paired device(s)", g_bt.pairedDeviceCount());
+
+        // 一次连接的收尾：上一拍发起过，这一拍既没连上、也不在连接中 = 这一次没成。
+        // 退避加档，并**从这一刻起**排下一次 —— 那 30 秒的阻塞刚刚过去，现在开始算留空。
+        if (attemptInFlight && !g_bt.isConnecting()) {
+            attemptInFlight = false;
+            misses++;
+            lastGapUs = kRetryGapUs[misses < 5 ? misses : 4];
+            nextTryUs = nowUs + lastGapUs;
         }
-        if (listLoaded && !g_bt.isConnecting() &&
-            (lastRetryUs == 0 || nowUs - lastRetryUs > 2000000)) {
-            lastRetryUs = nowUs;
+
+        // 用户刚回来动过机器 → 退回最快节奏：他多半正要开键盘。
+        // 判据取**跳变**（"静了一阵子之后的第一下输入"），不是"最近 N 秒内有输入" ——
+        // 后者在打字/连续翻页时全程为真，退避会被一直按住，等于白改，而打字正是这台
+        // 机器的常事。跳变同时覆盖了我们要的几种情形：待机唤醒、在阅读里停了一阵又
+        // 伸手、切进写作模式、进蓝牙管理页。（唤醒/开机本来就重启本任务，misses 归零。）
+        // 门槛 60 秒是权衡出来的：调小（比如 30 秒）会让"看一页翻一下"的读者几乎
+        // 每次都够到，退避等于白退；调大则"坐下来想用键盘"那种中断信号迟迟不认。
+        // 拿不准就改这一个数，别的地方不用动。
+        static const int64_t kActivityLullUs = 60 * 1000000LL;
+        if (s_last_activity_us != activitySeenUs) {
+            const int64_t quietUs = s_last_activity_us - activitySeenUs;
+            activitySeenUs = s_last_activity_us;
+            if (quietUs > kActivityLullUs) {   // 静了一阵子又来动静 = 用户回来了
+                misses = 0;
+                lastGapUs = 0;
+                nextTryUs = 0;                 // 立刻试一次，不等退避
+            }
+        }
+
+        // 配对表什么时候从 SD 重读。原来是无条件每 30 秒一次 —— 键盘不在时一小时读
+        // 120 次 /sdcard/settings/bt_paired，而这份名单只会在蓝牙管理页里变（配对成功
+        // 或 unpair）。所以：还没拿到名单时盯紧点（30 秒），刚退出那一页立刻重读，
+        // 其余只留 5 分钟一道安全网。
+        const int64_t reloadGapUs = (listLoaded && !reloadWanted) ? 300000000LL : 30000000LL;
+        if (reloadWanted || nowUs - lastReloadUs > reloadGapUs) {
+            lastReloadUs = nowUs;
+            reloadWanted = false;
+            const int before = g_bt.pairedDeviceCount();
+            g_bt.loadPairedDevices();
+            const int after = g_bt.pairedDeviceCount();
+            listLoaded = after > 0;
+            if (after != before) tryIdx = 0;   // 名单变了才从头轮，否则接着上一轮往后走
+            if (listLoaded) ESP_LOGI(TAG, "Loaded %d paired device(s)", after);
+        }
+
+        // 到点了就试下一个设备：失败一次换一台轮着来（键盘不在范围时，三台轮流试
+        // 比死磕一台更容易在用户把键盘拿过来时撞上）。这笔只在醒着时花，待机时
+        // enterLightSleep 会把蓝牙整个拆掉。
+        if (listLoaded && !g_bt.isConnecting() && nowUs >= nextTryUs) {
             const int n = g_bt.pairedDeviceCount();
             if (n > 0) {
                 if (tryIdx >= n) tryIdx = 0;
                 const BtPairedDevice *p = g_bt.getPairedDevice(tryIdx);
-                ESP_LOGI(TAG, "BT auto-reconnect retry %d/%d...", tryIdx + 1, n);
-                if (p) g_bt.connectBDA(p->bda, p->addr_type);
+                ESP_LOGI(TAG, "BT auto-reconnect retry %d/%d（连续未连上 %d 轮，留空 %llds）",
+                         tryIdx + 1, n, misses, (long long)(lastGapUs / 1000000));
+                if (p) {
+                    attemptInFlight = true;
+                    g_bt.connectBDA(p->bda, p->addr_type);
+                }
                 tryIdx = (tryIdx + 1) % n;
             }
         }
@@ -292,6 +371,9 @@ static void btInitTask(void *arg) {
 // 起一个 bt_init。若上一个还在跑，先请它退出（最多等 3 秒）；它退不干净就宁可不重启
 // BT，也好过两个实例同时踩蓝牙栈。
 static void spawnBtInit() {
+    // 全局蓝牙开关关着就什么都不做：不 init 协议栈、不重连。三个调用点（开机、
+    // 待机唤醒、用户在蓝牙管理页里打开开关）都从这里过，判一次就够。
+    if (!g_settings.btEnabled()) return;
     if (s_btInitRunning.load(std::memory_order_acquire)) {
         s_btInitStop.store(true, std::memory_order_relaxed);
         for (int i = 0; i < 30 && s_btInitRunning.load(std::memory_order_acquire); i++) {
@@ -311,6 +393,40 @@ static void spawnBtInit() {
     }
 }
 
+// 把蓝牙整个收掉：先请 bt_init 任务退出（最多等 3 秒），再 deinit 协议栈与控制器
+// （连着的键盘会被断开）。**必须等任务退出再 deinit** —— 两个人同时踩蓝牙栈就是
+// "控制器半死、键盘再也连不上"那个老毛病，见上面 spawnBtInit 的注释。
+//
+// 这段与待机里那段是同一件事，抽出来共用：顺序与超时是这类事故的全部内容，抄两遍
+// 迟早有一遍会漂。最坏要等 3.5 秒（任务 0.5s + deinit 里等一次在飞的 esp_hidh_dev_open
+// 最多 3s）——待机路径本来就是这个代价，开关这条只在用户明确按下时走。
+static void btTearDown() {
+    s_btInitStop.store(true, std::memory_order_relaxed);
+    for (int i = 0; i < 30 && s_btInitRunning.load(std::memory_order_acquire); i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    g_bt.deinit();
+}
+
+// ── 全局蓝牙开关（设置键 "bt_enabled"，默认开）──────────────────────────
+// 关 = 协议栈整个拆掉、射频停掉、此后不再有任何连接尝试；开 = 重新 init 并恢复自动
+// 重连。蓝牙键盘/遥控器是这台机器的主要输入手段，所以默认必须是开的 —— 这条路只在
+// 用户明确要"彻底关蓝牙"（省电/少干扰）时才走，实现在 main 里是因为只有这里管着
+// bt_init 任务与协议栈的生命周期。界面侧是蓝牙管理页最上面那一行（screen_bt_manage）。
+bool app_bt_enabled() { return g_settings.btEnabled(); }
+
+void app_bt_set_enabled(bool on) {
+    if (g_settings.btEnabled() == on) return;   // 没变就别动栈
+    g_settings.setString("bt_enabled", on ? "1" : "0");
+    if (on) {
+        spawnBtInit();
+        ESP_LOGI(TAG, "蓝牙已打开，后台重新初始化并自动重连");
+    } else {
+        btTearDown();
+        ESP_LOGI(TAG, "蓝牙已关闭，协议栈与射频已释放");
+    }
+}
+
 // ── Light sleep 空闲待机 ────────────────────────────────────────────────
 // 键盘/物理按键无输入 ≥ N 分钟后进入 ESP light sleep(RAM 保留、BLE 射频关闭)。
 // N 由「阅读设置 → 自动待机」定（关/5/10/15/20 分钟，见 g_settings.autoStandbyMinutes()）。
@@ -319,7 +435,7 @@ static void spawnBtInit() {
 #define AUTO_SLEEP_GRACE_US     (2 * 60 * 1000000LL)
 
 // 最近一次用户输入(BLE 键或按键)的时间,0 表示启动后尚未记录
-static int64_t s_last_activity_us = 0;
+// （定义在文件上半部分的蓝牙那一段之前，btInitBody 也要用它。）
 // 本帧的 key 来自蓝牙键盘/遥控器（见 pjournal_app.h）。每帧先置位,再被 hw 键补充。
 bool g_key_from_ble = false;
 // 唤醒后的首次按键释放不应再次触发休眠(唤醒按键与休眠按键是同一个键)
@@ -383,12 +499,12 @@ static void enterLightSleep(void) {
     // 休眠前停掉按键音效的蜂鸣器 PCM 会话,避免休眠期耗电
     typingClickRelease();
 
-    // 完全关断 BLE 射频(若键盘已连接,deinit 会同时断开 HID 连接)
-    s_btInitStop.store(true, std::memory_order_relaxed);
-    for (int i = 0; i < 30 && s_btInitRunning.load(std::memory_order_acquire); i++) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    g_bt.deinit();
+    // 完全关断 BLE 射频(若键盘已连接,收栈会同时断开 HID 连接)。与"全局蓝牙开关
+    // 关掉"是同一套动作，见 btTearDown。
+    // 开关关着时栈本来就是拆的（spawnBtInit 被门控，从来没能 init），别再走一遍：
+    // esp_hidh_deinit 在没初始化时返回 INVALID_STATE，deinit 里那 4 次重试会白等
+    // 1.2 秒还打一条"清理不干净"的假错误日志。
+    if (g_settings.btEnabled()) btTearDown();
 
     // 墨水屏断电(双稳态保留画面)
     epd_poweroff();

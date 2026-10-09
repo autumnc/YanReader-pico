@@ -161,3 +161,9 @@ extern AppState g_flomoReturnTo;
 // 阅读器当前子界面里，长按中间确认键是不是一个**动作**（删词典/解绑按键/删统计里的书）
 // 而不是"待机"。main.cpp 的全局"长按中间键 = 待机"靠它放行这三处，其余一律待机。
 bool screen_reader_long_confirm_is_action();
+
+// 全局蓝牙开关（设置键 "bt_enabled"，默认开）。实现在 main.cpp——只有它管着 bt_init
+// 任务与协议栈的生命周期。关 = 拆栈、停射频、不再有任何连接尝试；开 = 重新初始化并
+// 恢复自动重连。界面入口是蓝牙管理页最上面那一行（screen_bt_manage）。
+bool app_bt_enabled();
+void app_bt_set_enabled(bool on);

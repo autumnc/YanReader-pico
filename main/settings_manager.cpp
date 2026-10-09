@@ -193,6 +193,9 @@ bool SettingsManager::markdownRender() { return get("md_render") != "0"; }  // d
 bool SettingsManager::firstLineIndent() { return get("first_line_indent") == "1"; }  // default off
 bool SettingsManager::versionHistory() { return get("version_history") == "1"; }  // default off
 bool SettingsManager::recoveryDraft() { return get("recovery_draft") != "0"; }  // default on
+// 全局蓝牙开关。**默认开**：键盘/遥控器是这台机器的主要输入手段，这条只给"彻底
+// 关掉蓝牙省电/少干扰"的人用，界面入口是蓝牙管理页最上面那一行。
+bool SettingsManager::btEnabled() { return get("bt_enabled") != "0"; }  // default on
 bool SettingsManager::verticalReferenceLine() { return get("vertical_ref_line") == "1"; }  // default off
 
 int SettingsManager::fontSize() {
