@@ -24,13 +24,22 @@
 
 // 对 a、b 的每一行（每行 row_bytes 字节、共 rows 行）扫描，凡 ra[xb] != rb[xb] 就调
 // on_diff(xb, y)。a 与 b 的行距都假定为 row_bytes。
+//
+// 每行只扫字节区间 [xb0, xb1)。**这不是给回调加过滤**：瓶颈既然是"每条取数指令付满一次
+// PSRAM 延迟"，那就必须真的**不碰**区间外的字节，否则一次省钱都省不到 —— 只把回调写成
+// 提前 return，取数照旧发生，时间一分不少（2026-10-09 实测：同样的行段过滤写在回调里，
+// 整屏扫描仍是 29ms）。
 template <typename OnDiff>
-inline void fb_scan_diff_bytes(const uint8_t* a, const uint8_t* b, int row_bytes, int rows, OnDiff on_diff) {
+inline void fb_scan_diff_bytes_range(const uint8_t* a, const uint8_t* b, int row_bytes, int rows,
+                                     int xb0, int xb1, OnDiff on_diff) {
+  if (xb0 < 0) xb0 = 0;
+  if (xb1 > row_bytes) xb1 = row_bytes;
+  if (xb0 >= xb1) return;
   for (int y = 0; y < rows; y++) {
     const uint8_t* ra = a + (size_t)y * (size_t)row_bytes;
     const uint8_t* rb = b + (size_t)y * (size_t)row_bytes;
-    int xb = 0;
-    for (; xb + 8 <= row_bytes; xb += 8) {
+    int xb = xb0;
+    for (; xb + 8 <= xb1; xb += 8) {
       uint64_t wa, wb;
       memcpy(&wa, ra + xb, sizeof wa);
       memcpy(&wb, rb + xb, sizeof wb);
@@ -41,7 +50,7 @@ inline void fb_scan_diff_bytes(const uint8_t* a, const uint8_t* b, int row_bytes
       }
     }
     // 尾部：先 32 位（竖屏行长 342 = 8*42+6，省下 4 个字节的逐字节），再逐字节收尾。
-    for (; xb + 4 <= row_bytes; xb += 4) {
+    for (; xb + 4 <= xb1; xb += 4) {
       uint32_t wa, wb;
       memcpy(&wa, ra + xb, sizeof wa);
       memcpy(&wb, rb + xb, sizeof wb);
@@ -50,8 +59,14 @@ inline void fb_scan_diff_bytes(const uint8_t* a, const uint8_t* b, int row_bytes
         if (ra[xb + k] != rb[xb + k]) on_diff(xb + k, y);
       }
     }
-    for (; xb < row_bytes; xb++) {
+    for (; xb < xb1; xb++) {
       if (ra[xb] != rb[xb]) on_diff(xb, y);
     }
   }
+}
+
+// 整行扫描（区间 = 整行）。位置序列与逐字节扫描逐位相同。
+template <typename OnDiff>
+inline void fb_scan_diff_bytes(const uint8_t* a, const uint8_t* b, int row_bytes, int rows, OnDiff on_diff) {
+  fb_scan_diff_bytes_range(a, b, row_bytes, rows, 0, row_bytes, on_diff);
 }

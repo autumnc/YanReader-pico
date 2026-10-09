@@ -22,12 +22,19 @@
 
 #include "app_config.h"
 #include "board_hw.h"
-#include "diff_scan.h"   // fb_scan_diff_bytes：按 32 位字扫差分（逐字节等价，见 tests/host/diff_scan）
+#include "diff_scan.h"   // fb_scan_diff_bytes：按 64 位字扫差分（逐字节等价，见 tests/host/diff_scan）
 #include "display.h"
 #include "editor_vk.h"   // editorVkVisible/editorVkTop：虚拟键盘面板顶
 #include "e0470_epaper_waveform.h"
 #include "epdiy.h"
 #include "fb_fast.h"   // fb_rot_from_phys：全仓唯一的旋转方向定义（差分包围盒用）
+#include "fb_scan_window.h"   // 逻辑行段 → 物理扫描窗口（差分快路用；主机端穷举对拍过）
+
+// fb_scan_window.h 不 include epdiy（主机端测试要能原样 include），所以那里的 rot 只按
+// 数值判断 —— 这里把"数值 ↔ EpdRotation"钉死，哪天上游改了枚举顺序会在编译期炸掉。
+static_assert(EPD_ROT_LANDSCAPE == 0 && EPD_ROT_PORTRAIT == 1 &&
+                  EPD_ROT_INVERTED_LANDSCAPE == 2 && EPD_ROT_INVERTED_PORTRAIT == 3,
+              "fb_scan_window.h 的 rot 取值与 epdiy 的 EpdRotation 不一致");
 #include "ime/IME.h"   // g_ime.composing()（区域判定在 core0 侧算，见 ui_render_submit）
 #include "settings_manager.h"   // imeCleanMode()（同样只在 core0 侧读，见 ime_clean_policy）
 #include "u8g2_shim.h"
@@ -92,6 +99,12 @@ static bool uiPerfLogOn() {
 // 句读后 / 上屏后 / 两者 / 关闭），这里只定期限 —— 期限要钉在"最后一次输入法动作"上，
 // 取值要明显大于"连打时两次按键的间隔"（本机上大概 0.2~0.6s），否则每敲一个键都会触发。
 #define IME_CLEAN_PAUSE_US 700000
+// core0 申报"面板顶线以上一个像素都没动"时的抽检频率：每这么多拍快路里，重算**一次**
+// 线上那块的真差分校验申报（第 1 拍也查，见 render_present）。抽检那一拍线上那块照扫；
+// 不抽检的拍只扫面板那几行（约 179/684 行 ≈ 26% → ~3ms 而不是 28ms）。
+// 抽检不通过（线上真有差分）说明这条结构性不变量被破了 —— 打警告并短期失信
+// （s_hint_mistrust 记 8 拍，见 render_present），宁慢不错。
+#define HINT_CHECK_EVERY 8
 
 // 打字期间**一次全刷都不做**：键区以前每 7 键把键盘矩形整块过一遍 8 灰阶 GL16 清残影，
 // 结果就是打字打到一半莫名其妙闪一下键盘。现在清残影只针对"编码区+候选区那两行"，而且
@@ -140,6 +153,10 @@ struct UiJob {
     // 坐实 —— 见 render_present 第 2 条路与 note_ime_clean 的 extra 参数）。
     bool ime_commit_fast;
     bool force_full; // 强制整屏 GC16
+    // core0 申报"输入法面板顶线（ime_top）**以上**一个像素都没动"（false = 没申报）。
+    // 由 ui_render_note_ime_above_clean() 填（在 ui_render_submit 里取走并清空）。
+    // 见 render_present 里那条快路。
+    bool above_clean = false;
     // core0 提交这一刻的时间戳。只为计时：渲染任务拿它算"提交 → 推屏开始"之间
     // 排了多久（队列 + 合并窗口）。不用跨模块全局，是因为提交点本来就在 core0。
     int64_t stamp_us;
@@ -198,6 +215,17 @@ static EpdRect s_defer_rect;
 static EpdRect s_defer_cand;   // 本次合并窗口的编码区候选区矩形（core0 提交时带上来的）
 static bool s_defer_commit;    // 本次合并窗口是"上屏"那一拍（要顺手清一遍候选区）
 static int64_t s_defer_stamp_us;  // 扣住那一帧的提交时刻（只为计时）
+// 「提交→推屏」拆账用的两个中间时刻（只为计时）：只有"提交"到"推屏开始"之间那三件事
+// —— 队列唤醒、diff_bounding_rect、copy_to_front —— 需要分开看谁贵。见 flush_deferred 的日志。
+static int64_t s_diag_wake_us;
+static int64_t s_diag_diff_us;
+// core0 申报的"面板顶线以上没动"（false = 没申报）。core0 写完、ui_render_submit 取走
+// 并清空（跨核单次交接，不会有两个帧共用一次申报）。
+static bool s_above_clean = false;
+// 抽检计数与失信计数（只在渲染任务里动）。失信就是"下一次抽检提前来"：
+// 申报连续不靠谱时不装作没看见，直接把快路停 s_hint_mistrust 拍再说。
+static int s_hint_n = 0;
+static int s_hint_mistrust = 0;
 static std::atomic<bool> s_fast_partial{false};
 static std::atomic<bool> s_fast_partial_first{false};
 static std::atomic<bool> s_local_only{false};
@@ -237,41 +265,65 @@ static void release_buffer(int idx) {
 // 再把物理坐标反着映射回逻辑坐标。竖屏下以前一律退化成整屏，虚拟键盘打字就变成
 // 每键整屏刷新；这里必须精确。无差异返回空矩形。
 //
-// 扫描本身交给 fb_scan_diff_bytes（按 32 位字比、命中才展开成字节）—— 整屏 415,872
-// 字节、每个 UI 帧和每个阅读器按键都要过一遍，逐字节是白花带宽。它报出的位置与逐
-// 字节扫描逐位相同（主机端对拍在 tests/host/diff_scan/）。
-static EpdRect diff_bounding_rect(const uint8_t *a, const uint8_t *b) {
+// 扫描本身交给 fb_scan_diff_bytes（**按 64 位字比**、字不同才展开成字节）—— 整屏
+// 415,872 字节、每个 UI 帧和每个阅读器按键都要过一遍，逐字节是白花带宽。实测 32 位
+// 41ms、64 位 22ms（见 main/gfx/diff_scan.h 的微基准）；它报出的位置与逐字节扫描
+// 逐位相同（主机端对拍在 tests/host/diff_scan/）。
+//
+// **按行段扫**：y0/y1 是**逻辑**行区间 [y0, y1)（y1 < 0 = 一直到屏底）。给"面板顶线
+// 以上一定没动"那条快路用：它只需要线以下那块，于是把 831KB 的整屏扫描缩到那一段
+// （省下的就是取数指令本身，见 diff_scan.h 的说明）。传 (0, -1) 就是整屏，即旧口径。
+//
+// 逻辑行段 → 物理扫描窗口由 fb_scan_window_for_rows 算（纯函数，四种旋转都对，
+// 主机端 tests/host/diff_scan/ 穷举对拍过：窗口 = "含至少一个段内像素的字节"的精确集合）。
+static EpdRect diff_bounding_rect_rows(const uint8_t *a, const uint8_t *b, int y0, int y1) {
     const int fb_w = epd_width(), fb_h = epd_height();
     const int row_bytes = fb_w / 2;
     const int rot = epd_get_rotation();
     const int sw = SCREEN_W, sh = SCREEN_H;
 
-    int x0 = sw, y0 = sh, x1 = -1, y1 = -1;
+    if (y1 < 0 || y1 > sh) y1 = sh;
+    EpdRect e = {0, 0, 0, 0};
+    if (y0 >= y1) return e;
+
+    const FbScanWindow win = fb_scan_window_for_rows(rot, fb_w, fb_h, y0, y1);
+    if (win.n_rows <= 0) return e;
+    const int row_off = win.row_off;
+
+    int x0 = sw, ylo = sh, x1 = -1, yhi = -1;
+    // 物理 → 逻辑的方向定义在 fb_fast.h（全仓唯一一份，P4）；这里不再手抄 switch。
+    // 直接传 rot/fb_w/fb_h（epdiy 现读），不碰 fb_fast 的缓存，线程语义同原样。
     auto add = [&](int px, int py) {
-        // 物理 → 逻辑的方向定义在 fb_fast.h（全仓唯一一份，P4）；这里不再手抄 switch。
-        // 直接传 rot/fb_w/fb_h（epdiy 现读），不碰 fb_fast 的缓存，线程语义同原样。
         int lx, ly;
         fb_rot_from_phys(rot, fb_w, fb_h, px, py, &lx, &ly);
+        if (ly < y0 || ly >= y1) return;   // 列段/行段都放宽取整过，这里逐像素收口
         if (lx < x0) x0 = lx;
         if (lx > x1) x1 = lx;
-        if (ly < y0) y0 = ly;
-        if (ly > y1) y1 = ly;
+        if (ly < ylo) ylo = ly;
+        if (ly > yhi) yhi = ly;
     };
 
-    fb_scan_diff_bytes(a, b, row_bytes, fb_h, [&](int xb, int y) {
-        add(xb * 2, y);
-        add(xb * 2 + 1, y);
-    });
-    EpdRect e = {0, 0, 0, 0};
+    // 扫描从 a/b 的第 row_off 行起，回调报的 y 是**相对**行号 —— 加回 row_off 才是物理行
+    // （竖屏那两支 row_off 恒为 0，但横屏 180° 那支不是，绝不能漏）。
+    fb_scan_diff_bytes_range(a + (size_t)row_off * row_bytes, b + (size_t)row_off * row_bytes,
+                             row_bytes, win.n_rows, win.xb0, win.xb1, [&](int xb, int y) {
+                                 add(xb * 2, y + row_off);
+                                 add(xb * 2 + 1, y + row_off);
+                             });
     if (x1 < 0) return e;
 
     // 外扩 2px（抗锯齿 + 半字节边界余量）并夹到屏内
     x0 -= 2; if (x0 < 0) x0 = 0;
     x1 += 2; if (x1 >= sw) x1 = sw - 1;
-    y0 -= 1; if (y0 < 0) y0 = 0;
-    y1 += 1; if (y1 >= sh) y1 = sh - 1;
-    EpdRect r = {x0, y0, x1 - x0 + 1, y1 - y0 + 1};
+    ylo -= 1; if (ylo < 0) ylo = 0;
+    yhi += 1; if (yhi >= sh) yhi = sh - 1;
+    EpdRect r = {x0, ylo, x1 - x0 + 1, yhi - ylo + 1};
     return r;
+}
+
+// 整屏差分包围盒（= 行段 (0, 屏底)）。
+static EpdRect diff_bounding_rect(const uint8_t *a, const uint8_t *b) {
+    return diff_bounding_rect_rows(a, b, 0, -1);
 }
 
 // 两个矩形的并集；空矩形（width<=0）当"没有"处理。用来把"本帧变了的那块"扩到
@@ -289,6 +341,10 @@ static EpdRect rect_union(EpdRect a, EpdRect b) {
     EpdRect r = {x0, y0, x1 - x0, y1 - y0};
     return r;
 }
+
+// （原先两条抽检辅助 —— rect_covers / grow_px —— 随"按矩形申报"一起删掉了：
+// 现在申报的是"线上没动"这条**行**不变量，抽检只需要问"线上那块差分是不是空的"，
+// 不再需要矩形包含关系。）
 
 // ── 推屏 ─────────────────────────────────────────────────────────────────
 // 推屏前把这块工作缓冲**拷进** epdiy 的 front_fb（而不是临时改指针指过去）。
@@ -428,6 +484,7 @@ static void drop_defer() {
 
 // 一帧的完整推屏决策。cur/rel_idx 是这一帧的内容与它占的缓冲（-1 = front_fb 直画）。
 static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
+    s_diag_wake_us = esp_timer_get_time();   // 计时：到这里 = 队列唤醒开销（见 flush_deferred）
     // 先认领：本函数一返回，这块缓冲的内容就是"最新一帧"。ui_render_begin_overlay()
     // 靠它做叠加 —— 认领得早，叠加就不用等这次推屏做完。
     if (rel_idx >= 0) s_last_idx = rel_idx;
@@ -476,7 +533,40 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
     if (job.ime_punct) note_ime_clean(job);
 
     // 差分基准 = 面板上实际的内容（epdiy 的 back_fb）。
-    EpdRect d = diff_bounding_rect(cur, hl->back_fb);
+    //
+    // **快路：core0 申报"输入法面板顶线以上一个像素都没动"时，只扫线以下那一段。**
+    // 这一条不是"猜"，是**结构性**的：任何差分够到面板顶线以上的帧都不满足下面的推迟条件
+    // （`d.y >= job.ime_top`），会当场驱动、不进合并窗口，也就不会被丢弃；而被丢弃的帧
+    // 里留下的、没驱动的差异，只可能在面板顶线**以下**（输入法条本身 + 它下面的状态栏）。
+    // 所以"线以上是空的"对推迟/丢弃帧恒成立。
+    //
+    // 于是这里只需要：
+    //   * 扫 [ime_top, 屏底) —— 输入法条 + 状态栏那 26%（~179/684 行 → 约 3ms，不是 28ms）；
+    //   * 每 HINT_CHECK_EVERY 拍（第 1 拍也查）把 [0, ime_top) 那段也扫一遍核对申报，
+    //     线以上真有差分就告警 + 快路停 HINT_CHECK_EVERY 拍，并把那段并进本次驱动矩形
+    //     （这一拍照旧干净）。7/8 × (28−3)ms ≈ 22ms 是净收益。
+    if (s_hint_mistrust > 0) s_hint_mistrust--;
+    EpdRect d;
+    const bool hinted = job.above_clean && job.ime_top >= 0 && job.ime_top <= SCREEN_H &&
+                        s_hint_mistrust == 0;
+    if (hinted) {
+        d = diff_bounding_rect_rows(cur, hl->back_fb, job.ime_top, -1);
+        if ((s_hint_n++ % HINT_CHECK_EVERY) == 0) {
+            const EpdRect above = diff_bounding_rect_rows(cur, hl->back_fb, 0, job.ime_top);
+            if (above.width > 0 && above.height > 0) {
+                ESP_LOGW(TAG,
+                         "输入法条申报失效：面板顶线 %d 以上仍有差分 %d,%d %dx%d（申报说没有）"
+                         " —— 快路停 %d 拍",
+                         job.ime_top, above.x, above.y, above.width, above.height,
+                         HINT_CHECK_EVERY);
+                s_hint_mistrust = HINT_CHECK_EVERY;
+                d = rect_union(d, above);   // 这一拍照旧要画对
+            }
+        }
+    } else {
+        d = diff_bounding_rect(cur, hl->back_fb);
+    }
+    s_diag_diff_us = esp_timer_get_time();   // 计时：到这里 = 整屏差分开销（见 flush_deferred）
     if (d.width <= 0 || d.height <= 0) {
         // 无变化：墨水屏双稳态，不刷。
         release_buffer(rel_idx);
@@ -685,22 +775,28 @@ static void flush_deferred() {
     copy_to_front(hl, cur);
 
     const int64_t t0 = esp_timer_get_time();
+    // 「提交→推屏」三段拆账（只为计时）：排队 = 队列唤醒（渲染任务何时被调度到），
+    // 差分 = diff_bounding_rect（整屏 831KB 比对），拷贝 = copy_to_front（406KB memcpy）。
+    // 三段都是 core0 提交之后、面板开始驱动之前花的钱。
+    const long long q_ms = (long long)((s_diag_wake_us - s_defer_stamp_us) / 1000);
+    const long long diff_ms = (long long)((s_diag_diff_us - s_diag_wake_us) / 1000);
+    const long long copy_ms = (long long)((t0 - s_diag_diff_us) / 1000);
     if (commit && cand.width > 0 && cand.height > 0) {
         const EpdRect r = rect_union(s_defer_rect, cand);
         guard_draw_result(hl, update_display_area_with(hl, &E0470_GRAY8_TEXT_WAVEFORM, MODE_GL16, r));
         if (uiPerfLogOn())
-            ESP_LOGI(TAG, "打字帧: 上屏 %d,%d %dx%d 刷屏 %lldms（提交→推屏 %lldms）", r.x, r.y,
-                     r.width, r.height, (long long)((esp_timer_get_time() - t0) / 1000),
-                     (long long)((t0 - s_defer_stamp_us) / 1000));
+            ESP_LOGI(TAG, "打字帧: 上屏 %d,%d %dx%d 刷屏 %lldms（提交→推屏 %lld = 排队 %lld + 差分 %lld + 拷贝 %lld）",
+                     r.x, r.y, r.width, r.height, (long long)((esp_timer_get_time() - t0) / 1000),
+                     (long long)((t0 - s_defer_stamp_us) / 1000), q_ms, diff_ms, copy_ms);
     } else {
         guard_draw_result(hl, update_display_area_with(hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, s_defer_rect));
-        // "提交→推屏"就是队列 + 那 5ms 合并窗口。刷屏那一截是面板的物理时间（8 相 @FAST），
+        // "提交→推屏"就是队列 + 差分开销。刷屏那一截是面板的物理时间（8 相 @FAST），
         // 和区域大小无关；要判断"还能不能快"看的是**提交之前**那段（见编辑器的「打字耗时」）。
         if (uiPerfLogOn())
-            ESP_LOGI(TAG, "打字帧: 输入法条 %d,%d %dx%d 刷屏 %lldms（提交→推屏 %lldms）",
+            ESP_LOGI(TAG, "打字帧: 输入法条 %d,%d %dx%d 刷屏 %lldms（提交→推屏 %lld = 排队 %lld + 差分 %lld + 拷贝 %lld）",
                      s_defer_rect.x, s_defer_rect.y, s_defer_rect.width, s_defer_rect.height,
                      (long long)((esp_timer_get_time() - t0) / 1000),
-                     (long long)((t0 - s_defer_stamp_us) / 1000));
+                     (long long)((t0 - s_defer_stamp_us) / 1000), q_ms, diff_ms, copy_ms);
     }
     if (++s_follow_partials >= FOLLOW_GC16_EVERY) {
         s_follow_partials = 0;
@@ -1092,6 +1188,18 @@ void ui_render_note_ime_panel(int x, int y, int w, int h) {
     s_ime_panel_rect = EpdRect{x, y, w, h};
 }
 
+void ui_render_note_ime_above_clean(void) {
+    // 申报"输入法面板顶线（提交时算的 ime_top）**以上**一个像素都没动"。调用方
+    // （screen_editor 组合期只重画输入法条那条路）必须真的如此：正文/标题/顶栏一个都没碰，
+    // 只在打底像素上补了底部那条输入法条。面板顶线**以下**（输入法条 + 状态栏）随便变，
+    // 那一段渲染任务照扫。
+    //
+    // 为什么只报"线以上"而不是报一个矩形：状态栏在输入法条**下面**（y≈633 而条顶 505），
+    // 按矩形申报会把它漏在外面 —— 上屏那拍丢弃的推迟帧可以把状态栏的字留在旧值上，
+    // 那一刻矩形申报就是假的。按行申报天然把状态栏圈进"要扫的那一段"，少一类谎。
+    s_above_clean = true;
+}
+
 // 编码区+候选区矩形（逻辑坐标）—— 屏幕底部那两行，上屏时清的就是这一块。
 // 两种形态都认：
 //   * 虚拟键盘弹着 → 面板顶部的两行（不含键帽：键帽是"按下反白"这种一眼就换掉的
@@ -1209,7 +1317,6 @@ void ui_render_init(void) {
 uint8_t *ui_render_begin_frame(void) {
     if (!g_u8g2) return nullptr;
     if (s_taken >= 0) return s_fb[s_taken];  // 同一帧重复 ui_clear：沿用同一块
-
     int idx = acquire_buffer(pdMS_TO_TICKS(UI_RENDER_TAKE_MS));
     if (idx < 0 && s_active.load(std::memory_order_acquire)) {
         // 再宽限一轮：队列里可能正排着两帧整屏 GC16（每帧 ≤1s），不是卡住。
@@ -1245,6 +1352,10 @@ uint8_t *ui_render_begin_frame(void) {
 
 void ui_render_submit(bool force_full) {
     if (!g_u8g2) return;
+    // 申报"面板顶线以上没动"是**一次性交接**：这里先取走再清空，免得下面任何一条早退
+    // （降级同步推、队列满丢帧）把它漏给下一帧。
+    const bool above_clean = s_above_clean;
+    s_above_clean = false;
     if (s_taken < 0) {
         // 没走 ui_clear 就提交。降级为同步推（内容就在当前 u8g2 缓冲里）。
         // 正常路径不该出现 —— 每个界面都是 ui_clear → 画 → ui_commit。
@@ -1262,6 +1373,7 @@ void ui_render_submit(bool force_full) {
     job.idx = s_taken;
     job.kind = JOB_PRESENT;
     job.force_full = force_full;
+    job.above_clean = above_clean;  // "面板顶线以上没动"的申报
     // IME 面板顶在这里算：core0 侧才能安全读 g_ime / g_font（渲染任务不该碰它们）。
     job.ime_top = ime_top_now();
     job.cand = cand_rect_now();

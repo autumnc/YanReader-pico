@@ -31,6 +31,20 @@ extern "C" {
 // ，。！？ 之后输入法条自己就变空了，那一拍当场清、不推迟。见 ui_render.cpp。
 void ui_render_note_ime_panel(int x, int y, int w, int h);
 
+// 申报"输入法面板顶线（提交时算出来的 ime_top）**以上**一个像素都没动"。给**编辑器组合期
+// 只重画输入法条**那条路用：它以上一帧的像素打底、只补了 drawIMEUI 那一块，渲染任务据此
+// 只需要扫面板顶线**以下**那一段（约 26% → ~3ms，整屏是 28ms）。
+//
+// 这条不变量是**结构性**的：任何差分够到面板顶线以上的帧都不满足推迟条件
+// （`d.y >= job.ime_top`），会当场驱动、不进合并窗口，也就不会被丢弃；被丢弃的帧里留下的、
+// 没驱动的差异只可能在面板顶线以下。所以"线以上是空的"对推迟/丢弃帧恒成立。
+//
+// 调用方必须真的如此（正文/标题/顶栏一个都没碰），且这一帧是**以上一帧逐位打底**开的
+// （ui_render_begin_frame_seeded 返回 true）—— 只有这条路才可能"只画了线以下"。渲染任务侧
+// 每 8 拍抽检一次线上那段真差分（第 1 拍就查），发现申诉不实就告警并停快路 8 拍。
+// 见 ui_render.cpp 的 render_present。
+void ui_render_note_ime_above_clean(void);
+
 // 建渲染任务（core1, prio 6, 12KB 栈走 PSRAM）、双工作缓冲、作业队列。
 // 必须在 board_init() 之后、任何 ui_clear() 之前调用一次。
 void ui_render_init(void);

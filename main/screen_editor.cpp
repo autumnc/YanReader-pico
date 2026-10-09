@@ -3500,8 +3500,14 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             //                  ui_clear()+drawEditor()，所以它成立时打底打到的必是完整正文
             //   composing 前后都真 = 组合没翻转（翻转会带 scroll 跳，见上面 composingBefore）
             //   !vkOn      = 虚拟键盘在时面板归 editorVkDraw 管，不是 drawIMEUI
+            //   没 toast   = toast 是 ui_commit 在**内容之上**盖的框，而且有的调用方把它
+            //                  贴在正文下沿（= 输入法条顶线**之上**）—— 那一刻本帧就多了
+            //                  一块"线上"的像素，申报"线以上没动"就不成立了。当下有 toast
+            //                  就整屏重画，把那块画出去（下一帧起它就成了打底像素的一部分，
+            //                  与面板逐位相同，不再构成差分）。
             const bool barOnly = imeOut.empty() && imeStatus.empty() && g_editor.drawnOnce &&
-                                 composingBefore && g_ime.composing() && !editorVkVisible();
+                                 composingBefore && g_ime.composing() && !editorVkVisible() &&
+                                 !ui_toast_active();
             // 计时两桶在两条路上口径一致：清屏 = 把底铺白/铺上一帧，重画 = 往底上写字。
             int64_t tClear, tDraw;
             if (!(barOnly && ui_render_begin_frame_seeded())) {
@@ -3516,6 +3522,10 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                 tClear = esp_timer_get_time();
                 u8g2_SetDrawColor(g_u8g2, 0);
                 drawIMEUIWithStatusBar();
+                // 申报给渲染任务："输入法面板顶线**以上**一个像素都没动"。它据此只扫顶线以下
+                // 那一段（~26% → 约 3ms，整屏是 28ms），线上那块按 1/8 抽检。申报前提这一支
+                // 全占：底是上一帧逐位铺来的、这一帧只画了面板那一条（线以下），见 ui_render.h。
+                ui_render_note_ime_above_clean();
                 tDraw = esp_timer_get_time();
                 // drawnOnce 保持 true 不动：跳过 drawEditor 正好让它维持原值，
                 // 空闲帧照旧不重画（见 screen_editor_idle 的判据）。
