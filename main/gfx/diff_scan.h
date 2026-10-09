@@ -4,7 +4,13 @@
 //
 // 为什么单独抽出来：整屏 415,872 字节（1216/2 × 684），每个 UI 帧、每个阅读器虚拟
 // 键盘按键都要跑一遍（ui_render.cpp 的 diff_bounding_rect）。逐字节比较是纯带宽浪费
-// —— 内层先按 32 位字比，字不同才落回那 4 个字节逐个报。
+// —— 内层先按 64 位字比，字不同才落回那 8 个字节逐个报。
+//
+// **为什么是 64 位而不是 32 位**（2026-10-09 实机微基准，ESP32-S3 + PSRAM）：
+// 整屏 831KB（两块 415,872B）扫字实测 32 位/次 **41ms**、64 位/次 **22ms**、
+// 16 字节/次（4 条独立 32 位装填）**40ms**。16 字节档没比 32 位快，说明瓶颈不是
+// "在飞的请求数"而是**每条取数指令都要付满一次 PSRAM 延迟**（≈200ns，两路完全不
+// 重叠）；取宽一倍就正好省一半。别再往上加宽，实测无效。
 //
 // **契约**：回调报出的 (xb, y) 序列与"逐字节扫描"逐位相同（顺序也相同，xb 单调递增）。
 // 换句话说这只是一次纯提速，不改变任何调用方能观察到的结果。主机端对拍见
@@ -24,12 +30,22 @@ inline void fb_scan_diff_bytes(const uint8_t* a, const uint8_t* b, int row_bytes
     const uint8_t* ra = a + (size_t)y * (size_t)row_bytes;
     const uint8_t* rb = b + (size_t)y * (size_t)row_bytes;
     int xb = 0;
+    for (; xb + 8 <= row_bytes; xb += 8) {
+      uint64_t wa, wb;
+      memcpy(&wa, ra + xb, sizeof wa);
+      memcpy(&wb, rb + xb, sizeof wb);
+      if (wa == wb) continue;
+      // 字不同才展开成字节：报出的位置与逐字节扫描完全一致，不多也不少。
+      for (int k = 0; k < 8; k++) {
+        if (ra[xb + k] != rb[xb + k]) on_diff(xb + k, y);
+      }
+    }
+    // 尾部：先 32 位（竖屏行长 342 = 8*42+6，省下 4 个字节的逐字节），再逐字节收尾。
     for (; xb + 4 <= row_bytes; xb += 4) {
       uint32_t wa, wb;
       memcpy(&wa, ra + xb, sizeof wa);
       memcpy(&wb, rb + xb, sizeof wb);
       if (wa == wb) continue;
-      // 字不同才展开成字节：报出的位置与逐字节扫描完全一致，不多也不少。
       for (int k = 0; k < 4; k++) {
         if (ra[xb + k] != rb[xb + k]) on_diff(xb + k, y);
       }
