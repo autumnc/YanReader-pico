@@ -467,6 +467,10 @@ static void powerOffWithNotice() {
     // PMU 满 10s 会自己拉 EN **硬断电**，主机拿不到任何通知，不在这儿收尾就丢改动
     // （erase 的键还会复活）。趁 SD 还挂着，先落盘再 sync。
     g_settings.flush();
+    // 用户词库那条整表重写现在是"等用户停手"才做的（见主循环 tickDeferredSaves），
+    // 关机前必须收一笔 —— 只靠 journal 也丢不了（它每次按键都在写），但把最后那些
+    // 只置脏、没排 journal 的改动（删词/拒词/降权）一起坐实，关机页刷完就断电也不亏。
+    IME::getInstance().flushUserDictSavesNow();
     standbyShutdownDraw();   // 铺页 + 整屏 GC16（内部推完才返回）
     const esp_err_t se = read_pico_sd_sync();
     if (se != ESP_OK && se != ESP_ERR_NOT_FINISHED) {
@@ -758,6 +762,10 @@ static AppState scrEditor(int key, ScreenContext &ctx) {
         for (int left = 50; left > 0; ) {
             int step = (left > 20) ? 20 : left;
             input_tick();
+            // 按下即反馈（步 5）：input_tick 刚采到的那个"手指落屏"沿，如果落在虚拟键盘
+            // 的键上就把那个键帽先反白一帧。等待里每 20ms 就有机会，所以反馈在落屏后
+            // 一拍内；渲染忙（推屏/排队/缓冲被占）时门控会静默跳过，退回抬手那条老路。
+            screen_editor_press_feedback_tick();
             if (g_bt.waitKey(step)) break;
             left -= step;
         }
@@ -1396,6 +1404,14 @@ extern "C" void app_main() {
         // BLE 键盘输入视为活动,重置空闲休眠计时
         if (key > 0) s_last_activity_us = esp_timer_get_time();
 
+        // 用户词库的整表重写（113ms 的 SD 写，4 个文件）**只在用户停手时**做。
+        // 老写法把它挂在 handleKeyImpl 的第一句上、由 2s 定时器放行，于是每 8 次按键就有
+        // 一次在按键路径上卡 113–200ms —— 那一段里 core0 一次触摸都不采，一次点按整个
+        // 掉进去就没了（见 IME.h 的 flushUserDictSaves）。这里放在按键**处理完之后**、
+        // 并且要求"距最后一次输入 ≥400ms"：打字期间它一直不做（改动由 journal 保命），
+        // 用户一停手，那 113ms 就落在没人等的死时间里。
+        IME::getInstance().tickDeferredSaves(esp_timer_get_time() - s_last_activity_us);
+
         // 自适应屏幕方向（写作/计划模式选「自适应」时）：判定在 input_poll 里的采样钩子
         // 做（每 120ms 一拍，与"晃动机身=全刷"共用同一次 I2C 读），**落地只在这里** ——
         // 转一次屏是 drain + 整屏 GC16（约 1.8s），不能从补采样那种上下文里发。
@@ -1464,6 +1480,9 @@ extern "C" void app_main() {
                 ESP_LOGI("Heap", "---- internal regions ----");
                 heap_caps_print_heap_info(MALLOC_CAP_INTERNAL);
                 longop_end();
+                // 堆遍历那几下（尤其 largest/minimum 要扫整条空闲链）期间没人在采触摸，
+                // 顺手补一拍再打日志——这条线每 2s 走一次，漏在这儿的点按不划算。
+                input_tick_throttled();
             } else if (s_heap_info_us == 0) {
                 s_heap_info_us = nowh;
             }
@@ -1861,8 +1880,16 @@ extern "C" void app_main() {
         if (key == KEY_BACK) {
             int px = 0, py = 0, bdir = 1;
             input_back_dir(&bdir);
-            if (editorVkVisible() && input_press_xy(&px, &py) && editorVkSwipePage(px, py, bdir)) {
-                key = 0;   // 被候选行吃掉（翻候选页）
+            // ③ 虚拟键盘面板整个占住屏幕下半时，面板**里面**的横划一律不算返回。边缘返回
+            //    是"从左右边缘往中间划"，而键盘是铺满宽度的，最左/最右那两列键本身就落在
+            //    边缘带里 —— 按住「Q」往右划一下退出了编辑器、按住「P」往左划也退出，
+            //    而这两个动作在用户心里都是"想按住那个键"。键盘在自己脚下的这块矩形里
+            //    说了算：候选行横划翻候选页（editorVkSwipePage），其余键位横划什么也不做。
+            //    editorVkTop() 是面板（含编码/候选带）的顶边，所以这一条把候选行也一并盖住，
+            //    editorVkSwipePage 只是留在前面让"翻页"优先于"吃掉"。
+            if (editorVkVisible() && input_press_xy(&px, &py) &&
+                (editorVkSwipePage(px, py, bdir) || py >= editorVkTop())) {
+                key = 0;   // 起点落在虚拟键盘上：翻候选页 / 什么都不发生，总之不返回
             } else if (currentState != APP_READER) {
                 key = 0x1B;
             }
@@ -1885,6 +1912,7 @@ extern "C" void app_main() {
         // switch default 分支一致。空转路径的睡眠统一在这里做（scrXxx 自己不睡），
         // idle_ms == 0 的那几屏（编辑器/WebDAV/Flomo/阅读器）在体内自己 vTaskDelay。
         const Screen &scr = kScreens[currentState];
+        const AppState stateBeforeHandle = currentState;
         if (!scr.handle) {
             currentState = APP_MAIN;
         } else if (key > 0) {
@@ -1893,6 +1921,11 @@ extern "C" void app_main() {
             currentState = scr.handle(0, ctx);
             if (scr.idle_ms > 0) idleWaitWithTouch(scr.idle_ms);
         }
+        // 换屏了就扔掉还在暂存里的那个键。长重画段里的补采样（见 editor_vk.cpp 的
+        // evkKey / hw/input.cpp 的 input_flush_pending）会在**屏幕正重画**的时候
+        // 采到按键，而这一次重画之后界面可能已经切走了 —— 那个键属于旧界面，投给新界面
+        // 就是一次凭空多出来的按键。补采样既然是常设机制，这个兜底也就一直要留着。
+        if (currentState != stateBeforeHandle) input_flush_pending();
 
         // 界面生命周期收口（后半）：收各屏 handle 返回的 next（Esc 退出、进子页…）。
         // 与上面那次同一个函数，幂等 —— 界面没换就是一次比较。

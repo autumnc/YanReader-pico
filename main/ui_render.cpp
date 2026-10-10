@@ -29,6 +29,7 @@
 #include "epdiy.h"
 #include "fb_fast.h"   // fb_rot_from_phys：全仓唯一的旋转方向定义（差分包围盒用）
 #include "fb_scan_window.h"   // 逻辑行段 → 物理扫描窗口（差分快路用；主机端穷举对拍过）
+#include "hw/input.h"   // input_tick_throttled：等缓冲时补采样（见 acquire_buffer）
 
 // fb_scan_window.h 不 include epdiy（主机端测试要能原样 include），所以那里的 rot 只按
 // 数值判断 —— 这里把"数值 ↔ EpdRotation"钉死，哪天上游改了枚举顺序会在编译期炸掉。
@@ -289,9 +290,28 @@ void ui_render_set_local_only(bool enable) { s_local_only.store(enable, std::mem
 void ui_render_set_menu_only(bool enable) { s_menu_only.store(enable, std::memory_order_relaxed); }
 
 // ── 缓冲取还 ─────────────────────────────────────────────────────────────
+// **等缓冲的时候要补采样**（见 hw/input.h 的 input_tick_throttled）。
+//
+// 这里等的是核心 1 把上一帧推完。整屏 GC16 一记约 1.8s，区域刷大块也常有几百毫秒——
+// 实测主循环里 230~500ms 的"零采样窗口"全部落在这一段。cst836u **没有锁存寄存器**，
+// 一次 I2C 读只返回"当前是否按着"，所以这段时间里一次完整点按整个消失，用户侧就是
+// "打快了漏键"。拆成小段等、段间补一拍采样：**总时长不变**，只是把等待的空转拿来读
+// 了几次 I2C；按键的**按下沿**因此被记进手势状态机，抬手后的那一拍照常投递（晚一拍，
+// 但不会丢）。只采样，不投递——键照旧由主循环的 input_poll 取走。
+//
+// wait=0 时退化成"试一次就走"，与原来同义（pdMS_TO_TICKS(0) 的切片会让循环第一次就
+// 到期返回 -1）。
 static int acquire_buffer(TickType_t wait) {
     if (!s_active.load(std::memory_order_acquire)) return -1;
-    if (xSemaphoreTake(s_free, wait) != pdTRUE) return -1;
+    const TickType_t deadline = xTaskGetTickCount() + wait;
+    for (;;) {
+        TickType_t left = deadline - xTaskGetTickCount();
+        if ((int32_t)left <= 0) return -1;
+        TickType_t slice = pdMS_TO_TICKS(10);
+        if (slice > left) slice = left;
+        if (xSemaphoreTake(s_free, slice) == pdTRUE) break;
+        input_tick_throttled();
+    }
     int idx = -1;
     portENTER_CRITICAL(&s_free_mux);
     if (s_free_n > 0) idx = s_free_list[--s_free_n];
@@ -1669,6 +1689,16 @@ void ui_render_drain(void) {
     ESP_LOGW(TAG, "drain 超时");
 }
 
+bool ui_render_idle(void) {
+    if (!g_u8g2 || !s_active.load(std::memory_order_acquire)) return false;
+    if (s_taken >= 0 || s_sync_fb) return false;   // 已经有帧开着（还没 ui_commit）
+    if (s_last_drawn_idx < 0) return false;        // 还没画过任何一帧：没有底
+    if (!s_q || uxQueueMessagesWaiting(s_q) != 0) return false;   // 队列里还压着没推的帧
+    // 空闲缓冲数到位 = core1 手上没有正在推的那一块（保留帧占着一块时目标数减一）。
+    const int target = (s_kept_idx >= 0) ? 1 : 2;
+    return uxSemaphoreGetCount(s_free) >= target;
+}
+
 void ui_render_invalidate(void) {
     // 必须投给渲染任务做，不能在 core0 直接改：这些 static 里有正在飞的缓冲
     // （drop_defer 会还缓冲），和 core1 的推屏撞上就是缓冲被两边同时用。
@@ -1731,27 +1761,33 @@ static void post_last_frame(int kind) {
     ui_render_drain();
 }
 
-bool ui_render_begin_frame_seeded(void) {
+int ui_render_begin_frame_seeded_try(uint32_t wait_ms) {
     // "接着上一帧往下画"：把 **core0 自己最后画过的那帧** 拷进一块空闲缓冲当绘制目标，
-    // 于是只改其中一小块的界面（编辑器组合期的输入法条）不必整屏重画。
+    // 于是只改其中一小块的界面（编辑器组合期的输入法条 / 候选两行 + 键帽）不必整屏重画。
     //
     // 与 ui_render_begin_overlay 的差别只在底从哪来：那边取 s_last_idx（渲染任务最后
     // **认领**的帧），提交完到认领之间有个窗口，队里压着上一次推屏时最大能差一帧 ——
     // 拿它打底会把上屏前的旧正文铺回去。这里取 s_last_drawn_idx，提交那一刻就定死。
     //
-    // 返回 true = 已开帧且以上一帧打底；false = **没开帧**，调用方按老路走
-    // ui_clear() + 整屏重画。宁可返回 false 也绝不能让调用方在没打底的缓冲上"只画一小块"
+    // 返回 >= 0 = 已开帧且以上一帧打底（值就是缓冲下标）；-1 = **没开帧**，调用方按老路
+    // 走 ui_clear() + 整屏重画。宁可返回 -1 也绝不能让调用方在没打底的缓冲上"只画一小块"
     // —— 那会画出一张正文全白的帧。
-    if (!g_u8g2 || !s_active.load(std::memory_order_acquire)) return false;
-    if (s_taken >= 0 || s_sync_fb) return false;  // 已经开着帧：交给老路（它会沿用同一块）
+    //
+    // wait_ms 由调用方定：0 = 绝不阻塞（差分路，撞上推屏背压就退回整屏重画）。
+    if (!g_u8g2 || !s_active.load(std::memory_order_acquire)) return -1;
+    if (s_taken >= 0 || s_sync_fb) return -1;  // 已经开着帧：交给老路（它会沿用同一块）
     const int src = s_last_drawn_idx;
-    if (src < 0) return false;  // 还没画过任何一帧（首帧）：没有底可打
-    const int idx = acquire_buffer(pdMS_TO_TICKS(UI_RENDER_TAKE_MS));
-    if (idx < 0) return false;  // 取不到缓冲：老路的 begin_frame 会去做宽限/重启那套
+    if (src < 0) return -1;  // 还没画过任何一帧（首帧）：没有底可打
+    const int idx = acquire_buffer(pdMS_TO_TICKS(wait_ms));
+    if (idx < 0) return -1;  // 取不到缓冲：老路的 begin_frame 会去做宽限/重启那套
     if (src != idx) memcpy(s_fb[idx], s_fb[src], s_fb_size);
     s_taken = idx;
     u8g2_set_fb(g_u8g2, s_fb[idx]);
-    return true;
+    return idx;
+}
+
+bool ui_render_begin_frame_seeded(void) {
+    return ui_render_begin_frame_seeded_try(UI_RENDER_TAKE_MS) >= 0;
 }
 
 void ui_render_begin_overlay(void) {

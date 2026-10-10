@@ -187,6 +187,22 @@ public:
     bool predicting() const { return _predicting; }
     void handleHostBackspace();
     void cancelComposition() { reset(); }
+    // ── 用户词库落盘：分成"增量"和"整表重写"两条路（2026-10-10，步 3）────────────
+    // 整表重写是 **113ms 的 SD 写**（2000 条 userpredict.txt 实测：fwrite 82ms + open 7
+    // + close 8 + sort 5 + build 13）。它原来挂在 handleKeyImpl 的第一句上、由一个 2s
+    // 定时器放行，于是**每 8 次按键就有 1 次在按键路径上卡 113–200ms**，那一段里 core0
+    // 一次触摸都不采 —— 手指按住 p50 才 107ms，一次点按整个掉进去就没了。这正是
+    // 「输入快了会漏掉」。
+    //
+    // 所以：
+    //   * 按键路径**只调**这个，且只写 journal 增量（append + fflush + fsync，最坏 ~20ms，
+    //     自带 500ms / 16 条 的延迟批量）。断电安全靠的就是这一条 —— 它不会丢内存里的改动。
+    //   * force = true（睡前 / 关机 / 切屏这类"卡一下无所谓"的地方）照旧**立刻整表重写**。
+    // 主循环空闲时每轮调一次：距最后一次用户输入 ≥ USERDICT_SAVE_IDLE_US（400ms）才真去
+    // 做那次整表重写。打字期间它一直不做（改动由 journal 保命），用户一停手就落到死时间里。
+    // 2s 的 `_deferredUserDictSinceUs` 闸门依旧管着，两个条件同时满足才写。
+    void tickDeferredSaves(int64_t idle_us);
+
     void flushUserDictSavesNow() { flushUserDictSaves(true); }
 
     enum UserDictKind { FIXED_DICT = 0, DYNAMIC_DICT = 1, PREDICT_DICT = 2 };
@@ -359,6 +375,9 @@ private:
     void clearUserDictJournal(const char *path);
     void markUserDictDirty(bool &dirty, const char *path = nullptr, const UserEntry *entry = nullptr);
     void flushUserDictSaves(bool force);
+    // 整表重写本体（113ms）。只由 flushUserDictSaves(true) 和 tickDeferredSaves 调，
+    // **按键路径上任何地方都不该直接调它**（见公开区那段说明）。
+    void flushUserDictSavesHeavy(bool force);
     void markUserWordIndexesDirty(const char *reason = nullptr);
     void rebuildUserWordIndexes();
     void rebuildUserPredictIndex();

@@ -100,6 +100,12 @@ struct EditorVkHit {
 // 为该组首字母），其余键与 26 键布局完全一致。
 int editorVkHitTest(int x, int y, EditorVkHit *hit = nullptr);
 
+// 只问"这个点上是什么键"，**绝不把键按下去**。给"按下即反馈"用（见 .cpp 的 s_hitProbeOnly）：
+// editorVkHitTest 算几何的同时就会执行动作（换面、换布局、翻待发、开关 T9、挑读音、重输），
+// 那一次动作归抬手那头；在按下沿再问一次普通版就等于每个键被按了两遍 —— 翻面键原地不动、
+// T9 开一下又被关掉、布局键一次跳两档。除了不产生副作用，返回值与几何与普通版逐条相同。
+int editorVkProbeKey(int x, int y, EditorVkHit *hit = nullptr);
+
 // 按下反馈：记下命中的键，由 editorVkDraw 在本次重绘的结尾把该键画成反色。
 // 不额外推屏——反馈搭按键动作自己那次刷新的顺风车，下一次重绘覆盖即"抬起恢复"。
 void editorVkMarkPressed(const EditorVkHit &hit);
@@ -108,6 +114,20 @@ void editorVkMarkPressed(const EditorVkHit &hit);
 // 回带的几何/文字是按下前的那一份，而这些键的动作本身已经把它重画成新样子了，再叠
 // 一层旧标签就会出现两个标签摞在一起（"拼"/"英"叠字，要再按一个别的键才刷新）。
 void editorVkClearPressed();
+
+// ── 组合期差分重绘（只给编辑器那条路；阅读器有自己的 vkIncr）────────────────
+// 这一拍按下的键能不能走"只补画候选两行 + 两个键帽"的差分路？判据是**键本身**：
+// 候选（就在候选带里）、九宫格（组合中左列是动态的分音节列）、以及一切会改键帽面 /
+// 键位 / 整块版式的键，一律 false。返回 true 也只是"键这边没意见"——调用方还得自己
+// 核一遍**帧指纹**（正文/滚动/光标一个都没动）才真走差分：合成字恰恰满足这一点，
+// 而空格/回车/退格/方向键会因为正文被改了、指纹对不上而退回整屏重画。
+bool editorVkDeltaEligible(int k, const EditorVkHit &hit);
+
+// 在**已经 seed 成上一帧**的缓冲上补画这一拍：把上一拍的键帽擦回常态 → 重画候选条带
+// → 把这一拍的键帽画成反色。调用方必须已经 ui_render_begin_frame_seeded_try() 拿到
+// 缓冲（本函数不取缓冲、不开帧），画完照常提交并申报 ui_render_note_ime_above_clean()。
+// 正文一个像素都不碰 —— 这是把"每键重画 47-87ms"压到 ~5ms 的那一刀。
+void editorVkDrawDelta();
 
 // 候选行左右滑动翻页。x/y 是本次手势的**按下点**（input_press_xy），dir: +1=下一个/后一页
 // (手指左划)，-1=前一个/上一页。返回 true = 这次滑动是"划候选"，已经翻页（或没有可翻的

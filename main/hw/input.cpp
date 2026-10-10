@@ -2,6 +2,7 @@
 
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <stdio.h>
 
 #include "auto_orient.h"    // 自适应方向：同一次加速度采样喂它一份（见 shake_poll）
 #include "board_hw.h"
@@ -153,6 +154,27 @@ bool input_press_xy(int *x, int *y) {
     return true;
 }
 
+// 补采的时间闸：一次 I2C 读约 0.5ms，12ms 一拍足够把任何一段长活切成 ≤12ms 的碎片，
+// 代价是每 100ms 只花 4ms。见 input.h 的 input_tick_throttled。
+static const int64_t INPUT_TICK_THROTTLE_US = 12000;
+static int64_t s_throttle_tick_us = 0;
+
+// 按下沿（见 input.h）：一次性交接，读走就清。坐标在手势状态机建立按下点时一起记。
+static bool s_press_edge_pending = false;
+static int s_press_edge_lx = 0, s_press_edge_ly = 0;
+static uint32_t s_press_seq = 0;
+bool input_press_edge_xy(int *x, int *y) {
+    if (!s_press_edge_pending) return false;
+    s_press_edge_pending = false;
+    if (x) *x = s_press_edge_lx;
+    if (y) *y = s_press_edge_ly;
+    return true;
+}
+uint32_t input_press_seq() { return s_press_seq; }
+void input_press_edge_discard() {
+    s_press_edge_pending = false;
+}
+
 // ── 显示区拖动（按住移动）──────────────────────────────────────────────
 // 手指按住并移动超过 DRAG_MIN_PX 后进入"拖动"：此后每次位置变化都上报一次
 // 增量（相对上次上报的位置，不是相对按下点），由 KEY_TOUCH_DRAG 携带，
@@ -241,6 +263,7 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
         s_press_active = false;
         s_dragging = false;
         s_long_fired = false;
+        s_press_edge_pending = false;
     }
 
     if (disp_pts >= 2) {
@@ -256,6 +279,9 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
             s_press_active = false;
             s_dragging = false;
             s_long_fired = false;
+            // 单指状态机被捏合接管，那个还没被读走的按下沿也一并作废 —— 否则它会作为
+            // "刚按下"喂给虚拟键盘的按下反馈，给一个正在做缩放手势的指头反白一个键。
+            s_press_edge_pending = false;
         } else {
             const int d = dist - s_pinch_last_dist;
             if (d >= PINCH_STEP_PX) {
@@ -280,6 +306,11 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
             touch_to_logical(px, py, &s_press_lx, &s_press_ly);
             s_last_lx = s_press_lx;
             s_last_ly = s_press_ly;
+            // 按下沿（见 input.h）：坐标要等 touch_to_logical 算完才能记。
+            s_press_edge_pending = true;
+            s_press_edge_lx = s_press_lx;
+            s_press_edge_ly = s_press_ly;
+            s_press_seq++;
         } else {
             touch_to_logical(px, py, &s_last_lx, &s_last_ly);
             int dx = s_last_lx - s_press_lx;
@@ -445,6 +476,13 @@ int input_pending_key() {
     return s_pend_key;
 }
 
+void input_tick_throttled() {
+    const int64_t now = esp_timer_get_time();
+    if (now - s_throttle_tick_us < INPUT_TICK_THROTTLE_US) return;
+    s_throttle_tick_us = now;
+    input_tick();
+}
+
 bool input_pending_tap_xy(int *x, int *y) {
     if (s_pend_key == 0 || !s_pend_tap) return false;
     if (x) *x = s_pend_tx;
@@ -557,8 +595,12 @@ void input_note_key_wake() {
 // （结构与 take_key_short 相同：poll → 读队首事件 → ack），多认一个 KEY_FORCE_OFF。
 static int poll_pmu_key() {
     bool short_press = false, force_off = false;
+    // **只读事件**，不要全量快照（read_pico_pmu_poll）。这一句在**每一轮主循环**都跑，
+    // 而全量快照是五路寄存器读 + 身份/状态校验重试（每次重试 20ms 死等），实测整段
+    // 126~148ms —— 那段时间 cst836u 一次都采不到样，一次快按整个掉进去就是"按了没反应"。
+    // 事件是 FIFO，攒着不会丢（见 read_pico_pmu_poll_events 的说明）。
     for (int i = 0; i < PMU_EVENT_FIFO_DEPTH; i++) {
-        if (read_pico_pmu_poll() != ESP_OK) break;
+        if (read_pico_pmu_poll_events() != ESP_OK) break;
         const pmu_snapshot_t *s = read_pico_pmu_get();
         if (s == NULL || !s->event_ok || s->pending_events == 0) break;
         const uint16_t id = s->event.event_id;
@@ -592,6 +634,23 @@ static int poll_pmu_key() {
     if (force_off) return KEY_POWER_HOLD;   // 优先：已经在关机路上了
     if (short_press) return KEY_POWER;
     return 0;
+}
+
+// 丢掉排队中的待发键与它随身的那一份手势状态（换屏时调，见 main.cpp 的派发之后）。
+// 补采样（editor_vk.cpp 的 evkKey）会在**屏幕正重画**的时候采到按键并暂存，而那次
+// 重画之后界面可能已经切走了 —— 这个键属于旧界面，投给新界面就是一次凭空多出来的按键
+// （阅读器里翻一页、主菜单里选中一项）。今天只有补采样会在重画途中暂存按键，所以这条
+// 不是防抖，是给"输入采样的时机"和"界面归属"重新对上号。
+void input_flush_pending() {
+    s_pend_key = 0;
+    s_pend_tap = false;
+    s_pend_drag = false;
+    s_pend_press = false;
+    s_pend_back = false;
+    s_tap_valid = false;
+    s_drag_valid = false;
+    s_press_origin_valid = false;
+    s_back_valid = false;
 }
 
 int input_poll() {

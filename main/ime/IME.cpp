@@ -5,6 +5,7 @@
 #include "s2t_table.h"
 #include "kaomoji_table.h"
 #include "longop.h"  // 欠载探针：词库落盘也是"顺手写卡"的名录之一
+#include "hw/input.h"   // input_tick_throttled：整表落盘的写循环里补采触摸（见那里的说明）
 #include "settings_manager.h"
 #include <cstring>
 #include <cstdio>
@@ -37,6 +38,15 @@ static const char *USERDICT_JOURNAL_SUFFIX = ".journal";
 static const size_t USERDICT_FIXED_LIMIT = 1000;
 static const size_t USERDICT_DYNAMIC_LIMIT = 5000;
 static const size_t USERPREDICT_LIMIT = 2000;
+// 压缩余量：列表长到 LIMIT+SLACK 才做一次压缩（+全量重建索引），而不是一碰上限就做。
+// 为什么：`_userPredictWords` 长年卡在 2000，于是一起上限就 2000 —— **每新增一对词**都会
+// 撞进下面那段 compact + rebuildUserPredictIndex()，而那次重建要清掉又一个
+// unordered_map<string, vector<uint16_t>> 再塞回 2000 项（~4000 次 PSRAM 分配）。
+// 实测单次 66ms，一次上屏有 2 个新 pair，就是 132ms 全落在「空格上屏」那一键上。
+// 留 10% 余量后，压缩从"每个新词一次"变成"每 200 个新词一次"，而索引在两次压缩之间
+// 靠 append 增量维护、始终有效。内存里最多多躺 200 项（loadUserDictFile 仍按 LIMIT 读，
+// 落盘也照旧整份写，所以上限语义不变，只是"什么时候整理"变懒了）。
+static const size_t USERPREDICT_COMPACT_SLACK = 200;
 static const size_t USERPREDICT_REJECT_LIMIT = 1000;
 static const size_t ENGLISHDICT_LIMIT = 10000;
 // 用户词库文件读入的硬上限。动态库本身只留 5000 条（约 200KB 文本），正常远到不了
@@ -1512,6 +1522,16 @@ void IME::saveUserDictFile(const char *path, std::vector<UserEntry> &entries, bo
         std::string line = p.code + " " + p.word + " " + std::to_string(p.count)
                          + (p.trad ? " 1" : "") + "\n";
         fwrite(line.data(), 1, line.size(), f);
+        // ── 长活里的喘气点（见 hw/input.h 的 input_tick_throttled）──────────────
+        // 这张表实测 2000+ 行、这一圈要 76~115ms（userpredict.txt 最大），四张表一起
+        // 124~187ms，**每 8.5 秒就来一次**。这期间主循环一次触摸都不采，而 cst836u 没有
+        // 锁存寄存器——落在这一段的点按整次消失。实测它就是"打字期最长采样间隔"
+        // 155~250ms 的全部来源（把用户塞进这个窗口的那次点按数出来，和这条线的时长一
+        // 一对应）。这里 12ms 放行一拍补采，窗口直接塌到 12ms 以内。
+        //
+        // 落盘本来就已经在"用户停手 ≥400ms"时才会走到这儿（见 tickDeferredSaves），
+        // 所以这些 I2C 读撞不到正在打字的手；真正会被撞到的是"刚停下又立刻接着打"。
+        input_tick_throttled();
     }
 
     if (fclose(f) != 0) {
@@ -1592,7 +1612,13 @@ void IME::queueUserDictJournal(const char *path, const UserEntry &entry) {
     _pendingUserDictJournal.push_back({path, entry});
     if (_pendingUserDictJournalSinceUs == 0)
         _pendingUserDictJournalSinceUs = esp_timer_get_time();
-    flushUserDictJournal(false);
+    // **不在这里写盘**。这条链是从 handleKey 直接调的（上屏/分词/重输都走它），而在
+    // SD 上 fopen 一次就要几十毫秒——实测按键路径上「查找」里 68ms 有 60 多毫秒全耗在
+    // 第一次 fopen 上，那段时间触摸一次都采不到样，用户侧就是"打快了漏字"。攒着，由主
+    // 循环的 tickDeferredSaves 每轮调一次（判据 16 条 / 500ms 在 flushUserDictJournal
+    // 内部，空转早退）。只有队列真的堆起来了才当场写——那是内存和掉电窗口的兜底。
+    if (_pendingUserDictJournal.size() >= USERDICT_JOURNAL_BATCH_LIMIT * 4)
+        flushUserDictJournal(true);
 }
 
 void IME::flushUserDictJournal(bool force) {
@@ -1647,7 +1673,35 @@ void IME::markUserDictDirty(bool &dirty, const char *path, const UserEntry *entr
         _deferredUserDictSinceUs = esp_timer_get_time();
 }
 
+// 「距最后一次用户输入多久算停手」。400ms 是**折中**：太短则打字的自然停顿里也会写、
+// 白撞；太长则改动在内存里躺太久（journal 只护得住"已经进了 journal 的那些"，走
+// penalizePredictWord / rejectPredictWord / removeUserWord 这几条只置脏不排 journal 的
+// 路，改动就只在内存里）。实测打字停顿常在 0.5–2s，400ms 能让大部分停顿都落进这个窗口。
+static const int64_t USERDICT_SAVE_IDLE_US = 400000;
+
 void IME::flushUserDictSaves(bool force) {
+    if (!force) {
+        // 按键路径走这里：**什么都不写**。journal 增量挪到了主循环的 tickDeferredSaves
+        // ——SD 上 fopen 一次几十毫秒，打在按键上就是"打快了漏字"（见 queueUserDictJournal
+        // 的说明）。整表重写本来也不在这儿（只在停手 400ms 后或强制时）。
+        // 队列的硬上限仍在 queueUserDictJournal 里兜底，掉电窗口最多多一个主循环。
+        return;
+    }
+    flushUserDictSavesHeavy(true);
+}
+
+void IME::tickDeferredSaves(int64_t idle_us) {
+    // journal 增量：每轮主循环都问一次，判据（16 条 / 500ms）在 flushUserDictJournal
+    // 内部，没到点就是一次空 vector 早退。放在 idle 门之前——它不是"停手才做"的重活，
+    // 只是把按键路径上攒下的增量写出去。
+    flushUserDictJournal(false);
+    if (idle_us < USERDICT_SAVE_IDLE_US) return;
+    if (!_dynamicUserDirty && !_userPredictDirty && !_fixedUserDirty && !_userPredictRejectDirty)
+        return;
+    flushUserDictSavesHeavy(false);
+}
+
+void IME::flushUserDictSavesHeavy(bool force) {
     flushUserDictJournal(force);
     if (!_dynamicUserDirty && !_userPredictDirty && !_fixedUserDirty && !_userPredictRejectDirty) {
         _deferredUserDictSinceUs = 0;
@@ -2407,7 +2461,7 @@ void IME::bumpPredictFrequency(const std::string &key, const std::string &word, 
             }
         }
     }
-    if (_userPredictWords.size() >= USERPREDICT_LIMIT) {
+    if (_userPredictWords.size() >= USERPREDICT_LIMIT + USERPREDICT_COMPACT_SLACK) {
         compactUserEntries(_userPredictWords, USERPREDICT_LIMIT);
         if (_userPredictWords.size() >= USERPREDICT_LIMIT) _userPredictWords.pop_back();
         // Compaction reorders and drops entries, shifting every positional index, so

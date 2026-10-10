@@ -59,6 +59,11 @@ bool app_editor_popup_active();
 // 离开编辑器时清掉触摸选区与弹层（电源键切模式绕开了 screen_editor_init）。
 void app_editor_leave_cleanup();
 
+// 步 5「按下即反馈」：编辑器空转的每一小段里调一次（main.cpp 的 scrEditor 空转循环，
+// 紧跟 input_tick 之后）。有按下沿、且落在虚拟键盘的键上、且渲染那边闲着时，只补画
+// 那一个反白键帽推一帧出去；否则静默返回，一个副作用都不留。见 .cpp 的说明。
+void screen_editor_press_feedback_tick();
+
 // Get editor text for Flomo sending
 std::string app_get_editor_text();
 

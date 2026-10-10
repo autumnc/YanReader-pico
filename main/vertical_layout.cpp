@@ -1,6 +1,7 @@
 #include "vertical_layout.h"
 #include "font_renderer.h"
 #include "ui_helpers.h"
+#include "hw/input.h"   // input_tick_throttled：长重画段里补采样（见下）
 
 #include <algorithm>
 #include "u8g2_shim.h"
@@ -387,6 +388,10 @@ void drawVerticalCols(const std::vector<std::string> &lines, const VerticalData 
     int right = m.x + m.w - m.colAdvance;
     if (guideLine) drawVerticalGuideLines(m, guideStyle);
     for (int ci = 0; ci < m.cols; ci++) {
+        // 一整屏竖排正文是几百个字模，画完几十毫秒；这段时间里 cst836u 一次都采不到样，
+        // 而它没有锁存寄存器，一次快按整个掉进去就"按了没反应"。每列补一拍（12ms 限速，
+        // 见 hw/input.h），把这一段切成小片。只采样补帧，不投递键——键照旧由主循环取。
+        input_tick_throttled();
         int colIdx = scrollCol + ci;
         if (colIdx < 0 || colIdx >= (int)data.cols.size()) continue;
         const auto &col = data.cols[colIdx];

@@ -2183,6 +2183,10 @@ static void drawEditor() {
     mdSetRenderEnabled(mdOn);
     const std::vector<MdLineInfo> &mdInfo = getMdInfo(mdOn);
     for (int i = 0; i < visibleVrows; i++) {
+        // 一整屏正文是一整排字模，画完几十毫秒；这段时间 cst836u 一次都采不到样，而它
+        // 没有锁存寄存器，一次快按整个掉进去就"按了没反应"。每行补一拍（12ms 限速，
+        // 见 hw/input.h 的 input_tick_throttled）：只补采样，键照旧由主循环取。
+        input_tick_throttled();
         int idx = g_editor.scroll + i;
         if (idx < 0 || idx >= (int)vrows.size()) continue;  // 打字机留白行
         auto &vr = vrows[idx];
@@ -2751,6 +2755,10 @@ static void editorRedrawFull() {
 // 每次按键事件进来先清零，下面各条上屏分支都读它。
 static bool s_vkAteCommitClick = false;
 
+// 步 5「按下即反馈」：已经在**按下沿**响过音效的那一次按压的序号（见
+// screen_editor_press_feedback_tick）。抬手那头的按键音拿它比一下就跳过，不会响两下。
+static uint32_t s_vkClickedSeq = 0;
+
 // ── 触摸选区会话 ────────────────────────────────────────────────────────
 // 长按正文 → 选词 + 底部按钮条；拖两柄调边界；按钮条上复制/剪切/粘贴/全选/润色。
 // "复制完在光标附近长按即可粘贴"就是同一个入口：长按落在词上 → 编辑按钮条，落在
@@ -3080,10 +3088,58 @@ static int s_lastTapY = -1000;
 // render_present，编辑器这条实体键/蓝牙键的路一个点都没打）。
 static bool edPerfLogOn() { return g_settings.getString("ui_perf_log", "0") == "1"; }
 
+// ── 帧指纹（步 2）──────────────────────────────────────────────────────────
+// 「组合期只补画候选带 + 两个键帽」那条差分路的前提是：**这一键没动正文**。手写一串
+// 守卫（光标没动、滚动没动、字数没动…）迟早会漏掉一个，漏掉的那个就是一条擦不掉的
+// 残影。这里照阅读器的 RdVkIncrGuard 那样比一份**快照**：重画前后各算一次，全等才走
+// 差分。往后往编辑器状态里加字段、忘了给差分加守卫时，只要那个字段进了正文像素却没进
+// 这份快照，差分就会悄悄画错——所以宁可多装几个字段（全是整数/布尔比较，几乎没有成本）。
+struct EdFrameKey {
+    int cy = 0, cx = 0, scroll = 0, nlines = 0, targetX = 0;
+    int selAnchorCy = 0, selAnchorCx = 0;
+    uint32_t layoutRevision = 0;
+    bool hasSelection = false, imeActive = false, typewriter = false, vertical = false;
+    bool operator==(const EdFrameKey &o) const {
+        return cy == o.cy && cx == o.cx && scroll == o.scroll && nlines == o.nlines &&
+               targetX == o.targetX && selAnchorCy == o.selAnchorCy &&
+               selAnchorCx == o.selAnchorCx && layoutRevision == o.layoutRevision &&
+               hasSelection == o.hasSelection && imeActive == o.imeActive &&
+               typewriter == o.typewriter && vertical == o.vertical;
+    }
+};
+
+static EdFrameKey edFrameKeyNow() {
+    EdFrameKey k;
+    k.cy = g_editor.cy;
+    k.cx = g_editor.cx;
+    k.scroll = g_editor.scroll;
+    k.nlines = static_cast<int>(g_editor.lines.size());
+    k.targetX = g_editor.targetX;
+    k.selAnchorCy = g_editor.selAnchorCy;
+    k.selAnchorCx = g_editor.selAnchorCx;
+    k.layoutRevision = g_editor.layoutRevision;
+    k.hasSelection = g_editor.hasSelection;
+    k.imeActive = g_editor.imeActive;
+    k.typewriter = editorTypewriter();
+    k.vertical = editorVertical();
+    return k;
+}
+
+// 本拍按下的虚拟键盘键是不是"只动输入法、不动正文"的字符键（由点按分支置位，
+// 见 editorVkDeltaEligible）。每进一次 screen_editor_handle 都先复位。
+static bool s_vkTapDelta = false;
+
 AppState screen_editor_handle(int key, ScreenContext &ctx) {
     // 「打字耗时」直插那一支的起点（见函数末尾的记账）：ASCII 直插 / Enter / 退格 /
     // 方向键走的就是那条路，它们和中文组合一样每键整屏重画，只是没有"查找"那一段。
     const int64_t edT0 = esp_timer_get_time();
+    // 走到这里说明刚刚消费掉一个键，也就是说**上一个按下沿已经办完了**。长绘制段里补采样
+    // （editor_vk.cpp 的 evkKey）会在屏幕上正重画的时候记下按下沿，而那次点按的抬手
+    // 往往也在同一段里被采到、当场变成一个键投递出去 —— 那个按下沿就是残影，照常读它就会
+    // 给一个早就上屏的字补一帧反白键帽，而且这帧没人再擦（空转不重画），一直挂到下一次按键。
+    // 只有 key != 0 这一拍才扔：key == 0 是"进来重画一发"，此时挂着的按下沿是**这一拍正要
+    // 那个键**的（空转循环刚采到），得留给按下反馈用。
+    if (key != 0) input_press_edge_discard();
     // ── 编辑器的字号切分 ────────────────────────────────────────────────────
     // 「显示与版式 → 正文字号」只管**正文那一块**。做法是把 FontRenderer 的共享格子
     // 在**整个编辑器界面**上换成正文的 px，出去自动还原——这样正文的排版、换行、光标、
@@ -3100,6 +3156,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     // 同源，而 handle 里到处是正文几何。
     FontScope body(editorBodyFontPx());
     s_vkAteCommitClick = false;
+    s_vkTapDelta = false;   // 本拍的差分资格，由下面的虚拟键盘点按分支置位
 
     if (g_editor.promptGenerating) {
         if (!s_promptTaskDone.load(std::memory_order_acquire)) {
@@ -3247,6 +3304,9 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                 if (k == EVK_NONE) return APP_EDITOR;  // 点在键盘空白/键角死区：吞掉本次点按
                 // 按下反馈：记下命中键，反色随下面各分支的重绘一起上屏（不额外推屏）。
                 editorVkMarkPressed(hit);
+                // 这一拍够不够格走"只补画候选带 + 两个键帽"的差分路（键这边先判；正文那边
+                // 还要核帧指纹，见 IME 分支的 vkDelta）。
+                s_vkTapDelta = editorVkDeltaEligible(k, hit);
                 // 这五类键的动作会把键面本身重画成新状态（标签换字、反白翻转），
                 // 按下前那份几何再叠上去就是两个标签摞一起（中英切换时"拼""英"叠字）。
                 // 候选数字键同理：上屏后候选栏整排换新（多半是空的），按下前那份
@@ -3256,7 +3316,10 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                     editorVkClearPressed();
                 // 虚拟键盘的按键反馈：点哪个键都先响一声。紧跟着的上屏分支会因为
                 // s_vkAteCommitClick 不再重复响一次（同一个按键响两下会像回声）。
-                typingClickPlay(1);
+                // 按下沿已经响过就不重复（步 5：按键音挪到了手指落屏那一拍，见
+                // screen_editor_press_feedback_tick）。渲染忙时那次的**补画**会被跳过，
+                // 但声音照响、序号照记，所以这里仍然不重复。
+                if (s_vkClickedSeq != input_press_seq()) typingClickPlay(1);
                 s_vkAteCommitClick = true;
                 if (k == EVK_PAGE) {
                     // 换面板（字母/符号/数字）已在命中测试里完成，这里只需重绘；
@@ -3437,6 +3500,9 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         // 组合刚翻转那一拍，drawEditor 里打字机模式的防跳 clamp（见其字段说明）会跟
         // 着翻，scroll 一变正文像素就变 —— 那种拍必须整屏重画。
         const bool composingBefore = g_ime.composing();
+        // 帧指纹（步 2）：组合期间"正文一个像素都没动"是差分路的前提。重画前后各算一次，
+        // 全等才允许只补画候选带 + 键帽；不等（空格/回车/退格/方向键改了正文）就退回整屏。
+        const EdFrameKey frameBefore = edFrameKeyNow();
         std::string imeOut;
         if (g_ime.handleKey(key, imeOut)) {
             const int64_t tLookup = esp_timer_get_time();
@@ -3492,14 +3558,30 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             const bool barOnly = imeOut.empty() && imeStatus.empty() && g_editor.drawnOnce &&
                                  composingBefore && g_ime.composing() && !editorVkVisible() &&
                                  !ui_toast_active();
-            // 计时两桶在两条路上口径一致：清屏 = 把底铺白/铺上一帧，重画 = 往底上写字。
+            // 虚拟键盘那一半（barOnly 的镜像：它管"没键盘、drawIMEUI 那条"，这条管"有键盘、
+            // editorVkDraw 面板"）。多两条判据：
+            //   s_vkTapDelta = 这一拍按的是**字符键**（候选/九宫格/换面/待发…键那边已否掉，
+            //                  见 editorVkDeltaEligible）
+            //   指纹全等     = 正文/滚动/光标/选区/字号一个都没动（合成字恰好满足；空格、
+            //                  回车、退格、方向键会把正文改了，指纹对不上就被挡回整屏）
+            const bool vkDelta = imeOut.empty() && imeStatus.empty() && g_editor.drawnOnce &&
+                                 composingBefore && g_ime.composing() && editorVkVisible() &&
+                                 !ui_toast_active() && s_vkTapDelta &&
+                                 frameBefore == edFrameKeyNow();
+            // 计时两桶在三条路上口径一致：清屏 = 把底铺白/铺上一帧，重画 = 往底上写字。
             int64_t tClear, tDraw;
-            if (!(barOnly && ui_render_begin_frame_seeded())) {
-                ui_clear();   // 老路：整屏清白 + 整屏重画
+            // **先判据、后取缓冲**：begin_frame_seeded_try 一旦成功就把缓冲取走了，回不了头。
+            // 用 0ms 版：撞上推屏背压取不到缓冲就原地退回整屏，绝不在这里卡住主循环。
+            if (vkDelta && ui_render_begin_frame_seeded_try(0) >= 0) {
+                // 底是上一帧逐位铺来的；只补画候选带 + 两个键帽，正文一个像素不碰。
                 tClear = esp_timer_get_time();
-                drawEditor();
+                u8g2_SetDrawColor(g_u8g2, 0);
+                editorVkDrawDelta();
+                // 契约同 barOnly：VK 在时 ime_top = editorVkTop，候选带与键帽都在它以下，
+                // 线上一个像素都没动。
+                ui_render_note_ime_above_clean();
                 tDraw = esp_timer_get_time();
-            } else {
+            } else if (barOnly && ui_render_begin_frame_seeded()) {
                 // begin_frame_seeded 已经把上一帧铺进来了（那次 memcpy 落在"清屏"桶里），
                 // 这里只补画输入法条。画笔色的收尾与 ui_clear 一致（那边 memset 白底后
                 // 把笔设成"墨"）。
@@ -3513,6 +3595,11 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                 tDraw = esp_timer_get_time();
                 // drawnOnce 保持 true 不动：跳过 drawEditor 正好让它维持原值，
                 // 空闲帧照旧不重画（见 screen_editor_idle 的判据）。
+            } else {
+                ui_clear();   // 老路：整屏清白 + 整屏重画
+                tClear = esp_timer_get_time();
+                drawEditor();
+                tDraw = esp_timer_get_time();
             }
             ui_commit();
             if (edPerfLogOn()) {
@@ -3524,7 +3611,8 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                          (long long)((tDraw - tClear) / 1000),
                          (long long)((tEnd - tDraw) / 1000),
                          (long long)((tEnd - tKey) / 1000),
-                         !imeOut.empty() ? "上屏" : (barOnly ? "组合(只条)" : "组合"));
+                         !imeOut.empty() ? "上屏"
+                                         : (vkDelta ? "组合(只键)" : (barOnly ? "组合(只条)" : "组合")));
             }
             return APP_EDITOR;
         }
@@ -4044,6 +4132,55 @@ void app_editor_leave_cleanup() {
     // 走了就别留着白框等下一次进编辑器（空闲重绘的"画没画"记账也一并复位）。
     ui_toast_clear();
     s_toastShown = false;
+}
+
+// ── 步 5：按下即反馈（按下沿先补画一个反白键帽）───────────────────────────
+// 手指一落屏，若正好落在虚拟键盘的某个键上、渲染那边又闲着，就**立刻**只补画那一个键帽
+// （反色）推一帧出去。抬手那次重绘（screen_editor_handle 的 onVk 分支）照旧把它擦回常态
+// —— 两条路共用 editorVkDrawDelta，画面自洽。
+//
+// 为什么要提前这一拍：点按是在**抬手**那一帧才变成键码的（见 input.h 的手势状态机），
+// 手指按住 p50 107ms，那段时间屏上零反馈。按下沿补一帧把"点下去→屏开始变"从抬手后
+// 挪到落屏后一拍内。
+//
+// 为什么只在渲染空闲时给（用户定的取舍）：面板那一拍 80~90ms 是物理下限，一次点按本来
+// 就只值一帧；忙的时候再插一帧进去只会把真正要上的那帧往后顶。所以 ui_render_idle()
+// 判 false 就**静默跳过**退回今天的行为，绝不排队等待。
+void screen_editor_press_feedback_tick() {
+    int px, py;
+    if (!input_press_edge_xy(&px, &py)) return;   // 只在按下沿做事（消费式）
+    if (!editorVkVisible()) return;
+    // 屏上这一帧得确实是"编辑器 + 虚拟键盘"整帧：任何浮层/对话框都走自己的画法，
+    // 底也不是编辑器帧，在它们上面补画一个键帽是错的。
+    if (!g_editor.drawnOnce) return;
+    if (app_editor_popup_active() || app_editor_search_active() || app_editor_help_active() ||
+        g_editor.recoveryPrompt || g_editor.promptGenerating)
+        return;
+    // **必须是探针版**：editorVkHitTest 是命令不是查询，它算几何的同时就把键按下了
+    // （换面/换布局/翻待发/开关 T9/挑读音）。这里只想知道"画哪个键的反白"，用普通版
+    // 等于一次点按执行两遍 —— 见 editor_vk.h 的 editorVkProbeKey。
+    EditorVkHit hit;
+    if (editorVkProbeKey(px, py, &hit) == EVK_NONE) return;
+    // 有些键明确不要反白（面板开关/候选/九宫格读音这些"开关本身就是反馈"，
+    // 命中测试回带的是空矩形）。空矩形白填一下什么也画不出来，直接跳过。
+    if (hit.w <= 0 || hit.h <= 0) return;
+    // 按键音也挪到这一刻：抬手那一声（screen_editor_handle 的 onVk 分支）要等手指松开，
+    // 比这里晚 p50 107ms。响完记下按下沿的序号，抬手那头比一下就跳过 —— 按下去又拖出
+    // 键盘再抬手的那一路不会走到任何"清标志"的地方，用序号比用 bool 靠谱（见 input.h）。
+    // **不受下面那条渲染门控管**：声音不需要缓冲，渲染忙的时候照样该响。
+    typingClickPlay(1);
+    s_vkClickedSeq = input_press_seq();
+    if (!ui_render_idle()) return;
+    // **先判据、后取缓冲**：begin_frame_seeded_try 一旦成功就把缓冲取走了，回不了头。
+    // ui_render_idle 已经核过"空闲缓冲到位"，这里再用 0ms 版兜一次，撞上任何背压就原地
+    // 放弃，绝不在这里卡住主循环。
+    if (ui_render_begin_frame_seeded_try(0) < 0) return;
+    editorVkMarkPressed(hit);
+    u8g2_SetDrawColor(g_u8g2, 0);
+    editorVkDrawDelta();
+    // 契约同 vkDelta：VK 在时 ime_top = editorVkTop，候选带与键帽都在它以下。
+    ui_render_note_ime_above_clean();
+    ui_commit();
 }
 
 // ── App-level helpers ────────────────────────────────────────────────────

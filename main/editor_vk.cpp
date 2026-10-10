@@ -169,6 +169,26 @@ static void evkT9Set(bool on) {
 static EditorVkHit s_pressed;
 static bool s_pressedValid = false;
 
+// **上一拍**反色过的那个键。只有差分重绘（editorVkDrawDelta）用得上：整屏重绘本来就
+// 把整个键区重画一遍，旧键帽自然没了；差分只补两个键帽，得先知道"上一个反色的是谁"
+// 才能把它擦回常态。editorVkMarkPressed 在置新值前把旧的挪进来；整屏画完/清按下态时
+// 一并作废（那时它已经在屏幕上了，或者被整块重绘擦掉了）。
+static EditorVkHit s_prevPressed;
+static bool s_prevPressedValid = false;
+
+// 「命中测试是**命令**，不是**查询**」——这一条是它最容易踩的坑。
+// evkHitTestImpl 在算出几何的同时就把动作做掉了：换面（s_page）、换布局（还要写设置）、
+// 翻待发（s_ctrl / s_shift）、开关 T9、在 T9 面板里挑读音（ime.selectAmbigCode）、
+// 九宫格「重输」（ime.cancelComposition），evkFinishKey 还会**消耗**待发的 Ctrl/Shift。
+// 调用方在点按分支里只是"翻译完再重绘"，所以这些副作用一直被当成"按下的那一半"。
+//
+// 按下即反馈（步 5）需要在**手指落屏**那一刻知道"这个点上是什么键"来画一个反白键帽，
+// 但绝不能借它的手把键按下 —— 否则一次点按会执行两遍（按下沿一遍、抬手一遍）：
+// 翻面键原地不动（字母→符号→数字，两下正好绕回字母）、T9 面板开一下马上又被关掉、
+// 布局键一次跳两档（26→14→18→9，两下从 26 直接到 18），中英来回切、Ctrl/Shift 翻两次。
+// 所以探针这条路把 s_hitProbeOnly 置上，下面每一处副作用前面都问一句。
+static bool s_hitProbeOnly = false;
+
 // 字母页三行。
 // 全部 ASCII：键表的 strlen 就是键数，混入 ¥ 等多字节字符会算错列数。
 // 字母页第三行不走这张表：它固定 9 格满宽(zxcvbnm + ，。)，与 asdfghjkl 对齐。
@@ -535,8 +555,24 @@ static void evkReturnKey(int x, int y, int w, int h, bool filled) {
     evkIconKeyGlyph(x, y, w, h, 0xF0311, filled);
 }
 
+// ── 长绘制段补采样触摸 ──────────────────────────────────────────────────
+// 整块键盘是屏幕上最重的一块（上百个键帽文字，实测 ~50ms），这一段里主循环**一次触摸
+// 都不采**。而 cst836u 没有锁存寄存器，一次 I2C 读只回答"此刻按着没有"——落在这一段里
+// 的一次点按（按下到抬起全在里面）就整次消失，手感就是"打快了偶尔漏一个键"。
+//
+// 阅读器早就这么做（见 screen_reader.cpp 里画正文时的逐行补采），编辑器一直缺这一手。
+// 补在 evkKey 上是因为它是**所有面板所有键**的必经之路（字母页/符号页/数字页/九宫格，
+// 见 evkNineGridDraw / evkSymPanelDraw / evkNumPanelDraw / evkDrawImpl 的全部调用点），
+// 一个改动点就把整块面板盖住了；一帧里它被叫 30~40 次。
+//
+// 时间闸与"为什么按时间不按键数"都在 input_tick_throttled 里（hw/input.h）——同一把闸
+// 词库整表落盘那条路也在用，两处必须同一个节奏。补出来的一次点按会在同一个 handle 里
+// 当场变成键投递出去，那个"按下沿"就变成残影了，见 screen_editor_handle 开头的
+// input_press_edge_discard。
+
 // 单个键：外框 + (可选)反白填充 + 居中标签。
 static void evkKey(int x, int y, int w, int h, const char *label, bool filled) {
+    input_tick_throttled();   // 长重画段补采样触摸（见上）
     u8g2_SetDrawColor(g_u8g2, 0);
     u8g2_DrawFrame(g_u8g2, x, y, w, h);
     if (filled) u8g2_DrawBox(g_u8g2, x + 1, y + 1, w - 2, h - 2);
@@ -547,16 +583,30 @@ static void evkKey(int x, int y, int w, int h, const char *label, bool filled) {
     u8g2_SetDrawColor(g_u8g2, 1);
 }
 
-// ── 防误触：中心优先的键命中 ────────────────────────────────────────────
-// 键面画的是矩形，命中区取它的**内切椭圆**：点必须落在椭圆内才算按到这个键。
-// 四个角因此成为死区——相邻键的角彼此靠近，手指落在两键之间的对角地带（最容易
-// 误触的位置）时会被吞掉，而不是"就近猜一个键"。误触在 e-ink 上代价偏大：多一次
-// 刷屏，还得多退一次字。
-static bool evkInEllipse(int x, int y, int kx, int ky, int kw, int kh) {
+// ── 键命中：圆角矩形 ───────────────────────────────────────────────────
+// 键面画的是矩形，命中区取它的**圆角矩形**：点在矩形内、且不在四个圆角之外，才算按到
+// 这个键。圆角只为一个目的而留——四键交界那一个点上什么都不发生（保住"别乱猜一个键"
+// 的意思，那正是最容易误触的位置）；除此之外整个键面都算数。
+//
+// 原来是内切椭圆：四角 21.5% 的面积全是死区，实测**6.4% 的点按**落在角上被静默吞掉，
+// 用户侧就是"打快了会漏字"。圆角半径 r = min(kw,kh)/EVK_HIT_CORNER_DIV，取 1/5 时
+// 面积只丢 (4-π)r²/(kw·kh) ≈ 3.5%（椭圆丢 21.5%）。横向键格 kx = x0 + k*keyW 是无缝
+// 平铺的，所以矩形判定不会出现"两点都算同一个键"的歧义（顺序返回第一个命中的）。
+// 调大 EVK_HIT_CORNER_DIV = 角更小 = 更好按；调到很大就退化成纯矩形。
+static const int EVK_HIT_CORNER_DIV = 5;
+static bool evkInKey(int x, int y, int kx, int ky, int kw, int kh) {
     if (kw <= 0 || kh <= 0) return false;
-    const double dx = (x - (kx + kw / 2.0)) / (kw / 2.0);
-    const double dy = (y - (ky + kh / 2.0)) / (kh / 2.0);
-    return dx * dx + dy * dy <= 1.0;
+    if (x < kx || x >= kx + kw || y < ky || y >= ky + kh) return false;
+    const int r = (kw < kh ? kw : kh) / EVK_HIT_CORNER_DIV;
+    if (r <= 0) return true;
+    // 只有落在四角的 r×r 方块里才做圆判定，其余矩形区域直接算命中。cx/cy 是被夹到
+    // "最近的那个圆角圆心"的坐标：夹不动（cx==x && cy==y）说明这一点不在任何角上。
+    const int cx = (x < kx + r) ? kx + r : (x >= kx + kw - r ? kx + kw - r - 1 : x);
+    const int cy = (y < ky + r) ? ky + r : (y >= ky + kh - r ? ky + kh - r - 1 : y);
+    if (cx == x && cy == y) return true;
+    const double dx = (double)(x - cx), dy = (double)(y - cy);
+    if (dx * dx + dy * dy <= (double)r * r) return true;
+    return false;
 }
 
 // Ctrl 待发时把普通键翻译成组合键，翻译完自动清除。
@@ -569,6 +619,9 @@ static int evkFinishKey(int k) {
         k == EVK_LAYOUT) return k;
     // 一键多字母的组码同样不参与 Ctrl/Shift 翻译（它按下一个字母组，不是字母）。
     if (k >= IME::KEY_AMBIG_BASE) return k;
+    // 探针（见 s_hitProbeOnly）：只回答"是什么键"，**不消耗**待发的 Ctrl/Shift ——
+    // 翻待发那一下归抬手那头，这里再翻一次就把用户刚按下的 Ctrl 吃掉了。
+    if (s_hitProbeOnly) return k;
     if (s_shift && k >= 'a' && k <= 'z') {          // Shift 待发只吃字母，其余键不动它
         s_shift = false;
         k = k - 'a' + 'A';
@@ -703,32 +756,49 @@ bool editorVkIconHit(int x, int y) {
     return slot > 0 && y >= STATUS_BAR_Y && x >= SCREEN_W - slot;
 }
 
-// 把命中的键按反色重画一次（按下态的视觉反馈）。只由 editorVkDraw 最后调用。
-static void evkDrawPressedInv(const EditorVkHit &hit) {
-    const bool inv = !hit.filled;   // 按下 = 常态取反
+// 把一个键的矩形**按给定形态重画一遍**。按下反馈（反色）与差分重绘（擦旧的/画新的）
+// 共用这一处：几何/文字都来自命中测试回带的那一份，不必再猜。
+//
+// inverse=true 就是"按下态"= 常态取反（沿用老 evkDrawPressedInv 的 `inv = !hit.filled`）。
+//
+// 与逐键绘制函数（evkKey 一族）的**唯一差别**是这里先把整个矩形**填白**再画：它们在
+// filled=false 时只画外框、不填底（键间留白靠的就是这个），拿它们去擦一个刚被反色填实
+// 的键帽，黑底会原样留在那儿。差分路每键都要"先擦旧的、再画新的"，擦不干净就是幽灵
+// 键帽；整屏重绘时多这一下填白无所谓（下一句就盖上去）。
+static void evkDrawKeyRect(const EditorVkHit &hit, bool inverse) {
+    if (hit.w <= 0 || hit.h <= 0) return;
+    const bool v = inverse ? !hit.filled : hit.filled;
+    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawBox(g_u8g2, hit.x, hit.y, hit.w, hit.h);
     switch (hit.shape) {
-        case 1: evkTriangleKey(hit.x, hit.y, hit.w, hit.h, hit.dir, inv); break;
-        case 2: evkShiftKey(hit.x, hit.y, hit.w, hit.h, inv); break;
-        case 4: evkBackspaceKey(hit.x, hit.y, hit.w, hit.h, inv); break;
-        case 5: evkSpaceKey(hit.x, hit.y, hit.w, hit.h, inv); break;
-        case 6: evkReturnKey(hit.x, hit.y, hit.w, hit.h, inv); break;
+        case 1: evkTriangleKey(hit.x, hit.y, hit.w, hit.h, hit.dir, v); break;
+        case 2: evkShiftKey(hit.x, hit.y, hit.w, hit.h, v); break;
+        case 4: evkBackspaceKey(hit.x, hit.y, hit.w, hit.h, v); break;
+        case 5: evkSpaceKey(hit.x, hit.y, hit.w, hit.h, v); break;
+        case 6: evkReturnKey(hit.x, hit.y, hit.w, hit.h, v); break;
         case 3: {
-            u8g2_SetDrawColor(g_u8g2, inv ? 0 : 1);
+            u8g2_SetDrawColor(g_u8g2, v ? 0 : 1);
             u8g2_DrawBox(g_u8g2, hit.x, hit.y, hit.w, hit.h);
             u8g2_SetDrawColor(g_u8g2, 1);
             int tw = g_vk_font.textWidth(hit.text);
             int bx = hit.x + (hit.w - tw) / 2;
             int by = hit.y + (hit.h + g_vk_font.ascent() - g_vk_font.descent()) / 2;
-            g_vk_font.drawText(bx, by, hit.text, inv);
+            g_vk_font.drawText(bx, by, hit.text, v);
             break;
         }
-        default: evkKey(hit.x, hit.y, hit.w, hit.h, hit.text, inv); break;
+        default: evkKey(hit.x, hit.y, hit.w, hit.h, hit.text, v); break;
     }
+    u8g2_SetDrawColor(g_u8g2, 1);
 }
 
 // T9 候选面板(实现在命中测试前，与它共用几何)：绘制入口与"是否展开"。
 static bool evkT9Active();
 static void evkT9Draw(int w);
+
+// 明面上的入口与躯干分离：躯干排在下面（它要用到后面才定义的面板几何），两个都有
+// 好几个提前返回，与其在每个 return 前插一句，不如包一层。
+static void evkDrawImpl();
+static int evkHitTestImpl(int x, int y, EditorVkHit *hit);
 
 // 两张面板的命中（实现排在 editorVkHitTest 之后：它们要用 evkFinishKey/evkSetHit，
 // 那两件就在下面一点，而绘制那半边已经先用到面板几何了）。绘制走 evkSymPanelDraw /
@@ -838,19 +908,14 @@ static const char *evkPanelKeyLabel(int which) {
     return which == 0 ? "符" : "123";
 }
 
-void editorVkDraw() {
-    // 键盘面板是界面框架：在编辑器正文作用域里也会被调到，钉回界面字号。
-    FontScope ui(FontRenderer::uiPxHeight());
-    UI_FONT_GUARD();
-    if (!s_visible) return;
-    int w = SCREEN_W;
-    int top = editorVkTop();
-    int bottom = STATUS_BAR_Y;
-    if (top < FONT_H || bottom - top < 16) return;   // 屏太小，放弃绘制
-
-    // 面板白底 + 顶边/编码-候选/候选-键区三条分隔线
+// ── 候选条带：编码行 + 候选行 + 那三条分隔线 ──────────────────────────────
+// 整块重绘（evkDrawImpl）与差分重绘（editorVkDrawDelta）**共用这一段**：两条路各画
+// 一遍的话，差一个像素就是一条擦不掉的横线残影。白底只罩候选区这一条带（键区那边由
+// evkDrawImpl 自己罩整块面板）。top = 面板顶边。
+static void evkDrawCandBand(int w, int top) {
+    // 候选区白底 + 顶边/编码-候选/候选-键区三条分隔线
     u8g2_SetDrawColor(g_u8g2, 1);
-    u8g2_DrawBox(g_u8g2, 0, top, w, bottom - top);
+    u8g2_DrawBox(g_u8g2, 0, top, w, evkCandH());
     u8g2_SetDrawColor(g_u8g2, 0);
     u8g2_DrawHLine(g_u8g2, 0, top, w);
     u8g2_DrawHLine(g_u8g2, 0, top + evkCandRowH(0), w);
@@ -888,11 +953,44 @@ void editorVkDraw() {
         }
         evkCandDrawText(s_candX[i], candTextY, s_candLabel[i].c_str(), sel);
     }
+    u8g2_SetDrawColor(g_u8g2, 1);
+}
+
+void editorVkDraw() {
+    evkDrawImpl();
+}
+
+static void evkDrawImpl() {
+    // 键盘面板是界面框架：在编辑器正文作用域里也会被调到，钉回界面字号。
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
+    if (!s_visible) return;
+    int w = SCREEN_W;
+    int top = editorVkTop();
+    int bottom = STATUS_BAR_Y;
+    if (top < FONT_H || bottom - top < 16) return;   // 屏太小，放弃绘制
+
+    // 面板白底 + 候选条带（编码行/候选行 + 三条分隔线，与差分重绘共用一条路径）
+    //
+    // 白底这一块是 1216×约 400 = 48 万像素的 DrawBox：u8g2 逐像素做旋转映射 + 半字节
+    // 读改写（见 ui_helpers.cpp:ui_clear 的量法：83 万像素约 100ms），实测就是"键盘重画"
+    // 那条 80~100ms 零采样窗口的主要部分——键帽那点绘制量根本不到这个数。切成横条、
+    // 条间补一拍采样（同一屏正文/键帽的做法，见 hw/input.h 的 input_tick_throttled）。
+    u8g2_SetDrawColor(g_u8g2, 1);
+    for (int yy = top; yy < bottom; yy += 32) {
+        int hh = bottom - yy;
+        if (hh > 32) hh = 32;
+        u8g2_DrawBox(g_u8g2, 0, yy, w, hh);
+        input_tick_throttled();
+    }
+    evkDrawCandBand(w, top);
+    IME &ime = IME::getInstance();
 
     // ── T9 候选面板：点开"编码"行后，整块键区换成 读音列 + 候选宫格 ──
     if (evkT9Active()) {
         evkT9Draw(w);
-        if (s_pressedValid) evkDrawPressedInv(s_pressed);
+        if (s_pressedValid) evkDrawKeyRect(s_pressed, true);
+        s_prevPressedValid = false;   // 整块重画，旧键帽已被盖掉
         u8g2_SetDrawColor(g_u8g2, 1);
         return;
     }
@@ -989,7 +1087,8 @@ void editorVkDraw() {
     evkReturnKey(fx[4], by, fw[4], hFunc, false);
 
     // 刚按下的键：最后补一遍反色，压在常态之上（不额外推屏，随本次重绘上屏）。
-    if (s_pressedValid) evkDrawPressedInv(s_pressed);
+    if (s_pressedValid) evkDrawKeyRect(s_pressed, true);
+    s_prevPressedValid = false;   // 整块重画，旧键帽已经被盖掉，差分不用再擦
 
     u8g2_SetDrawColor(g_u8g2, 1);
 }
@@ -1041,7 +1140,7 @@ static void evkSetHit(EditorVkHit *hit, int x, int y, int w, int h, int shape, i
 
 // 文字键帽的命中：椭圆判定 + 回填(单字符用 char 快路径，避免临时串)。
 static bool evkHitKeyChar(int px, int py, int kx, int ky, int kw, int kh, char c, EditorVkHit *hit) {
-    if (!evkInEllipse(px, py, kx, ky, kw, kh)) return false;
+    if (!evkInKey(px, py, kx, ky, kw, kh)) return false;
     char buf[2] = {c, 0};
     evkSetHit(hit, kx, ky, kw, kh, 0, 0, false, buf);
     return true;
@@ -1066,11 +1165,11 @@ static int evkNineGridHit(int x, int y, int w, int hLet, EditorVkHit *hit) {
             evkNineSylWindow(gh, &n, &rh, &vis, &first, &last);
             for (int i = first; i < last; i++) {
                 const int cy = gy + (i - first) * rh;
-                if (!evkInEllipse(x, y, 0, cy, pw - 2, rh)) continue;
+                if (!evkInKey(x, y, 0, cy, pw - 2, rh)) continue;
                 // 先回带文字再选：selectAmbigCode 会把这张表整个重算，之后就取不到了。
                 // （反色按旧文字画没关系，下一帧整列都会重画成新内容。）
                 evkSetHit(hit, 0, cy, pw, rh, 0, 0, false, codes[i].c_str());
-                ime.selectAmbigCode(i);
+                if (!s_hitProbeOnly) ime.selectAmbigCode(i);
                 return EVK_SEP;
             }
             return EVK_NONE;
@@ -1081,7 +1180,7 @@ static int evkNineGridHit(int x, int y, int w, int hLet, EditorVkHit *hit) {
         for (int i = 0; i < 4; i++) {
             int py, ph;
             evkNinePunctCell(gy, gh, i, &py, &ph);
-            if (!evkInEllipse(x, y, 0, py, pw, ph)) continue;
+            if (!evkInKey(x, y, 0, py, pw, ph)) continue;
             evkSetHit(hit, 0, py, pw, ph, 0, 0, false, PUNCT_LAB[i]);
             return evkFinishKey(static_cast<unsigned char>(PUNCT_KEY[i]));
         }
@@ -1091,18 +1190,18 @@ static int evkNineGridHit(int x, int y, int w, int hLet, EditorVkHit *hit) {
     // 右列功能：⌫ / 重输 / 0，与三个字母行一一对齐。
     if (x >= rx) {
         const int ry[3] = {gy, gy + hLet, gy + 2 * hLet};
-        if (evkInEllipse(x, y, rx, ry[0], rw, hLet)) {
+        if (evkInKey(x, y, rx, ry[0], rw, hLet)) {
             evkSetHit(hit, rx, ry[0], rw, hLet, 4, 0, false, nullptr);
             return evkFinishKey('\b');
         }
-        if (evkInEllipse(x, y, rx, ry[1], rw, hLet)) {
+        if (evkInKey(x, y, rx, ry[1], rw, hLet)) {
             // 「重输」= 手机上那个清空当前输入键。这里只清**拼音组合**，绝不动正文：
             // 用户的正文是攒出来的，一次误触就抹掉是不可接受的代价。没在组合时无动作。
             evkSetHit(hit, rx, ry[1], rw, hLet, 0, 0, false, "重输");
-            IME::getInstance().cancelComposition();
+            if (!s_hitProbeOnly) IME::getInstance().cancelComposition();
             return EVK_CLEAR;
         }
-        if (evkInEllipse(x, y, rx, ry[2], rw, hLet)) {
+        if (evkInKey(x, y, rx, ry[2], rw, hLet)) {
             evkSetHit(hit, rx, ry[2], rw, hLet, 0, 0, false, "0");
             // 组合中按 0 什么都不做：IME 把"非拼音键"一律当作"上屏首选词然后收尾"，
             // 于是用户按的是 0、上屏的却是一个词。与其造成这种意外，不如在组合期间
@@ -1121,7 +1220,7 @@ static int evkNineGridHit(int x, int y, int w, int hLet, EditorVkHit *hit) {
         if (y < ky || y >= ky + hLet) continue;
         for (int c = 0; c < 3; c++) {
             const int kx = cx + c * cw;
-            if (!evkInEllipse(x, y, kx, ky, cw, hLet)) continue;
+            if (!evkInKey(x, y, kx, ky, cw, hLet)) continue;
             const int idx = r * 3 + c;
             if (idx == 0) {
                 // 「1 分词」：确定下一个音节（命中测试内已生效），候选跟着重算。
@@ -1351,8 +1450,9 @@ static int evkT9Hit(int x, int y, int w, EditorVkHit *hit) {
         const int first = evkT9CodeFirst(n, vis);
         const int last = n < first + vis ? n : first + vis;
         for (int i = first; i < last; i++) {
-            if (!evkInEllipse(x, y, 0, top + (i - first) * rh, lw - 2, rh)) continue;
+            if (!evkInKey(x, y, 0, top + (i - first) * rh, lw - 2, rh)) continue;
             evkSetHit(hit, 0, 0, 0, 0, 0, 0, false, nullptr);   // 不补反色，面板本身会重画
+            if (s_hitProbeOnly) return EVK_T9;                  // 探针：不真去挑读音
             return ime.selectAmbigCode(i) ? EVK_T9 : EVK_NONE;
         }
     }
@@ -1365,7 +1465,7 @@ static int evkT9Hit(int x, int y, int w, EditorVkHit *hit) {
     if (cw < 20 || ch < 20) return EVK_NONE;
     for (int j = 0; j < n; j++) {
         const int cx = gx + (j % EVK_T9_COLS) * cw, cy = top + (j / EVK_T9_COLS) * ch;
-        if (!evkInEllipse(x, y, cx, cy, cw, ch)) continue;
+        if (!evkInKey(x, y, cx, cy, cw, ch)) continue;
         // 不补按下反色：这一下会立刻选词上屏、面板跟着重画（组合结束还会整块收起），
         // 留着的反色块会画到"下一个界面"上——面板收起后那些坐标已经是字母键了。
         evkSetHit(hit, 0, 0, 0, 0, 0, 0, false, nullptr);
@@ -1375,6 +1475,17 @@ static int evkT9Hit(int x, int y, int w, EditorVkHit *hit) {
 }
 
 int editorVkHitTest(int x, int y, EditorVkHit *hit) {
+    return evkHitTestImpl(x, y, hit);
+}
+
+int editorVkProbeKey(int x, int y, EditorVkHit *hit) {
+    s_hitProbeOnly = true;
+    const int k = editorVkHitTest(x, y, hit);
+    s_hitProbeOnly = false;
+    return k;
+}
+
+static int evkHitTestImpl(int x, int y, EditorVkHit *hit) {
     // 键位命中必须与 editorVkDraw 画出来的格子逐像素对齐 —— 那是界面字号下的几何，
     // 所以这里也要钉回界面字号（本函数在编辑器正文作用域里被调到）。
     FontScope ui(FontRenderer::uiPxHeight());
@@ -1395,7 +1506,7 @@ int editorVkHitTest(int x, int y, EditorVkHit *hit) {
             // 没在组合时这一行本来就是空的，点了也不响应。
             IME &ime = IME::getInstance();
             if (!ime.composing()) return EVK_NONE;
-            evkT9Set(!s_t9);
+            if (!s_hitProbeOnly) evkT9Set(!s_t9);
             evkSetHit(hit, 0, 0, 0, 0, 0, 0, false, nullptr);   // 开关本身就是反馈，不补反色
             return EVK_T9;
         }
@@ -1406,7 +1517,7 @@ int editorVkHitTest(int x, int y, EditorVkHit *hit) {
         int hlH = evkCandHlH();
         for (size_t i = 0; i < s_candX.size(); i++) {
             int cx = s_candX[i] - 2, cw = s_candW[i] + 4;
-            if (evkInEllipse(x, y, cx, hlY, cw, hlH)) {
+            if (evkInKey(x, y, cx, hlY, cw, hlH)) {
                 evkSetHit(hit, cx, hlY, cw, hlH, 3, 0,
                           static_cast<int>(i) == ime.highlightIdx(), s_candLabel[i].c_str());
                 return '1' + static_cast<int>(i % ps);   // 与物理键盘按数字键等价
@@ -1438,32 +1549,33 @@ int editorVkHitTest(int x, int y, EditorVkHit *hit) {
             // 布局键：先按"按下前"的常态回填，再翻转（闪的就是这一下）。
             // 英文态下布局被强制成 26 键(见 evkAmbig)，这时按键只给一下反色反馈、
             // 不改 s_layout：改了也看不见，留着等切回中文时生效反而更让人糊涂。
-            if (evkInEllipse(x, y, ex[0], ry, ew[0], rh)) {
+            if (evkInKey(x, y, ex[0], ry, ew[0], rh)) {
                 const bool cn = evkCnPunct();
                 evkSetHit(hit, ex[0], ry, ew[0], rh, 0, 0, evkAmbig(), evkLayoutLabelEff());
                 // 26→14→18→9→26。改完写设置：下次开机还是这个布局（9 键用户不该每次
                 // 开机再点三下）。写只在这一次点按上发生，绘制路径不碰。
-                if (cn) editorVkSetLayout(evkLayoutKey((s_layout + 1) % IME::ambigLayoutCount()));
+                if (cn && !s_hitProbeOnly)
+                    editorVkSetLayout(evkLayoutKey((s_layout + 1) % IME::ambigLayoutCount()));
                 return EVK_LAYOUT;
             }
-            if (evkInEllipse(x, y, ex[1], ry, ew[1], rh)) {
+            if (evkInKey(x, y, ex[1], ry, ew[1], rh)) {
                 evkSetHit(hit, ex[1], ry, ew[1], rh, 0, 0, s_ctrl, "Ctl");
-                s_ctrl = !s_ctrl;
+                if (!s_hitProbeOnly) s_ctrl = !s_ctrl;
                 return EVK_CTRL;
             }
             static const int DIRKEY[4] = {KEY_LEFT, KEY_UP, KEY_DOWN, KEY_RIGHT};
             for (int d = 0; d < 4; d++) {
-                if (evkInEllipse(x, y, ex[2 + d], ry, ew[2 + d], rh)) {
+                if (evkInKey(x, y, ex[2 + d], ry, ew[2 + d], rh)) {
                     evkSetHit(hit, ex[2 + d], ry, ew[2 + d], rh, 1, d, false, nullptr);
                     return evkFinishKey(DIRKEY[d]);
                 }
             }
-            if (evkInEllipse(x, y, ex[6], ry, ew[6], rh)) {
+            if (evkInKey(x, y, ex[6], ry, ew[6], rh)) {
                 evkSetHit(hit, ex[6], ry, ew[6], rh, 2, 0, s_shift, nullptr);
-                s_shift = !s_shift;
+                if (!s_hitProbeOnly) s_shift = !s_shift;
                 return EVK_SHIFT;
             }
-            if (!nine && evkInEllipse(x, y, ex[7], ry, ew[7], rh)) {
+            if (!nine && evkInKey(x, y, ex[7], ry, ew[7], rh)) {
                 evkSetHit(hit, ex[7], ry, ew[7], rh, 4, 0, false, nullptr);
                 return evkFinishKey('\b');
             }
@@ -1501,7 +1613,7 @@ int editorVkHitTest(int x, int y, EditorVkHit *hit) {
                 evkAmbigRowRects(r, w, keyW, xs, ws);
                 IME &ime = IME::getInstance();
                 for (int k = 0; k < IME::ambigRowKeys(r) && k < kMaxAmbig; k++) {
-                    if (!evkInEllipse(x, y, xs[k], ky, ws[k], kh)) continue;
+                    if (!evkInKey(x, y, xs[k], ky, ws[k], kh)) continue;
                     int g = IME::ambigRowGroup(r, k);
                     const char *letters = IME::ambigGroupLetters(g);
                     evkSetHit(hit, xs[k], ky, ws[k], kh, 0, 0, false, IME::ambigGroupLabel(g));
@@ -1529,7 +1641,7 @@ int editorVkHitTest(int x, int y, EditorVkHit *hit) {
                 bool cn = evkCnPunct();
                 for (int k = 0; k < 9; k++) {
                     int kxx = l3x + k * keyW;
-                    if (!evkInEllipse(x, y, kxx, ky, keyW, kh)) continue;
+                    if (!evkInKey(x, y, kxx, ky, keyW, kh)) continue;
                     if (k == 7) {
                         evkSetHit(hit, kxx, ky, keyW, kh, 0, 0, false, cn ? "，" : ",");
                         return evkFinishKey(',');
@@ -1557,26 +1669,26 @@ int editorVkHitTest(int x, int y, EditorVkHit *hit) {
             bool en = ime.english();
             // ①②：命中测试里就把面板切好（和布局键同一套路），调用方只需重绘。
             // 三个面板绕一圈，见 evkPanelKeyLabel 的注释。
-            if (evkInEllipse(x, y, fx[0], by, fw[0], bh)) {
+            if (evkInKey(x, y, fx[0], by, fw[0], bh)) {
                 evkSetHit(hit, fx[0], by, fw[0], bh, 0, 0, false, evkPanelKeyLabel(0));
-                s_page = evkNumPage() ? 1 : (evkSymPage() ? 0 : 1);
+                if (!s_hitProbeOnly) s_page = evkNumPage() ? 1 : (evkSymPage() ? 0 : 1);
                 return EVK_PAGE;
             }
-            if (evkInEllipse(x, y, fx[1], by, fw[1], bh)) {
+            if (evkInKey(x, y, fx[1], by, fw[1], bh)) {
                 evkSetHit(hit, fx[1], by, fw[1], bh, 0, 0, false, evkPanelKeyLabel(1));
-                s_page = evkNumPage() ? 0 : 2;
+                if (!s_hitProbeOnly) s_page = evkNumPage() ? 0 : 2;
                 return EVK_PAGE;
             }
-            if (evkInEllipse(x, y, fx[2], by, fw[2], bh)) {
+            if (evkInKey(x, y, fx[2], by, fw[2], bh)) {
                 evkSetHit(hit, fx[2], by, fw[2], bh, 5, 0, false, nullptr);
                 return evkFinishKey(' ');
             }
-            if (evkInEllipse(x, y, fx[3], by, fw[3], bh)) {
+            if (evkInKey(x, y, fx[3], by, fw[3], bh)) {
                 const char *lang = !ime.active() ? "中" : (en ? "英" : "拼");
                 evkSetHit(hit, fx[3], by, fw[3], bh, 0, 0, en, lang);
                 return EVK_LANG;
             }
-            if (evkInEllipse(x, y, fx[4], by, w - fx[4], bh)) {
+            if (evkInKey(x, y, fx[4], by, w - fx[4], bh)) {
                 evkSetHit(hit, fx[4], by, w - fx[4], bh, 6, 0, false, nullptr);
                 return evkFinishKey('\n');
             }
@@ -1613,7 +1725,7 @@ static int evkNumPanelHit(int x, int y, int w, EditorVkHit *hit) {
     for (int r = 0; r < 4; r++) {
         const int ry = evkNumRowY(r), rh = evkNumRowH(r);
         if (y < ry || y >= ry + rh) continue;
-        if (evkInEllipse(x, y, 0, ry, side, rh)) {                 // 左列
+        if (evkInKey(x, y, 0, ry, side, rh)) {                 // 左列
             char lk[2] = {EVK_NUM_LEFT[r], 0};
             evkSetHit(hit, 0, ry, side, rh, 0, 0, false, lk);
             return evkFinishKey(static_cast<unsigned char>(EVK_NUM_LEFT[r]));
@@ -1621,22 +1733,22 @@ static int evkNumPanelHit(int x, int y, int w, EditorVkHit *hit) {
         if (r < 3) {                                               // 中间三列：1..9
             for (int c = 0; c < 3; c++) {
                 const int cx = side + c * colW;
-                if (!evkInEllipse(x, y, cx, ry, colW, rh)) continue;
+                if (!evkInKey(x, y, cx, ry, colW, rh)) continue;
                 char dk[2] = {static_cast<char>('1' + r * 3 + c), 0};
                 evkSetHit(hit, cx, ry, colW, rh, 0, 0, false, dk);
                 return evkFinishKey(static_cast<unsigned char>(dk[0]));
             }
-        } else if (evkInEllipse(x, y, side, ry, colW * 3, rh)) {   // 末行：0 横跨三列
+        } else if (evkInKey(x, y, side, ry, colW * 3, rh)) {   // 末行：0 横跨三列
             evkSetHit(hit, side, ry, colW * 3, rh, 0, 0, false, "0");
             return evkFinishKey('0');
         }
         if (r == 0) {                                              // 右列第一格：退格
-            if (evkInEllipse(x, y, w - side, ry, side, rh)) {
+            if (evkInKey(x, y, w - side, ry, side, rh)) {
                 evkSetHit(hit, w - side, ry, side, rh, 4, 0, false, nullptr);
                 return evkFinishKey('\b');
             }
         } else {
-            if (evkInEllipse(x, y, w - side, ry, side, rh)) {
+            if (evkInKey(x, y, w - side, ry, side, rh)) {
                 char rk[2] = {EVK_NUM_RIGHT[r], 0};
                 evkSetHit(hit, w - side, ry, side, rh, 0, 0, false, rk);
                 return evkFinishKey(static_cast<unsigned char>(EVK_NUM_RIGHT[r]));
@@ -1739,6 +1851,8 @@ bool editorVkSwipeScroll(int x, int y, int dir) {
 // 遍），实测"按一下闪一下"，正是要改掉的。
 void editorVkMarkPressed(const EditorVkHit &hit) {
     if (hit.w <= 0 || hit.h <= 0) { s_pressedValid = false; return; }
+    // 上一拍反色过的键挪进"待擦"位（差分路靠它把旧键帽擦回常态；整屏重绘会忽略它）。
+    if (s_pressedValid) { s_prevPressed = s_pressed; s_prevPressedValid = true; }
     s_pressed = hit;
     s_pressedValid = true;
 }
@@ -1748,7 +1862,57 @@ void editorVkMarkPressed(const EditorVkHit &hit) {
 // 新样子，再拿旧的一份反色叠上去，就会新旧两个标签摞在一起（"拼"和"英"叠字，
 // 要再按一个其它键才刷新——那个键的反馈把旧的盖掉了）。这些键在本次重绘里已经
 // 是最终形态，直接取消补画即可。
-void editorVkClearPressed() { s_pressedValid = false; }
+void editorVkClearPressed() {
+    // 两个都要清：只清 s_pressedValid 的话，"待擦"位还留着上一个键帽，差分路下次会把
+    // 它画回屏幕 —— 一个早该消失的幽灵键帽。整屏重绘会忽略这个标记，所以清多了无害。
+    s_pressedValid = false;
+    s_prevPressedValid = false;
+}
+
+// ── 组合期差分重绘（见 editor_vk.h）──────────────────────────────────────
+bool editorVkDeltaEligible(int k, const EditorVkHit &hit) {
+    // 候选就在候选条带里（evkDrawCandBand 每拍整条重画）。让它走差分的话，候选行会被
+    // 画两遍（条带一遍、这个键帽一遍），所以一律不eligible。
+    if (hit.shape == 3) return false;
+    // 九宫格：组合中左列会换成"分音节选择列"（evkNineSylOn），键帽内容跟着组合走，
+    // 不是"擦掉上一拍的键帽、画上这一拍的"能覆盖的。整块交给全量重绘。
+    if (evkNineKey()) return false;
+    switch (k) {
+        case EVK_NONE:   // 死区：连按下反馈都没有，调用方照旧直接返回
+        case EVK_PAGE:   // 换面板：整张键表换掉
+        case EVK_LANG:   // 中/英：键帽标签本身变了
+        case EVK_LAYOUT: // 换布局：整张键表换掉
+        case EVK_CTRL:   // 修饰键待发：键帽面变
+        case EVK_SHIFT:  // 同上
+        case EVK_T9:     // 开合 T9 面板：整块键区换掉
+        case EVK_SEP:    // 九宫格分词：左列换组分页（正常情况下已被 evkNineKey 拦住）
+        case EVK_CLEAR:  // 九宫格重输：同上
+        case EVK_NOOP:   // 键按到了、此刻没动作（九宫格「0」）：走全量重绘画反色反馈
+            return false;
+        default:
+            break;
+    }
+    return true;
+}
+
+void editorVkDrawDelta() {
+    FontScope ui(FontRenderer::uiPxHeight());
+    UI_FONT_GUARD();
+    if (!s_visible) return;
+    const int w = SCREEN_W;
+    const int top = editorVkTop();
+    if (top < FONT_H || STATUS_BAR_Y - top < 16) return;
+
+    // 1) 上一拍的键帽擦回常态（evkDrawKeyRect 先白填再画，反色黑底擦得掉）
+    if (s_prevPressedValid) evkDrawKeyRect(s_prevPressed, false);
+    // 2) 候选条带（编码行 + 候选行 + 三条分隔线）：组合期的变化全在这一块
+    evkDrawCandBand(w, top);
+    // 3) 这一拍的键帽反色
+    if (s_pressedValid) evkDrawKeyRect(s_pressed, true);
+
+    s_prevPressedValid = false;   // 旧键帽已经擦掉，下一拍不用再擦
+    u8g2_SetDrawColor(g_u8g2, 1);
+}
 
 std::string editorVkTruncateToWidth(const std::string &s, int maxWidth) {
     // 给状态栏文字截宽用的，按**界面字号**量 —— 调用方可能正在正文作用域里
