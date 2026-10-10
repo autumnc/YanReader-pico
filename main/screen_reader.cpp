@@ -6787,19 +6787,26 @@ static int s_pagesSinceFull = 0;
 //   1 = 老行为（只挂 1 相）；4 / 8 = 中间档；挂满 = 该表所有白推相（正文表 10、默认表 20）。
 // 档位在不同长度表上的绝对值不同，所以标成"帧"而不是"相"，实际挂满由波形组件按表封顶。
 //
-// **默认挂满**（这就是这一项本身要改的事；波形组件的编译期默认仍是 1，所以兄弟固件
-// read_pico_firmware 一个字节都不变）。觉得白底发灰/发脏就往下调：先退到 8，再退到 4，
-// 最后 1 = 完全回到改动前的行为。
+// **默认 1 帧（= 老行为）。** 默认曾经是挂满，2026-10-10 实测那是**过驱**：白底被推得比
+// 原厂更过之后**停不住** —— 任何画面静止下来约 **5 秒**就开始发灰、几秒到某个阈值停住，
+// 而**任何一次刷新都能立刻恢复**（所以"刷的时候不灰、一停就灰"）。翻页越多、累积的账越大，
+// 那个平衡位越暗，这正是用户侧的"翻得越多、灰得越快越多"。当天退到 1 帧用户复测："好像就
+// 没了"。所以这一格是个**很窄的窗口**：太少 → 白轨漂了没人回收（上面那层旧灰影），
+// 太多 → 过驱、弛回灰。默认取老行为（1 帧），想把底压得更净的人自己往上试 4 / 8。
+//
+// 这一项改的是**共享**波形表，所以和压黑 / 擦除加强一样：进阅读模式挂上、**出去也要归零**
+// （见本文件收尾那段）—— 漏了归零，它就会在开过一次书之后泄漏到所有界面的差分刷，
+// 表现就是"任何画面静止下来都发灰"，而不只是待机页。
 static const int kRdWhitePushValues[] = {1, 4, 8, -1};
 static const char *kRdWhitePushKeys[] = {"1", "4", "8", "-1"};
 static const char *kRdWhitePushNames[] = {"1 帧", "4 帧", "8 帧", "挂满"};
 static const int kRdWhitePushCount = 4;
 static int whitePushFrames() {
-  std::string k = g_settings.getString("reader_white_pushes", "-1");
+  std::string k = g_settings.getString("reader_white_pushes", "1");
   for (int i = 0; i < kRdWhitePushCount; i++) {
     if (k == kRdWhitePushKeys[i]) return kRdWhitePushValues[i];
   }
-  return -1;  // 挂满
+  return kRdWhitePushValues[0];  // 认不出来就按 1 帧（老行为）
 }
 static const char *whitePushName(int v) {
   for (int i = 0; i < kRdWhitePushCount; i++) {
@@ -11863,7 +11870,8 @@ void screen_reader_init() {
   ImageBlock::setBilinearScaling(st.imageBilinear);
   st.imageDither = imageDitherIndex();
   ImageBlock::setDitherMode(ditherModeOf(st.imageDither));
-  // 白推档要在第一次推屏之前落到波形表上（改表不能和推屏并发）。默认 1 = 老行为。
+  // 白推档要在第一次推屏之前落到波形表上（改表不能和推屏并发）。默认 1 帧 = 老行为：
+  // 曾经默认挂满，实测那是过驱 —— 画面一停就弛回灰（见 kRdWhitePushValues 上面那段）。
   reader_set_white_pushes(whitePushFrames());
   // 压黑档同理。它改的是**共享**的那三张 GL16 表，所以只在阅读模式里挂着 —— 进来这一
   // 下挂上、出去那一下归零（见本文件收尾那段），别的界面的差分刷一点没变。
@@ -11981,7 +11989,10 @@ void screen_reader_exit() {
   s_ghostAccum = 0;
   s_pagesSinceFull = 0;
   s_pendingTurn = 0;
-  // 「残影治理」里压黑/擦除加强改的是共享的 GL16 表，出门就归零，写作/设置的差分刷一点没变。
+  // 「残影治理」这三个旋钮（白推/压黑/擦除）改的都是共享的那几张 GL16 表，出门一律归零，
+  // 写作/设置的差分刷一点没变。**白推这一项从前漏了归零** —— 它一进书就挂满、出来还挂着，
+  // 于是"开过一次书之后，任何界面静止约 5 秒都发灰"。补上这一行才算把泄漏堵死。
+  reader_set_white_pushes(kRdWhitePushValues[0]);
   reader_set_black_pushes(0);
   reader_set_erase_pushes(0);
   // 错相揭页的 37KB 相位表只在阅读时按需分配，退出时还回 PSRAM。
