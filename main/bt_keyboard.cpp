@@ -16,6 +16,7 @@
 #include <esp_gattc_api.h>
 #include <esp_hidh.h>
 #include <esp_hid_common.h>
+#include <esp_heap_caps.h>   // bt_conn 创建失败时打内部 RAM 余量（见 requestConnect）
 
 static const char *TAG = "BtKeybrd";
 
@@ -125,6 +126,7 @@ static bool s_connected = false;
 static bool s_init_done = false;   // set once esp_hidh init completes
 static bool s_scanning = false;
 static bool s_connecting = false;  // 新增：标记正在连接中
+static int64_t s_connect_started_us = 0;  // 本次连接尝试的起始时刻(仅在 s_connecting 为真时有意义)
 static bool s_deiniting = false;   // deinit 进行中:阻止重连逻辑再发起新连接尝试
 static bool s_shift_tap_armed = false;  // 左Shift 单击检测武装标记
 static int s_kb_battery = -1;           // 键盘电池电量 %，-1=未知/未连接
@@ -152,6 +154,13 @@ static esp_ble_addr_type_t s_paired_addr_type = BLE_ADDR_TYPE_RANDOM;
 // 连接在后台任务里执行: esp_hidh_dev_open 是同步阻塞的(连接失败要等链路层
 // 超时 ~30s),不能放在主循环里,否则 UI 会卡死。s_connect_task 非空表示任务存活。
 static TaskHandle_t s_connect_task = nullptr;
+
+// 单次连接尝试的最长寿命。正常路径不用它兜底: 失败时 esp_hidh_dev_open 会在 ~30s 后
+// 返回 NULL 并自行复位 s_connecting。取 60s 是给"卡死"留的出口 —— 任务创建失败、
+// Bluedroid 内部命令阻塞、OPEN 事件丢失都会让 s_connecting 永远为真,而主循环的
+// 自动重连门是 !isConnecting()（main.cpp），于是键盘再也不会自动重连，日志上只看得到
+// 每 30s 一次的配对列表重载，完全看不出原因。超时后主动放弃这次尝试，让重试继续。
+static const int64_t CONNECT_ATTEMPT_TIMEOUT_US = 60 * 1000000LL;
 static struct {
     uint8_t bda[ESP_BD_ADDR_LEN];
     esp_ble_addr_type_t addr_type;
@@ -661,8 +670,22 @@ static void requestConnect(const uint8_t *bda, esp_ble_addr_type_t addr_type) {
     memcpy(s_connect_req.bda, bda, ESP_BD_ADDR_LEN);
     s_connect_req.addr_type = addr_type;
     s_connecting = true;
+    s_connect_started_us = esp_timer_get_time();
     s_connect_task = nullptr;
-    xTaskCreate(connect_task, "bt_conn", 4096, NULL, 3, &s_connect_task);
+    // 必须检查返回值。这里原先不看，一旦任务创建失败(内堆不足)就没人再复位
+    // s_connecting，主循环的 !isConnecting() 门永远打不开 —— 键盘从此不会自动重连，
+    // 且全程没有任何日志（日志里"auto-reconnect retry"之后 connect_task 那句
+    // "Connecting to %s..." 一行都没有，就是这个失败形态）。
+    if (xTaskCreate(connect_task, "bt_conn", 4096, NULL, 3, &s_connect_task) != pdPASS) {
+        s_connect_task = nullptr;
+        s_connecting = false;
+        s_connect_started_us = 0;
+        // 打的是**内部** RAM：xTaskCreate 的 TCB+栈只能在内部 RAM 上分配，而这台机器
+        // 内部 RAM 常年吃紧（蓝牙 + WiFi 的地板见 internal-ram-floor 那条笔记），
+        // 用 esp_get_free_heap_size() 会把 8MB PSRAM 算进去，完全看不出真正的原因。
+        ESP_LOGE(TAG, "bt_conn task create failed, internal free=%u, giving up this attempt",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
 }
 
 BtKeyboard& BtKeyboard::getInstance() {
@@ -859,7 +882,19 @@ bool BtKeyboard::isScanning() {
 }
 
 bool BtKeyboard::isConnecting() const {
-    return s_connecting;
+    if (!s_connecting) return false;
+    // 自愈：连接尝试有可能永远不结束（任务创建失败、Bluedroid 命令阻塞、OPEN 事件
+    // 丢失）。超时即视为本次尝试失败，主动放行 —— 否则主循环每次都被 !isConnecting()
+    // 挡回去，键盘再也不会自动重连，而日志上完全看不出原因。
+    if (s_connect_started_us != 0 &&
+        esp_timer_get_time() - s_connect_started_us > CONNECT_ATTEMPT_TIMEOUT_US) {
+        ESP_LOGW(TAG, "Connect attempt stuck for %lld ms, abandoning it",
+                 (long long)((esp_timer_get_time() - s_connect_started_us) / 1000));
+        s_connecting = false;
+        s_connect_started_us = 0;
+        return false;
+    }
+    return true;
 }
 
 esp_err_t BtKeyboard::connectDevice(int idx) {
