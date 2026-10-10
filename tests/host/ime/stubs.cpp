@@ -93,3 +93,11 @@ int candidateLineWidth() { return 1216 - 12; }          // 横屏
 int candidateLineWidthPortrait() { return 684 - 12; }   // 竖屏
 
 }  // namespace hostime
+
+// ── 长活/补采样桩（主机测试用）─────────────────────────────────────────────
+// IME.cpp 的 saveUserDictFile 写循环里调这两个：longop 记账（固件里是关中断重活
+// 探针）和 input_tick_throttled（按 12ms 放闸补采触摸）。主机上没有它们，给空桩
+// 只为过链接 —— 不放进 hostime 命名空间，IME.cpp 是无限定名直接调的。
+extern "C" void longop_begin(const char *) {}
+extern "C" void longop_end(void) {}
+void input_tick_throttled() {}

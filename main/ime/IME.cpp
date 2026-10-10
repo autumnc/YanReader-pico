@@ -47,6 +47,18 @@ static const size_t USERPREDICT_LIMIT = 2000;
 // 靠 append 增量维护、始终有效。内存里最多多躺 200 项（loadUserDictFile 仍按 LIMIT 读，
 // 落盘也照旧整份写，所以上限语义不变，只是"什么时候整理"变懒了）。
 static const size_t USERPREDICT_COMPACT_SLACK = 200;
+// 通用压紧水位线：表长到 LIMIT + LIMIT/4 才做一次压缩（+全量重建索引），而不是一碰上限
+// 就做。为什么：动态表长年卡在 5000，于是一碰上限就 5000 —— **每新增一条词**都会撞进
+// compactUserEntries（5000 条 stable_sort）+ markUserWordIndexesDirty 的全量索引重建，
+// 而 learnAutoPhraseFromSingle 一次上屏最多学 3 条，全落在"空格上屏"那一键上（同写法在
+// esp32 上实测约 30ms/条）。留 25% 余量后，压缩从"每条新词一次"变成"每 1250 条一次"，
+// 摊到每条是亚毫秒级。代价是表里最多多躺 1250 条（约 100KB 文本，本来就在 PSRAM 里），
+// 落盘仍照旧整份写，所以「上限」语义不变，变的只是"什么时候整理"。
+// 注意：预测表不走这里，它有自己的 USERPREDICT_COMPACT_SLACK（200，10%）。
+static const size_t USERDICT_COMPACT_DIVISOR = 4;
+static inline size_t userDictHighWater(size_t limit) {
+    return limit + limit / USERDICT_COMPACT_DIVISOR;
+}
 static const size_t USERPREDICT_REJECT_LIMIT = 1000;
 static const size_t ENGLISHDICT_LIMIT = 10000;
 // 用户词库文件读入的硬上限。动态库本身只留 5000 条（约 200KB 文本），正常远到不了
@@ -1428,9 +1440,8 @@ bool IME::loadUserDictFile(const char *path, std::vector<UserEntry> &entries,
                 hadDuplicates = true;
                 if (existing.count < count) existing.count = count;
             } else {
-                if (entries.size() >= maxEntries) {
+                if (entries.size() >= userDictHighWater(maxEntries)) {
                     compactUserEntries(entries, maxEntries);
-                    if (entries.size() >= maxEntries) entries.pop_back();
                     hadDuplicates = true;
                     entryIndex.clear();
                     entryIndex.reserve(entries.size() * 2 + 1);
@@ -1570,9 +1581,8 @@ void IME::loadUserDictJournal(const char *path, std::vector<UserEntry> &entries,
                 changed = true;
             }
         } else {
-            if (entries.size() >= maxEntries) {
+            if (entries.size() >= userDictHighWater(maxEntries)) {
                 compactUserEntries(entries, maxEntries);
-                if (entries.size() >= maxEntries) entries.pop_back();
                 entryIndex.clear();
                 entryIndex.reserve(entries.size() * 2 + 1);
                 for (size_t i = 0; i < entries.size(); i++)
@@ -2340,11 +2350,11 @@ void IME::bumpFrequency(const std::string &code, const std::string &word, int we
     }
     if (word.length() >= 3 && code.length() >= 1) {
         if (!confirmNewUserWordLearning(code, word, weight)) return;
-        if (_dynamicUserWords.size() >= USERDICT_DYNAMIC_LIMIT) {
+        if (_dynamicUserWords.size() >= userDictHighWater(USERDICT_DYNAMIC_LIMIT)) {
             compactUserEntries(_dynamicUserWords, USERDICT_DYNAMIC_LIMIT);
-            if (_dynamicUserWords.size() >= USERDICT_DYNAMIC_LIMIT) _dynamicUserWords.pop_back();
             // Compaction drops entries and shifts every following index, so the maps
             // must be rebuilt; leaving the dirty flag set makes the append below a no-op.
+            // 压紧后 size 一定 ≤ LIMIT < 水位线，所以不再需要 pop_back 兜底。
             markUserWordIndexesDirty("compact");
         }
         _dynamicUserWords.push_back({code, word, weight, _trad, userInitialForCode(code)});
