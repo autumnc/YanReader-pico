@@ -255,68 +255,182 @@ int e0470_phase_action(const EpdWaveformPhases* phases, int phase, int to, int f
     return (*cell >> (6 - 2 * (from % 4))) & 3;
 }
 
-// 白底 15→15 源表全保持。挂在已经「往白推」的那几相上再推，**不增加相数**。
-// 差分会跳过未变白像素，GL16 必须走全像素这帧才打到白底。
+// ── (15→15)「不变的白底」这一格：白推 + 压黑两个旋钮 ──────────────────────
+// 源表在这一格是全保持。它为什么重要：差分刷把每个像素编码成一个字节 (to<<4)|from，
+// **没变的白像素正好编成 15→15** —— 也就是说一屏里"本来就没字的白底"挨到的驱动，
+// 全由这一格决定，而"由黑变白"的像素走的是 0→15（默认表 18 相白推、正文表 10 相）。
+// 两边不对称：白底只吃到挂上去的那点推力，退不到白轨，攒下来就是那层灰影。
 //
-// 为什么不止 1 帧：一屏里各像素类的推力是不对称的 —— 由黑变白（0→15）在正文表里有
-// 10 相、默认 37 相表里有 20 相，而**不变的白底（15→15）只吃到挂上去的那 1 相**。
-// 残影正好攒在这一类上：上一页的字被推走之后，本页没字的空白只挨过 1 次推，退不干净。
-// 挂满 = 让白底也吃到它那张表自己的白推预算，代价 0ms（相是现成的，只是把这一格的
-// 动作从"保持"改成"推白"）。留成档位是因为推过头会把白底带出灰边，得实测。
-//
-// count: >0 挂这么多相（取候选里**最后**的几相，那是白推阶梯的饱和端，对推向白轨最
-//         有效）；<0 = 挂满（候选相全挂）；0 = 关。
-// 先把 (15,15) 的所有位清零再重挂 —— 同一张表反复调用结果只由 count 决定（幂等），
-// 所以换档不必重算整表。返回实际挂上的相数。
-// / count: >0 that many phases (the LAST candidates — the saturated end of the white
-// ladder); <0 = all; 0 = off. Clears every (15,15) bit first, so repeated calls are
-// idempotent and a knob change needs no rebuild. Returns the count actually hung.
-static int e0470_gl16_white_pushes(uint8_t (*data)[16][4], int frames, int count) {
+// 两个旋钮挂的都是**表里现成的相**（只是把这一格的动作从"保持"改成"压黑/推白"），
+// 所以不增加相数、不增加刷新时间：
+//   白推（往白轨推）—— 挂在已经「往白推」的相上；取候选里**最后**几相（白推阶梯的
+//                     饱和端，对推向白轨最有效）。
+//   压黑（先往黑轨打回去再推白）—— 挂在已经「往黑压」的相上；取候选里**最前**几相
+//                     （默认表 3~15 是那一段擦除，正文表 11~17）。这一项就是把 GC16
+//                     里 15→15 那段"先压黑再推白"的摆动借到 GL16 上，代价是白底会跟着
+//                     闪一下——挂几相就是闪多深，得实测。
+// 同一相被两个旋钮都选中时压黑优先（它在前，是"先打回去"那一半）。
+// 先把这一格清零再重挂：同一张表反复调用结果只由两个 count 决定（幂等），换档不必重算整表。
+// / The (15→15) cell: white pushes and black pushes, both hung on phases that
+// already carry that action elsewhere in the to=15 row — no extra phases, no
+// extra time. Idempotent: the cell is cleared, then rebuilt from the two counts.
+static void e0470_gl16_1515_build(
+    uint8_t (*data)[16][4], int frames, int white_count, int black_count
+) {
+    int wcand[E0470_FULL_GL16_FRAMES];
+    int bcand[E0470_FULL_GL16_FRAMES];
     for (int f = 0; f < frames; f++) lut_set(data, f, 15, 15, 0);
-    int cand[E0470_FULL_GL16_FRAMES];
+    int wn = 0, bn = 0;
+    for (int f = 0; f < frames; f++) {
+        int has_white = 0, has_black = 0;
+        for (int from = 0; from < 15; from++) {
+            const int a = lut_get(data, f, 15, from);
+            if (a == 2) has_white = 1;
+            else if (a == 1) has_black = 1;
+        }
+        if (has_white) wcand[wn++] = f;
+        if (has_black) bcand[bn++] = f;
+    }
+
+    // 压黑：取最前几相（擦除段），挂满 = 全部候选。
+    int want_b = (black_count < 0) ? bn : black_count;
+    if (want_b > bn) want_b = bn;
+    for (int i = 0; i < want_b; i++) lut_set(data, bcand[i], 15, 15, 1);
+
+    // 白推：取最后几相（饱和端），挂满 = 全部候选。压黑已经占住的相跳过。
+    int want_w = (white_count < 0) ? wn : white_count;
+    if (want_w > wn) want_w = wn;
+    for (int i = wn - want_w; i < wn; i++) {
+        if (lut_get(data, wcand[i], 15, 15) == 0) lut_set(data, wcand[i], 15, 15, 2);
+    }
+
+    // 异常表（源表里没有白推相）：退回老做法，取倒数第三相，保底 1 帧。
+    if (wn == 0 && white_count != 0) {
+        const int tick = frames > 2 ? frames - 3 : 0;
+        lut_set(data, tick, 15, 15, 2);
+    }
+}
+
+// 当前档位。白推：0 = 关，>0 = 每张表挂这么多相，<0 = 挂满。压黑同义。
+// 见 e0470_waveform_set_white_pushes / e0470_waveform_set_black_pushes。
+static int s_white_pushes = E0470_GL16_WHITE_PUSHES_DEFAULT;
+static int s_black_pushes = E0470_GL16_BLACK_PUSHES_DEFAULT;
+
+// 表内容的版本号：每改一次表 +1。谁把"从这些表展开出来的 LUT"缓存了，就拿它判陈旧 ——
+// 只比表指针和相数是不够的（档位改的就是同一张表的内容，指针不变）。
+// 现役消费方：错相揭页的相位 LUT（e0470_page_turn.c 的 build_luts）。它原来只在
+// 指针/相数变化时重建，于是"进书后第一页翻页建好 LUT、之后在设置里改档"完全不生效 ——
+// 四档看着一模一样就是这个原因。
+// / Content generation of the writable waveform tables, bumped on every change.
+// Consumers that cache LUTs expanded from these tables must compare this too —
+// the pointer and phase count stay the same when only a knob changes.
+static int s_wf_gen = 1;
+
+// 8 灰阶正文表的擦除加强档（见 e0470_waveform_set_erase_pushes）。0 = 关。
+static int s_erase_pushes = E0470_GRAY8_TEXT_ERASE_PUSHES_DEFAULT;
+
+// 8 灰阶正文表（E0470_GRAY8_TEXT_WAVEFORM 的 GL16 —— 阅读器**正文页翻页走的就是它**，
+// 自适应和局刷都会把整页文字判进这一档）**擦除不够**：
+//   · 它的 to=15 行对 from=0（旧黑字）只有 **10 相推白**，默认 37 相表是 **18 相**；
+//     （主机端逐格拆过：8 灰阶表 to=15 行 = 18 保持 + 10 推白 + 2 整定，
+//      默认 GL16 表 = 16 保持 + 18 推白 + 3 整定。）
+// 于是"上一页的黑字该变白"这件事只被推了 10 次，退不到白轨 —— 留在屏上就是那层看得见的
+// 浅影（用户描述："旧字迹的浅影"）。压黑/白推那两个旋钮动的是 (15,15)（本来就白、还是白
+// 的背景），跟这里**不是同一格**，所以它们治不了这个。
+//
+// 这里把该行**前导的空相**借给 from<15 推白：那些相对 from<15 本来就是"保持"（相 0..10
+// 全保持），改成推白**不增加相数**。时间上也几乎不花：前导保持跳过实测只有 1 相
+// （日志「跳相 1」），把它变活最多多扫 1 相 ≈ 11ms。只动 to=15 行、只动 from<15 的格子；
+// (15,15) 一格都不碰，仍归白推/压黑那两个旋钮。
+//   count > 0：借这么多相；count < 0：全部借满；count == 0：关。
+// / Borrow the leading all-hold phases of the 8-gray text table's to=15 row into
+// white pushes for from<15 — the old ink is erased with only 10 pushes (the
+// default table uses 18), which is exactly the faint previous-page ghost. The
+// borrowed phases already hold for those cells, so no phase is added and the
+// measured leading-hold skip is 1 phase, i.e. at most ~11 ms more. Only the
+// to=15 row and only from<15; the (15,15) cell is untouched.
+static void e0470_gray8_text_erase_boost(void) {
+    if (s_erase_pushes == 0) return;
+    uint8_t (*data)[16][4] = e0470_gray8_text_data;
+    const int frames = E0470_GRAY8_GL16_FRAMES;
+    // 只借**前导连续**的那一段空相（相 0..10），借到该行第一个有动作的相就停。
+    // 表尾那两相（28、29）也是空的，但它们是"驱动完让面板歇一拍"的整定相
+    // （见 E0470_TRIM_HOLD），拿它们推白等于把整定期也变成驱动期，所以不碰。
+    int cand[E0470_GRAY8_GL16_FRAMES];
     int n = 0;
     for (int f = 0; f < frames; f++) {
+        int used = 0;
         for (int from = 0; from < 15; from++) {
-            if (lut_get(data, f, 15, from) == 2) {
-                cand[n++] = f;
+            if (lut_get(data, f, 15, from) != 0) {
+                used = 1;
                 break;
             }
         }
+        if (used) break;
+        cand[n++] = f;
     }
-    if (n == 0) {
-        // 异常表（源表里没有白推相）：退回老做法，取倒数第三相，保底 1 帧。
-        const int tick = frames > 2 ? frames - 3 : 0;
-        lut_set(data, tick, 15, 15, 2);
-        return 1;
-    }
-    int want = (count < 0) ? n : count;
+    int want = (s_erase_pushes < 0) ? n : s_erase_pushes;
     if (want > n) want = n;
-    for (int i = n - want; i < n; i++) lut_set(data, cand[i], 15, 15, 2);
-    return want;
+    for (int i = 0; i < want; i++) {
+        for (int from = 0; from < 15; from++) lut_set(data, cand[i], 15, from, 2);
+    }
 }
 
-// 当前档位。0 = 关，>0 = 每张表挂这么多相，<0 = 挂满。见 e0470_waveform_set_white_pushes。
-static int s_white_pushes = E0470_GL16_WHITE_PUSHES_DEFAULT;
-
-// 把当前档位刷到三张可写的 GL16 表上（默认 37 相、完整 48 相、8 灰阶正文 30 相）。
+// 把当前三个档位刷到三张可写的 GL16 表上（默认 37 相、完整 48 相、8 灰阶正文 30 相）。
 // 必须在下一次推屏之前调，不能在 epd_hl_update_* 走到一半时改表。
-// / Re-apply the knob to the three writable GL16 tables. Call before the next
-// push, never while an epd_hl_update_* is mid-scan.
-static void e0470_white_pushes_apply(int count) {
-    e0470_gl16_white_pushes(e0470_full_gl16_live, E0470_FULL_GL16_FRAMES, count);
-    e0470_gl16_white_pushes(e0470_gl16_data, E0470_GL16_FRAMES, count);
-    e0470_gl16_white_pushes(e0470_gray8_text_data, E0470_GRAY8_GL16_FRAMES, count);
+// **必须是纯函数**：同一个档位组合重复调用结果一致。8 灰阶那张要从源表整体重建 ——
+// 借空相那一步改的就是"空相"本身，不重建的话第二次调用会把剩下的空相也借走，越借越多。
+// / Re-apply all knobs. Pure: same knobs ⇒ same tables. The 8-gray one is rebuilt
+// from the source because the erase boost consumes the very hold phases it looks
+// for, so re-running it without a rebuild would keep borrowing more each time.
+static void e0470_1515_apply(void) {
+    e0470_gl16_1515_build(
+        e0470_full_gl16_live, E0470_FULL_GL16_FRAMES, s_white_pushes, s_black_pushes
+    );
+    e0470_gl16_1515_build(e0470_gl16_data, E0470_GL16_FRAMES, s_white_pushes, s_black_pushes);
+    memcpy(e0470_gray8_text_data, e0470_gray8_gl16_data, sizeof(e0470_gray8_text_data));
+    e0470_gl16_1515_build(
+        e0470_gray8_text_data, E0470_GRAY8_GL16_FRAMES, s_white_pushes, s_black_pushes
+    );
+    e0470_gray8_text_erase_boost();
+    s_wf_gen++;
+}
+
+int e0470_waveform_generation(void) {
+    return s_wf_gen;
 }
 
 void e0470_waveform_set_white_pushes(int count) {
     if (count == s_white_pushes) return;
     s_white_pushes = count;
-    e0470_white_pushes_apply(count);
+    e0470_1515_apply();
     ESP_LOGI(TAG, "白推档 = %d（<0 挂满，0 关）", count);
 }
 
 int e0470_waveform_white_pushes(void) {
     return s_white_pushes;
+}
+
+void e0470_waveform_set_black_pushes(int count) {
+    if (count == s_black_pushes) return;
+    s_black_pushes = count;
+    e0470_1515_apply();
+    ESP_LOGI(TAG, "压黑档 = %d（<0 挂满，0 关）", count);
+}
+
+int e0470_waveform_black_pushes(void) {
+    return s_black_pushes;
+}
+
+void e0470_waveform_set_erase_pushes(int count) {
+    if (count == s_erase_pushes) return;
+    s_erase_pushes = count;
+    e0470_1515_apply();
+    ESP_LOGI(TAG, "擦除加强 = %d（<0 借满，0 关）", count);
+}
+
+int e0470_waveform_erase_pushes(void) {
+    return s_erase_pushes;
 }
 
 void e0470_waveform_init(void) {
@@ -338,6 +452,11 @@ void e0470_waveform_init(void) {
     memcpy(e0470_gray8_text_data, e0470_gray8_gl16_data, sizeof(e0470_gray8_text_data));
 
     s_white_pushes = E0470_GL16_WHITE_PUSHES_DEFAULT;
-    e0470_white_pushes_apply(s_white_pushes);
-    ESP_LOGI(TAG, "白推档 = %d（<0 挂满，0 关）", s_white_pushes);
+    s_black_pushes = E0470_GL16_BLACK_PUSHES_DEFAULT;
+    s_erase_pushes = E0470_GRAY8_TEXT_ERASE_PUSHES_DEFAULT;
+    e0470_1515_apply();
+    ESP_LOGI(
+        TAG, "白推档 = %d，压黑档 = %d，擦除加强 = %d（<0 挂满/借满，0 关）",
+        s_white_pushes, s_black_pushes, s_erase_pushes
+    );
 }

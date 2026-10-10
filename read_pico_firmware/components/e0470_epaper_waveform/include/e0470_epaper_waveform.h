@@ -133,6 +133,79 @@ int e0470_waveform_white_pushes(void);
 #define E0470_GL16_WHITE_PUSHES_DEFAULT 1
 #endif
 
+/// GL16 表里同一格（15→15，「不变的白底」）的另一个旋钮：先往黑轨打回去几相，再走上面
+/// 那套白推。差分刷把**没变的白像素**编成 15→15，而源表在这一格是全保持 —— 于是白底只
+/// 会被白推、永远不会被压回去，白轨漂了没人纠正。这一项就是把 GC16 里 15→15 那段
+/// 「先压黑 10 相、再推白 10 相」的摆动借到 GL16 上，借的还是表里现成的压黑相
+/// （默认表 14 相、8 灰阶正文表 7 相），所以**不增加相数、不增加刷新时间**。
+/// 它顺手解决了「白底发灰」的根：先打回黑轨再推白，等于把白轨重新锚定一次。
+///
+/// 代价：白底会跟着闪一下 —— 挂几相就闪多深。0 = 关（默认，与改动前完全一致）；
+/// 小档（2~4）= 轻压；<0 = 挂满（白底明显闪，接近一次局部全刷）。
+/// 与白推共用 (15,15) 这一格，同一相被两边都选中时压黑优先。
+/// 三张可写 GL16 表一起改，**必须在下一次推屏之前调**。
+/// / How many darken phases to hang on the 15→15 cell before the white pushes:
+/// borrows the GC16 dark-then-white swing into the GL16 tables using phases that
+/// already darken elsewhere, so no phase count and no time is added. Off by
+/// default; a small count anchors the white rail back, <0 = all (visible flash).
+void e0470_waveform_set_black_pushes(int count);
+
+/// 当前压黑档。
+/// / Current black-push knob.
+int e0470_waveform_black_pushes(void);
+
+/// 压黑档的编译期默认值：0 = 关（与改动前一致）。
+/// / Compile-time default: 0 = off, matching the pre-change behaviour.
+#ifndef E0470_GL16_BLACK_PUSHES_DEFAULT
+#define E0470_GL16_BLACK_PUSHES_DEFAULT 0
+#endif
+
+/// 可写波形表**内容**的版本号：每调一次上面两个 set 就 +1。
+///
+/// 给"把从这些表展开出来的 LUT 缓存住"的组件判陈旧用。原来错相揭页只比
+/// (表指针, 相数)，而档位改的正是同一张表的内容 —— 指针和相数都不变，于是缓存永不失效：
+/// 进书后第一页翻页建好相位 LUT，之后再在设置里改档，屏幕一点变化都没有（四档同观感）。
+/// 缓存方把这一项一起比对即可。
+/// / Content generation of the writable tables; bumped by either set() call.
+/// Caches expanded from these tables must compare it alongside the pointer and
+/// phase count — neither of those changes when only a knob does.
+int e0470_waveform_generation(void);
+
+/// 8 灰阶正文表（正文页翻页实际走的那张）的**擦除加强**档 —— 治"旧字迹的浅影"的那一个。
+///
+/// 上面两个旋钮（白推 / 压黑）改的都是 `(15,15)` —— **本来就白、还是白**的那个像素，也就是
+/// **背景**。而"上一页的字没擦干净"是另一个格子：旧黑字要变白，走的是 `(15, from<15)`。
+/// 差分刷的每个像素都编成 `(to<<4)|from`，所以那格才是"旧字迹"的出口。
+///
+/// 8 灰阶正文表的 `to=15` 行对 `from=0`（旧黑字）只有 **10 相**推白（默认 37 相表是 **18 相**），
+/// 所以 10 次推白退不到白轨，残留在屏上就是那层浅影。因为阅读器的自适应与局刷都把整页文字
+/// 判进这一档（日志实测：变化 235~296‰ 全部 → 8 灰阶正文刷），这条路上的残影基本全由这里决定。
+///
+/// 这一项把该行**前导连续的空相**借给 `from<15` 推白：那些相对 `from<15` 本来就是"保持"
+/// （30 相表里是相 0..10，共 11 相），改成推白**不增加相数**。时间上也几乎不花 —— 前导保持
+/// 跳过实测只有 1 相（日志「跳相 1」），最多多扫 1 相 ≈ 11ms。只动 to=15 行、只动 from<15
+/// 的格子，`(15,15)` 一格都不碰（仍归白推/压黑）。表尾那两相整定保持**不借**。
+///   count > 0：借这么多相；count < 0：借满；count == 0：关（默认）。
+/// 借过头会把白底推得更白一点点（推白只会朝白轨饱和，不会伤灰阶），留成档位实测。
+/// / Erase-strength knob for the 8-gray text table: borrow its leading all-hold
+/// phases on the to=15 row into white pushes for from<15. That cell — not
+/// (15,15) — is where a previous page's black text gets erased, and this table
+/// only pushes it 10 times vs the default table's 18, which is the faint
+/// previous-page ghost. No phase count is added; the measured leading-hold skip
+/// is 1 phase, so at most ~11 ms. (15,15) is untouched, and the trailing settle
+/// holds are not borrowed.
+void e0470_waveform_set_erase_pushes(int count);
+
+/// 当前擦除加强档。
+/// / Current erase-strength knob.
+int e0470_waveform_erase_pushes(void);
+
+/// 擦除加强档的编译期默认值：0 = 关（与改动前一致）。
+/// / Compile-time default: 0 = off.
+#ifndef E0470_GRAY8_TEXT_ERASE_PUSHES_DEFAULT
+#define E0470_GRAY8_TEXT_ERASE_PUSHES_DEFAULT 0
+#endif
+
 #ifdef __cplusplus
 }
 #endif

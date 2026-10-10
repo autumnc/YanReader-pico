@@ -36,6 +36,10 @@ void epd_lcd_bus_park(void) __attribute__((weak));
 void epd_lcd_bus_unpark(void) __attribute__((weak));
 void e0470_waveform_set_white_pushes(int count) __attribute__((weak));
 int e0470_waveform_white_pushes(void) __attribute__((weak));
+void e0470_waveform_set_black_pushes(int count) __attribute__((weak));
+int e0470_waveform_black_pushes(void) __attribute__((weak));
+void e0470_waveform_set_erase_pushes(int count) __attribute__((weak));
+int e0470_waveform_erase_pushes(void) __attribute__((weak));
 
 void display_set_bulk_io(bool active) {
     s_bulk_io = active;
@@ -789,6 +793,32 @@ void reader_set_white_pushes(int count) {
 int reader_white_pushes(void) {
     return e0470_waveform_white_pushes ? e0470_waveform_white_pushes() : -1;
 }
+
+// 见 reader_refresh_bridge.h：同一格 (15→15) 的另一个旋钮 —— 先压黑几相再走白推。
+// 和上面白推走同一条薄壳，档位存在波形组件里。默认 0 = 关，与改动前逐字节一致；
+// 阅读器只在阅读模式里挂它，离开时归零，所以别的界面的 GL16 差分刷一点没变。
+void reader_set_black_pushes(int count) {
+    if (e0470_waveform_set_black_pushes) e0470_waveform_set_black_pushes(count);
+}
+
+int reader_black_pushes(void) {
+    return e0470_waveform_black_pushes ? e0470_waveform_black_pushes() : 0;
+}
+
+// 见 reader_refresh_bridge.h：8 灰阶正文表 to=15 行的擦除加强档 —— 治"旧字迹的浅影"。
+// 上面两个旋钮动的是 (15,15)（背景），这一项动的是 (15, from<15)（旧字迹的出口）。
+void reader_set_erase_pushes(int count) {
+    if (e0470_waveform_set_erase_pushes) e0470_waveform_set_erase_pushes(count);
+}
+
+int reader_erase_pushes(void) {
+    return e0470_waveform_erase_pushes ? e0470_waveform_erase_pushes() : 0;
+}
+
+// 见 reader_refresh_bridge.h：共享软刷预算到点了没有。阅读器拿它决定"这一帧翻页要不
+// 要放弃揭页动画、让常规差分路去升级成整屏 GC16"。与上面 display_soft_refresh_due()
+// 是同一份账，只是绕开 display.h 那道 include 墙。
+int reader_soft_refresh_due(void) { return display_soft_refresh_due() ? 1 : 0; }
 
 // ── 清一块区域的残影（输入法那两行）────────────────────────────────────────
 //

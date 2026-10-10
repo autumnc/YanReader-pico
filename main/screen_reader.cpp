@@ -5178,7 +5178,7 @@ enum class MenuAct {
   Orient,
   ToggleBookmark, Bookmarks, Footnotes, FootnoteBack, Percent, Qr, LayoutMenu,
   Dict, DictDl, ResDl, Weread, Wifi, Opds, NetShare, KeyMap, StatusBar, About, RefreshTest, Standby, UsbDrive,
-  ClockFace, ShelfStyle, RefreshStrategy, FullEvery, WhitePush, TurnAnim, PreRender, StyleSource, EmbeddedFont, AutoStandby,
+  ClockFace, ShelfStyle, RefreshStrategy, FullEvery, WhitePush, BlackPush, GhostMode, TurnAnim, PreRender, StyleSource, EmbeddedFont, AutoStandby,
   ToShelf, Back
 };
 struct MenuItem { std::string label; MenuAct act; };
@@ -6808,6 +6808,90 @@ static const char *whitePushName(int v) {
   return kRdWhitePushNames[0];
 }
 
+// ── 压黑帧数（设置 → 压黑帧数，只有「残影治理: 16灰阶正文+压黑」那一档用）──────────
+// 同一个 (15,15) 格子的另一半：先往黑轨打回去几相、再走上面那套白推。
+// 为什么要它：「本来就白、还是白」的像素在差分图里正好编成 15→15，而源表在这一格
+// **全是保持** —— 一屏里最大的一块面积（没字的白底）一点驱动都吃不到，白轨漂了没人
+// 往回收。实测（2026-10-10）：不加压黑，四档都是"放置一会儿底变脏"；挂满压黑，底干净
+// 了但白底跟着走一遍黑↔白，观感接近一次全刷。
+//
+// 所以这一项是"底干净"与"闪"之间的那个旋钮，取的是候选里**最前**几相（擦除段），
+// 挂满就是全部候选（默认表 16 相、正文表 7 相）。挂的相本来就在驱动别人，**不加相数、
+// 不加时间**；深度只由相数决定：
+//   0 = 关（白底照旧只被白推）；2 / 4 / 8 = 轻压；挂满 = 白底明显闪一下。
+// **默认 4**：压黑挂满那一下太像全刷，4 相是"底干净"与"闪"的起点，往下调不闪、往上调更干净。
+static const int kRdBlackPushValues[] = {0, 2, 4, 8, -1};
+static const char *kRdBlackPushKeys[] = {"0", "2", "4", "8", "-1"};
+static const char *kRdBlackPushNames[] = {"关", "2 帧", "4 帧", "8 帧", "挂满"};
+static const int kRdBlackPushCount = 5;
+static int blackPushFrames() {
+  std::string k = g_settings.getString("reader_black_pushes", "4");
+  for (int i = 0; i < kRdBlackPushCount; i++) {
+    if (k == kRdBlackPushKeys[i]) return kRdBlackPushValues[i];
+  }
+  return 4;
+}
+static const char *blackPushName(int v) {
+  for (int i = 0; i < kRdBlackPushCount; i++) {
+    if (kRdBlackPushValues[i] == v) return kRdBlackPushNames[i];
+  }
+  return kRdBlackPushNames[2];
+}
+
+// ── 翻页残影（设置 → 残影治理）────────────────────────────────────────────
+// 三件独立的事，各治一种残影；与刷新策略正交（局刷/自适应都用得上），单列一项方便
+// 一档一档试。
+//
+// 先把"残影长什么样"和"改哪一格"对上是关键。差分刷把每个像素编成一个字节 (to<<4)|from：
+//   · 没变的白底        → 15→15      （背面就是 (15,15) 那一格）
+//   · 上一页的黑字变白  → 15←0       （to=15 行里 from<15 的那几格）
+// 实测用户看到的残影是**旧字迹的浅影**，也就是第二类 —— 旧字没擦干净，不是白底发灰。
+//
+//   (1) 16 灰阶正文（档 1）—— 正文页从「8 灰阶正文刷」改回**默认 37 相 GL16**。
+//       阅读器的自适应与局刷都把整页文字判进 8 灰阶正文刷（日志实测：变化 235~296‰
+//       全部落这一档），而那张 30 相表的擦除只有 **10 相**推白，默认表是 **18 相**，
+//       而且默认表还给近白像素一条"先压回黑轨再推白"的整定梯（擦除梯最多 11 相）。
+//       代价实测 +86ms（推屏 380ms → 466ms，同一次采集里两档都出现过）。
+//       **用户实测：这一档旧字迹残影最低。**
+//
+//   (2) 擦除加强（档 2）—— 保留 30 相表，把它 to=15 行**前导的空相**借给 from<15 当
+//       推白（见 e0470_waveform_set_erase_pushes）：擦除 10 相 → 21 相，**不加相数**，
+//       时间上最多多扫 1 相 ≈ 11ms（前导保持跳过实测只有 1 相「跳相 1」）。
+//       实测不如档 1：借来的 11 相和原来的 10 相中间隔着 7 相保持，粒子松一拍再推，
+//       净擦除赶不上默认表那 18 相连推。留作"零成本"的对照档。
+//
+//   (3) 16 灰阶正文 + 白底压黑（档 3）—— 冲"放置一会儿底会变脏"来的（用户实测：
+//       现状/档 1/档 2 **三档都脏**，所以这不是某一档的锅，是差分刷本来的老账）。
+//       机制：一屏里最大的一块面积 —— "本来就白、还是白"的像素 —— 在差分图里正好编成
+//       15→15，而源表在这一格**全是保持**，一点驱动都吃不到，白轨漂了没人往回收。
+//       这一档借 GC16 里 (15,15) 那段"先压黑再推白"的摆动，每翻一页把白轨重锚一次。
+//       实测挂满时底确实干净了，但白底跟着走一遍黑↔白、**观感接近一次全刷**；
+//       所以相数抽成「压黑帧数」那一档（默认 4），在"底干净"与"闪"之间找点。
+//
+// 改的都是**共享**的波形表，所以只在阅读模式里挂、离开时归零（见 screen_reader 的收尾）；
+// 波形组件的编译期默认全是关，兄弟固件 read_pico_firmware 不受影响。
+//
+// 四档 = 现状 / 16 灰阶正文 / 擦除加强 / 16 灰阶正文+白底压黑 —— 一档一档试。
+static const char *kRdGhostKeys[] = {"0", "1", "2", "3"};
+static const char *kRdGhostNames[] = {"现状", "16灰阶正文", "擦除加强", "16灰阶正文+压黑"};
+static const int kRdGhostCount = 4;
+static int ghostMode() {
+  std::string k = g_settings.getString("reader_ghost_mode", "0");
+  for (int i = 0; i < kRdGhostCount; i++) {
+    if (k == kRdGhostKeys[i]) return i;
+  }
+  return 0;
+}
+// 档 1/3：正文页改走默认 37 相表（擦除 18 相 + 一条把像素先拉回黑轨再推白的整定梯，
+// 推屏 +86ms 实测）。用户实测：**这一档旧字迹残影最低**。
+static bool ghostUseFullTable() { return ghostMode() == 1 || ghostMode() == 3; }
+// 借几相去推白（治旧字迹浅影，只对 8 灰阶正文表有效）：只有档 2。
+static int ghostErasePushes() { return ghostMode() == 2 ? -1 : 0; }
+// 挂几相压黑（治"放置一会儿底变脏"，改 (15,15) 那一格）：只有档 3 用，相数走
+// 「压黑帧数」那一档（默认 4）。用户实测：挂满时底干净但白底跟着走一遍黑↔白、观感
+// 接近全刷；档 1/2/现状三档都不加压黑，条"放置变脏"三档都有。
+static int ghostBlackPushes() { return ghostMode() == 3 ? blackPushFrames() : 0; }
+
 // ── 会自己按秒重画的进度画面 ────────────────────────────────────────────
 // 微读整本缓存 / 词典下载 / 资源下载：这三屏在阻塞请求之间由自己的 tick 反复重画
 // （微读每拍一次、词典每 5% 一次），而它们**不能走 HALF(局刷)** —— display 侧有一条
@@ -7226,6 +7310,15 @@ void renderCurrent() {
   if (turn != 0) s_turnDir = (turn > 0) ? 1 : -1;
   // 本帧有没有真的挂上揭页动画（收尾那行耗时日志要用）。
   bool turnAnim = false;
+  // 「残影治理: 16 灰阶正文」那一档：正文页本来的 8 灰阶正文刷换成**默认 37 相 GL16**
+  // （display 侧的 HALF）—— 两者的擦除强度差一倍（10 相 vs 18 相），而自适应与局刷都会把
+  // 整页文字判进 8 灰阶正文刷（日志实测：变化 235~296‰ 全落这一档），所以"旧字迹的浅影"
+  // 基本全出在这里。代价实测 +86ms（推屏 380 → 466ms）。
+  // 只换**正文页**（RdMode::Reading）的差分档；菜单/列表/过渡屏那些 GRAY8_TEXT 不动。
+  if (ghostUseFullTable() && st.mode == RdMode::Reading && !st.fullRefresh &&
+      m == HalDisplay::GRAY8_TEXT_REFRESH) {
+    m = HalDisplay::HALF_REFRESH;
+  }
   if (turn != 0 && pageTurnAnimOn() &&
       (m == HalDisplay::HALF_REFRESH || m == HalDisplay::GRAY8_TEXT_REFRESH)) {
     // 揭页只有一条梯：默认表 GL16（37 相、16 级灰，@stride6 = 127 拍 ≈ 1.06s）。
@@ -8726,6 +8819,8 @@ static void doMenuAction(MenuAct act) {
     case MenuAct::RefreshStrategy:
     case MenuAct::FullEvery:
     case MenuAct::WhitePush:
+    case MenuAct::BlackPush:
+    case MenuAct::GhostMode:
     case MenuAct::TurnAnim:
     case MenuAct::PreRender:
     case MenuAct::ClockFace:
@@ -8861,6 +8956,13 @@ static std::vector<MenuItem> settingsItems() {
   // 白推帧数：局刷残影的旋钮（改的是波形表里"不变的白底"挂几相白推）。只在差分档
   // （局刷/快刷/自适应）上看得出区别；策略选「全局」时每页都是 GC16 全刷，这一项不参与。
   m.push_back({std::string("白推帧数: ") + whitePushName(whitePushFrames()), MenuAct::WhitePush});
+  // 残影治理：白底压黑 + 到点清账两个旋钮，四档从轻到重（见 ghostMode 上面那段）。
+  // 与「白推帧数」同一条差分路，但那一项只管"往白推多少"，这一项管"要不要先压回黑轨"
+  // 以及"翻页算不算进残影预算"。只在差分档上看得出区别。
+  m.push_back({std::string("残影治理: ") + kRdGhostNames[clampI(ghostMode(), 0, kRdGhostCount - 1)],
+               MenuAct::GhostMode});
+  // 压黑帧数：残影治理档 3 用的那个深度旋钮（见 blackPushFrames 上面那段）。其它档不看它。
+  m.push_back({std::string("压黑帧数: ") + blackPushName(blackPushFrames()), MenuAct::BlackPush});
   // 插图/书架封面的抖动档。它跟刷新策略一样是「屏幕怎么出画面」的档位，阅读页的
   // 「排版设定」子菜单里也有一条（挨着「图片: 双线性」）；两边写同一个键
   // （reader_image_dither），改哪儿都算数（同「翻页动画」的惯例）。
@@ -9159,6 +9261,14 @@ static void rdPickTable(int act, std::string &title, std::vector<std::string> &l
       title = "白推帧数";
       for (int i = 0; i < kRdWhitePushCount; i++) add(kRdWhitePushNames[i], kRdWhitePushKeys[i]);
       break;
+    case MenuAct::BlackPush:
+      title = "压黑帧数";
+      for (int i = 0; i < kRdBlackPushCount; i++) add(kRdBlackPushNames[i], kRdBlackPushKeys[i]);
+      break;
+    case MenuAct::GhostMode:
+      title = "残影治理";
+      for (int i = 0; i < kRdGhostCount; i++) add(kRdGhostNames[i], kRdGhostKeys[i]);
+      break;
     case MenuAct::TurnAnim:
       title = "翻页动画";
       add("开", "1");
@@ -9264,6 +9374,13 @@ static std::string rdPickCurValue(int act) {
         if (kRdWhitePushValues[i] == v) return kRdWhitePushKeys[i];
       return kRdWhitePushKeys[0];
     }
+    case MenuAct::BlackPush: {
+      const int v = blackPushFrames();
+      for (int i = 0; i < kRdBlackPushCount; i++)
+        if (kRdBlackPushValues[i] == v) return kRdBlackPushKeys[i];
+      return kRdBlackPushKeys[0];
+    }
+    case MenuAct::GhostMode: return kRdGhostKeys[clampI(ghostMode(), 0, kRdGhostCount - 1)];
     case MenuAct::ClockFace:
       return standbyFaceKey(standbyFaceFromKey(g_settings.getString("clock_face").c_str()));
     case MenuAct::AutoStandby: return std::to_string(g_settings.autoStandbyMinutes());
@@ -10069,6 +10186,36 @@ static void applyRdPick(int act, const std::string &value) {
       reader_set_white_pushes(n);
       rdShowFloat(std::string("白推帧数: ") + whitePushName(n),
                   "不变的白底多推几相 · 不额外花时间", 1500);
+      st.fullRefresh = true;
+      break;
+    }
+    case MenuAct::GhostMode: {
+      // 四档改的都是**共享**的波形表（内容，不是指针），所以改完必须让缓存重展开：
+      // 揭页动画那套相位 LUT 用 e0470_waveform_generation() 判陈旧，两个 set 都会 +1。
+      // 不重排、不重开书。改完立刻落表，并顺手全刷一次，让 A/B 从干净的底起算。
+      g_settings.setString("reader_ghost_mode", value);
+      reader_set_black_pushes(ghostBlackPushes());
+      reader_set_erase_pushes(ghostErasePushes());
+      const int mode = clampI(atoi(value.c_str()), 0, kRdGhostCount - 1);
+      rdShowFloat(std::string("残影治理: ") + kRdGhostNames[mode],
+                  mode == 0   ? "改动前的行为"
+                  : mode == 1 ? "正文页走默认 37 相表 · 擦除 18 相（+86ms）"
+                  : mode == 3 ? "同上 + 白底压黑（深度看「压黑帧数」）"
+                              : "擦除 10→21 相 · 几乎不加时间",
+                  1800);
+      st.fullRefresh = true;
+      break;
+    }
+    case MenuAct::BlackPush: {
+      // 与 WhitePush 同一条路：改的是共享波形表的 (15,15) 那一格，改完立刻落表。
+      // 只有「残影治理: 16灰阶正文+压黑」那一档读它，其它档这一格保持全保持。
+      g_settings.setString("reader_black_pushes", value);
+      const int n = atoi(value.c_str());
+      reader_set_black_pushes(ghostBlackPushes());
+      rdShowFloat(std::string("压黑帧数: ") + blackPushName(n),
+                  ghostMode() == 3 ? "白底先压回黑轨再推白 · 深度越大底越干净也越闪"
+                                   : "当前残影治理档不用它（只有 +压黑 那一档读）",
+                  1800);
       st.fullRefresh = true;
       break;
     }
@@ -11718,6 +11865,12 @@ void screen_reader_init() {
   ImageBlock::setDitherMode(ditherModeOf(st.imageDither));
   // 白推档要在第一次推屏之前落到波形表上（改表不能和推屏并发）。默认 1 = 老行为。
   reader_set_white_pushes(whitePushFrames());
+  // 压黑档同理。它改的是**共享**的那三张 GL16 表，所以只在阅读模式里挂着 —— 进来这一
+  // 下挂上、出去那一下归零（见本文件收尾那段），别的界面的差分刷一点没变。
+  reader_set_black_pushes(ghostBlackPushes());
+  // 擦除加强档：治"旧字迹的浅影"（改的是 to=15 行 from<15 那几格，不是 (15,15)），
+  // 同样只借表里现成的保持相：不加相数，最多多扫 1 相。共享表，所以同上：进来挂、出去归零。
+  reader_set_erase_pushes(ghostErasePushes());
   st.night = g_settings.nightMode();  // 全设备夜间（旧键 reader_night 由访问器迁移）
   board_set_night(st.night);          // 进阅读模式时套用一次，保证与其他界面同向
   loadBookmarks();
@@ -11828,6 +11981,9 @@ void screen_reader_exit() {
   s_ghostAccum = 0;
   s_pagesSinceFull = 0;
   s_pendingTurn = 0;
+  // 「残影治理」里压黑/擦除加强改的是共享的 GL16 表，出门就归零，写作/设置的差分刷一点没变。
+  reader_set_black_pushes(0);
+  reader_set_erase_pushes(0);
   // 错相揭页的 37KB 相位表只在阅读时按需分配，退出时还回 PSRAM。
   // 留在原地也不会坏（下次进来会复用），但写作模式正缺 PSRAM。
   reader_release_page_turn();

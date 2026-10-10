@@ -151,6 +151,9 @@ static int8_t s_band_phase[TURN_BANDS];
 static int8_t s_line_phase[TURN_LINE_MAX] DRAM_ATTR;
 static const EpdWaveformPhases* s_lut_src;
 static int s_lut_n;
+// 建 LUT 时源表内容的版本号（见 e0470_waveform_generation）。档位只改同一张表的**内容**，
+// 指针与相数都不动 —— 不带这一项，进书后改档就永远不生效。
+static int s_lut_gen;
 // 拍长下限的**配置值**（e0470_page_turn_set_tick_us 可改）。每帧的节拍从这里起算，
 // 只在该帧内往上抬（见 e0470_page_turn 里的 tick_target）—— 不跨帧累积：一次偶发
 // 抖动（WiFi/UI 抢核）不该让后面每一次翻页都跟着变慢。
@@ -173,6 +176,7 @@ void e0470_page_turn_release(void) {
     s_lut = NULL;
     s_lut_src = NULL;
     s_lut_n = 0;
+    s_lut_gen = 0;
 }
 
 const char* e0470_turn_dir_name(e0470_turn_dir_t dir) {
@@ -350,13 +354,14 @@ static void assign_bands(
 }
 
 static bool build_luts(const EpdWaveformPhases* gl) {
+    const int gl_gen = e0470_waveform_generation();
     if (!s_lut) {
         s_lut = heap_caps_aligned_alloc(
             16, sizeof(uint8_t[TURN_PHASE_CAP][1024]), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
         );
         if (!s_lut) return false;
     }
-    if (s_lut_src == gl && s_lut_n == gl->phases) return true;
+    if (s_lut_src == gl && s_lut_n == gl->phases && s_lut_gen == gl_gen) return true;
     const int n = gl->phases < TURN_PHASE_CAP ? gl->phases : TURN_PHASE_CAP;
     for (int phase = 0; phase < n; phase++) {
         epd_build_1ppB_lut_1k(s_lut[phase], gl, phase);
@@ -364,6 +369,7 @@ static bool build_luts(const EpdWaveformPhases* gl) {
     }
     s_lut_src = gl;
     s_lut_n = gl->phases;
+    s_lut_gen = gl_gen;
     return true;
 }
 

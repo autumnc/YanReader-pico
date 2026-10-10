@@ -72,6 +72,52 @@ void reader_set_white_pushes(int count);
 /// 当前白推档（未设过就是波形组件的编译期默认）。
 int reader_white_pushes(void);
 
+/// 同一格 (15→15) 的另一个旋钮：**先压黑几相再走白推**。
+///
+/// 差分刷把每个像素编码成一个字节 (to<<4)|from，**没变的白像素正好编成 15→15**，所以
+/// 一屏里"本来就没字的白底"挨到的驱动全由这一格决定。源表在这一格是全保持 → 白底只会
+/// 被白推、永远不会被压回去，白轨漂了没人纠正。这一项把 GC16 里 15→15 那段"先压黑再
+/// 推白"的摆动借到 GL16 上，借的全是表里现成的压黑相（默认表 14 相、8 灰阶正文表 7 相），
+/// 所以**不增加相数、不增加刷新时间**。
+///
+/// 代价：白底跟着闪一下，挂几相就闪多深。0 = 关（默认）；小档 2~4 = 轻压；<0 = 挂满。
+/// 与白推共用这一格，同一相两边都选中时压黑优先。**必须在下一次推屏之前调。**
+/// / How many darken phases to hang on the (15→15) cell before the white pushes.
+void reader_set_black_pushes(int count);
+
+/// 当前压黑档。
+int reader_black_pushes(void);
+
+/// **治"旧字迹的浅影"的那一个**（上面两个治的是背景，不是这个）。
+///
+/// 差分刷把每个像素编成一个字节 `(to<<4)|from`：
+///   · 没变的白底 → 15→15 —— 归上面白推/压黑两个旋钮；
+///   · **上一页的黑字要变白 → 15←0（以及 from<15 的各档）** —— 归这一项。
+///
+/// 阅读器的自适应和局刷都把整页文字判进「8 灰阶正文刷」（日志实测：变化 235~296‰ 全落这一档），
+/// 而这张 30 相表的 `to=15` 行对 from=0（旧黑字）只有 **10 相**推白（默认 37 相表是 **18 相**）
+/// —— 10 次推白退不到白轨，残留就是那层浅影。
+/// 这一项把该行前导连续的空相（相 0..10）借给 from<15 推白：**不加相数**，时间上也几乎不花
+/// （前导保持跳过实测只有 1 相「跳相 1」，最多多扫 1 相 ≈ 11ms）。只动 to=15 行、只动
+/// from<15 的格子，(15,15) 不碰（那格归上面的白推/压黑两个旋钮）。
+///   count > 0：借这么多相；count < 0：借满；count == 0：关。
+/// 阅读器只在阅读模式里挂它、离开时归零。
+/// / Erase-strength knob for the previous page's ink: borrows the 8-gray text
+/// table's leading all-hold phases on the to=15 row into white pushes for
+/// from<15. That cell — not (15,15) — is what erases the old text, and this
+/// table only pushes it 10 times vs the default table's 18.
+void reader_set_erase_pushes(int count);
+
+/// 当前擦除加强档。
+int reader_erase_pushes(void);
+
+/// 共享软刷预算是不是该升级了（`s_soft_refreshes + 1 >= APP_GC16_EVERY`）。
+/// 阅读器只用它做一件事：**揭页动画那条路会吞掉升级** —— update_display_page_turn 记了
+/// 一笔 `++s_soft_refreshes` 就返回了，而升级判据在 hl_update_ex / update_display_gray8_text
+/// 里，于是"翻着翻着来一次整屏黑白整刷"在阅读模式下从来不会发生（自适应另有自己那笔
+/// s_ghostAccum，但局刷一分钱都不记）。到点这一帧不挂动画、让常规差分路去升级即可。
+int reader_soft_refresh_due(void);
+
 #ifdef __cplusplus
 }
 #endif
