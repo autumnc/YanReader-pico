@@ -1,0 +1,47 @@
+menu "Read Pico board configuration"
+
+config READ_PICO_I2C_PORT
+    int "I2C controller"
+    default 0
+    range 0 1
+
+config READ_PICO_I2C_SCL_GPIO
+    int "I2C SCL GPIO"
+    default 40
+    range 0 48
+
+config READ_PICO_I2C_SDA_GPIO
+    int "I2C SDA GPIO"
+    default 39
+    range 0 48
+
+config READ_PICO_I2C_FREQ_HZ
+    int "I2C frequency (Hz)"
+    default 400000
+    range 10000 400000
+
+config READ_PICO_IOE_INT_GPIO
+    int "FCA9555 interrupt GPIO"
+    default 41
+    range 0 48
+
+config READ_PICO_TP_INT_GPIO
+    int "CST836U interrupt GPIO"
+    default 43
+    range 0 48
+
+config READ_PICO_EPD_SMALL_FEED_QUEUE
+    bool "Use a smaller EPD feed queue to save internal RAM"
+    default n
+    help
+        epdiy 每个喂图线程持有一条行队列，本板 16 位总线默认 64 行 × 304B ≈ 19KB，
+        NUM_RENDER_THREADS=2 时共占约 38KB **内部** RAM（DMA 区，PSRAM 走不了）。
+        开启后走 epdiy 的 EPD_FEED_QUEUE_8 选项；16 位总线下 epdiy 退一档
+        到 32 行（不再强制 64），省下约 19KB 内部 RAM，代价是喂图流水线变浅。
+        需要与 WiFi/BLE 同存、内部 RAM 吃紧的固件可以打开。
+        / epdiy keeps a per-thread feed queue; this board's 16-bit bus forces 64
+        lines (~19KB internal DMA RAM) per thread, ~38KB total. Enabling this
+        opts into EPD_FEED_QUEUE_8, which for a 16-bit bus steps down to 32
+        lines, freeing ~19KB of internal RAM at some rendering cost.
+
+endmenu

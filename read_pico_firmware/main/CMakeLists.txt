@@ -1,0 +1,70 @@
+set(main_requires
+    read_pico
+    read_pico_transfer
+    read_pico_search
+    espressif__qrcode
+    continuous_du
+    e0470_epaper_waveform
+    read_pico_pmu
+    fatfs
+    wear_levelling
+    bootloader_support
+    spi_flash
+    heap
+    nvs_flash
+    esp_hw_support
+    esp_rom
+    esp_driver_gpio
+    esp_driver_usb_serial_jtag
+    esp_app_format
+)
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "display.c"
+        "sleep.c"
+        "settings.c"
+        "app/app_loop.c"
+        "app/app_registry.c"
+        "ui/ui_kit.c"
+        "ui/ui_gesture.c"
+        "ui/ui_wifi_qr.c"
+        "ui/datamatrix.c"
+        "ui/ui_menu.c"
+        "apps/app_home.c"
+        "apps/app_refresh.c"
+        "apps/app_reading.c"
+        "apps/app_book.c"
+        "apps/app_transfer.c"
+        "book/book_store.c"
+        "book/book_progress.c"
+        "book/book_source.c"
+        "book/book_txt.c"
+        "book/book_epub.c"
+        "book/book_image.c"
+        "book/vendor/tjpgd.c"
+        "book/zip_reader.c"
+        "book/html_text.c"
+        "book/book_layout.c"
+        "book/gbk.c"
+        "apps/app_touch.c"
+        "apps/app_axis.c"
+        "apps/app_power.c"
+        "apps/app_ioe.c"
+        "apps/app_pmu.c"
+        "apps/app_sd.c"
+        "apps/app_font_pick.c"
+        "apps/app_sleep.c"
+        "apps/app_selftest.c"
+        "apps/app_key.c"
+        "font/ttf_font.c"
+        "factory/pmu_selftest.c"
+        "factory/vcom_setup.c"
+    REQUIRES ${main_requires}
+    INCLUDE_DIRS "." "app" "apps" "font" "ui" "factory" "book"
+    EMBED_FILES
+        "assets/lock_4bpp.bin"
+        "assets/loading_4bpp.bin"
+        "assets/builtin.ttf"
+        "assets/reading.md"
+)
