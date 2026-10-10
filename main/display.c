@@ -53,6 +53,30 @@ void display_set_bulk_io(bool active) {
 // 0 means the rails are off; otherwise a deadline (ms) after which the loop powers them down.
 static int64_t rails_deadline_ms;
 
+// ── 面板此刻是否停在"平衡"态：上一次真正驱动到面板上的刷法是不是**整屏全像素 GC16** ──
+//
+// 为什么要记账：灰底只有整屏全像素 GC16 压得掉。GC16 每一格都是完整梯子（连 15→15 都
+// 走 10 黑 + 10 白），面板不管停在哪都落回目标灰阶；GL16 的 15→15 是**全保持**，
+// DU/跟随表更是只推动变了的像素 —— 它们都不重推未变像素，所以攒下的灰底擦不掉
+// （实测见 update_display_area_clean 上面那段）。一页挂住之前如果最后一拍是差分/区域刷，
+// 那点灰底就冻在屏上，用户看到的是"放着不动，过一会儿整屏均匀发灰"。
+//
+// 1.5.4 及以前不必担心：打字那一拍每按一次键都替共享预算 +1（攒够 APP_GC16_EVERY=14
+// 就升一次整屏 GC16），挂住前最后一拍经常正好是整屏刷。1.5.5 为了让打字不再"全屏黑白
+// 闪一下"（5f29a93：update_display_typing_du 不记账），顺带把这条也拆掉了 ——
+// 打字/翻页/滚动这一路从此**一次整屏全像素驱动都没有**，灰底只涨不退。这是用户
+// 2026-10-10 报的"空闲一小段时间就自动变灰变脏"（只有 Alt+R / 晃动机身那记
+// update_display_full 能救回来）。
+//
+// 所以下电之前补一记（见 rails_idle_check）。默认 false —— 宁可多补一次，不要漏一次；
+// present_begin 每次推屏都先置 false，只有那几条整屏全像素 GC16 的路会置回 true。
+static bool s_screen_balanced;
+
+// 两次"下电前补一记"之间的最小间隔。不设这道闸的话，"翻一页 → 停 8 秒"就闪一次整屏，
+// 翻页手感会变成"每页闪一下"。攒灰底是按分钟计的，一分钟补一记足够压住它。
+#define BALANCE_MIN_INTERVAL_MS 60000
+static int64_t s_last_balance_ms;
+
 // ── HV 轨上电/下电互斥 ──────────────────────────────────────────────────
 // 阅读器在 core0 同步推屏（present_begin → 驱动 → rails_keepalive），而 HV 轨空闲下电在
 // core1 的 ui_render 任务里（ui_render.cpp 末尾的 rails_idle_check）。两核操作的是同一路
@@ -113,6 +137,9 @@ static void present_begin(void) {
     if (s_rail_mtx) xSemaphoreTake(s_rail_mtx, portMAX_DELAY);
     display_bus_unpark();   // 空闲下电时收过的线，推屏前先接回来（见 display_bus_park）
     epd_poweron();
+    // 这一拍默认**不是**平衡刷；下面那些整屏全像素 GC16 的出口会置回 true
+    // （判据在 hl_update_ex 里一处收敛，理由见 s_screen_balanced）。
+    s_screen_balanced = false;
 }
 
 void rails_keepalive(void) {
@@ -122,6 +149,30 @@ void rails_keepalive(void) {
 
 void rails_idle_check(int64_t now_ms) {
     if (rails_deadline_ms == 0 || now_ms < rails_deadline_ms) return;
+
+    // ── 下电前先把面板驱动到平衡态（见 s_screen_balanced）────────────────────
+    // 这一记**必须在拿轨锁之前**做：update_display_full 走 present_begin，而它拿的正是
+    // 下面那把锁 —— FreeRTOS 互斥量不可重入，持锁调用会把自己锁死。
+    //
+    // 只在"上一拍不是整屏全像素 GC16"时才补：菜单/待机那类走整屏 GC16 的出口到这里是
+    // no-op（s_screen_balanced 已是 true）。加 60 秒的间隔闸（BALANCE_MIN_INTERVAL_MS）
+    // 是为了不让"翻一页停 8 秒"变成"每页闪一下"。
+    if (!s_screen_balanced && now_ms - s_last_balance_ms >= BALANCE_MIN_INTERVAL_MS) {
+        EpdiyHighlevelState* hl = board_hl();
+        if (hl) {
+            ESP_LOGI(TAG, "空闲下电前补一记整屏 GC16（上一拍不是整屏全像素，屏上会闪一下）");
+            guard_draw_result(hl, update_display_full(hl));
+            s_last_balance_ms = esp_timer_get_time() / 1000;
+            // 这一记本身就是"下电前的收尾"：update_display_full 内部的 rails_keepalive
+            // 刚把期限又推到 +8s，这里让它立刻到期，接着就断电，不必再空等 8 秒。
+            now_ms = s_last_balance_ms;
+            if (s_rail_mtx && xSemaphoreTake(s_rail_mtx, portMAX_DELAY) == pdTRUE) {
+                if (rails_deadline_ms != 0) rails_deadline_ms = now_ms;
+                xSemaphoreGive(s_rail_mtx);
+            }
+        }
+    }
+
     // 到点了。推屏会持有 s_rail_mtx，试拿失败就跳过这一次下电；推屏结束后
     // rails_keepalive 会重新武装 deadline，下一拍再算。
     if (!s_rail_mtx || xSemaphoreTake(s_rail_mtx, 0) != pdTRUE) return;
@@ -267,6 +318,12 @@ static enum EpdDrawError hl_update_ex(
             ESP_LOGI(TAG, "promote to GC16 after %d soft refreshes", APP_GC16_EVERY);
         }
     }
+    // 到这一步 (area, mode, full) 已经定死（上面那次升级可能刚把 mode 换成 GC16 + full）：
+    // 只有"整屏 + 全像素 + GC16"这一种刷法把面板送回平衡态。GL16 虽然被强制成全像素，
+    // 但它的 15→15 是**全保持**、压不掉灰底，所以不算（理由见 update_display_area_clean
+    // 上面那段实测）。区域刷（area != NULL）只驱动那块矩形，矩形以外一个像素都不动。
+    s_screen_balanced = (area == NULL && full && (mode & 0xF) == MODE_GC16);
+
     enum EpdDrawError r;
     if (area != NULL) {
         night_enter(hl);
@@ -310,6 +367,9 @@ enum EpdDrawError update_display_from_white_with(
     night_leave(hl);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     s_soft_refreshes = 0;
+    // 从白底出整屏：整屏每个像素都被驱动一遍，MODE_GC16 时就是一次平衡刷
+    // （同 hl_update_ex 那条判据；这里绕过了 hl_update_ex，所以自己记一笔）。
+    s_screen_balanced = ((mode & 0xF) == MODE_GC16);
     rails_keepalive();
     return result;
 }
