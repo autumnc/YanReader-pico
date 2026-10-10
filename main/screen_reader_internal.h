@@ -159,6 +159,20 @@ struct BookEntry {
   int kind;  // 0=epub 1=txt 2=xtc
 };
 
+// 浮动阅读菜单的一行。字体/排版两个 tab 是**滑块行**（[标签] [轨道 ●] [当前档名]），
+// 目录/笔记是**列表行**（整行文字）。两种共用一个模型：count==0 就是列表/nav 行。
+struct RdSheetRow {
+  int act = -1;                       // MenuAct 的整数值（MenuAct 定义在后面，这里只能存 int）
+  bool nav = false;                   // true = 不值调（nav 行 / 禁用的滑块行）：不画轨道
+  bool disabled = false;              // nav 行的"置灰"（如 缩进/对齐 在"随书"时）
+  std::string label;                  // 左端标签（滑块）/ 整行文字（列表行）
+  std::string value;                  // 右端当前档名（滑块）/ 右端备注（nav 行）
+  int idx = 0;                        // 滑块：当前档下标；列表行：条目下标（跳转用）
+  int count = 0;                      // 滑块：档数（0 = 列表/nav 行）
+  int level = 0;                      // 目录 tab：缩进级别；笔记 tab：0 = 书签 / 1 = 标注
+  std::vector<std::string> names;     // 滑块档名（画两端与当前值）；列表行为空
+};
+
 struct RdState {
   RdMode mode = RdMode::Browser;
   int dirty = 1;
@@ -192,6 +206,34 @@ struct RdState {
   std::vector<std::string> pickValues;  // 落定后交给 applyRdPick 解释（不透明）
   int pickSel = 0;
   int pickScroll = 0;
+  // 这个弹层是从**浮动阅读菜单**的滑块行开出来的：↑↓ 挪档要挂"停手 0.5s 才落地"
+  // （见 rdSheetLiveSchedule）。设置标签里开的弹层置 false —— 那里改排版/方向立刻
+  // 生效才是对的。
+  bool pickLive = false;
+
+  // ── 浮动阅读菜单（下半屏菜单卡 + 顶部三按钮）──────────────────────────────
+  // 用户要的形态（`../阅读菜单.jpg`）：阅读页正中点一下浮出，再点一下（或 Esc）收起。
+  // **模式仍是 RdMode::Reading** —— 两张卡是画在正文页之上的浮层（与脚注弹注同一层，
+  // 见 renderCurrent 的浮层段）。正文像素本来就在屏上、常驻首帧（s_hold）与邻页留档
+  // 照旧有效，所以开/合菜单只是"又一次正文页差分刷"，不整屏闪、不重排。
+  // **三条硬不变量**（挪代码前先读 sheet 那一节的注释）：①卡片绝不进 renderReading
+  // ②rdLiveLayerUp() 不许加 sheetOpen ③换模式/回书架/退出阅读器都要清 sheetOpen。
+  bool sheetOpen = false;
+  int  sheetTab = 0;                  // 0=目录 1=字体 2=笔记 3=排版
+  int  sheetSel[4] = {0, 0, 0, 0};    // 每个 tab 各自记光标（切回来不跳回首行）
+  int  sheetDragRow = -1;             // 正在拖的滑块行（-1 = 没在拖）
+  bool sheetReturn = false;           // 从浮动菜单进的全屏页（书签/设置/排版设定页）Esc 回阅读页
+  // 实时预览：改档**先只改眼前的画**，停手约 0.5s 才落地（落地 = reopenBook 重排 +
+  // 一次整屏 GC16）。挂在阅读器空闲帧上，见 rdSheetLiveTick。dueUs==0 = 没有待落地的改动。
+  int64_t sheetLiveDueUs = 0;
+  int  sheetLiveAct = -1;             // 待落地的 MenuAct 整数值
+  int  sheetLiveIdx = -1;             // 待落地的档位下标（画刀柄用；书等落地）
+  std::string sheetLiveVal;           // 待落地的值字面量（交给 applyRdPick）
+  // 当前 tab 的行表。**只在开菜单 / 切 tab / 落地之后重建**，每帧只画不建 ——
+  // FontFamily 那张档位表会 ttf_font_scan() 扫 SD，每帧建一次就是每帧一次目录扫描。
+  std::vector<RdSheetRow> sheetRows;
+
+
 
   // 子界面 Esc 的返回目标：从「阅读菜单」进 → Menu；从「设置」标签进 → Settings。
   // 这样同一批子界面（WiFi/OPDS/按键映射…）在两个入口下都能回到来处。
@@ -331,6 +373,13 @@ struct RdState {
   };
   std::vector<RdBookmark> bookmarks;
   int bookmarkSel = 0;
+  // 书签删除的二次确认（照笔记列表 noteDelArm 那套）：长按一次挂起、再长按同一条才真删，
+  // 免得误触直接丢书签。全屏「书签」页一套、浮动菜单「笔记」tab 一套（行号是两个不同的
+  // 下标空间：前者是 st.bookmarks 的下标，后者是 st.sheetRows 的下标，不能合并）。
+  bool bookmarkDelArm = false;
+  int bookmarkDelIdx = -1;
+  bool sheetDelArm = false;
+  int sheetDelIdx = -1;
 
   // 脚注
   std::vector<std::string> footnoteNums, footnoteHrefs;

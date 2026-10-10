@@ -230,6 +230,23 @@ void rdShowFloat(const std::string &msg, const std::string &sub, int ms);
 static void openRdPick(int act);
 static void drawSettingPicker();
 static void handleSettingPicker(int key);
+// 「浮动阅读菜单」那一节（定义在 openRdPick 之前）。渲染侧 rdSheetDraw 由 renderCurrent
+// 的浮层段调，按键侧 rdSheetToggle/rdSheetHandle 由 handleReading 与 screen_reader_handle
+// 调，sheetVisible 由 refresh 判定与收尾闸调 —— 三处都在定义之前，所以先声明。
+static bool sheetVisible();
+static void rdSheetDraw();
+static void rdSheetToggle();
+static void rdSheetClose();
+static bool rdSheetHandle(int key);
+static void rdSheetLiveTick();
+static void rdSheetTabChanged();
+// 行表重建：开菜单/切 tab/落地后各一次。布局设定页与设置页的 Esc 回到"菜单还开着"时
+// （那两处定义在浮动菜单这一节之前）也要它，所以先声明。
+static void rdSheetBuildRows();
+// 落定档位（定义在 openRdPick 之后）。浮动菜单的实时预览与弹层落定都要它。
+static void applyRdPick(int act, const std::string &value);
+// 跳到某条笔记的原文（定义在笔记一节）。浮动菜单的笔记 tab 要它。
+static void rdGotoNote(int idx);
 
 // 「应用」标签（1 号位）的图标入口页。渲染/按键定义在文件后段（设置标签那一节之后），
 // 这里先声明，供 renderCurrent / screen_reader_handle 的分派用。
@@ -408,6 +425,8 @@ void switchTab(int tab) {
   tab = clampI(tab, 0, kTabCount - 1);
   if (tab == st.tab && st.mode == tabMode(tab)) return;
   st.pickOpen = false;   // 切标签一定收起设置弹层（防它被带进别的标签）
+  st.sheetOpen = false;  // 浮动菜单同理：切根标签 = 离场，别把它带进别的模式
+  st.sheetReturn = false;
   st.tab = tab;
   st.mode = tabMode(tab);
   st.fullRefresh = true;
@@ -1684,6 +1703,10 @@ struct TocIndex {
   std::string path;                  // 缓存归属：按书路径判，避免 Epub 指针被复用
   std::vector<int> spine;
   std::vector<std::string> title;
+  // nav/ncx 的嵌套深度（1 起，随 book.bin v11 落盘）。浮动菜单的目录 tab 要缩进，
+  // 而 renderToc 那条路是**每帧**调 getTocItem() 现取 level（每次一条 SD 读）；
+  // 这里顺手存一份，菜单卡就只吃 RAM 表。
+  std::vector<uint8_t> level;
 };
 
 static const TocIndex &tocIndex() {
@@ -1694,12 +1717,15 @@ static const TocIndex &tocIndex() {
     s.path = st.bookPath;
     s.spine.clear();
     s.title.clear();
+    s.level.clear();
     s.spine.reserve(n);
     s.title.reserve(n);
+    s.level.reserve(n);
     for (int i = 0; i < n; i++) {
-      auto e = st.epub->getTocItem(i);     // 一次 SD 读拿全：spineIndex + title
+      auto e = st.epub->getTocItem(i);     // 一次 SD 读拿全：spineIndex + title + level
       s.spine.push_back(e.spineIndex);
       s.title.push_back(e.title);
+      s.level.push_back(e.level);
     }
     ESP_LOGI(TAG, "章节名索引: %d 条 TOC 一次读入 RAM 表 %lldms",
              n, (esp_timer_get_time() - t0) / 1000);
@@ -5386,15 +5412,15 @@ static std::vector<MenuItem> layoutMenuItems() {
   return m;
 }
 
+// 「书签」全屏页的条目（RdMode::Menu）。原来是阅读页正中点一下进的"阅读菜单"；现在那一指
+// 归**浮动阅读菜单**了，这一页只从浮动菜单顶栏的「书签」按钮进，所以只留与**当前这本书**
+// 有关的书签/标注操作与工具（目录/排版设定搬去浮动菜单的 tab，返回书架/返回阅读由浮动
+// 菜单的顶栏与"再点一下"承接 —— 见 plan 的入口对照表：老项一个都没少，只是换了入口）。
+// 系统级条目（WiFi/传书/OPDS/按键映射/状态栏/方向/待机/关于）本来就在主界面「设置」标签，
+// 这里不再重复。导出标注是**跨书**的，入口在笔记标签页搜索栏右端（见 rdExportAnnot）。
 static std::vector<MenuItem> menuItems() {
   char buf[64];
   std::vector<MenuItem> m;
-  m.push_back({"目录", MenuAct::Toc});
-  // ‹› 那一对（U+2039/203A）内置字体里都有（见 assets/builtin.ttf 的 cmap；用户字体缺字
-  // 会走替补链），所以行尾那个 › 直接写进标签串就行，不用另画。
-  m.push_back({"排版设定 ›", MenuAct::LayoutMenu});
-  // 「夜间」「方向」已搬到主界面设置（夜间模式 / 阅读器方向）——它们本来就是设备级
-  // 设定，放在"当前这本书"的菜单里不对路。
   snprintf(buf, sizeof(buf), "书签(%d)", static_cast<int>(st.bookmarks.size()));
   m.push_back({buf, MenuAct::Bookmarks});
   m.push_back({isCurrentBookmarked() ? "删除书签" : "添加书签", MenuAct::ToggleBookmark});
@@ -5403,22 +5429,7 @@ static std::vector<MenuItem> menuItems() {
   m.push_back({"跳转百分比", MenuAct::Percent});
   m.push_back({"二维码", MenuAct::Qr});
   m.push_back({"词典", MenuAct::Dict});
-  // 系统级条目（WiFi/传书/OPDS/词典下载/按键映射/状态栏/方向/待机/关于）都移到了
-  // 主界面的「设置」标签，这里只留与「当前这本书」有关的阅读操作。
-  // 导出标注也不在这里：它是**跨书**的，入口在笔记标签页搜索栏右端（见 rdExportAnnot）。
-  m.push_back({"返回书架", MenuAct::ToShelf});
-  m.push_back({"返回阅读", MenuAct::Back});
   return m;
-}
-
-// 「排版设定」在阅读菜单里的行号：从子菜单 Esc 回来时把光标落回它，而不是跳回第一行
-// （那样看起来像菜单被重置了）。找不到就退回第一项之后的位置。
-static int rdMenuLayoutRow() {
-  const auto items = menuItems();
-  for (size_t i = 0; i < items.size(); i++) {
-    if (items[i].act == MenuAct::LayoutMenu) return static_cast<int>(i);
-  }
-  return 1;
 }
 
 // 菜单列表的绘制（阅读菜单与排版子菜单共用一套几何：绘制和点按命中都从 titleListView
@@ -5462,7 +5473,7 @@ static int rdMenuListKey(const std::vector<MenuItem> &items, int &sel, int key) 
   return clampI(sel, 0, n - 1);
 }
 
-static void renderMenu() { rdDrawMenuList(menuItems(), "阅读菜单", st.menuSel); }
+static void renderMenu() { rdDrawMenuList(menuItems(), "书签", st.menuSel); }
 static void renderLayoutMenu() { rdDrawMenuList(layoutMenuItems(), "排版设定", st.layoutSel); }
 
 // ── 词典 ────────────────────────────────────────────────────────────────
@@ -6040,6 +6051,16 @@ static void toggleBookmark() {
   saveBookmarks();
 }
 
+// 按下标删一条书签（长按删除的两条路——全屏「书签」页与浮动菜单「笔记」tab——共用）。
+// 落盘走 saveBookmarks()（整表重写，与 toggleBookmark 的加/删同一个出口）。
+static void rdDeleteBookmark(int idx) {
+  if (idx < 0 || idx >= static_cast<int>(st.bookmarks.size())) return;
+  st.bookmarks.erase(st.bookmarks.begin() + idx);
+  saveBookmarks();
+  st.bookmarkSel =
+      clampI(st.bookmarkSel, 0, std::max(0, static_cast<int>(st.bookmarks.size()) - 1));
+}
+
 // 把 epub 当前 spine 排到 target 页为止（跳转书签/脚注/百分比用）。
 void buildToPage(int target) {
   if (!st.section) return;
@@ -6472,6 +6493,39 @@ static ListView footnoteListView() {
   return titleListView(static_cast<int>(st.footnoteNums.size()), st.footnoteSel, uiLineHeight() + 8, statusTop());
 }
 
+// 书签"对应哪一章"：EPUB 按 spine 反查 tocIndex()（取最后一个 spine ≤ 书签 spine 的目录项 ——
+// 书签落在"章内没有自己目录项"的位置时，显示它所属的那一章）；TXT 按页反查章节表。
+// 只对**当前这本书**成立（tocIndex / 章节表都是当前书的那一份），别的书的书签返回空串。
+static std::string rdBookmarkChapterLabel(const RdState::RdBookmark &b) {
+  if (b.path != st.bookPath) return "";
+  if (b.kind == 0 && st.epub) {
+    const TocIndex &ti = tocIndex();
+    if (ti.spine.empty()) return "";
+    auto it = std::upper_bound(ti.spine.begin(), ti.spine.end(), b.spine);
+    if (it == ti.spine.begin()) return "";
+    const size_t i = static_cast<size_t>(it - ti.spine.begin() - 1);
+    return (i < ti.title.size()) ? ti.title[i] : std::string();
+  }
+  if (b.kind == 1 && !st.txtChapterOffsets.empty() && !st.txtLineStarts.empty()) {
+    size_t line = static_cast<size_t>(std::max(0, b.page)) * static_cast<size_t>(linesPerPage());
+    if (line >= st.txtLineStarts.size()) line = st.txtLineStarts.size() - 1;
+    auto it = std::upper_bound(st.txtChapterOffsets.begin(), st.txtChapterOffsets.end(),
+                               st.txtLineStarts[line]);
+    const size_t i = (it == st.txtChapterOffsets.begin())
+                         ? 0
+                         : static_cast<size_t>(it - st.txtChapterOffsets.begin() - 1);
+    return (i < st.txtChapterTitles.size()) ? st.txtChapterTitles[i] : std::string();
+  }
+  return "";
+}
+
+// summary 多数是 epub 的 "12/200" 页码串（见 currentPageSummary）—— 它只是"章内第几页"，
+// 光看它认不出是哪一章。真正带原文的（TXT 那条路）才值得原样跟出来。
+static bool rdBookmarkSummaryIsPageOnly(const RdState::RdBookmark &b) {
+  return !b.summary.empty() && b.summary.find('/') != std::string::npos &&
+         b.summary.find_first_not_of("0123456789/") == std::string::npos;
+}
+
 static void renderBookmarks() {
   g_rd.clearScreen();
   int w = g_rd.getScreenWidth();
@@ -6488,18 +6542,62 @@ static void renderBookmarks() {
   for (int i = 0; i < maxRows && start + i < static_cast<int>(st.bookmarks.size()); i++) {
     int idx = start + i;
     auto &b = st.bookmarks[idx];
-    char line[160];
-    snprintf(line, sizeof(line), "%d%%  %s", static_cast<int>(b.percent * 100), b.summary.c_str());
+    // 行 = 「章节名 · 位置」：原来只有 "%d%%  12/200"，认不出是哪一章，也不够直观。
+    // 章节名打头（截断时先丢的也是尾巴，不会把"哪一章"丢掉）；接着是位置读数 ——
+    // epub 的 summary 就是"章内第几页/共几页"，和百分比是同一件事的两种写法，凑成一组
+    // "5/12  45%"；TXT 的 summary 是一段原文，跟在百分比后面。
+    const std::string chap = rdBookmarkChapterLabel(b);
+    char pct[16];
+    snprintf(pct, sizeof(pct), "%d%%", static_cast<int>(b.percent * 100.0f + 0.5f));
+    std::string text;
+    if (!b.summary.empty() && rdBookmarkSummaryIsPageOnly(b)) {
+      text = chap.empty() ? std::string() : (chap + "  ");
+      text += b.summary + "  " + pct;
+    } else {
+      if (!chap.empty()) text = chap + "  ";
+      text += pct;
+      if (!b.summary.empty()) text += "  " + b.summary;
+    }
+    const std::string line = g_rd.truncatedText(uiFontId(), text.c_str(), w - 2 * MARGIN);
     int y = lv.top + i * itemH;
-    if (idx == st.bookmarkSel) { g_rd.fillRect(0, y, w, itemH, true); drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, line, false); }
-    else drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, line, true);
+    if (idx == st.bookmarkSel) { g_rd.fillRect(0, y, w, itemH, true); drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, line.c_str(), false); }
+    else drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, line.c_str(), true);
   }
-  drawFooter("↑↓ 选择  Enter 跳转  Esc 返回");
+  drawFooter("↑↓ 选择  Enter 跳转  长按删除  Esc 返回");
 }
 
 static void handleBookmarks(int key) {
   int n = static_cast<int>(st.bookmarks.size());
-  if (key == 0x1B) { st.mode = RdMode::Menu; st.fullRefresh = true; st.dirty = 1; return; }
+  if (key == 0x1B) {
+    st.mode = RdMode::Menu;
+    st.bookmarkDelArm = false;
+    st.fullRefresh = true;
+    st.dirty = 1;
+    return;
+  }
+  if (key == KEY_TOUCH_LONG) {  // 长按 = 删除（二次确认，误触不至于直接丢书签）
+    // 删哪一条必须**按落点认**，不能按 st.bookmarkSel —— 长按的行不一定就是光标那一行。
+    const bool armed = st.bookmarkDelArm;
+    const int armedIdx = st.bookmarkDelIdx;
+    st.bookmarkDelArm = false;
+    st.bookmarkDelIdx = -1;
+    int x, y;
+    if (!input_tap_xy(&x, &y)) { st.dirty = 1; return; }
+    const int row = listViewHitAt(bookmarkListView(), y);
+    if (row < 0 || row >= n) { st.dirty = 1; return; }
+    st.bookmarkSel = row;
+    if (armed && armedIdx == row) {
+      rdDeleteBookmark(row);
+      rdShowFloat("已删除书签", "", 2000);
+    } else {
+      st.bookmarkDelArm = true;
+      st.bookmarkDelIdx = row;
+      rdShowFloat("再长按一次删除该书签", "", 3000);
+    }
+    st.dirty = 1;
+    return;
+  }
+  st.bookmarkDelArm = false;  // 按别的键 = 撤销删除的挂起态
   if (n == 0) return;
   {  // 上下/翻页在 ui/list_view.h（与 renderBookmarks 共用同一个几何）
     ListView lv = bookmarkListView();
@@ -6935,6 +7033,10 @@ void renderCurrent() {
   // 常驻首帧：正文层刚画完、下面那些浮层还没叠上来，此刻帧缓冲里正是"这一页干净的样子"，
   // 存一份下来（切模式回来那一拍 memcpy 顶替绘制，见 rdHoldCapture）。
   rdHoldCapture();
+  // 浮动阅读菜单的两张卡：也是"盖在正文页上的一层"，与脚注弹注同一层。**必须画在
+  // rdHoldCapture 之后**（否则会被烤进常驻首帧，之后每次开菜单都贴出上一次的卡）、
+  // **drawFootnotePopup 之前**（脚注弹注与档位弹层要能盖在卡上）。
+  if (sheetVisible()) rdSheetDraw();
   // 脚注弹注：盖在正文页上的一层（自己就是内容，不是提示），所以在所有别的浮层之前画。
   drawFootnotePopup();
   // 设置标签的选择弹层：也是"盖在底图上的一层"，底图由上面那个 case 画好，这里叠上去。
@@ -7016,6 +7118,15 @@ void renderCurrent() {
   HalDisplay::RefreshMode m;
   if (st.fullRefresh) {
     m = HalDisplay::FULL_REFRESH;          // 进入新界面首帧：清掉上一屏的残影
+  } else if (sheetVisible()) {
+    // 浮动阅读菜单帧：浮层底下的正文一个像素没动，只有两张卡在变 —— 与脚注弹注同类。
+    // 档位固定取正文表 GRAY8_TEXT（30 相、不闪，比 GL16 的 37 相省约 80ms），**不采样
+    // 分档、不累计、不动 s_pagesSinceFull** —— 开合菜单不是翻页，不能替"全刷频率 N 页"
+    // 那本账 +1（否则设了 5 页的人开合五次菜单就来一次整屏黑白闪）。
+    // 上面那个 `st.mode == RdMode::Reading` 的块（:7018）已经量过 frameChange 并把
+    // s_prevSample 推成了当前帧（菜单帧的模式就是 Reading，条件必然成立），所以这里
+    // 不必、也不该再采一次 —— 再采一次等于拿当前帧与自己比，白白扫一遍帧缓冲。
+    m = HalDisplay::GRAY8_TEXT_REFRESH;
   } else if (st.mode == RdMode::Reading) {
     const int strat = refreshStrategy();
     stratAuto = (strat == 3);
@@ -7190,7 +7301,11 @@ void renderCurrent() {
   // 一个例外：排队等着的那一指**正是朝 s_turnDir 这一侧的翻页**时不再让开 —— 让开的话
   // 它下一拍照样要现画 ~720ms，而把这一趟干完它就只剩 memcpy（见 rdPrerenderTurnPage
   // 里 committed 那一段）。这是快翻死锁唯一的突破口，所以入口也得放行。
-  if (!g_bt.waitKey(0)) {
+  // 收尾那趟预建/预渲染：**菜单开着时跳掉**。rdPrebuildAhead() 头一行是
+  // `if (st.mode != RdMode::Reading) return;` —— 今天开菜单会把模式切走、天然被跳过；
+  // 这一版模式保持 Reading，不挡的话每一帧菜单帧都要把这趟（最多几百毫秒）付掉，
+  // 正是"下一指要先等几百毫秒才被看一眼"的来源，直接打在用户唯一在意的那个指标上。
+  if (!g_bt.waitKey(0) && !sheetVisible()) {
     const int want = (s_turnDir >= 0) ? 1 : -1;
     int pd = rdPendingTurnDir();
     if (pd == 0 || pd == want) {
@@ -7397,7 +7512,12 @@ static void handleBrowser(int key) {
   }
 }
 
+// 「书签」全屏页（RdMode::Menu）。原来是阅读页正中点一下进的"阅读菜单"，现在那一指归
+// 浮动菜单了；这一页只从浮动菜单顶栏的「书签」按钮进，条目见 menuItems()（本书签列表 +
+// 工具）。进来时先收掉浮动菜单，Esc 一路回阅读页（不再是"菜单还开着"）。
 static void openMenu() {
+  st.sheetOpen = false;
+  st.sheetReturn = false;
   st.mode = RdMode::Menu;
   st.menuSel = 0;
   st.fullRefresh = true;
@@ -7427,6 +7547,12 @@ static void gotoBookshelf() {
   st.bookFontLocal.clear();
   st.bookFontTag = 0;
   st.tab = 0;
+  // 浮动菜单/待落地那一档一并收掉：回书架 = 离场，别让标记幸存、下次进来菜单自己冒出来
+  // （rdRecordReturnPoint 会把不认识的模式映射回 Reading，标记因而能活过模式切换）。
+  st.sheetOpen = false;
+  st.sheetReturn = false;
+  st.sheetLiveAct = -1;
+  st.sheetLiveIdx = -1;
   // 书架按最近阅读排序：刚读完的这本已经在进度表表头了，重排一次让它跳回最前面，
   // 并把光标停在它身上 —— 排序会移动下标，光标不跟过去的话就指着另一本书了。
   {
@@ -8032,6 +8158,12 @@ static void handleReading(int key) {
     return;
   }
 
+  // ── 浮动阅读菜单：模态，开着的时候**每一个键/触点**都归它（见 rdSheetHandle）──
+  // 放在脚注弹注之后、选区之前：脚注弹注是更上一层（能从菜单里的"脚注"进），选区
+  // 是正文之上的另一层浮层；菜单开着时两者都不该被触到。这一句同时也堵掉了点按那条
+  // 整屏坐标命中链（会穿到卡底下的链接/标注）与阅读页原样放行的长按（会起选区）。
+  if (sheetVisible() && rdSheetHandle(key)) return;
+
   // ── 选中态：键先给选区/浮层用，翻页等一概不理会 ─────────────────────
   if (st.selActive) {
     // 按住手柄拖动：把被拖的那一端挪到手指底下的词上。放在最前面——拖动帧不是
@@ -8163,10 +8295,10 @@ static void handleReading(int key) {
       // crossmux 阅读器触摸分区：左右 1/3 翻页，中间 1/3 菜单
       if (x < w / 3) turnBook(-1);
       else if (x > w * 2 / 3) turnBook(+1);
-      else openMenu();
+      else rdSheetToggle();  // 中间 1/3：浮出浮动菜单 / 再点一下收起（用户定死的手势）
       return;
     }
-    openMenu();  // 非点按回车(BLE/KEY3)，没有点按坐标
+    rdSheetToggle();  // 非点按回车(BLE/KEY3)，没有点按坐标
     return;
   }
   // 双击左右电容键 = 跳上/下一章（由 main.cpp 的电容键双击分支产生）。
@@ -8180,7 +8312,8 @@ static void handleReading(int key) {
   // 统计删书这三个把它当动作键的子界面才被放行（screen_reader_long_confirm_is_action）。
   // 原来的"长按 = 全屏刷新"改由**晃动机身**触发，落点见 screen_reader_handle 顶部的
   // KEY_SHAKE 分支。
-  if (key == 0x1B) { openMenu(); return; }
+  // Esc：浮出浮动菜单（菜单开着时上面那句 sheetVisible() 已经先接走 = 收起菜单）。
+  if (key == 0x1B) { rdSheetToggle(); return; }
 }
 
 // 目录条目跳转（原来是 `openSpine(getSpineIndexForTocIndex(sel)); st.page = 0;`）。
@@ -8657,10 +8790,16 @@ static void handleMenu(int key) {
 
 static void handleLayoutMenu(int key) {
   if (key == 0x1B) {
-    st.mode = RdMode::Menu;
+    // 「排版设定」那一整屏现在只从**浮动阅读菜单**的「更多设置」进（见 rdSheetRowAct）：
+    // Esc 回"阅读页 + 菜单还开着"，而不是回书签页（书签页里已经没有这一项了，原来那句
+    // "光标落回排版设定行"也就没了意义）。sheetReturn 是进这一屏时置的标记。
+    const bool fromSheet = st.sheetReturn;
+    st.sheetReturn = false;
+    st.mode = RdMode::Reading;
+    st.sheetOpen = fromSheet;      // 从浮动菜单来的：菜单仍是开着的，回到原来的样子
+    if (fromSheet) rdSheetBuildRows();
     st.fullRefresh = true;
     st.dirty = 1;
-    st.menuSel = rdMenuLayoutRow();   // 光标落回「排版设定」那一行（见 rdMenuLayoutRow）
     return;
   }
   auto items = layoutMenuItems();
@@ -8772,7 +8911,21 @@ static void handleSettingsTab(int key) {
   // 微读/设置标签里 ←→ 是空的，顺手用来切标签（书架标签要用它们换封面，故不占用）。
   if (key == KEY_LEFT) { switchTab(st.tab - 1); return; }
   if (key == KEY_RIGHT) { switchTab(st.tab + 1); return; }
-  if (key == 0x1B || key == KEY_LONG_CONFIRM) { switchTab(0); return; }
+  if (key == 0x1B || key == KEY_LONG_CONFIRM) {
+    // 从浮动阅读菜单顶栏的「设置」进来的（sheetReturn）：Esc 回"阅读页 + 菜单还开着"，
+    // 而不是根标签栏。原来那句 switchTab(0) 只对"从底部标签栏进设置"那一类成立。
+    if (st.sheetReturn) {
+      st.sheetReturn = false;
+      st.mode = RdMode::Reading;
+      st.sheetOpen = true;
+      rdSheetBuildRows();
+      st.fullRefresh = true;
+      st.dirty = 1;
+      return;
+    }
+    switchTab(0);
+    return;
+  }
   {  // 上下/翻页在 ui/list_view.h（与 renderSettingsTab 共用同一个几何）
     ListView lv = titleListView(n, st.setSel, uiLineHeight() + 12, tabBottom());
     if (listViewKey(lv, key)) { st.setSel = lv.sel; st.dirty = 1; return; }
@@ -8941,23 +9094,25 @@ static int rdPickRowTop(int by, int i) {
 }
 
 // 每个轮换条目的档位表（标签 + 值两张平行表）。
-static void rdPickFill(int act) {
-  st.pickLabels.clear();
-  st.pickValues.clear();
-  auto add = [](const std::string &label, const std::string &value) {
-    st.pickLabels.push_back(label);
-    st.pickValues.push_back(value);
+static void rdPickTable(int act, std::string &title, std::vector<std::string> &labels,
+                        std::vector<std::string> &values) {
+  labels.clear();
+  values.clear();
+  title.clear();
+  auto add = [&](const std::string &label, const std::string &value) {
+    labels.push_back(label);
+    values.push_back(value);
   };
   switch (static_cast<MenuAct>(act)) {
     case MenuAct::Font:
       // 字号档（kBodyPx 的像素高就是用户看得懂的那个数，菜单标签一直这么写）。
-      st.pickTitle = "字号";
+      title = "字号";
       for (int i = 0; i < kUserFontLevels; i++) add(std::to_string(kBodyPx[i]), std::to_string(i));
       break;
     case MenuAct::FontFamily:
       // 与「设置 → 字体」同一份清单：内建 + ttf_font_scan() 扫到的 SD 字体。值的字面量
       // 也必须一致（""=内建，其余=字体文件路径），否则弹层认不出当前档、● 会落错行。
-      st.pickTitle = "字体";
+      title = "字体";
       add("内建", "");
       {
         const int n = ttf_font_scan();
@@ -8969,53 +9124,53 @@ static void rdPickFill(int act) {
       break;
     case MenuAct::FontWeight:
       // 值的字面量就是档位下标（与 Font 的写法一致，落定后 applyRdPick 只做 atoi）。
-      st.pickTitle = "字重";
+      title = "字重";
       for (int i = 0; i < kFontWeightCount; i++) add(kFontWeightLabels[i], std::to_string(i));
       break;
     case MenuAct::Contrast:
-      st.pickTitle = "对比度";
+      title = "对比度";
       for (int i = 0; i < kContrastCount; i++) add(kContrastLabels[i], std::to_string(i));
       break;
     case MenuAct::ShelfStyle:
-      st.pickTitle = "书架风格";
+      title = "书架风格";
       for (int i = 0; i < kShelfStyleCount; i++) add(kShelfStyleNames[i], kShelfStyleKeys[i]);
       break;
     case MenuAct::StyleSource:
-      st.pickTitle = "样式解析";
+      title = "样式解析";
       for (int i = 0; i < kStyleSrcCount; i++) add(kStyleSrcNames[i], kStyleSrcKeys[i]);
       break;
     case MenuAct::EmbeddedFont:
-      st.pickTitle = "内嵌字体";
+      title = "内嵌字体";
       for (int i = 0; i < kEmbFontCount; i++) add(kEmbFontNames[i], kEmbFontKeys[i]);
       break;
     case MenuAct::RefreshStrategy:
-      st.pickTitle = "刷新策略";
+      title = "刷新策略";
       for (int i = 0; i < kRdRefreshCount; i++) add(kRdRefreshNames[i], kRdRefreshKeys[i]);
       break;
     case MenuAct::ImageDither:
-      st.pickTitle = "图片抖动";
+      title = "图片抖动";
       for (int i = 0; i < kRdDitherCount; i++) add(kRdDitherNames[i], kRdDitherKeys[i]);
       break;
     case MenuAct::FullEvery:
-      st.pickTitle = "全刷频率";
+      title = "全刷频率";
       for (int i = 0; i < kRdFullEveryCount; i++) add(kRdFullEveryNames[i], kRdFullEveryKeys[i]);
       break;
     case MenuAct::WhitePush:
-      st.pickTitle = "白推帧数";
+      title = "白推帧数";
       for (int i = 0; i < kRdWhitePushCount; i++) add(kRdWhitePushNames[i], kRdWhitePushKeys[i]);
       break;
     case MenuAct::TurnAnim:
-      st.pickTitle = "翻页动画";
+      title = "翻页动画";
       add("开", "1");
       add("关", "0");
       break;
     case MenuAct::PreRender:
-      st.pickTitle = "翻页预渲染";
+      title = "翻页预渲染";
       add("开", "1");
       add("关", "0");
       break;
     case MenuAct::ClockFace:
-      st.pickTitle = "待机表盘";
+      title = "待机表盘";
       add(standbyFaceLabel(StandbyFace::Off), standbyFaceKey(StandbyFace::Off));
       add(standbyFaceLabel(StandbyFace::Clock), standbyFaceKey(StandbyFace::Clock));
       add(standbyFaceLabel(StandbyFace::Almanac), standbyFaceKey(StandbyFace::Almanac));
@@ -9023,14 +9178,14 @@ static void rdPickFill(int act) {
       add(standbyFaceLabel(StandbyFace::Image), standbyFaceKey(StandbyFace::Image));
       break;
     case MenuAct::AutoStandby:
-      st.pickTitle = "自动待机";
+      title = "自动待机";
       for (int i = 0; i < kAutoStandbyCount; i++) add(kAutoStandbyLabels[i], kAutoStandbyValues[i]);
       break;
     // ── 排版设定（阅读页菜单 → 排版设定）────────────────────────────────────
     // 值一律是**档位下标**（上面 Font/FontWeight 的惯例），applyRdPick 只做一次 atoi。
     case MenuAct::LineSpacing:
       // 标签与列表行同一个写法（"%.1f"）：弹层里挑的那一档，回到列表行上是同一个数。
-      st.pickTitle = "行距";
+      title = "行距";
       for (int i = 0; i < 5; i++) {
         char b[16];
         snprintf(b, sizeof(b), "%.1f", kLineSpacings[i]);
@@ -9038,37 +9193,43 @@ static void rdPickFill(int act) {
       }
       break;
     case MenuAct::ParaSpacing:
-      st.pickTitle = "段距";
+      title = "段距";
       for (int i = 0; i < 6; i++) add(kParaSpacingLabels[i], std::to_string(i));
       break;
     case MenuAct::Indent:
-      st.pickTitle = "缩进";
+      title = "缩进";
       for (int i = 0; i < 3; i++) add(kIndentLabels[i], std::to_string(i));
       break;
     case MenuAct::Align:
-      st.pickTitle = "对齐";
+      title = "对齐";
       for (int i = 0; i < 4; i++) add(kAlignLabels[i], std::to_string(i));
       break;
     case MenuAct::Margin:
-      st.pickTitle = "边距";
+      title = "边距";
       for (int i = 0; i < 3; i++) add(kMarginLabels[i], std::to_string(i));
       break;
     case MenuAct::Image:
-      st.pickTitle = "图片缩放";
+      title = "图片缩放";
       for (int i = 0; i < 2; i++) add(kImageScalingLabels[i], std::to_string(i));
       break;
     case MenuAct::ReadingLine:
-      st.pickTitle = "阅读线";
+      title = "阅读线";
       for (int i = 0; i < 4; i++) add(kReadingLineNames[i], std::to_string(i));
       break;
     case MenuAct::Orient:
-      st.pickTitle = "阅读器方向";
+      title = "阅读器方向";
       for (int i = 0; i < 2; i++) add(kOrientNames[i], kOrientKeys[i]);
       break;
     default:
-      st.pickTitle.clear();
+      title.clear();
       break;
   }
+}
+
+// 弹层选择器用的那一份：把 rdPickTable 的结果灌进 st.pick*。**档位表只有 rdPickTable
+// 一处定义**，所以浮动菜单的滑块能拖到的档和弹层能选到的档不可能不一致。
+static void rdPickFill(int act) {
+  rdPickTable(act, st.pickTitle, st.pickLabels, st.pickValues);
 }
 
 // 这一项现在是什么值（用来把弹层的选中行落在当前档上，并画那个 ●）。
@@ -9121,8 +9282,604 @@ static std::string rdPickCurValue(int act) {
   }
 }
 
+// ══ 浮动阅读菜单：下半屏菜单卡 + 顶部三按钮 ══════════════════════════════════════
+//
+// 形态来自用户给的 `../阅读菜单.jpg`：阅读页正中点一下浮出，再点一下（或 Esc）收起。
+// 顶上一条三按钮卡（返回 / 书签 / 设置，点开都是全屏页），下面一张**只占下半屏**的卡，
+// 卡底一排 4 个 tab（目录 / 字体 / 笔记 / 排版），两张卡之间的正文**留在屏上**。
+//
+// **最关键的一笔：st.mode 保持 RdMode::Reading**。两张卡不是"另一个界面"，而是画在
+// 正文页之上的浮层 —— 和脚注弹注（drawFootnotePopup）同一层、同一套刷新语义（见
+// rdOverlayRefresh 那段注释："浮层底下的正文页一个像素没动，差分天然既能把浮层画上去、
+// 也能在关掉时擦干净"）。于是：
+//   · 正文像素本来就在屏上，不用清屏、不用重排；
+//   · 常驻首帧（s_hold）与邻页留档全照旧有效 —— 开/合菜单命中留档时只是一次 ~406KB
+//     memcpy，不重排、不栅格化、不绘制；
+//   · 刷新档位在 renderCurrent 里单独一支接走（GRAY8_TEXT，30 相、不闪、不记账）。
+//
+// **三条硬不变量**（挪代码前先读，破了就是难查的坑）：
+//   1. 卡片只在 renderCurrent 的浮层段画（rdHoldCapture 之后、drawFootnotePopup 之前），
+//      **绝不进 renderReading** —— 进了会被 rdPrerenderTurnPage 烤进整帧预渲染 s_preFb，
+//      而那个失效键（rdLayoutKey）根本不知道卡在不在，之后会贴出"带着上次菜单"的正文页。
+//   2. rdLiveLayerUp()（= selActive || vkVisible）**不许加 sheetOpen** —— 它一为真，
+//      rdHoldCapture/rdHoldTake 就双双停工，开菜单会从"一次 memcpy"变成"整页重排+重画"。
+//      要拦的是它的**调用者**（收尾那趟预建/预渲染），见 renderCurrent 那个条件。
+//   3. 换模式 / 回书架 / 退出阅读器都要清 sheetOpen（见 rdSheetClose 的调用点）。
+
+struct SheetBox { int x, y, w, h; };
+static bool sheetHit(const SheetBox &b, int x, int y) {
+  return x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h;
+}
+static constexpr int kSheetPad = 8;
+static constexpr int kSheetTabCount = 4;
+static const char *const kSheetTabNames[kSheetTabCount] = {"目录", "字体", "笔记", "排版"};
+static constexpr const char *kSheetTopLabels[3] = {"返回", "书签", "设置"};
+// 滑块"/停手落地"的等待（见 rdSheetLiveSchedule）。
+static constexpr int64_t kSheetLiveDelayUs = 500 * 1000;
+
+// 卡片只在"阅读页 + 开着"时存在。**这个判据是绘制/按键/刷新的唯一开关** ——
+// 模式被切走（进设置/书签/书架）时标记可能还留着，所以每次都要连模式一起判。
+static bool sheetVisible() { return st.sheetOpen && st.mode == RdMode::Reading; }
+
+// ── 几何：绘制与命中共用（两处各写一份就是"点哪行开隔壁那行"的老坑）────────────
+static int sheetLh() { return uiLineHeight(); }
+static SheetBox sheetTopCardBox() {
+  const int w = g_rd.getScreenWidth();
+  return {kSheetPad, kSheetPad, w - 2 * kSheetPad, sheetLh() + 20};
+}
+static int sheetTabH() { return sheetLh() + 18; }
+static SheetBox sheetCardBox() {
+  const int w = g_rd.getScreenWidth(), h = g_rd.getScreenHeight();
+  const int top = h / 2 + 4;   // "只占下半边屏幕"
+  return {kSheetPad, top, w - 2 * kSheetPad, h - kSheetPad - top};
+}
+static SheetBox sheetTabBox(int i) {
+  const SheetBox c = sheetCardBox();
+  const int tw = c.w / kSheetTabCount;
+  const int x = c.x + i * tw;
+  const int w = (i == kSheetTabCount - 1) ? (c.x + c.w - x) : tw;
+  return {x, c.y + c.h - sheetTabH(), w, sheetTabH()};
+}
+// 卡内可用区（tab 条以上）。
+static SheetBox sheetBodyBox() {
+  const SheetBox c = sheetCardBox();
+  const int b = c.y + c.h - sheetTabH();
+  return {c.x, c.y, c.w, std::max(0, b - c.y)};
+}
+// 顶栏三按钮：返回在最左，设置在右端、书签在它左边（与用户给的截图一致）。
+static SheetBox sheetTopBtnBox(int i) {
+  const SheetBox c = sheetTopCardBox();
+  const int pad = 4, gap = 4;
+  const int y = c.y + pad, h = c.h - 2 * pad;
+  const int w0 = g_rd.getTextWidth(uiFontId(), kSheetTopLabels[0]) + 28;
+  const int w1 = g_rd.getTextWidth(uiFontId(), kSheetTopLabels[1]) + 28;
+  const int w2 = g_rd.getTextWidth(uiFontId(), kSheetTopLabels[2]) + 28;
+  if (i == 0) return {c.x + pad, y, w0, h};
+  if (i == 2) return {c.x + c.w - pad - w2, y, w2, h};
+  return {c.x + c.w - pad - w2 - gap - w1, y, w1, h};
+}
+// 行高：笔记 tab 是两行（原文 + 笔记），其余一行。行号/窗口/命中全走 ui/list_view.h。
+static int sheetRowH() { return (st.sheetTab == 2) ? (sheetLh() * 2 + 8) : (sheetLh() + 12); }
+static ListView sheetList() {
+  const SheetBox b = sheetBodyBox();
+  ListView lv;
+  lv.top = b.y + 2;
+  lv.itemH = sheetRowH();
+  lv.count = static_cast<int>(st.sheetRows.size());
+  lv.rows = std::max(1, (b.h - 4) / lv.itemH);
+  lv.sel = st.sheetSel[st.sheetTab];
+  listViewCenter(lv);
+  return lv;
+}
+// 一行的上沿（窗口已滚过，所以要用 lv.first 换算）。
+static int sheetRowY(const ListView &lv, int i) { return lv.top + (i - lv.first) * lv.itemH; }
+// 滑块轨道：左端标签区固定宽（"对比度"三字也放得下），右端留给当前档名。
+static SheetBox sheetTrackBox(const ListView &lv, int row) {
+  const int lh = sheetLh();
+  const SheetBox b = sheetBodyBox();
+  const int labW = lh * 5, valW = lh * 4;
+  const int x0 = b.x + 12 + labW;
+  const int x1 = b.x + b.w - 12 - valW;
+  const int y = sheetRowY(lv, row) + (lv.itemH - lh) / 2;
+  return {x0, y, std::max(24, x1 - x0), lh};
+}
+// 轨道上某个横坐标落在第几档（拖拽 / 点按共用）。
+static int sheetTrackIdx(int row, int x) {
+  const int n = st.sheetRows[row].count;
+  if (n <= 1) return 0;
+  const SheetBox t = sheetTrackBox(sheetList(), row);
+  const int knobW = std::max(1, sheetLh() / 2);
+  const int span = std::max(1, t.w - knobW);
+  const int i = ((x - t.x - knobW / 2) * (n - 1) + span / 2) / span;
+  return clampI(i, 0, n - 1);
+}
+
+// ── 行表：只在开菜单 / 切 tab / 落地之后建（FontFamily 那张表会 ttf_font_scan 扫 SD，
+//    每帧建一次就是每帧一次目录扫描）─────────────────────────────────────────
+static void rdSheetBuildRows() {
+  st.sheetRows.clear();
+  auto slider = [](MenuAct act, const char *label, const std::vector<std::string> &names, int cur) {
+    RdSheetRow r;
+    r.act = static_cast<int>(act);
+    r.label = label;
+    r.names = names;
+    r.count = static_cast<int>(names.size());
+    r.idx = clampI(cur, 0, std::max(0, r.count - 1));
+    r.value = r.count > 0 ? names[r.idx] : std::string();
+    st.sheetRows.push_back(r);
+  };
+  auto nav = [](const char *label, const char *value, MenuAct act, bool disabled) {
+    RdSheetRow r;
+    r.act = static_cast<int>(act);
+    r.nav = true;
+    r.disabled = disabled;
+    r.label = label;
+    r.value = value;
+    st.sheetRows.push_back(r);
+  };
+  switch (st.sheetTab) {
+    case 0: {  // 目录：EPUB 吃 tocIndex() 那张 RAM 表（不每帧读 SD），TXT 吃章节表
+      if (st.bookKind == 1) {
+        for (int i = 0; i < static_cast<int>(st.txtChapterTitles.size()); i++) {
+          RdSheetRow r;
+          r.idx = i;
+          r.label = st.txtChapterTitles[i];
+          st.sheetRows.push_back(r);
+        }
+      } else if (st.bookKind == 0 && st.epub) {
+        const TocIndex &ti = tocIndex();
+        int minLevel = 255;
+        for (uint8_t lv : ti.level) minLevel = std::min<int>(minLevel, lv);
+        if (minLevel == 255) minLevel = 0;
+        for (int i = 0; i < static_cast<int>(ti.title.size()); i++) {
+          RdSheetRow r;
+          r.idx = i;
+          r.label = ti.title[i];
+          r.level = clampI(static_cast<int>(ti.level[i]) - minLevel, 0, kTocMaxIndent);
+          st.sheetRows.push_back(r);
+        }
+      }
+      break;
+    }
+    case 1: {  // 字体
+      {
+        std::vector<std::string> names;
+        for (int i = 0; i < kUserFontLevels; i++) names.push_back(std::to_string(kBodyPx[i]));
+        slider(MenuAct::Font, "字号", names, st.fontLevel);
+      }
+      slider(MenuAct::FontWeight, "字重",
+             std::vector<std::string>(kFontWeightLabels, kFontWeightLabels + kFontWeightCount),
+             st.fontWeight);
+      slider(MenuAct::Contrast, "对比度",
+             std::vector<std::string>(kContrastLabels, kContrastLabels + kContrastCount), st.contrast);
+      // 字体族是 nav 行：它要 ttf_font_open 重开字面 + 重排，PSRAM 吃紧时本来就可能失败，
+      // 不适合每挪一格来一次 —— 点开弹层、确认时才落地（弹层自己扫 SD）。
+      nav("字体", st.bookFontLocal.empty() ? ttf_font_display_name() : "书内嵌", MenuAct::FontFamily,
+          false);
+      nav("更多设置", "", MenuAct::LayoutMenu, false);
+      break;
+    }
+    case 2: {  // 笔记：**本书的标记和笔记**（用户原话"当前书籍的标记和笔记"）
+      for (int i = 0; i < static_cast<int>(st.bookmarks.size()); i++) {
+        const auto &b = st.bookmarks[i];
+        if (b.path != st.bookPath) continue;
+        RdSheetRow r;
+        r.level = 0;  // 0 = 书签
+        r.idx = i;
+        // 第一行 = 章节名（拿不到就退回摘要），第二行 = 位置读数 —— 与全屏书签页同一个
+        // 口径（见 rdBookmarkChapterLabel / rdBookmarkSummaryIsPageOnly）：epub 的
+        // summary 是"章内第几页/共几页"，和百分比凑成"5/12  45%"；TXT 是"45%  原文"。
+        const std::string chap = rdBookmarkChapterLabel(b);
+        char pc[24];
+        snprintf(pc, sizeof(pc), "%d%%", static_cast<int>(b.percent * 100.0f + 0.5f));
+        if (chap.empty()) {
+          r.label = b.summary.empty() ? "（书签）" : b.summary;
+          r.value = pc;
+        } else {
+          r.label = chap;
+          if (!b.summary.empty() && rdBookmarkSummaryIsPageOnly(b)) {
+            r.value = b.summary + "  " + pc;
+          } else {
+            r.value = pc;
+            if (!b.summary.empty()) r.value += "  " + b.summary;
+          }
+        }
+        st.sheetRows.push_back(r);
+      }
+      for (int i = 0; i < static_cast<int>(st.notes.size()); i++) {
+        const auto &n = st.notes[i];
+        if (n.path != st.bookPath) continue;
+        RdSheetRow r;
+        r.level = 1;  // 1 = 标注
+        r.idx = i;
+        r.label = n.text;
+        r.value = n.note.empty() ? "（仅标注）" : n.note;
+        st.sheetRows.push_back(r);
+      }
+      break;
+    }
+    default: {  // 3 排版
+      // 缩进/对齐在"样式解析=书籍内嵌且 EPUB"时由书里的 CSS 接管 —— 判据必须与
+      // layoutMenuItems 里的 embedded 一字不差，否则会出现"标着随书、拖了却真改了"。
+      const bool embedded = styleEmbedded() && st.bookKind == 0;
+      {
+        std::vector<std::string> names;
+        for (int i = 0; i < 5; i++) {
+          char b[16];
+          snprintf(b, sizeof(b), "%.1f", kLineSpacings[i]);
+          names.push_back(b);
+        }
+        slider(MenuAct::LineSpacing, "行距", names, spacingIdx());
+      }
+      slider(MenuAct::ParaSpacing, "段距",
+             std::vector<std::string>(kParaSpacingLabels, kParaSpacingLabels + 6), st.paraSpacing);
+      if (embedded) nav("缩进", "随书", MenuAct::Indent, true);
+      else slider(MenuAct::Indent, "缩进",
+                  std::vector<std::string>(kIndentLabels, kIndentLabels + 3), st.indentMode);
+      if (embedded) nav("对齐", "随书", MenuAct::Align, true);
+      else slider(MenuAct::Align, "对齐", std::vector<std::string>(kAlignLabels, kAlignLabels + 4),
+                  st.alignMode);
+      slider(MenuAct::Margin, "边距",
+             std::vector<std::string>(kMarginLabels, kMarginLabels + 3), st.marginIdx);
+      slider(MenuAct::Image, "图片",
+             std::vector<std::string>(kImageScalingLabels, kImageScalingLabels + 2),
+             st.imageBilinear ? 1 : 0);
+      slider(MenuAct::ImageDither, "抖动",
+             std::vector<std::string>(kRdDitherNames, kRdDitherNames + kRdDitherCount),
+             st.imageDither);
+      slider(MenuAct::ReadingLine, "阅读线",
+             std::vector<std::string>(kReadingLineNames, kReadingLineNames + 4), st.readingLine);
+      nav("更多设置", "", MenuAct::LayoutMenu, false);
+      break;
+    }
+  }
+  int &sel = st.sheetSel[st.sheetTab];
+  const int n = static_cast<int>(st.sheetRows.size());
+  sel = n > 0 ? clampI(sel, 0, n - 1) : 0;
+  if (st.sheetLiveAct >= 0) {
+    // 落地之后把待落地标记清掉（行表已经是新档了）。
+    st.sheetLiveAct = -1;
+    st.sheetLiveIdx = -1;
+    st.sheetLiveDueUs = 0;
+    st.sheetLiveVal.clear();
+  }
+}
+
+// ── 实时预览："停手约 0.5s 后落地"───────────────────────────────────────────
+// 值一改**先只改眼前的画**（刀柄当场跟着手走），书等 0.5s。落地 = applyRdPick，它自己
+// reopenBook（重排）+ st.fullRefresh（一次整屏 GC16 ≈0.4s）—— 正是用户认可的代价。
+static void rdSheetLiveSchedule(int act, int idx) {
+  std::string title;
+  std::vector<std::string> labels, values;
+  rdPickTable(act, title, labels, values);
+  if (idx < 0 || idx >= static_cast<int>(values.size())) return;
+  st.sheetLiveAct = act;
+  st.sheetLiveIdx = idx;
+  st.sheetLiveVal = values[idx];
+  st.sheetLiveDueUs = esp_timer_get_time() + kSheetLiveDelayUs;
+  st.dirty = 1;
+}
+// 立刻落地（弹层关闭 / 收起菜单 / 拖完手抬起来时都要先 flush，用户不会白改）。
+static void rdSheetLiveFlush() {
+  if (st.sheetLiveAct < 0) return;
+  const int act = st.sheetLiveAct;
+  const std::string v = st.sheetLiveVal;
+  st.sheetLiveAct = -1;
+  st.sheetLiveIdx = -1;
+  st.sheetLiveDueUs = 0;
+  st.sheetLiveVal.clear();
+  applyRdPick(act, v);
+  rdSheetBuildRows();  // 档位名/当前档刷新
+  st.dirty = 1;
+}
+// 空闲帧上跑：到点才落地（连按十几下只落最后那一档）。
+static void rdSheetLiveTick() {
+  if (!sheetVisible() || st.sheetLiveAct < 0) return;
+  if (esp_timer_get_time() < st.sheetLiveDueUs) return;
+  rdSheetLiveFlush();
+  renderCurrent();  // 空闲帧没有帧末统一推屏，谁动了谁自己收帧（同 float 提示那条）
+}
+
+// ── 开 / 关 / 切 tab ──────────────────────────────────────────────────────
+static void rdSheetTabChanged() {
+  // 上一个 tab 上还没落地的滑块值先落地，别切个 tab 就静默丢掉（用户已经看见刀柄挪过去了）。
+  rdSheetLiveFlush();
+  rdSheetBuildRows();
+  st.dirty = 1;
+}
+static void rdSheetOpen() {
+  st.sheetOpen = true;
+  st.sheetTab = 0;
+  st.sheetDragRow = -1;
+  st.sheetLiveAct = -1;
+  st.sheetLiveIdx = -1;
+  st.sheetLiveDueUs = 0;
+  st.sheetLiveVal.clear();
+  rdSheetBuildRows();
+  rdOverlayRefresh();  // 与脚注弹注同一套：只有策略"全局"才整屏，否则走正文页差分
+}
+static void rdSheetClose() {
+  if (!st.sheetOpen) return;
+  rdSheetLiveFlush();  // 还没落地的改动顺手落地，用户不会白拖
+  st.sheetOpen = false;
+  st.sheetDragRow = -1;
+  // 删除的挂起态跟着菜单一起收掉：不然下次开菜单再长按同一行下标＝一次长按就删了。
+  st.sheetDelArm = false;
+  st.sheetDelIdx = -1;
+  rdOverlayRefresh();
+}
+static void rdSheetToggle() {
+  if (st.sheetOpen) rdSheetClose();
+  else rdSheetOpen();
+}
+
+// ── 行动作（Enter / 点按）─────────────────────────────────────────────────
+static void rdSheetRowAct(int i) {
+  if (i < 0 || i >= static_cast<int>(st.sheetRows.size())) return;
+  const RdSheetRow &r = st.sheetRows[i];
+  if (r.disabled) {
+    rdShowFloat("随书", "样式解析=书籍内嵌时，这一项由书里的 CSS 决定", 2400);
+    st.dirty = 1;
+    return;
+  }
+  if (st.sheetTab == 0) {  // 目录 → 跳过去，收起菜单回正文
+    if (st.bookKind == 1) {
+      if (r.idx >= 0 && r.idx < static_cast<int>(st.txtChapterOffsets.size()))
+        st.txtPage = txtPageForOffset(st.txtChapterOffsets[r.idx]);
+    } else if (st.bookKind == 0 && st.epub) {
+      rdTocJump(r.idx);  // 带锚点解析（跨节/同节两种都处理），比 openSpine+page=0 准
+    }
+    st.sheetOpen = false;
+    st.fullRefresh = true;
+    st.dirty = 1;
+    return;
+  }
+  if (st.sheetTab == 2) {  // 笔记 → 跳到原文（书签走 gotoBookmark，标注走 rdGotoNote）
+    st.sheetOpen = false;
+    if (r.level == 0) gotoBookmark(r.idx);
+    else rdGotoNote(r.idx);
+    st.dirty = 1;
+    return;
+  }
+  // 字体 / 排版
+  if (r.nav) {
+    if (static_cast<MenuAct>(r.act) == MenuAct::LayoutMenu) {
+      // 「更多设置 ›」→ 老的全屏 12 项表（一个字节没改）。进去时记下"从浮动菜单来的"，
+      // Esc 才回得到"阅读页 + 菜单还开着"（见 handleLayoutMenu）。
+      st.sheetReturn = true;
+      st.mode = RdMode::LayoutMenu;
+      st.layoutSel = 0;
+      st.fullRefresh = true;
+      st.dirty = 1;
+      return;
+    }
+    openRdPick(r.act);  // 字体族：现扫 SD 建表
+    st.pickLive = false;  // 字体族不进实时预览，落定才生效
+    st.dirty = 1;
+    return;
+  }
+  openRdPick(r.act);
+  st.pickLive = true;  // 从浮动菜单开的档位弹层：↑↓ 挪档也挂"停手落地"
+  st.dirty = 1;
+}
+
+// ── 绘制 ──────────────────────────────────────────────────────────────────
+static void rdSheetDrawBody() {
+  const SheetBox b = sheetBodyBox();
+  const int n = static_cast<int>(st.sheetRows.size());
+  if (n == 0) {
+    const char *empty = st.sheetTab == 0 ? "本书无目录"
+                        : st.sheetTab == 2 ? "这本书还没有标记或笔记"
+                                           : "";
+    if (*empty) drawCenteredLine(b.y + b.h / 2 - sheetLh() / 2, empty);
+    return;
+  }
+  const ListView lv = sheetList();
+  const int lh = sheetLh();
+  for (int i = lv.first; i < lv.first + lv.rows && i < n; i++) {
+    const int y = sheetRowY(lv, i);
+    const RdSheetRow &r = st.sheetRows[i];
+    const bool sel = (i == st.sheetSel[st.sheetTab]);
+    if (st.sheetTab == 0) {  // 目录：按层级缩进（照 renderToc 那套）
+      const int x = b.x + 12 + r.level * tocIndentStep();
+      const std::string t =
+          g_rd.truncatedText(uiFontId(), r.label.c_str(), b.x + b.w - 12 - x);
+      if (sel) g_rd.fillRect(b.x + 2, y, b.w - 4, lv.itemH - 1, true);
+      drawLineText(x, y + 3, t.c_str(), !sel);
+    } else if (st.sheetTab == 2) {  // 笔记：原文一行 + 笔记正文一行
+      const std::string l1 = g_rd.truncatedText(uiFontId(), r.label.c_str(), b.w - 24);
+      const std::string l2 = g_rd.truncatedText(uiFontId(), r.value.c_str(), b.w - 24);
+      if (sel) g_rd.fillRect(b.x + 2, y, b.w - 4, lv.itemH - 1, true);
+      drawLineText(b.x + 12, y + 3, l1.c_str(), !sel);
+      drawLineText(b.x + 12, y + 3 + lh, l2.c_str(), !sel);
+    } else {  // 滑块行：[标签] [轨道 ●] [当前档名]
+      const SheetBox t = sheetTrackBox(lv, i);
+      const int ty = y + (lv.itemH - lh) / 2;
+      if (sel) g_rd.fillRect(b.x + 6, y + 2, t.x - b.x - 10, lv.itemH - 5, true);
+      drawLineText(b.x + 12, ty, r.label.c_str(), !sel);
+      if (r.count > 0) {
+        // 待落地的档位**当场画出来**（刀柄跟手走），书等 0.5s 才重排。
+        int cur = r.idx;
+        if (r.act == st.sheetLiveAct && st.sheetLiveIdx >= 0 && st.sheetLiveIdx < r.count)
+          cur = st.sheetLiveIdx;
+        const int cy = t.y + t.h / 2;
+        g_rd.drawLine(t.x, cy, t.x + t.w, cy, true);
+        const int knobW = std::max(1, lh / 2), knobH = lh * 2 / 3;
+        const int span = std::max(1, t.w - knobW);
+        const int kx = t.x + (r.count > 1 ? cur * span / (r.count - 1) : span / 2);
+        g_rd.fillRect(kx, cy - knobH / 2, knobW, knobH, true);  // 实心方柄（没画圆的原语）
+        drawLineText(t.x + t.w + 8, ty, r.names[cur].c_str(), true);
+      } else if (!r.value.empty()) {
+        drawLineText(t.x, ty, r.value.c_str(), true);
+      }
+    }
+  }
+}
+static void rdSheetDraw() {
+  if (!sheetVisible()) return;
+  // 顶栏三按钮卡
+  const SheetBox tc = sheetTopCardBox();
+  g_rd.fillRect(tc.x, tc.y, tc.w, tc.h, false);
+  g_rd.drawRect(tc.x, tc.y, tc.w, tc.h, true);
+  for (int i = 0; i < 3; i++) {
+    const SheetBox b = sheetTopBtnBox(i);
+    g_rd.drawRect(b.x, b.y, b.w, b.h, true);
+    const int tw = g_rd.getTextWidth(uiFontId(), kSheetTopLabels[i]);
+    drawLineText(b.x + (b.w - tw) / 2, b.y + (b.h - sheetLh()) / 2, kSheetTopLabels[i], true);
+  }
+  // 下半屏菜单卡
+  const SheetBox c = sheetCardBox();
+  g_rd.fillRect(c.x, c.y, c.w, c.h, false);
+  g_rd.drawRect(c.x, c.y, c.w, c.h, true);
+  const int tabTop = c.y + c.h - sheetTabH();
+  g_rd.drawLine(c.x, tabTop, c.x + c.w, tabTop, true);
+  for (int i = 0; i < kSheetTabCount; i++) {
+    const SheetBox b = sheetTabBox(i);
+    const bool on = (i == st.sheetTab);
+    if (on) g_rd.fillRect(b.x + 1, tabTop + 1, b.w - 2, b.h - 1, true);
+    if (i > 0) g_rd.drawLine(b.x, tabTop, b.x, tabTop + b.h, true);
+    const int tw = g_rd.getTextWidth(uiFontId(), kSheetTabNames[i]);
+    drawLineText(b.x + (b.w - tw) / 2, tabTop + (sheetTabH() - sheetLh()) / 2, kSheetTabNames[i], !on);
+  }
+  rdSheetDrawBody();
+}
+
+// ── 按键 / 触点：菜单开着时**所有**键都归它（模态）───────────────────────────
+// 模态还有第二个作用：点按那条命中链（rdTapOnAnnotation→rdTapOnLink→rdTapOnFootnote→
+// rdTapOnNoteBack）是**按整屏坐标**判的，会命中卡底下的链接/标注；长按在阅读页是原样
+// 放行的，不收进来会长按起选区。两者都靠"菜单开着就全吃掉"堵掉。
+static bool rdSheetHandle(int key) {
+  if (!sheetVisible()) return false;
+  // 长按删除的挂起态：除了"接着再长按一次"，任何别的按键都撤销它（同笔记列表那套）。
+  if (key != KEY_TOUCH_LONG) {
+    st.sheetDelArm = false;
+    st.sheetDelIdx = -1;
+  }
+  int x = 0, y = 0;
+  if (key == 0x1B) {
+    rdSheetClose();
+    return true;
+  }
+  if (key == KEY_TOUCH_LONG) {  // 长按 = 删除「笔记」tab 里的书签（二次确认，误触不至于直接丢）
+    const bool armed = st.sheetDelArm;
+    const int armedIdx = st.sheetDelIdx;
+    st.sheetDelArm = false;
+    st.sheetDelIdx = -1;
+    int px = 0, py = 0;
+    if (!input_tap_xy(&px, &py)) { st.dirty = 1; return true; }
+    const int r = listViewHitAt(sheetList(), py);
+    // 只有「笔记」tab 的书签行有删除：其余 tab 没有可删的东西（滑块/目录/更多设置）。
+    if (st.sheetTab != 2 || !sheetHit(sheetBodyBox(), px, py) || r < 0 ||
+        r >= static_cast<int>(st.sheetRows.size())) {
+      st.dirty = 1;
+      return true;
+    }
+    st.sheetSel[st.sheetTab] = r;
+    // 落点那一行必须**先拷一份**：rdDeleteBookmark 会让 st.sheetRows 重建（引用失效）。
+    const RdSheetRow row = st.sheetRows[r];
+    if (row.level != 0) {  // 标注行：这里不给删，指到全屏「笔记」页那本书的手势上
+      rdShowFloat("标注请到「笔记」页长按删除", "", 2400);
+      st.dirty = 1;
+      return true;
+    }
+    if (armed && armedIdx == r) {
+      rdDeleteBookmark(row.idx);
+      rdSheetBuildRows();  // 行表跟着 st.bookmarks 变（它自己夹了 sheetSel[2]）
+      rdShowFloat("已删除书签", "", 2000);
+    } else {
+      st.sheetDelArm = true;
+      st.sheetDelIdx = r;
+      rdShowFloat("再长按一次删除该书签", "", 3000);
+    }
+    st.dirty = 1;
+    return true;
+  }
+  if (key == KEY_LEFT || key == KEY_RIGHT) {  // ←→ 切 tab（与设置标签同规矩）
+    st.sheetTab = (st.sheetTab + (key == KEY_RIGHT ? 1 : kSheetTabCount - 1)) % kSheetTabCount;
+    rdSheetTabChanged();
+    return true;
+  }
+  if (key == KEY_TOUCH_DRAG) {  // 拖滑块刀柄
+    int px = 0, py = 0;
+    if (input_press_xy(&px, &py)) {
+      const ListView lv = sheetList();
+      const int r = listViewHitAt(lv, py);
+      if (r >= 0 && r < static_cast<int>(st.sheetRows.size()) && !st.sheetRows[r].nav &&
+          !st.sheetRows[r].disabled && st.sheetRows[r].count > 0) {
+        st.sheetSel[st.sheetTab] = r;
+        const int idx = sheetTrackIdx(r, px);
+        if (idx != st.sheetRows[r].idx) rdSheetLiveSchedule(st.sheetRows[r].act, idx);
+        st.dirty = 1;
+      }
+    }
+    return true;
+  }
+  if (key == '\n' && input_tap_xy(&x, &y)) {
+    for (int i = 0; i < 3; i++) {  // 顶栏三按钮
+      if (!sheetHit(sheetTopBtnBox(i), x, y)) continue;
+      if (i == 0) {  // 返回 → 书架
+        rdSheetClose();
+        gotoBookshelf();
+      } else if (i == 1) {  // 书签 → 全屏的书签/工具页（RdMode::Menu，见 menuItems）
+        openMenu();  // 它自己收掉浮动菜单并置 sheetReturn=false（Esc 回阅读页）
+      } else {  // 设置 → 阅读模式的系统设置
+        rdSheetClose();
+        st.tab = 3;               // 设置标签在 3 号位（见 tabMode）；直接进这一屏要照它设
+        st.mode = RdMode::Settings;
+        st.retMode = RdMode::Reading;
+        st.sheetReturn = true;    // 记下拉浮动菜单来的：Esc 回"阅读页 + 菜单还开着"
+        st.fullRefresh = true;
+        st.dirty = 1;
+      }
+      return true;
+    }
+    for (int i = 0; i < kSheetTabCount; i++) {  // 卡底 tab（整列都是命中区）
+      if (!sheetHit(sheetTabBox(i), x, y)) continue;
+      if (i != st.sheetTab) {
+        st.sheetTab = i;
+        rdSheetTabChanged();
+      }
+      return true;
+    }
+    const ListView lv = sheetList();
+    const int r = listViewHitAt(lv, y);
+    if (r >= 0 && r < static_cast<int>(st.sheetRows.size()) && sheetHit(sheetBodyBox(), x, y)) {
+      st.sheetSel[st.sheetTab] = r;
+      const RdSheetRow &row = st.sheetRows[r];
+      if (!row.nav && !row.disabled && row.count > 0 && sheetHit(sheetTrackBox(lv, r), x, y)) {
+        const int idx = sheetTrackIdx(r, x);  // 点在轨道上 = 直接设档
+        if (idx != row.idx) rdSheetLiveSchedule(row.act, idx);
+        st.dirty = 1;
+        return true;
+      }
+      rdSheetRowAct(r);
+      return true;
+    }
+    // 卡上的空白处点了不动；卡外（正文上）点一下 = 收起菜单（"再单击返回阅读"）。
+    if (sheetHit(sheetTopCardBox(), x, y) || sheetHit(sheetCardBox(), x, y)) return true;
+    rdSheetClose();
+    return true;
+  }
+  if (key == '\n') {  // 无坐标回车（BLE/KEY3）：等于 Enter 到当前行
+    rdSheetRowAct(st.sheetSel[st.sheetTab]);
+    return true;
+  }
+  {  // 上下 / 翻页 / 首尾：行光标
+    ListView lv = sheetList();
+    if (listViewKey(lv, key)) {
+      st.sheetSel[st.sheetTab] = lv.sel;
+      st.dirty = 1;
+      return true;
+    }
+  }
+  return true;  // 模态：其余键一律吃掉
+}
+
 static void openRdPick(int act) {
   st.pickAct = act;
+  // 默认**不进实时预览**：只有从浮动菜单的滑块行开出来的弹层才置 true（见 rdSheetRowAct）。
+  // 在这里清一次，免得"上一次从浮动菜单开的弹层"把标记留给设置标签/布局设定页开的弹层。
+  st.pickLive = false;
   rdPickFill(act);
   if (st.pickLabels.empty()) { st.pickOpen = false; return; }
   const std::string cur = rdPickCurValue(act);
@@ -9138,6 +9895,7 @@ static void openRdPick(int act) {
 static void closeRdPick() {
   st.pickOpen = false;
   st.pickAct = -1;
+  st.pickLive = false;   // 弹层关了就清掉"从浮动菜单开的"这个标记（下次从设置里开要没有它）
   st.pickTitle.clear();
   st.pickLabels.clear();
   st.pickValues.clear();
@@ -9423,7 +10181,9 @@ static void handleSettingPicker(int key) {
   } else if (key == '\n') {
     int tx, ty;
     if (input_tap_xy(&tx, &ty)) {
-      if (tx < bx || tx >= bx + bw || ty < by || ty >= by + bh) {   // 点浮层外 = 取消
+      if (tx < bx || tx >= bx + bw || ty < by || ty >= by + bh) {
+        // 点浮层外 = 取消。但待落地的（浮动菜单开出来的弹层）先落地 —— 见下面 Esc 那条。
+        if (st.pickLive) rdSheetLiveFlush();
         closeRdPick();
         return;
       }
@@ -9436,15 +10196,28 @@ static void handleSettingPicker(int key) {
     }
     const int act = st.pickAct;
     const std::string value = st.pickValues[st.pickSel];
+    // 落定的就是当前选中的这一档：先把挂着的那次"停手落地"撤掉，免得它到点又用**更早**
+    // 那一档把刚选定的值盖回去。
+    st.sheetLiveAct = -1;
+    st.sheetLiveIdx = -1;
+    st.sheetLiveDueUs = 0;
+    st.sheetLiveVal.clear();
     closeRdPick();
     applyRdPick(act, value);   // 应用后列表标签变了，closeRdPick 已标脏 → 底图重画
     return;
   } else if (key == 0x1B) {
+    // 从浮动菜单开的弹层（pickLive）Esc 也要把待落地的落地：用户已经看见正文/刀柄跟着
+    // 变了，Esc 只关弹层、不撤那一档（与"点浮层外"同一套）。
+    if (st.pickLive) rdSheetLiveFlush();
     closeRdPick();
     return;
   } else {
     return;   // 其余键一概吃掉（模态）
   }
+  // 走到这里的都是"挪了光标"的键：从浮动菜单开出来的弹层挂"停手 0.5s 落地"
+  // （键盘 ↑↓ 挪档 = 主力路径，见 plan 第四节）。设置标签里开的弹层 pickLive=false，
+  // 一个字节不变（那里改排版/方向立刻生效才是对的）。
+  if (st.pickLive) rdSheetLiveSchedule(st.pickAct, st.pickSel);
   st.dirty = 1;
 }
 
@@ -11040,6 +11813,15 @@ void screen_reader_exit() {
   st.pickAct = -1;
   st.pickLabels.clear();
   st.pickValues.clear();
+  st.pickLive = false;
+  // 浮动阅读菜单与它那个"待落地"也一样，都是静态 st 上的一层。
+  st.sheetOpen = false;
+  st.sheetReturn = false;
+  st.sheetLiveAct = -1;
+  st.sheetLiveIdx = -1;
+  st.sheetLiveDueUs = 0;
+  st.sheetLiveVal.clear();
+  st.sheetRows.clear();
   // 刷新侧的跨屏状态一并作废：下次进来重新建立基准、重新记章节。
   s_chapterKnown = false;
   s_prevSampleValid = false;
@@ -11156,6 +11938,10 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
       st.dirty = 1;
       renderCurrent();
     }
+    // 浮动菜单滑块的"停手落地"：到点把待落地那一档 applyRdPick 掉（重排 + 整屏 GC16，
+    // ≈0.4s 闪一下 —— 正是用户认可的实时预览代价）。挂空闲帧是因为它本来就是"读者没按键"
+    // 的唯一节拍源；连按十几下只落最后那一档（每次挪档只把期限往后推，不落地）。
+    rdSheetLiveTick();
     // 统计的会话心跳/检查点落盘全挂在这里（空闲帧是它唯一的节拍源）。
     rdStatsIdleTick();
     // 排版余量也挂这里：空闲帧是"读者在看书、没按任何键"的唯一节拍源，正好用来
@@ -11163,7 +11949,9 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     rdPrebuildAhead();
     // 再把"下一次翻页那一侧"的整帧像素先画出来（接着上面那趟：排版与字形都在留档里了，
     // 这一趟只剩下绘制）。放在留档之后是硬要求 —— 它自己会看留档备齐没有，没备齐就等下一拍。
-    rdPrerenderTurnPage();
+    // **菜单开着时跳掉**：菜单帧保持 RdMode::Reading，不挡的话它会按"正文页"去烤整帧预渲染
+    // 的 s_preFb —— 而那个失效键根本不知道卡在不在（与 renderCurrent 收尾那处同一理由）。
+    if (!sheetVisible()) rdPrerenderTurnPage();
     // 书架空闲预建（把冷开一本书的一次性产物提前做掉，见函数头）。放在排版余量后面：
     // 阅读页里 rdPrebuildAhead 才是主角，书架那一支它自己会早退。
     rdShelfIdlePrebuild();
@@ -11200,8 +11988,8 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 会误删（其余场合它已经被 main.cpp 拿去当"待机"了）。
   if (key == KEY_BACK) {
     // 脚注弹注开着时它也算"一层浮层"：划回来先收起弹注（转成 Esc，由弹注自己吃），
-    // 而不是一路滑回书架。
-    if (st.mode == RdMode::Reading && !st.selActive && st.fnPopNum.empty()) {
+    // 而不是一路滑回书架。浮动菜单同理：开着时划回来先收菜单、不是直接回书架。
+    if (st.mode == RdMode::Reading && !st.selActive && st.fnPopNum.empty() && !sheetVisible()) {
       gotoBookshelf();
       key = 0;      // 不再往下分发（下一次空转 tick 正常走书架的重绘）
     } else {
@@ -11226,18 +12014,21 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 那时也该是标准的 上/下，不翻。
   if (key == KEY_CAP_RIGHT || key == KEY_CAP_LEFT) {
     const bool right = (key == KEY_CAP_RIGHT);
-    const bool readingPage = (st.mode == RdMode::Reading && !st.selActive && st.fnPopNum.empty());
+    // 菜单开着时电容键归菜单（在卡里上/下移行光标），所以要一起排掉。
+    const bool readingPage =
+        (st.mode == RdMode::Reading && !st.selActive && st.fnPopNum.empty() && !sheetVisible());
     key = readingPage ? (right ? KEY_DOWN : KEY_UP)    // 右侧=下一页 / 左侧=上一页
                       : (right ? KEY_UP : KEY_DOWN);   // 其它界面照旧
   }
 
-  // 触摸长按：阅读页（选词/标注）、笔记列表（删除）、文件浏览器（弹上下文菜单）、
-  // 书架（弹出菜单并锁定长按的那一本）要拿到原始长按键——只有原始键才带落点
-  // （input_tap_xy），展平成 0x1B 就分不出"长按的是哪一本"了。其余界面保持
+  // 触摸长按：阅读页（选词/标注）、笔记列表（删除）、书签列表（删除）、文件浏览器
+  // （弹上下文菜单）、书架（弹出菜单并锁定长按的那一本）要拿到原始长按键——只有原始键才带
+  // 落点（input_tap_xy），展平成 0x1B 就分不出"长按的是哪一条"了。其余界面保持
   // "长按=返回"的老语义。文件菜单/重命名/详情这三个界面里的长按仍按 Esc 处理
   // （取消），所以只在 FileBrowser / Browser 这两处放行。
   if (key == KEY_TOUCH_LONG && st.mode != RdMode::Reading && st.mode != RdMode::Notes &&
-      st.mode != RdMode::FileBrowser && st.mode != RdMode::Browser && st.mode != RdMode::Stats)
+      st.mode != RdMode::Bookmarks && st.mode != RdMode::FileBrowser &&
+      st.mode != RdMode::Browser && st.mode != RdMode::Stats)
     key = 0x1B;
 
   // 虚拟键盘候选行左右划翻页。放在分发之前：起点落在候选行的横滑是"划候选"，
