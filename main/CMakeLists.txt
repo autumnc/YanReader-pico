@@ -152,7 +152,7 @@ idf_component_register(SRCS
 )
 
 # 本工程是独立项目，版本号不复用 pjournal 那条线：从 1.0.0 重新起算。
-target_compile_definitions(${COMPONENT_LIB} PRIVATE YAN_READER_VERSION="1.6.0")
+target_compile_definitions(${COMPONENT_LIB} PRIVATE YAN_READER_VERSION="1.6.1")
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PJOURNAL_IME_ENABLE_PINYIN=$<BOOL:${PJOURNAL_IME_ENABLE_PINYIN}>
     PJOURNAL_IME_ENABLE_LIANGFEN=$<BOOL:${PJOURNAL_IME_ENABLE_LIANGFEN}>
