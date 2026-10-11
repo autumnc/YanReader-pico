@@ -176,8 +176,10 @@ static void drawInstrDialog() {
 // Runs the blocking chain (WiFi + DeepSeek HTTP) in a task so the main loop
 // stays responsive and can honour Esc-cancel. Draws nothing; the handle loop
 // repaints the working frame each cycle.
-static void runPolishChainTask(void *arg) {
-    (void)arg;
+// 真活在这个 body 里：vTaskDelete **不回卷 C++ 栈**，留在任务函数里的 `DeepseekResult dr`
+// （含整篇润色结果）析构不会跑 —— 每润色一次漏一份。`g.result = dr.content` 是拷贝，
+// dr 本身在 body 返回时就该释放。
+static void runPolishChainBody() {
     bool wasConnected = g_wifi.isConnected();
     bool ok = false;
     bool wifiOk = ensure_wifi_connected();
@@ -199,6 +201,11 @@ static void runPolishChainTask(void *arg) {
     g.phase = ok ? P_RESULT : P_ERROR;
     if (ok) prepareResult();
     s_chainDone.store(true, std::memory_order_release);
+}
+
+static void runPolishChainTask(void *arg) {
+    (void)arg;
+    runPolishChainBody();
     vTaskDelete(nullptr);
 }
 

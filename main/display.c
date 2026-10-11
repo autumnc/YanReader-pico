@@ -12,6 +12,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>   // 跨核共享的几个裸标志（见 s_soft_refreshes / s_white_exit）
 
 #include "app_config.h"
 #include "e0470_epaper_waveform.h"
@@ -109,6 +110,32 @@ void display_bus_unpark(void) {
     if (!s_bus_parked) return;
     if (epd_lcd_bus_unpark) epd_lcd_bus_unpark();
     s_bus_parked = false;
+}
+
+// 浅睡关机前：下电 + 收线，全程持推屏锁。**必须走这里**（不能像 main.cpp 原来那样裸调
+// epd_poweroff()+display_bus_park()）：core1 的 rails_idle_check 与 core0 的 present_begin
+// 都在同一把锁下做同一批事，裸调会交错在 sy7636a 的 I2C（poweroff 内含 500ms hold 与多路
+// 寄存器写）和 16 根数据线的重接线上 —— 可能停在"一半接线、一半 hold 低"的混合态，而
+// present_begin 只在 s_bus_parked == true 时才重接，标志落在 false 就再也修不回来，只能等
+// 下一次空闲下电重新 park→unpark。顺手把空闲下电期限归零：睡下去之后 core1 不该再去下电。
+void display_rails_off(void) {
+    if (s_rail_mtx == NULL) { epd_poweroff(); display_bus_park(); rails_deadline_ms = 0; return; }
+    xSemaphoreTake(s_rail_mtx, portMAX_DELAY);
+    epd_poweroff();
+    display_bus_park();
+    rails_deadline_ms = 0;
+    xSemaphoreGive(s_rail_mtx);
+}
+
+// 唤醒尾巴：接线 + 上电，并**重新武装空闲下电的期限**再放锁。不武装的话，浅睡前排的
+// deadline 早已过期，core0 一放锁 core1 下一拍就下电收线，正好撞在紧接着的 epd_clear /
+// ui_restore_snapshot 上。rails_keepalive() 就是"武装 + 放锁"，直接复用它。
+void display_rails_on(void) {
+    if (s_rail_mtx == NULL) { display_bus_unpark(); epd_poweron(); return; }
+    xSemaphoreTake(s_rail_mtx, portMAX_DELAY);
+    display_bus_unpark();
+    epd_poweron();
+    rails_keepalive();
 }
 
 // 推屏开始：拿锁 + 接回总线 + 上电。与 rails_keepalive()（放锁）严格成对。
@@ -221,7 +248,13 @@ static void use_scan_for(const EpdWaveform* waveform, enum EpdDrawMode mode) {
 // Whole-page differentials since the last GC16. Area (partial) updates are excluded:
 // menu taps / key feedback are small-area differentials and counting them would trip a
 // full black-white flash after a few presses. Mirrors the reference firmware's policy.
-static int s_soft_refreshes;
+//
+// 跨核原子：自增只在 present_begin..rails_keepalive 之间（持锁），但**清零和读取全在锁外**
+// （do_full_refresh 的 display_soft_refresh_reset、guard_draw_result 的 s_soft_refreshes=0），
+// 而 core0（阅读器整页差分）与 core1（ui_render_task 的 do_full_refresh）都会做 load-add-store
+// 与 store-0。裸 int 上这两者交错会把一次自增吞掉（或反过来），攒够 APP_GC16_EVERY 的节拍
+// 整体错一拍：该来的黑白整刷晚一帧，或者刚清完又白闪一帧。原子化后 RMW 不丢。
+static _Atomic int s_soft_refreshes;
 
 // 所有按 fb 刷屏的出口都经这里。GL16 必须全像素（白底补 1 帧靠它打到）。
 // 差分刷攒够 APP_GC16_EVERY 次就把这一次升为全像素 GC16：区域、fb 都不变，只换模式，
@@ -331,16 +364,20 @@ enum EpdDrawError update_display_white(EpdiyHighlevelState* hl) {
     return update_display_full(hl);
 }
 
-static bool s_white_exit;
+// "白底参考帧还欠着一笔"的账单。消费点既有 core0（update_display_reader）也有 core1
+// （ui_render 的 render_present / from_white_now / invalidate_state），置位点是 core0 的
+// reader_set_gray_panel —— 两个核真的会同时取。原来的"读一次再写回 false"是裸的 RMW：
+// 两边同时读到 true 就同一笔账被消费两次（连着两记 from-white 整屏 GC16，多一次 ~400ms
+// 白闪）；反过来若一条路在另一条路置位前读完，账被丢，差分刷会拿着中灰参考帧出图（发脏）。
+// 取用 atomic_exchange 做成一次到位的"取走并清零"。
+static _Atomic bool s_white_exit;
 
 void display_hold_white_exit(bool hold) {
-    s_white_exit = hold;
+    atomic_store(&s_white_exit, hold);
 }
 
 bool display_take_white_exit(void) {
-    const bool hold = s_white_exit;
-    s_white_exit = false;
-    return hold;
+    return atomic_exchange(&s_white_exit, false);
 }
 
 // ── 白底参考帧纪律（阅读器侧的裸声明桥，见 reader_refresh_bridge.h）──────────
@@ -478,7 +515,10 @@ static int s_turn_dir = -1;  // -1 = 无；否则是 e0470_turn_dir_t
 
 // 揭页失败时要退回安全时钟，而它的定义在下面（跟 guard_draw_result 在一起）。
 // 这里先声明一次；C 的暂定定义 + 后面的带初值定义是合法的。
-static int s_pclk_mhz;
+// 跨核：写点有 core0（欠载恢复）与 guard_draw_result（两个核都会调），读点 display_pclk_mhz。
+// 原子化只为不出现"读到一半"的中间值 —— 最坏影响很小（同一次欠载里写两次同一个值），
+// 但和上面两个标志同一口径。
+static _Atomic int s_pclk_mhz;
 
 void reader_hint_page_turn(int dir) {
     s_turn_dir = dir;
@@ -823,7 +863,7 @@ enum EpdDrawError update_display_area_clean(EpdiyHighlevelState* hl, EpdRect are
 // hold, and highlevel only writes back on success), so one whole-screen full-pixel
 // GC16 from the frame we already hold repairs it: every GC16 cell is a complete
 // ladder, so the panel lands on the target gray whatever state it was left in.
-static int s_pclk_mhz = DISPLAY_PCLK_DEFAULT_MHZ;
+static _Atomic int s_pclk_mhz = DISPLAY_PCLK_DEFAULT_MHZ;
 
 int display_pclk_mhz(void) { return s_pclk_mhz; }
 

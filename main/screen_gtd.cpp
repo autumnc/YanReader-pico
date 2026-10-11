@@ -324,8 +324,14 @@ static const char *progressIconStr(int pct) {
                                     "\xEE\x80\x88", "\xEE\x80\x89", "\xEE\x80\x8A", "\xEE\x80\x8B",
                                     "\xEE\x80\x8C" };
     if (pct <= 0) return icons[0];
+    // 先夹**上界**再算。pct 直接来自 gtd.json 的数字字段（内置网页文件管理器能传任意值），
+    // pct*2 在 pct > 1073741823 时 int 溢出（UB，Xtensa 回绕成负）→ lvl 变负 →
+    // icons[负下标] 越界读到别的函数指针槽位，再交给 snprintf("%s")/std::string 解引用。
+    // 夹到 100 之后 (pct*2+24)/25 ≤ 8，与原来对正常输入的行为逐字一致。
+    if (pct > 100) pct = 100;
     int lvl = (pct * 2 + 24) / 25;
     if (lvl > 8) lvl = 8;
+    if (lvl < 0) lvl = 0;   // 形式上的下界：防以后有人把上面的夹取挪走
     return icons[lvl];
 }
 
@@ -648,7 +654,11 @@ static void rebuildFilter() {
 
         if (!taskMatchesView(t, g.view)) continue;
 
-        if (g.view == V_PROJECT && g.projectDrillIdx >= 0) {
+        // 下钻下标必须一并查上界：g.projectList 是从 tasks 里的 project 名推出来的，而
+        // projectDrillIdx 是上一拍留下的，任务引用的项目名被删/被改之后它就会越界。
+        // 同字段另两处（本文件 ~5974 / ~6069）都查了 size()，只有这里漏。
+        if (g.view == V_PROJECT && g.projectDrillIdx >= 0 &&
+            g.projectDrillIdx < (int)g.projectList.size()) {
 
             std::string proj = t["project"].asString();
 
@@ -1038,6 +1048,8 @@ static void autoArchive() {
     }
 
     bool anyArchived = false;
+    bool allArchived = true;
+    std::vector<std::string> archivedMonths;   // 只有**真写进了**归档文件的月份才能删源
     for (auto &kv : byMonth) {
         std::string month = kv.first;
         std::vector<int> &indices = kv.second;
@@ -1056,21 +1068,50 @@ static void autoArchive() {
         for (int idx : indices)
             arcTasks.pushBack(tasks[idx]);
 
-        JsonValue::saveToFile(arcPath, arcData);
-        anyArchived = true;
+        // 落盘**成功**才算归档完成。原来不看返回值、无条件 anyArchived = true：卡满 /
+        // 卡不可写时归档文件里什么都没有，下面照样把这些任务从 gtd.json 里删掉并
+        // saveData() 落盘，末尾还把 lastArchive 盖成当月 —— 而函数开头
+        // `if (lastArchive == curMonth) return;` 之后永不再试 → **那个月已完成的任务
+        // 两头都没有，彻底丢失**。写失败的那一份留在源数据里，下次归档再过一次。
+        if (JsonValue::saveToFile(arcPath, arcData)) {
+            anyArchived = true;
+            archivedMonths.push_back(month);
+        } else {
+            // 写失败：不记入 archivedMonths（下面的删除循环看不见它），也不盖当月章。
+            allArchived = false;
+        }
     }
 
     // Remove archived tasks from main data (erase from back to front)
+    // —— 只删归档成功那些月份的；失败的仍旧留在 gtd.json 里。
     std::vector<int> allToRemove;
-    for (auto &kv : byMonth)
+    for (auto &kv : byMonth) {
+        bool ok = false;
+        for (const auto &m : archivedMonths)
+            if (m == kv.first) { ok = true; break; }
+        if (!ok) continue;
         for (int idx : kv.second)
             allToRemove.push_back(idx);
+    }
     std::sort(allToRemove.rbegin(), allToRemove.rend());
     for (int idx : allToRemove)
         tasks.elements.erase(tasks.elements.begin() + idx);
 
-    g.data.set("lastArchive", curMonth);
+    // 有月份没写成功就不盖当月章：留着 lastArchive 旧值，下次启动/下次归档再补。
+    // （已归档成功的月份在源数据里已经删干净了，重跑时 byMonth 里自然没有它们。）
+    if (anyArchived && allArchived) g.data.set("lastArchive", curMonth);
     if (anyArchived) saveData();
+
+    // 删完必须重建视图索引。g.filtered / g.projectList 里存的是**删除前**的 tasks 下标，
+    // 上面 erase 之后那些下标就悬空了，而下游到处是 `g.sel < g.filtered.size()` 这种
+    // **只看 filtered 不查 tasks** 的判据 → 直接 `tasks[g.filtered[i]]` 越界读
+    // （std::vector 无边界检查，读到的是脏 JsonValue）。autoArchive 只在
+    // screen_gtd_init 里紧跟 loadData() 调一次，而 loadData 末尾已经建过一份 filtered ——
+    // 那份现在过期了。这条路径一个月才走一次（跨月后首次进计划模式），最容易漏。
+    if (anyArchived) {
+        rebuildFilter();
+        buildProjectList();
+    }
 }
 
 
@@ -2096,7 +2137,9 @@ static void drawList() {
     // Status bar: left=help hint | selected task info
     char statusLine[128];
     statusLine[0] = '\0';
-    if (g.sel >= 0 && g.sel < (int)g.filtered.size()) {
+    // 同上：项目列表视图里 g.sel 是项目下标，拿它索引进 g.filtered 只会显示成别的一条任务
+    // 的 @情境/#标签/截止。纯显示错，但也别让它出来。
+    if (!isInProjectList() && g.sel >= 0 && g.sel < (int)g.filtered.size()) {
         auto &st = tasks[g.filtered[g.sel]];
         std::string parts;
         std::string sCtx = st["context"].asString();
@@ -3987,7 +4030,12 @@ static int gtdKeyFromTap(int x, int y) {
     // 否则点空白会被当成 Enter 立刻把当前选中日期定死，很别扭。
     if (g.mode == M_CALENDAR) {
         CalBox cb = calBox();
-        if (x < cb.x || x >= cb.x + cb.w || y < cb.y || y >= cb.y + cb.h) return -1;
+        // 必须是 0（吃掉），不是 -1。本函数的 -1 是"这个点按我不认领"，而调用方
+        // （gtdHandleTouch 里 `if (k >= 0) key = k;`）对点按预设的 key **就是 Enter**
+        // —— 返回 -1 等于"点浮层外面 = 回车"，正好是上面这句注释说要避免的那件事：
+        // 任务没有截止日期时点一下空白，今天就被当成选中日期写进 due 并落盘。
+        // 浮层内的"吃掉"也是 0（见下面星期行/空日期格），口径一致。
+        if (x < cb.x || x >= cb.x + cb.w || y < cb.y || y >= cb.y + cb.h) return 0;
         if (y < cb.wdBase - g_font.ascent())            // 年月那一行：左半上月、右半下月
             return (x < cb.x + cb.w / 2) ? 'h' : 'l';
         int gridTop = cb.sepY + 4;
@@ -5941,7 +5989,11 @@ static AppState gtdHandleBrowse(int key, ScreenContext &ctx) {
 
 
 
-    if (key == 'a' || key == 'A') {
+    // 下面 space / a / i 三支都拿 g.sel 去索引 g.filtered，而**项目列表视图里这两者不是一套
+    // 东西**：g.sel 是项目下标，g.filtered 里装的是全部任务（rebuildFilter 对 V_PROJECT 只在
+    // 下钻时按项目过筛）。少了闸门就会拿项目序号去改某个不相干的任务 —— 静默改数据。
+    // 同款闸见下面 's' 那一支与 hjkl 搬序块上的 !isInProjectList()。
+    if ((key == 'a' || key == 'A') && !isInProjectList()) {
 
         g.mode = M_ADD;
 
@@ -5985,7 +6037,7 @@ static AppState gtdHandleBrowse(int key, ScreenContext &ctx) {
 
 
 
-    if (key == ' ' && g.sel < (int)g.filtered.size()) {
+    if (key == ' ' && !isInProjectList() && g.sel < (int)g.filtered.size()) {
 
         auto &task = tasks[g.filtered[g.sel]];
 
@@ -6054,7 +6106,7 @@ static AppState gtdHandleBrowse(int key, ScreenContext &ctx) {
 
 
 
-    if ((key == 'i' || key == 'I') && g.sel < (int)g.filtered.size()) {
+    if ((key == 'i' || key == 'I') && !isInProjectList() && g.sel < (int)g.filtered.size()) {
 
         // add subtask under selected, insert after parent
 
@@ -6280,7 +6332,11 @@ static AppState gtdHandleBrowse(int key, ScreenContext &ctx) {
 
 
 
-    if ((key == 'd' || key == 'D') && g.sel < (int)g.filtered.size()) {
+    // !isInProjectList() 不是形式主义：项目列表那一支（上面的 isInProjectList() 块）已经跑过
+    // gtdBeginDelete 把项目删了，而它**不 return**（"没有确认框要弹"直接回列表）——执行会一路
+    // 走到这里。此时 g.sel 是项目下标、g.filtered 是任务表，判据几乎必然成立，于是**一次按键
+    // 连删两个项目**（[A,B,C] 光标在 A 上按一下 d，A 和 B 一起没），而且删的第二个连提示都没有。
+    if ((key == 'd' || key == 'D') && !isInProjectList() && g.sel < (int)g.filtered.size()) {
 
         if (g.view != V_PROJECT && hasMultiSel()) {
 

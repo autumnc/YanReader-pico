@@ -2293,8 +2293,9 @@ static void drawPromptGenerating() {
     ui_commit();
 }
 
-static void runPromptTask(void *arg) {
-    (void)arg;
+// body 与任务分开：vTaskDelete **不回卷 C++ 栈**，留在任务函数里的 `DeepseekResult
+// result`（含 AI 生成的那段提示词正文）析构不会跑 —— 每生成一次漏一份。
+static void runPromptBody() {
     bool wifiWasConnected = g_wifi.isConnected();
     DeepseekResult result = {false, ""};
     if (ensure_wifi_connected()) {
@@ -2307,6 +2308,11 @@ static void runPromptTask(void *arg) {
     s_promptTaskResult = result;
     unlockPromptResult();
     s_promptTaskDone.store(true, std::memory_order_release);
+}
+
+static void runPromptTask(void *arg) {
+    (void)arg;
+    runPromptBody();
     vTaskDelete(nullptr);
 }
 
@@ -3851,7 +3857,12 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                                 prefix = lead + cur.substr(m.start, m.len);
                         } else {
                             int n = 0;
-                            for (int k = m.start; k < d; k++) n = n * 10 + (cur[k] - '0');
+                            // 序号位数不设限：正文里写 "9999999999. x" 时 n*10 会 int 溢出（UB）。
+                            // 夹到 1e8 之上就停 —— 再大的有序列表序号本来也没意义。
+                            for (int k = m.start; k < d; k++) {
+                                if (n >= 100000000) break;
+                                n = n * 10 + (cur[k] - '0');
+                            }
                             n++;
                             char num[16];
                             snprintf(num, sizeof(num), "%d", n);

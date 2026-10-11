@@ -86,13 +86,19 @@ void board_apply_orientation(const char *orientation) {
 
 // 阅读模式强制横屏：screen_reader.cpp 不能 include epdiy.h（EpdFont 符号与
 // crossmux 冲突），旋转切换集中在这里，原型在 hw/board.h（epdiy 无关那一半）。
+//
+// 与 board_apply_orientation / board_rotate_live 一样必须先 drain：core1 的推屏任务
+// 用「算差分矩形时的那个旋转值」去送驱动，旋转在中途换掉就是拿旧矩形按新方向刷。这两条
+// 是改 epd_set_rotation 的**第三条路**（写作模式方向 / 计划模式方向都走它），原来漏了这一步。
 void board_force_landscape() {
+    ui_render_drain();
     epd_set_rotation(EPD_ROT_LANDSCAPE);
     ESP_LOGI(TAG, "orientation=landscape (reader) → logical %d×%d",
              epd_rotated_display_width(), epd_rotated_display_height());
 }
 
 void board_force_portrait() {
+    ui_render_drain();
     epd_set_rotation(EPD_ROT_INVERTED_PORTRAIT);
     ESP_LOGI(TAG, "orientation=portrait (reader) → logical %d×%d",
              epd_rotated_display_width(), epd_rotated_display_height());

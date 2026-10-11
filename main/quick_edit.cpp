@@ -60,9 +60,10 @@ std::string quickEditLoad(int idx) {
     std::string result;
     char buf[256];
     int n;
-    while ((n = fread(buf, 1, sizeof(buf) - 1, f)) > 0) {
-        buf[n] = 0;
-        result += buf;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        // 按长度 append（同 journal_storage::readEntry 的说明）：`+= buf` 会
+        // 在正文里的 0x00 处截断。
+        result.append(buf, static_cast<size_t>(n));
     }
     fclose(f);
     return result;

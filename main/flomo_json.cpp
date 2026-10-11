@@ -164,10 +164,17 @@ std::string JsonValue::serialize(int indent) const {
 
 // ── Parser ───────────────────────────────────────────────────────────────────
 
+// 嵌套深度上限（与 json_parser.cpp 同款）：parseValue ⇄ parseArray/parseObject 互递归，
+// 原来没有上限，畸形 JSON 能把 4~8KB 的任务栈打穿 → panic 重启。
+// 笔记库的实际深度 ≤5（memos[].content / files[].xxx），16 留足余量。
+static const int kMaxJsonDepth = 16;
+
 struct ParseCtx {
     const char *p;
     size_t len;
     size_t pos;
+    int depth = 0;
+    bool failed = false;   // 畸形（嵌套超深 / 循环不前进）；parse() 见它即返回 null
 };
 
 static void skipWS(ParseCtx &c) {
@@ -256,7 +263,12 @@ static JsonValue parseArray(ParseCtx &c) {
     skipWS(c);
     if (c.pos < c.len && c.p[c.pos] == ']') { c.pos++; return arr; }
     while (c.pos < c.len) {
+        const size_t before = c.pos;
         arr.elements.push_back(parseValue(c));
+        // parseValue 遇到不认识的字符时不消费也不前进，本循环又只在 ',' / ']' 上推进
+        // —— 两个都不成立就原地打转，**死循环**（`[x]`、`[1,]` 都能触发）。卡住的任务
+        // 不 yield，主任务上就是整机假死。认"没前进"为畸形输入，整份放弃。
+        if (c.failed || c.pos == before) { c.failed = true; return arr; }
         skipWS(c);
         if (c.pos >= c.len) break;
         if (c.p[c.pos] == ']') { c.pos++; return arr; }
@@ -293,8 +305,13 @@ static JsonValue parseValue(ParseCtx &c) {
     if (c.pos >= c.len) return JsonValue(nullptr);
     char ch = c.p[c.pos];
     if (ch == '"') return JsonValue(parseString(c));
-    if (ch == '{') return parseObject(c);
-    if (ch == '[') return parseArray(c);
+    if (ch == '{' || ch == '[') {
+        if (c.depth >= kMaxJsonDepth) { c.failed = true; return JsonValue(nullptr); }
+        c.depth++;
+        JsonValue v = (ch == '{') ? parseObject(c) : parseArray(c);
+        c.depth--;
+        return v;
+    }
     if (ch == 't' && peek(c, "true"))  { c.pos += 4; return JsonValue(true); }
     if (ch == 'f' && peek(c, "false")) { c.pos += 5; return JsonValue(false); }
     if (ch == 'n' && peek(c, "null"))  { c.pos += 4; return JsonValue(nullptr); }
@@ -307,7 +324,9 @@ JsonValue JsonValue::parse(const std::string &json) {
     c.p = json.c_str();
     c.len = json.size();
     c.pos = 0;
-    return parseValue(c);
+    JsonValue v = parseValue(c);
+    if (c.failed) return JsonValue(nullptr);   // 畸形输入：宁可"解析失败"也别交半份数据
+    return v;
 }
 
 // ── File I/O ─────────────────────────────────────────────────────────────────

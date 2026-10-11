@@ -9,7 +9,12 @@
 
 static const char *TAG = "Clipboard";
 static const char *kPath = "/sdcard/settings/clipboard.txt";
-static constexpr size_t kClipboardFileMax = 64 * 1024;
+// 读上限。**必须大于本文件自己能写出的最坏情况**，否则满历史会被整份读不出来：
+// readWholeFile 超过上限时返回空串（不是截断），于是重启后历史全空，而用户下一次
+// 复制又会 safeWriteFile 把这文件覆盖成"只剩新那一条" —— 10 条历史永久消失。
+// 最坏字节数：kClipboardMax(10) × kClipboardItemMax(4096) × 转义最多 2 倍
+// （escapeItem 把 \n 与 \\ 各变 2 字节）+ 每条一个换行 ≈ 82KB。取 128KB 留余量。
+static constexpr size_t kClipboardFileMax = 128 * 1024;
 
 static std::vector<std::string> s_items;   // s_items[0] = 最新
 static bool s_loaded = false;

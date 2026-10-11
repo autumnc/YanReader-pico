@@ -43,8 +43,10 @@ static void fileMgrSetStatus(const std::string &s) {
     fileMgrUnlock();
 }
 
-static void fileMgrStartTask(void *arg) {
-    (void)arg;
+// 真活在这个 body 里：vTaskDelete **不回卷 C++ 栈**，留在任务函数里的 `std::string ip`
+// 与 `std::string result`（状态串，可能含服务端错误详情）析构不会跑 —— 每开一次文件
+// 服务器任务漏两条。body 里没有 lock_guard，只有手写的 fileMgrLock/Unlock，安全。
+static void fileMgrStartBody() {
     bool ok = false;
     bool wifiWasConnected = false;
     std::string ip;
@@ -93,6 +95,11 @@ done:
     std::string result = g_fileMgrState.status;
     fileMgrUnlock();
     s_fileMgrJob.finish(ok ? "服务已启动" : result);
+}
+
+static void fileMgrStartTask(void *arg) {
+    (void)arg;
+    fileMgrStartBody();
     vTaskDelete(nullptr);
 }
 

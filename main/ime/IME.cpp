@@ -1014,7 +1014,14 @@ static bool parseUserDictLine(const std::string &raw, std::string &code,
             if (cc < '0' || cc > '9') { validCount = false; break; }
         if (validCount) {
             count = 0;
-            for (char cc : cntStr) count = count * 10 + (cc - '0');
+            // 逐位累加要卡上限：用户词库是 SD 上的文本，一行 "wo 我们 99999999999" 就能让
+            // int 溢出（主机 UBSan 实测 "signed integer overflow: 1111111111 * 10" = UB）。
+            // 频率只用来排序（userCandidateScore 里还有 IME_SCORE_USER_COUNT_CAP 兜底），
+            // 封在 1e8 与封在 INT_MAX 完全等效。
+            for (char cc : cntStr) {
+                if (count >= 100000000) break;
+                count = count * 10 + (cc - '0');
+            }
         }
         if (count < 1) count = 1;
         if (sp3 != std::string::npos) {
@@ -1262,18 +1269,30 @@ static std::string imePunctForKey(int key) {
 // 词组是否含繁体字形(trad_table.h 位图, U+346E-U+9FD3)。
 static bool wordHasTrad(const std::string &w) {
     const char *p = w.c_str();
-    while (*p) {
+    // 用 size() 算出的 end 当护栏，不能靠结尾的 '\0'：**先在末尾放一个残缺的多字节字节
+    // （半个汉字、被 substr 按字节切开的词、SD 上损坏的条目）就会读穿 '\0'** —— 同
+    // tradConvert，ASan 实测 heap-buffer-overflow。所以次序必须是"先按首字节定长、再卡
+    // 剩余长度、最后才读 p[1..3]"。
+    const char *end = p + w.size();
+    while (p < end) {
         unsigned char c = (unsigned char)*p;
-        uint32_t cp;
-        if (c < 0x80) { cp = c; p += 1; }
-        else if ((c & 0xE0) == 0xC0) { cp = ((c & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F); p += 2; }
-        else if ((c & 0xF0) == 0xE0) { cp = ((c & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6) | ((unsigned char)p[2] & 0x3F); p += 3; }
-        else if ((c & 0xF8) == 0xF0) { cp = ((c & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12) | (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F); p += 4; }
+        int adv;
+        if (c < 0x80) adv = 1;
+        else if ((c & 0xE0) == 0xC0) adv = 2;
+        else if ((c & 0xF0) == 0xE0) adv = 3;
+        else if ((c & 0xF8) == 0xF0) adv = 4;
         else { p += 1; continue; }
+        if (p + adv > end) break;   // 尾部残缺：再往后没有完整码点可查了
+        uint32_t cp;
+        if (adv == 1) cp = c;
+        else if (adv == 2) cp = ((c & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F);
+        else if (adv == 3) cp = ((c & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6) | ((unsigned char)p[2] & 0x3F);
+        else cp = ((c & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12) | (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F);
         if (cp >= kTradLo && cp <= kTradHi) {
             uint32_t off = cp - kTradLo;
             if ((kTradBitmap[off / 8] >> (off % 8)) & 1) return true;
         }
+        p += adv;
     }
     return false;
 }
@@ -1293,15 +1312,26 @@ static std::string tradConvert(const std::string &s) {
     std::string out;
     out.reserve(s.size() + 8);
     const char *p = s.c_str();
-    while (*p) {
+    // 用 size() 算出的 end 当护栏，不能靠结尾的 '\0'：**先在末尾放一个残缺的多字节字节
+    // （半个汉字、被 substr 按字节切开的词、SD 上损坏的条目）就会读穿 '\0'** —— 主机
+    // ASan 实测 heap-buffer-overflow（1296/1302/1303 三行）。次序必须是"先按首字节定长、
+    // 再卡剩余长度、最后才读 p[1..3]"。
+    const char *end = p + s.size();
+    while (p < end) {
         unsigned char c = (unsigned char)*p;
-        uint32_t cp;
         int adv;
-        if (c < 0x80) { cp = c; adv = 1; }
-        else if ((c & 0xE0) == 0xC0) { cp = ((c & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F); adv = 2; }
-        else if ((c & 0xF0) == 0xE0) { cp = ((c & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6) | ((unsigned char)p[2] & 0x3F); adv = 3; }
-        else if ((c & 0xF8) == 0xF0) { cp = ((c & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12) | (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F); adv = 4; }
-        else { out.append(p, 1); p += 1; continue; }
+        if (c < 0x80) adv = 1;
+        else if ((c & 0xE0) == 0xC0) adv = 2;
+        else if ((c & 0xF0) == 0xE0) adv = 3;
+        else if ((c & 0xF8) == 0xF0) adv = 4;
+        else { out.append(p, 1); p += 1; continue; }          // 非法首字节（0x80..0xBF / 0xF8..0xFF）
+        if (p + adv > end) { out.append(p, 1); p += 1; continue; }   // 尾部残缺：原样吐出这一个字节
+
+        uint32_t cp;
+        if (adv == 1) cp = c;
+        else if (adv == 2) cp = ((c & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F);
+        else if (adv == 3) cp = ((c & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6) | ((unsigned char)p[2] & 0x3F);
+        else cp = ((c & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12) | (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F);
 
         const char *repl = nullptr;
         int lo = 0, hi = N - 1;
@@ -2261,7 +2291,11 @@ static std::vector<std::string> vTimeDateWeek(const std::string &body) {
     time_t now;
     time(&now);
     struct tm tmv;
-    localtime_r(&now, &tmv);
+    // 返回值必须判：失败时 tmv 根本没被写入，下面拿它索引 EN[tmv.tm_wday] / CN[...] /
+    // chineseDayMonth(tmv.tm_hour|mon|mday) / chineseYear(tmv.tm_year+1900) 全是野值下标。
+    // 触发点是系统时钟异常（PMU RTC 只判了下限，给回一个 localtime_r 处理不了的超大时间戳）。
+    // 同仓 reading_stats.cpp 的 localtime_r 就判了 —— 这里补上，失败就当没有候选。
+    if (localtime_r(&now, &tmv) == nullptr) return out;
     char buf[48];
     if (body == "/t") {
         snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
@@ -4006,7 +4040,9 @@ void IME::lookup() {
             if (p.code.find('\'') != std::string::npos) continue;  // 撇号码只在分词路径匹配
             const std::string &init = p.initial;
             if ((int)init.length() >= qlen && strncmp(init.c_str(), q, qlen) == 0) {
-                int score = p.count * 8 + (((int)init.length() == qlen) ? 100000 : std::max(0, 64 - ((int)init.length() - qlen)));
+                // 频次先夹再乘（同 userCandidateScore）。p.count 来自 SD 上的 userdict.txt，
+                // 解析端只封到 ~1e9，直接 *8 在 count ≥ 268435456 时 int 溢出（Xtensa 回绕成负）。
+                int score = std::min(p.count, IME_SCORE_USER_COUNT_CAP) * 8 + (((int)init.length() == qlen) ? 100000 : std::max(0, 64 - ((int)init.length() - qlen)));
                 score += recentCommitBoost(p.code, p.word);
                 int ctxBoost = contextCandidateBoost(p.word);
                 int stableBoost = stableCandidateBoost(p.word);
@@ -5411,7 +5447,8 @@ void IME::beginPredict(const std::string &text, bool afterSpaceCommit) {
                 if (p.trad != _trad) continue;
                 if (rejectedPredictWord(keyText, p.word)) continue;
                 int wordChars = utf8TextCharCount(p.word);
-                int score = p.count * 24 + keyChars * 1500 - std::max(0, wordChars - 2) * 40;
+                // 同上：*24 在 count ≥ 89478485 时就溢出，先夹再乘。
+                int score = std::min(p.count, IME_SCORE_USER_COUNT_CAP) * 24 + keyChars * 1500 - std::max(0, wordChars - 2) * 40;
                 addRankedPredictCandidate(ranked, keyText, p.word, score, 300, order++);
             }
         }
@@ -6198,7 +6235,10 @@ bool IME::handleKeyImpl(int key, std::string &out) {
     if (key == ' ') {
         if (_page.size() > 0) commit(_highlightSelectMode ? _sel : 0, out, true);
         else if (!_deleteMode && !_lfMode) {
-            out = _code + " ";
+            // 歧义布局（9/14/18 键）下"已挑好的字 + 余码"这种续接状态：余码没候选时
+            // 空格要把它接回来。`_ambigCommitted` 为空时与原式完全一致。
+            out = _ambigCommitted + _code + " ";
+            _ambigCommitted.clear();
             clearLearningContext();
             reset();
         } else {
@@ -6211,7 +6251,11 @@ bool IME::handleKeyImpl(int key, std::string &out) {
         if (_highlightSelectMode && _page.size() > 0) {
             commit(_sel, out);
         } else {
-            out = _code;
+            // 回车 = "把我敲的先原样送进去"（普通拼音上屏原始编码）。但歧义布局续接之后
+            // 敲的只是**余码**，已经上屏的那截还在 _ambigCommitted 里 —— 只吐 _code 就等于
+            // 把用户挑好的字扔掉、换成一串拉丁字母。接回来，与 commit() 的收尾同一口径。
+            out = _ambigCommitted + _code;
+            _ambigCommitted.clear();
             clearLearningContext();
             reset();
         }

@@ -190,6 +190,14 @@ bool WifiManager::connect(const char *ssid, const char *password, ConnectProgres
     // 新配置已生效，之后掉线才允许自动重连
     s_auto_reconnect = true;
     s_last_reason = 0;
+    // WIFI_CONNECTED_BIT 全仓只有两个清点：下面等待循环的 xEventGroupWaitBits
+    // （xClearOnExit=pdTRUE，命中即清）和这里。驱动**自己**重连时（掉线 → 回调里
+    // esp_wifi_connect() → GOT_IP）也会置位，而那一刻没人在等，位就留在事件组里；
+    // disconnect() 也不清。于是下一次 connect() 一进等待循环就立刻读到这个**陈旧**的
+    // 位 → 直接 return true，可新 AP 其实还没连上（甚至正连向另一个 SSID），调用方
+    // （NTP / WebDAV / 文件服务器 / 设置页）拿着"已连接"去发请求，失败得莫名其妙。
+    // 发起连接前清干净：只认这次 esp_wifi_connect 之后置起来的那一位。
+    if (s_wifi_event) xEventGroupClearBits(s_wifi_event, WIFI_CONNECTED_BIT);
     err = esp_wifi_connect();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_connect 失败: 0x%x (%s)", err, esp_err_to_name(err));
@@ -230,6 +238,9 @@ void WifiManager::disconnect() {
     s_auto_reconnect = false;
     esp_wifi_disconnect();
     s_connected = false;
+    // 连接位也必须清：它记的是"某次连接成功过"，不是"现在连着"。留着会骗过下一次
+    // connect() 的等待循环（见 connect 里清位处那段说明）。
+    if (s_wifi_event) xEventGroupClearBits(s_wifi_event, WIFI_CONNECTED_BIT);
     // Fully power down the radio; WiFi is only needed on demand
     if (esp_wifi_stop() == ESP_OK) _started = false;
 }

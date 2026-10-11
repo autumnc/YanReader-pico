@@ -60,6 +60,16 @@ bool display_scan_busy(void);
 void display_bus_park(void);
 void display_bus_unpark(void);
 
+/// 浅睡/唤醒尾巴专用的**加锁版**下电+收线 / 接线+上电。main.cpp 的 enterLightSleep
+/// 原来自己裸调 epd_poweroff()+display_bus_park()（唤醒尾巴同理），而 core1 的
+/// rails_idle_check 与 core0 的一次推屏（present_begin）都在同一把推屏互斥锁下做同一批
+/// 事 —— 裸调会与它们交错在 sy7636a 的 I2C 和 16 根数据线的重接线上，可能停在"一半接线、
+/// 一半 hold 低"的混合态（s_bus_parked 标志一旦错，下一次 present_begin 也不会重接），
+/// 或对着正在掉电的轨刷屏。这两支就是把那批事包进锁里；off 还顺手把空闲下电的期限归零
+/// （入睡期间不该再有人去下电），on 重新武装期限再放锁，免得一放锁 core1 立刻又下电。
+void display_rails_off(void);
+void display_rails_on(void);
+
 /// 全设备夜间反色开关。反色的实施点在 display.c 的推屏处（front/back 成对取反），
 /// **不在** HalDisplay —— 后者只覆盖阅读器一族，其余界面由渲染任务直呼本文件，
 /// 从那里走（见 display.c 顶部说明）。由 board_set_night() 统一转发。

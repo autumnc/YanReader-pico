@@ -125,8 +125,16 @@ static void drawCenteredBusy(const char *title, const char *line) {
     ui_commit();
 }
 
-static void webdavSyncTask(void *arg) {
-    (void)arg;
+// ── 下面这三个 worker 都写成"body + 一行自杀"的形状，不是风格问题 ──────────
+// 任务以 vTaskDelete 收尾，而 FreeRTOS 删任务**不做 C++ 栈回卷**：函数体里那些
+// std::string / 带 std::string 成员的结构体的析构**不会执行**（json_parser 那套
+// std::string 也一样）。原来每同步一次就漏一份 url+user+pass+响应正文（WebDAV 备份
+// 那份响应可达几十 KB，拉一整个 books 目录时更大）。把活干在独立函数里，局部对象
+// 在它返回时就正常析构，任务函数只剩一个指针参数。（btInitTask / editorAsyncSaveTask
+// 是同一个坑的另外两种形状。）注意：body 里**不能**出现 std::lock_guard —— 那会在
+// 自杀前把互斥量永久锁死，这里沿用手写的 lock/unlock。
+
+static void webdavSyncBody() {
     bool wifiWasConnected = g_wifi.isConnected();
     SyncResult result = {false, ""};
 
@@ -147,11 +155,15 @@ static void webdavSyncTask(void *arg) {
     s_webdavResult = result;
     unlockAsyncResult();
     s_webdavState.store(AsyncUiState::Done, std::memory_order_release);
+}
+
+static void webdavSyncTask(void *arg) {
+    (void)arg;
+    webdavSyncBody();
     vTaskDelete(nullptr);
 }
 
-static void flomoSendTask(void *arg) {
-    (void)arg;
+static void flomoSendBody() {
     bool wifiWasConnected = g_wifi.isConnected();
     FlomoResult result = {false, ""};
 
@@ -168,15 +180,18 @@ static void flomoSendTask(void *arg) {
     s_flomoResult = result;
     unlockAsyncResult();
     s_flomoState.store(AsyncUiState::Done, std::memory_order_release);
+}
+
+static void flomoSendTask(void *arg) {
+    (void)arg;
+    flomoSendBody();
     vTaskDelete(nullptr);
 }
 
-static void ntpSyncTask(void *arg) {
-    (void)arg;
+static void ntpSyncBody() {
     std::string ssid = g_settings.wifiSsid();
     if (ssid.empty()) {
         ESP_LOGW(TAG, "WiFi not configured, cannot NTP sync");
-        vTaskDelete(nullptr);
         return;
     }
     std::string pass = g_settings.wifiPassword();
@@ -216,13 +231,22 @@ static void ntpSyncTask(void *arg) {
         ESP_LOGW(TAG, "WiFi connection failed for NTP sync");
     }
     restore_wifi_state(wifiWasConnected);
+}
+
+static void ntpSyncTask(void *arg) {
+    (void)arg;
+    ntpSyncBody();
     vTaskDelete(nullptr);
 }
 
 // 最近一次用户输入(BLE 键或按键)的时间,0 表示启动后尚未记录。
 // 放在这一段上面（而不是下面待机那一段）是因为 btInitBody 的重连循环也要看它：
 // "用户刚回来动过机器"是重连退避退回快节奏的唯一信号，见下面的 btInitBody。
-static int64_t s_last_activity_us = 0;
+// 必须是 atomic：写的人在主任务（按键那一段），读的人在 btInitBody 那条任务上，
+// 而 32 位 Xtensa 上一次 64 位存取分两条指令 —— 读到的可能是"新低半 + 旧高半"的
+// 缝合值，进而算出一个假的静默时长（数值巨大/为负）。后果不重（退避退回的判断错一拍），
+// 但没有理由留一个随手能免掉的数据竞争。
+static std::atomic<int64_t> s_last_activity_us{0};
 
 // BLE stack init + auto-connect in a background task so the main UI
 // renders immediately instead of waiting ~1s for the BT controller.
@@ -511,19 +535,18 @@ static void enterLightSleep(void) {
     // 1.2 秒还打一条"清理不干净"的假错误日志。
     if (g_settings.btEnabled()) btTearDown();
 
-    // 墨水屏断电(双稳态保留画面)
-    epd_poweroff();
-
-    // 面板下电之后，把总线引脚（D0~D15 / XCL / XLE / XSTL / SPV / CKV）显式拉到低电平并
-    // hold 住，整个浅睡期间都保持这个电平。理由见 epd_lcd_bus_park 的注释：面板断了电，
-    // 而总线上还挂着最后一帧的残余电平，睡一晚就是给源极线一个漂移的偏置，底色的不均匀
-    // 的灰多半有这个成分。唤醒时 display_bus_unpark() 把接线接回去（在下面 epd_poweron
-    // 之前，第一次刷新要用总线）。
+    // 墨水屏断电(双稳态保留画面) + 面板下电之后把总线引脚（D0~D15 / XCL / XLE / XSTL /
+    // SPV / CKV）显式拉到低电平并 hold 住，整个浅睡期间都保持这个电平。理由见
+    // epd_lcd_bus_park 的注释：面板断了电，而总线上还挂着最后一帧的残余电平，睡一晚就是
+    // 给源极线一个漂移的偏置，底色的不均匀的灰多半有这个成分。
     //
-    // 走 display_bus_park 而不是直接 epd_lcd_bus_park：同一件事 display.c 的空闲下电
-    // 那一拍也要做（放下机器 8 秒后 HV 轨下电，画面在屏上挂很久的那种空闲），两边共用
-    // 一份"收过线没有"的状态 —— 混着直接调 epd_* 会让下一次推屏漏掉接回来那一步。
-    display_bus_park();
+    // 这两件事一起走 display_rails_off()，而不是像原来那样在这儿裸调 epd_poweroff() +
+    // display_bus_park()：它们和 core1 的 rails_idle_check、core0 的一次推屏（present_begin）
+    // 是同一批操作，共用 display.c 那把推屏互斥锁（sy7636a 的 poweroff 内含 500ms hold 与
+    // 多路 I2C 写，park 要重接 16 根数据线），裸调会与它们交错并可能停在"一半接线、一半
+    // hold 低"的混合态（s_bus_parked 标志一旦错，下一次 present_begin 就不再重接）。
+    // 唤醒侧对称地用 display_rails_on()。
+    display_rails_off();
 
     // 电源键唤醒：PMU 事件拉低 FCA9555 INT#(GPIO41)，浅睡唤醒。
     gpio_config_t wcfg = {
@@ -589,12 +612,11 @@ static void enterLightSleep(void) {
         esp_sleep_enable_gpio_wakeup();
     }
 
-    // 先把 sleeping 期间锁住的那些总线脚解回来、接线重建（display_bus_park 的逆操作），
-    // 再上电清屏 —— epd_clear 就要用总线了。
-    display_bus_unpark();
+    // 面板重新上电（display_rails_off 的逆操作：接线重建 + 上电，并在锁内重新武装空闲
+    // 下电的期限），再清屏 —— epd_clear 就要用总线了。
+    display_rails_on();
 
-    // 面板重新上电 + 清屏；ui_restore_snapshot 用 from-white 重绘恢复原画面。
-    epd_poweron();
+    // 清屏；ui_restore_snapshot 用 from-white 重绘恢复原画面。
     epd_clear();
     ui_restore_snapshot();
 
@@ -1997,7 +2019,15 @@ extern "C" void app_main() {
             ui_clear();
             ui_show_message_centered(ctx.statusMessage.c_str());
             ctx.statusMessage.clear();
-            vTaskDelay(pdMS_TO_TICKS(1500));
+            // 1.5s 让用户看清提示，但**不能整段死等**：这期间主循环不采一次触摸，而
+            // cst836u 没有锁存寄存器，一次点按要成立就得有一拍采样落在手指按住的那段里
+            // —— 用户恰在这 1.5s 内点一下会整个消失（PMU 按键走 FIFO 不丢，触摸会丢）。
+            // 切成 12ms 一拍的碎片补采样（同 ui_render 的 acquire_buffer / drain），
+            // 只采样不投递，键仍由主循环 input_poll 取走。
+            for (int i = 0; i < 125; i++) {
+                input_tick_throttled();
+                vTaskDelay(pdMS_TO_TICKS(12));
+            }
             // 编辑器空闲 tick 会跳过重绘,消息遮罩需在此手动刷掉
             if (currentState == APP_EDITOR) screen_editor_idle(ctx, true);
         }

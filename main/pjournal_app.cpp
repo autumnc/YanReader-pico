@@ -80,8 +80,10 @@ static void historyPreviewUnlock() {
     if (s_historyPreviewMutex) xSemaphoreGive(s_historyPreviewMutex);
 }
 
-static void historyPreviewLoadTask(void *arg) {
-    HistoryPreviewLoadArg *job = static_cast<HistoryPreviewLoadArg *>(arg);
+// body 与任务分开：本任务以 vTaskDelete 收尾，而 FreeRTOS 删任务**不做 C++ 栈回卷**，
+// 留在任务函数里的 `std::string content`（一整份历史版本正文）析构不会跑 —— 每看一次
+// 历史版本漏一份。搬进单独函数后它在返回时正常析构。
+static void historyPreviewLoadBody(HistoryPreviewLoadArg *job) {
     std::string content;
     if (job && !s_historyPreviewJob.cancelled()) {
         content = g_journal.readHistoryVersion(job->entry, job->version);
@@ -91,6 +93,10 @@ static void historyPreviewLoadTask(void *arg) {
     historyPreviewUnlock();
     delete job;
     s_historyPreviewJob.finish(s_historyPreviewJob.cancelled() ? "已取消" : "");
+}
+
+static void historyPreviewLoadTask(void *arg) {
+    historyPreviewLoadBody(static_cast<HistoryPreviewLoadArg *>(arg));
     vTaskDelete(nullptr);
 }
 
@@ -100,7 +106,14 @@ static void startHistoryPreviewLoad() {
     s_historyPreviewContent.clear();
     historyPreviewUnlock();
     s_historyPreviewJob.begin("历史版本", "正在读取...");
-    auto *arg = new HistoryPreviewLoadArg{g_history.filename, g_history.versions[g_history.selection].filename};
+    // new (std::nothrow)：本仓不开 C++ 异常（CONFIG_COMPILER_CXX_EXCEPTIONS 未设），
+    // 裸 new 失败会直接 std::terminate → abort → 重启，而不是返回空指针。
+    auto *arg = new (std::nothrow)
+        HistoryPreviewLoadArg{g_history.filename, g_history.versions[g_history.selection].filename};
+    if (!arg) {
+        s_historyPreviewJob.failToStart("内存不足");
+        return;
+    }
     if (!s_historyPreviewJob.start(historyPreviewLoadTask, "hist_preview", 6144, arg)) {
         delete arg;
         s_historyPreviewJob.failToStart("任务启动失败");
@@ -214,8 +227,9 @@ static void loadViewerText(const std::string &content) {
     g_viewer.mdInfoDirty = true;
 }
 
-static void viewerLoadTask(void *arg) {
-    ViewerLoadArg *job = static_cast<ViewerLoadArg *>(arg);
+// 同 historyPreviewLoadTask：vTaskDelete 不回卷 C++ 栈，`std::string content`
+// （一整篇日记）留在任务函数里就是每看一次漏一篇，所以搬进 body。
+static void viewerLoadBody(ViewerLoadArg *job) {
     std::string content;
     if (job && !s_viewerLoadJob.cancelled()) {
         content = g_journal.readEntry(job->filename);
@@ -225,6 +239,10 @@ static void viewerLoadTask(void *arg) {
     viewerLoadUnlock();
     delete job;
     s_viewerLoadJob.finish(s_viewerLoadJob.cancelled() ? "已取消" : "");
+}
+
+static void viewerLoadTask(void *arg) {
+    viewerLoadBody(static_cast<ViewerLoadArg *>(arg));
     vTaskDelete(nullptr);
 }
 
@@ -233,7 +251,11 @@ static void startViewerLoad(const std::string &filename) {
     s_viewerLoadContent.clear();
     viewerLoadUnlock();
     s_viewerLoadJob.begin("日记详情", "正在读取...");
-    auto *arg = new ViewerLoadArg{filename};
+    auto *arg = new (std::nothrow) ViewerLoadArg{filename};   // 不开异常：裸 new 失败 = abort
+    if (!arg) {
+        s_viewerLoadJob.failToStart("内存不足");
+        return;
+    }
     if (!s_viewerLoadJob.start(viewerLoadTask, "viewer_load", 6144, arg)) {
         delete arg;
         s_viewerLoadJob.failToStart("任务启动失败");

@@ -272,6 +272,7 @@ Response request(const Request &req) {
         r.error = "内存不足";
         return r;
     }
+    esp_err_t read_err = ESP_OK;   // 传输层错误（见下面 n<0 那一支）
     while (true) {
         if (req.cancel && req.cancel->load(std::memory_order_acquire)) {
             r.cancelled = true;
@@ -301,14 +302,21 @@ Response request(const Request &req) {
             }
         } else if (n == -ESP_ERR_HTTP_EAGAIN) {
             continue;  // 单次读超时，回头再看标志
+        } else if (n == 0) {
+            break;  // 读完
         } else {
-            break;  // 0 = 读完；<0 = 传输错误
+            // n < 0：传输层错误（半路断链 / 读超时 / 半截）。原来这一支和 n==0 合并成
+            // 一条 break，紧接着的 `r.err = ESP_OK` 把错误抹平 —— 于是"HTTP 2xx + 只收到
+            // 一半 body"会被当成完整响应交给调用方：WebDAV 同步拿它当"远端文件全集"
+            // （尾部文件被判成已删 → 删本地日记），下载拿它当正文写进日记。
+            read_err = static_cast<esp_err_t>(n);
+            break;
         }
     }
     free(buf);   // heap_caps_malloc 的内存也用 free 释放（同一个分配器）
     esp_http_client_cleanup(client);
 
-    r.err = ESP_OK;
+    r.err = read_err;
     if (r.cancelled) {
         r.error = "已取消";
         return r;
@@ -316,6 +324,10 @@ Response request(const Request &req) {
     if (r.timed_out) {
         r.error = "请求超时";
         return r;
+    }
+    if (read_err != ESP_OK) {
+        r.error = "连接中断，响应不完整";
+        return r;   // ok 保持 false：半截响应绝不能当成功
     }
     r.ok = r.status >= 200 && r.status < 300 && !r.overflow;
     if (!r.ok) {

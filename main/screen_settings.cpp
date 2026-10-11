@@ -1121,12 +1121,14 @@ static SettingsAsyncOp s_settingsAsyncOp = SettingsAsyncOp::None;
 static AppAsyncJob s_settingsAsync;
 static bool s_settingsAsyncRestart = false;
 
-static void settingsFlomoTokenTask(void *) {
+// 下面两个 worker 的活干在各自的 *Body 里：vTaskDelete **不回卷 C++ 栈**，留在任务
+// 函数里的 email/pass（Flomo 凭据）、token、ntp/tz 这些 std::string 析构不会跑，
+// 每用一次设置页的这两项就漏一批。body 返回时它们才正常释放。
+static void settingsFlomoTokenBody() {
     std::string email = g_settings.flomoEmail();
     std::string pass = g_settings.flomoPassword();
     if (email.empty() || pass.empty()) {
         s_settingsAsync.finish("请先设置Flomo邮箱和密码");
-        vTaskDelete(nullptr);
         return;
     }
     bool wifiWas = false;
@@ -1147,22 +1149,24 @@ static void settingsFlomoTokenTask(void *) {
         }
     }
     app_disconnect_wifi_if_needed(wifiWas);
+}
+
+static void settingsFlomoTokenTask(void *) {
+    settingsFlomoTokenBody();
     vTaskDelete(nullptr);
 }
 
-static void settingsSyncTimeTask(void *) {
+static void settingsSyncTimeBody() {
     bool wifiWas = false;
     bool ok = app_connect_wifi_from_settings(&wifiWas);
     if (!ok) {
         s_settingsAsync.finish("WiFi连接失败");
-        vTaskDelete(nullptr);
         return;
     }
     if (!wifiWas) vTaskDelay(pdMS_TO_TICKS(500));
     if (s_settingsAsync.cancelled()) {
         s_settingsAsync.finish("已取消");
         app_disconnect_wifi_if_needed(wifiWas);
-        vTaskDelete(nullptr);
         return;
     }
     std::string ntp = g_settings.ntpServer();
@@ -1202,6 +1206,10 @@ static void settingsSyncTimeTask(void *) {
         }
     }
     app_disconnect_wifi_if_needed(wifiWas);
+}
+
+static void settingsSyncTimeTask(void *) {
+    settingsSyncTimeBody();
     vTaskDelete(nullptr);
 }
 

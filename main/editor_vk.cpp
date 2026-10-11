@@ -1227,7 +1227,12 @@ static int evkNineGridHit(int x, int y, int w, int hLet, EditorVkHit *hit) {
                 char lb[12];
                 evkSetHit(hit, kx, ky, cw, hLet, 0, 0, false,
                           evkNineKeyLabel(-1, cw, lb, sizeof(lb)));
-                IME::getInstance().ambigCommitSyllable();
+                // **和上面那两处副作用一样必须问 s_hitProbeOnly**（漏了这一句）。
+                // 探针版（editorVkProbeKey，见 editor_vk.h）存在的意义就是"只回答画哪个
+                // 键的反白，绝不下命令"：按下沿的按下即反馈帧会跑一遍探针，抬手那次真
+                // 命中再跑一遍 —— 少了这道门，**一次点按会把两个音节都钉死**（候选按多
+                // 断一段的读音取），手指只是按住又划走也会白钉一个音节。
+                if (!s_hitProbeOnly) IME::getInstance().ambigCommitSyllable();
                 return EVK_SEP;
             }
             const int g = idx - 1;

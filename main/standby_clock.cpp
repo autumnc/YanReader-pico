@@ -594,7 +594,13 @@ static void drawCenteredPx(int baseline, int px, const char *s, uint8_t fg, uint
     int total = 0;
     for (const char *p = s; *p != '\0';) {
         const unsigned char c = (unsigned char)*p;
-        const int m = (c < 0x80) ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        int m = (c < 0x80) ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        // 尾部截断的多字节字要缩到 NUL 前（同 ui_helpers 的两个候选绘制函数）：p[1] 一定
+        // 落在分配内（就是那个 NUL），短路保证不会再往后读。**两个循环必须用同一套 m**，
+        // 否则量宽度和落笔的步长不一致，整行会漂。
+        if (m > 1 && p[1] == '\0') m = 1;
+        else if (m > 2 && p[2] == '\0') m = 2;
+        else if (m > 3 && p[3] == '\0') m = 3;
         if (m == 1) {
             char ch[2] = {(char)c, '\0'};
             total += ttf_text_width_px(px, ch);
@@ -607,7 +613,11 @@ static void drawCenteredPx(int baseline, int px, const char *s, uint8_t fg, uint
     if (x < 0) x = 0;
     for (const char *p = s; *p != '\0';) {
         const unsigned char c = (unsigned char)*p;
-        const int m = (c < 0x80) ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        int m = (c < 0x80) ? 1 : (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        // 与上面量宽度那一趟逐字一致（见那处的说明）：不缩 m 的话 memcpy 会读过量。
+        if (m > 1 && p[1] == '\0') m = 1;
+        else if (m > 2 && p[2] == '\0') m = 2;
+        else if (m > 3 && p[3] == '\0') m = 3;
         char ch[5];
         memcpy(ch, p, (size_t)m);
         ch[m] = '\0';

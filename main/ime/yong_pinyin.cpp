@@ -71,40 +71,66 @@ static bool splitExplicit(const std::string &code, bool allowPartial, PinyinSpli
     return !out.tokens.empty();
 }
 
-static void enumerateSplits(const std::string &code, size_t pos, bool allowPartial,
-                            PinyinSplit &cur, std::vector<PinyinSplit> &out,
-                            int maxVariants) {
-    if ((int)out.size() >= maxVariants) return;
-    if (pos >= code.size()) {
-        out.push_back(cur);
-        return;
+// 切分 DFS 的上下文。`dead` 是"从 pos 往下切不出任何完整切法"的记忆表 —— 没有它这段
+// 是**指数级**的：原来唯一的剪枝是"已经凑够 maxVariants 条完整切法就收手"，而
+// **一条完整切法都不存在**时这个条件永远不成立，整棵树被穷举（分支因子由"这个位置上
+// 哪些长度是合法音节"决定，与 maxVariants 无关）。实测 62 个字母的
+// "angaanga…angau" 要走 196604 个节点、31ms（主机 -O2；240MHz 的 S3 上是数百毫秒），
+// 而它在按键热路径上**每敲一个字母重跑一遍**：
+// 根无解 ⇒ 从根可达的每个 pos 都无解 ⇒ 每个 pos 展开一次就被记死，之后 O(1) 返回，
+// 整趟退化成 O(长度 × 每层 6 个分支)。有解的那一支本来就被 maxVariants 截住。
+struct SplitCtx {
+    const std::string *code;
+    bool allowPartial;
+    int maxVariants;
+    std::vector<PinyinSplit> *out;
+    std::vector<char> dead;
+
+    SplitCtx(const std::string &c, bool ap, int mv, std::vector<PinyinSplit> &o)
+        : code(&c), allowPartial(ap), maxVariants(mv), out(&o), dead(c.size() + 1, 0) {}
+};
+
+// 返回 true = 这棵子树被**穷尽**了（不是因为撞上 maxVariants 提前收手）。
+static bool enumerateSplits(SplitCtx &c, size_t pos, PinyinSplit &cur) {
+    if ((int)c.out->size() >= c.maxVariants) return false;
+    if (pos >= c.code->size()) {
+        c.out->push_back(cur);
+        return true;
     }
+    if (c.dead[pos]) return true;   // 已知从这里往下无解：产不出东西，但也确实是穷尽的
+    const size_t outBefore = c.out->size();
     // 两处循环都要判 exact, 但 isValidSyllable 是对 409 条 kSyllables(flash rodata)的二分,
     // 每键要以千次计; 第一轮算出来就得存住, 别在第二轮重算一遍。
     int bestLens[8];
     bool bestExact[8];
     int bestCount = 0;
-    int maxLen = std::min<int>(6, (int)code.size() - (int)pos);
+    int maxLen = std::min<int>(6, (int)c.code->size() - (int)pos);
     for (int len = maxLen; len >= 1; len--) {
-        std::string part = code.substr(pos, len);
+        std::string part = c.code->substr(pos, len);
         bool exact = PinyinEngine::isValidSyllable(part);
-        bool partial = !exact && allowPartial && (pos + len == code.size()) &&
+        bool partial = !exact && c.allowPartial && (pos + len == c.code->size()) &&
                        PinyinEngine::isSyllablePrefix(part);
         if (!exact && !partial) continue;
         bestExact[bestCount] = exact;
         bestLens[bestCount++] = len;
         if (bestCount >= (int)(sizeof(bestLens) / sizeof(bestLens[0]))) break;
     }
+    bool exhausted = true;
     for (int i = 0; i < bestCount; i++) {
         int len = bestLens[i];
         bool exact = bestExact[i];
-        std::string part = code.substr(pos, len);
+        std::string part = c.code->substr(pos, len);
         cur.tokens.push_back({part, !exact});
         cur.score += exact ? (len * 8 + (len >= 2 ? 2 : -4)) : len;
-        enumerateSplits(code, pos + len, allowPartial, cur, out, maxVariants);
+        if (!enumerateSplits(c, pos + len, cur)) exhausted = false;
         cur.score -= exact ? (len * 8 + (len >= 2 ? 2 : -4)) : len;
         cur.tokens.pop_back();
+        if ((int)c.out->size() >= c.maxVariants) { exhausted = false; break; }
     }
+    // 只有"整棵子树走完、且一条完整切法都没吐出来"才记死：吐过东西的 pos 换一个前缀
+    // 再来还得吐，记死会漏结果；被 maxVariants 截断的也不算穷尽，更不能记死。
+    if (exhausted && c.out->size() == outBefore) c.dead[pos] = 1;
+    return exhausted;
 }
 
 static std::string tokensToCode(const std::vector<PinyinToken> &tokens, bool split) {
@@ -240,7 +266,8 @@ std::vector<PinyinSplit> PinyinEngine::splitVariants(const std::string &raw,
         return out;
     }
     PinyinSplit cur;
-    enumerateSplits(code, 0, allowPartial, cur, out, maxVariants);
+    SplitCtx ctx(code, allowPartial, maxVariants, out);
+    enumerateSplits(ctx, 0, cur);
     std::stable_sort(out.begin(), out.end(), [](const PinyinSplit &a, const PinyinSplit &b) {
         if (a.score != b.score) return a.score > b.score;
         return a.tokens.size() < b.tokens.size();

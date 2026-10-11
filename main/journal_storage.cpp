@@ -446,9 +446,11 @@ std::string JournalStorage::readEntry(const std::string &filename) {
     std::string result;
     char buf[256];
     int n;
-    while ((n = fread(buf, 1, sizeof(buf) - 1, f)) > 0) {
-        buf[n] = 0;
-        result += buf;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        // 按长度 append，不要 `+= buf`：那是 C 字符串语义，正文里只要有一个 0x00
+        // 就会被截在那里 —— 而这条路读出来的正文会经 WebDAV 上传回去，截断版会
+        // 覆盖远端。safe_file.cpp 的 readWholeFile 一直是 append(buf, n)，这里补齐。
+        result.append(buf, static_cast<size_t>(n));
     }
     fclose(f);
     if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex);

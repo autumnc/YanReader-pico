@@ -1391,11 +1391,12 @@ struct RdStandbyCoverJob {
 };
 static std::atomic<bool> s_rdStandbyCoverTaskRunning{false};
 
-static void rdStandbyCoverTask(void *arg) {
-  // 裸指针 + 手工 delete：本任务以 vTaskDelete 结束，FreeRTOS 不做 C++ 栈回卷，
-  // unique_ptr 的析构不会跑 —— 原来这里每开一本书漏一个 job（见 screen_editor 的
-  // editorAsyncSaveTask 同一处坑）。
-  RdStandbyCoverJob *job = static_cast<RdStandbyCoverJob *>(arg);
+// 真活在这个 body 里，因为 vTaskDelete **不回卷 C++ 栈**：原来 `job` 是手工 delete 的
+// （那一处已修），但同一函数里的 `const std::string out`、`shared_ptr<Epub>`、`Txt t`
+// 三个局部对象照样一个都不会析构 —— 每开一本书漏一整个 Epub/Txt 句柄（含它读进来的
+// 元数据与解压缓冲，几 KB~几十 KB 起）。搬进 body 后它们在返回时正常析构。
+// 注意 body 里**没有**提前 return，所以 job 的手工 delete 仍然照旧放在末尾。
+static void rdStandbyCoverBody(RdStandbyCoverJob *job) {
   const std::string out = standbyCoverPathFor(job->path, job->kind);
   if (!Storage.exists(out.c_str())) {
     const int64_t t0 = esp_timer_get_time();
@@ -1414,6 +1415,10 @@ static void rdStandbyCoverTask(void *arg) {
     }
   }
   delete job;
+}
+
+static void rdStandbyCoverTask(void *arg) {
+  rdStandbyCoverBody(static_cast<RdStandbyCoverJob *>(arg));
   s_rdStandbyCoverTaskRunning.store(false, std::memory_order_release);
   vTaskDelete(nullptr);
 }
@@ -2384,7 +2389,13 @@ static bool rdWarmStringResume(int role, const std::string &text, size_t &offset
     // 接着喂（预算见 rdWarmShouldYield）。用户要翻页时，多半秒的等待比少暖几个字重要得多。
     if (yieldToKey && rdWarmShouldYield()) return false;
     size_t n = std::min(kChunk, text.size() - offset);
-    while (offset + n < text.size() && (static_cast<unsigned char>(text[offset + n]) & 0xC0) == 0x80) n++;
+    // 让位到 UTF-8 边界，但**必须以 buf 为界**：合法 UTF-8 里前导字节后最多 3 个续字节，
+    // 所以 n 最多 384+3=387、buf[387]='\0' 正好落在 388 字节里 —— 但喂进来的是**书籍正文**，
+    // TXT 只在检测成 GBK 时才转码，检测成 UTF-8 的坏文件原样保留。块边界上只要出现 ≥4 个
+    // 连续续字节（0x80..0xBF），原来的循环就只受剩余正文长度限制，n 可冲到几百 →
+    // memcpy + buf[n]='\0' 一次踩穿这块栈缓冲。夹到 sizeof(buf)-1 后最多让到 buf 最后一格。
+    while (offset + n < text.size() && n < sizeof(buf) - 1 &&
+           (static_cast<unsigned char>(text[offset + n]) & 0xC0) == 0x80) n++;
     memcpy(buf, text.data() + offset, n);
     buf[n] = '\0';
     ttf_warm_text_px(px, buf);     // 这一块的字形块读进块缓存（IO）
@@ -2786,9 +2797,8 @@ static int s_subLayoutHit = 0;
 // 而它自己在文件前段（空闲帧那几个函数的旁边）。
 static void renderReading();
 
-static uint8_t *s_preFb = nullptr;   // 备用整帧缓冲（PSRAM；懒分配，分配失败就永久关掉）
+static uint8_t *s_preFb = nullptr;   // 备用整帧缓冲（PSRAM；懒分配，要不到隔 2 秒再试）
 static size_t s_preFbSize = 0;
-static bool s_preAllocTried = false;
 // 连续多少个空闲帧没见过按键。绘制内部只在每两行回调一次 input_tick（只能把点按**收下**、
 // 不能让它插进来），所以刚按过键的那几拍不动手：用户连点两下时，第二下不该等这一趟。
 static int s_preQuiet = 0;
@@ -2842,13 +2852,85 @@ static RdHeldFrame s_hold[2];
 static uint8_t *s_holdFb[2] = {nullptr, nullptr};
 static size_t s_holdFbSize = 0;
 static int s_holdSlot = 0;   // 当前格的序号；只有翻页那一拍才 ^= 1（第二格没分配时不动）
-static bool s_holdAllocTried = false;
 // 分配它之前要求的 PSRAM 余量：这块是常驻的，进了写作模式也一直在（那边正常缺 PSRAM）。
-// 只在开书后的阅读页上分配（那时 PSRAM 的账就是这块 + s_preFb 的头寸），余量不够就永久
-// 关掉这个功能 —— 少省 319ms，好过把写作模式挤爆。
+// 只在开书后的阅读页上分配（那时 PSRAM 的账就是这块 + s_preFb 的头寸），余量不够就**先**
+// 关着这个功能 —— 少省 319ms，好过把写作模式挤爆。但"先关着"**不再等于"这一场都没有"**：
+// 2026-10-11 起改成隔 2 秒再判一次（见 rdPsramRetryDue）。理由是这条闸门跟字形缓存的上限
+// （free − 1.5MB，见 psram-extra-buffers-come-out-of-glyph-cache）几乎是同一条线，余量的
+// 差只有几十 KB —— 一次判负就把整场开机钉在慢速上、只能靠重启重掷，实测吃过这个亏。
 // 第二格（放"刚翻走那一页"）按**同一把尺子再要一份**：`2n + 这个数`。要不到就只留一格，
 // 退回这个功能原来的样子（切模式回来照省，反转那 6% 照旧现画），不是故障。
 static const size_t kHoldMinFreePsram = 1500 * 1024;
+
+// ── 几块提速缓冲的 PSRAM 申领：要不到就隔一会儿再试 ───────────────────────────
+// 预渲染备用整帧（416KB）与常驻首帧（2×416KB）都是懒分配、**一次定终身**：头一回想申请的
+// 那一拍如果 PSRAM 正好被切碎（largest 不够连续）或被别的界面占着（free 不够），老代码置一个
+// Tried 标志就再也不试。症状正是"这一整场开机翻页都慢、重启就好了" —— 重启只是重新掷一次
+// 骰子。2026-10-11 抓到的两次开机：慢的那次 largest 只剩 784KB、free 离 1.5MB 那条线只剩
+// 38KB；快的那次申请时刻还有 3.85MB（完整记录见 memory 的 reader-slow-turns-psram-latch）。
+// PSRAM 的余量在这台机器上会自己变（字形缓存的上限就是 free − 1.5MB），"现在没有"不该记成
+// "这一场都没有"。
+static const int64_t kPsramRetryIntervalUs = 2LL * 1000 * 1000;
+static bool rdPsramRetryDue(int64_t *lastTryUs) {
+  const int64_t now = esp_timer_get_time();
+  if (*lastTryUs != 0 && now - *lastTryUs < kPsramRetryIntervalUs) return false;
+  *lastTryUs = now;
+  return true;
+}
+
+// 要不到时打一行：**首次必打（带全部数字），之后限速**（2 秒拍一次的失败会把日志淹掉）。
+// 打 free 与 largest 两个数是有用的：free 够而 largest 不够 = 池子被切碎，两个都不够 = 真缺，
+// 两者修法不同。老代码只说"余量不足/分配失败"，看不出差多少（实测就差 38KB）。
+static void rdLogPsramMiss(int *counter, const char *what, size_t needContig, size_t needFree) {
+  ++*counter;
+  if (*counter != 1 && (*counter % 16) != 0) return;
+  ESP_LOGW(TAG,
+           "%s: PSRAM 还拿不到（第 %d 次；需连续 %u 字节、free ≥ %u；现在 free %u largest %u）"
+           "——先关着，%d 秒后再试",
+           what, *counter, static_cast<unsigned>(needContig), static_cast<unsigned>(needFree),
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
+           static_cast<int>(kPsramRetryIntervalUs / 1000000));
+}
+static int64_t s_preFbRetryUs = 0;
+static int s_preFbMissCount = 0;
+static int64_t s_holdRetryUs = 0;
+static int s_holdMissCount = 0;
+
+// 「这一拍为什么没预渲染」—— 只给 reader_perf_log 那条每帧日志用。慢的时候最常见的原因不是
+// "分配失败"（那有它自己的 WARN），而是**留档那条尾巴被闸门挡下了**：待发的是朝另一侧的翻页、
+// 菜单开着、或蓝牙键待取。这几条以前都是静默 return，日志里只剩"这一拍什么都没做"的空缺，
+// 没法分辨是哪一条。每帧一次赋值，代价可以忽略。
+enum RdPreSkip {
+  kPreSkipNone = 0,
+  kPreSkipBtKey,      // 蓝牙键盘有键待取（整条尾巴跳过）
+  kPreSkipSheet,      // 菜单/浮层开着
+  kPreSkipWrongDir,   // 待取的那个键是朝另一侧翻页
+  kPreSkipNoFb,       // 备用帧缓冲还没拿到
+};
+static int s_preSkip = kPreSkipNone;
+static const char *rdPreSkipName(int v) {
+  switch (v) {
+    case kPreSkipBtKey:    return "蓝牙键待取";
+    case kPreSkipSheet:    return "菜单开着";
+    case kPreSkipWrongDir: return "待取键朝另一侧";
+    case kPreSkipNoFb:     return "备用帧缓冲没拿到";
+    default:               return "无（跑了）";
+  }
+}
+
+// 只给 `reader_perf_log` 那两行用：几块 PSRAM 缓冲挂上没挂上、这一拍没预渲染是被哪道闸挡的。
+// 慢的时候这一行自己就回答了"是功能压根没挂上，还是这一拍它没轮到"，不用再回日志里翻 WARN。
+static std::string rdPrerenderStateText() {
+  char buf[256];
+  snprintf(buf, sizeof(buf), "｜预渲染 %s、常驻首帧 %s（PSRAM free %u largest %u）｜本帧未预渲染: %s",
+           s_preFb != nullptr ? "开" : "关",
+           s_holdFb[0] != nullptr ? (s_holdFb[1] != nullptr ? "2格" : "1格") : "关",
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
+           rdPreSkipName(s_preSkip));
+  return std::string(buf);
+}
 // 上一次离开阅读模式时留档是好的（screen_reader_exit 置位）。只用来把"切回来那一拍真
 // 命中了"这一句打出来 —— 否则这个功能省了多少只能从拆账数字上猜；打完就清，菜单来来回回
 // 那些正常的命中不再打日志。
@@ -2897,18 +2979,17 @@ static void rdHoldCapture() {
   if (rdLiveLayerUp()) return;                        // 有跟着手在变的层（见 rdLiveLayerUp）
   const size_t n = g_rd.getBufferSize();
   if (n == 0) return;
-  if (!s_holdAllocTried) {
-    s_holdAllocTried = true;
+  // 还没拿到就隔 2 秒再判一次（见 rdPsramRetryDue）。拿到之后 s_holdFb[0] 非空，这里再也不
+  // 进来 —— 第二格那次性的单/双格判定同理，不在后面补试。
+  if (s_holdFb[0] == nullptr && rdPsramRetryDue(&s_holdRetryUs)) {
     const size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     if (freePsram < n + kHoldMinFreePsram) {
-      ESP_LOGW(TAG, "常驻首帧: PSRAM 余量不足（free %u，要 %u+%u），本功能关闭",
-               static_cast<unsigned>(freePsram), static_cast<unsigned>(n),
-               static_cast<unsigned>(kHoldMinFreePsram));
+      rdLogPsramMiss(&s_holdMissCount, "常驻首帧", n, n + kHoldMinFreePsram);
       return;
     }
     s_holdFb[0] = static_cast<uint8_t *>(heap_caps_aligned_alloc(16, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (s_holdFb[0] == nullptr) {
-      ESP_LOGW(TAG, "常驻首帧: 缓冲 %u 字节分配失败，本功能关闭", static_cast<unsigned>(n));
+      rdLogPsramMiss(&s_holdMissCount, "常驻首帧", n, n + kHoldMinFreePsram);
       return;
     }
     // 第二格（放"刚翻走那一页"）只在余量宽裕时申请。不够就退回单格 —— 那是这个功能原来的
@@ -2916,10 +2997,13 @@ static void rdHoldCapture() {
     if (freePsram >= n * 2 + kHoldMinFreePsram) {
       s_holdFb[1] = static_cast<uint8_t *>(heap_caps_aligned_alloc(16, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     }
+    const bool hadMiss = s_holdMissCount > 0;
+    s_holdMissCount = 0;
     s_holdFbSize = n;
-    ESP_LOGI(TAG, "常驻首帧: 缓冲 %u×%d 字节（PSRAM，剩 %u）", static_cast<unsigned>(n),
+    ESP_LOGI(TAG, "常驻首帧: 缓冲 %u×%d 字节（PSRAM，剩 %u）%s", static_cast<unsigned>(n),
              (s_holdFb[1] != nullptr) ? 2 : 1,
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+             hadMiss ? "（前几拍没拿到，现在拿到了）" : "");
   }
   if (n > s_holdFbSize) return;
   // **翻页这一拍换格**。另一格留住的正是"刚翻走那一页"，而它恰好就是下一次方向反转要贴的
@@ -3137,21 +3221,29 @@ static void rdPrerenderTurnPage(bool afterTurn = false) {
   // 安静闸只给空闲帧那条路：推屏后这一趟本来就是"刚刚才翻过页"，拿它判等于永远不动手。
   if (!afterTurn && ++s_preQuiet < kPreQuietFrames) return;
 
-  if (!s_preAllocTried) {
-    s_preAllocTried = true;
+  // 拿不到就隔 2 秒再试一次（见 rdPsramRetryDue）：老代码第一次失败就把整个功能永久关掉，
+  // 于是"这一拍 PSRAM 正好被切碎"被记成了"这一场都别想预渲染"，只能靠重启重掷骰子。
+  if (s_preFb == nullptr && rdPsramRetryDue(&s_preFbRetryUs)) {
     const size_t n = g_rd.getBufferSize();
     if (n == 0) return;
     // PSRAM：内部 RAM 只剩几十 KB（实测最大连续块 26KB），416KB 只能放这儿。对齐 16 与
     // epdiy 给 fb 的对齐一致（绘制原语按字节索引，这只是对齐习惯上的保险）。
+    const size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     s_preFb = static_cast<uint8_t *>(heap_caps_aligned_alloc(16, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (s_preFb == nullptr) {
-      ESP_LOGW(TAG, "预渲染: 备用帧缓冲 %u 字节分配失败，本功能关闭", static_cast<unsigned>(n));
+      rdLogPsramMiss(&s_preFbMissCount, "预渲染", n, n);
       return;
     }
+    const bool hadMiss = s_preFbMissCount > 0;
+    s_preFbMissCount = 0;
     s_preFbSize = n;
-    ESP_LOGI(TAG, "预渲染: 备用帧缓冲 %u 字节（PSRAM）", static_cast<unsigned>(n));
+    ESP_LOGI(TAG, "预渲染: 备用帧缓冲 %u 字节（PSRAM，申请前 free %u）%s", static_cast<unsigned>(n),
+             static_cast<unsigned>(freePsram), hadMiss ? "（前几拍没拿到，现在拿到了）" : "");
   }
-  if (s_preFb == nullptr) return;   // 分配关了这个功能（上面那条日志只打一次）
+  if (s_preFb == nullptr) {
+    s_preSkip = kPreSkipNoFb;   // 这一拍没预渲染的原因（只给 reader_perf_log 那条日志用）
+    return;
+  }
 
   // 现场：下面这一趟把 st 当成"已经在目标页"来画。画完**原样**还回去 —— 这一帧不上屏，
   // 除了那块 scratch 之外任何状态都不该被它改动，包括 st.dirty（它只属于上屏那一帧）。
@@ -6065,13 +6157,25 @@ static void rdDeleteBookmark(int idx) {
 void buildToPage(int target) {
   if (!st.section) return;
   while (static_cast<int>(st.section->pageCount) < target + 1 && !st.section->isBuildComplete()) {
-    st.section->buildSomeMore(16);
+    // 出口一：**没有活构建**。排版失败时 Section 会 abandonBuild()：build_ 清空、
+    // pageCount 归 0、buildComplete_ 置回 false，此后每次 buildSomeMore() 都直接打在
+    // "no active build" 上、秒返 false 且不动任何状态。原来的循环只认 pageCount 和
+    // isBuildComplete()，这两个在残局里恒定不变 → **无限空转**：vTaskDelay(1) 喂着 idle，
+    // 看门狗不复位，而主任务是 core0 上唯一采样按键的 —— 屏面冻死，只能抠电池，
+    // 且同样的书下次打开还会再来一遍。（Section.cpp:322 那条注释说的就是这个残局。）
+    if (!st.section->isBuilding()) break;
+    // 出口二：本次排版报错（内部已 abandonBuild，pageCount 顺手清 0）。
+    if (!st.section->buildSomeMore(16)) break;
     // 让出 CPU。单次 buildSomeMore 现在有界（Section 里按源字节封顶），但这个循环
     // 可能要跑很多轮；主任务是 core0 上唯一采样按键/触摸的地方，一直不让出就等于把
     // 输入通道掐了（看门狗也不会复位：阻塞/不让出的是 idle 之外的活儿）。
     vTaskDelay(1);
   }
-  st.page = clampI(target, 0, static_cast<int>(st.section->pageCount) - 1);
+  // 一个页都排不出来（上面两个出口之一）时，pageCount-1 == -1，clampI 会返回 -1 ——
+  // 于是 st.page = -1：屏面空白、状态栏 "0/0"，而且这个 -1 会被写进进度表/常驻首帧键。
+  // 夹到 0，至少让 loadPage(0) 走它自己的守卫而不是把 -1 散出去。
+  const int maxPage = static_cast<int>(st.section->pageCount) - 1;
+  st.page = maxPage < 0 ? 0 : clampI(target, 0, maxPage);
 }
 
 // ── 阅读位置记忆 ────────────────────────────────────────────────────────
@@ -7413,10 +7517,19 @@ void renderCurrent() {
   // `if (st.mode != RdMode::Reading) return;` —— 今天开菜单会把模式切走、天然被跳过；
   // 这一版模式保持 Reading，不挡的话每一帧菜单帧都要把这趟（最多几百毫秒）付掉，
   // 正是"下一指要先等几百毫秒才被看一眼"的来源，直接打在用户唯一在意的那个指标上。
-  if (!g_bt.waitKey(0) && !sheetVisible()) {
+  // 「这一拍为什么没预渲染」的记账（见 s_preSkip）：下面这几道闸以前都是静默跳过，日志里
+  // 只剩"这一拍什么都没做"的空缺，看不出是哪一条挡的 —— 而"慢"最常见的成因就在这几条里。
+  s_preSkip = kPreSkipNone;
+  if (g_bt.waitKey(0)) {
+    s_preSkip = kPreSkipBtKey;
+  } else if (sheetVisible()) {
+    s_preSkip = kPreSkipSheet;
+  } else {
     const int want = (s_turnDir >= 0) ? 1 : -1;
     int pd = rdPendingTurnDir();
-    if (pd == 0 || pd == want) {
+    if (pd != 0 && pd != want) {
+      s_preSkip = kPreSkipWrongDir;
+    } else {
       const bool savedCommit = s_rdCommitted;
       // 进了这道门就是"认准"：待发的键要么没有（这一趟是面板扫相位那片白地，更该干完），
       // 要么正朝这一侧翻。预建那一趟也不许见键就缩 —— 留档建不出来，下面几道闸全是
@@ -7430,7 +7543,11 @@ void renderCurrent() {
       // 现付的排版/预热。付一次，下一拍就只剩 memcpy，空档随之变大，之后自己跟得上。
       // 放在预建**之后**是硬要求：它要的排版留档正是上一句刚建好的（本函数不自己现排）。
       pd = rdPendingTurnDir();   // 上面那趟预建（几百 ms）里可能刚冒出来一个键
-      if (pd == 0 || pd == want) rdPrerenderTurnPage(true);
+      if (pd != 0 && pd != want) {
+        s_preSkip = kPreSkipWrongDir;
+      } else {
+        rdPrerenderTurnPage(true);
+      }
     }
   }
   // 面板真的推完了才收尾。异步那一趟在这之前一直和上面的备页并行跑 —— 备页通常更长
@@ -7463,9 +7580,10 @@ void renderCurrent() {
                            : m == HalDisplay::FAST_REFRESH         ? "极速"
                            : m == HalDisplay::STATUS_REFRESH       ? "过渡屏"
                                                                    : "局刷";
-    ESP_LOGI(TAG, "翻页耗时: 变化 %d‰ + 重画 %d + max(推屏 %d, 备页 %d) = %d｜本帧 %d ms（%s，%s，跳相 %d）",
+    ESP_LOGI(TAG, "翻页耗时: 变化 %d‰ + 重画 %d + max(推屏 %d, 备页 %d) = %d｜本帧 %d ms（%s，%s，跳相 %d）%s",
              frameChange, renderMs, pushMs, tailMs, renderMs + (pushMs > tailMs ? pushMs : tailMs),
-             frameMs, modeName, turnAnim ? "揭页·GL16 37相" : "无动画", reader_leading_skip());
+             frameMs, modeName, turnAnim ? "揭页·GL16 37相" : "无动画", reader_leading_skip(),
+             rdPrerenderStateText().c_str());
     // 重画三段拆账。方案（空闲帧留档邻页排版 + 预热下一页字形）唯一的成功判据：
     // **排版**与**预热**这两栏在翻页这一拍上都该只剩零头 —— 排版来自留档（0ms），字形
     // 在上一页的空档里备好了。哪一栏没降就是哪一栏没接上：排版"现读现建"= 键没对上

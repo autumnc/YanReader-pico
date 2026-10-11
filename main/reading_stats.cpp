@@ -811,7 +811,14 @@ bool adjustBookReadingTime(const std::string &path, uint32_t dayOrdinal, int32_t
 
     rebuildAggregatedDays();
     markDirty();
-    return save();
+    // 这里**不把 save() 的结果当返回值**（其余几个改动函数是 `return save()`，这条不同）。
+    // 本函数的 false 在唯一调用方 handleStatsAdj 里被解释成"改不了：这一天没有这么多记录"
+    // —— "这次调整没生效"。可 save() 失败时上面 readingDays / totalReadingMs **已经扣完
+    // 了**（内存里已生效，界面照新值画，s_dirty 挂着等下一次 checkpoint 重试）。再返回
+    // false 就是对用户撒谎，而且调用方会**留在调整界面**，用户再按一次回车就**又扣一遍**。
+    // 落盘失败交给 dirty 标志自愈（shouldCheckpoint 会重试），这里只吞掉返回值。
+    (void)save();
+    return true;
 }
 
 bool removeBook(const std::string &path) {

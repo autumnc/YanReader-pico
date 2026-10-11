@@ -382,7 +382,13 @@ int imeCandStrW(const char *s) {
             s += 1;
             continue;
         }
-        const int m = (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        int m = (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        // 只按首字节定长，遇到"残缺的多字节序列"（半个汉字：末尾只剩首字节）就会 memcpy
+        // 读穿字符串结尾的 '\0'（主机 ASan: heap-buffer-overflow）。下面的链式判断只会
+        // 在前一个字节非零时才往后看一格，所以每一步读到的都还在 NUL 之内。
+        if (m > 1 && s[1] == '\0') m = 1;
+        else if (m > 2 && s[2] == '\0') m = 2;
+        else if (m > 3 && s[3] == '\0') m = 3;
         char ch[5];
         memcpy(ch, s, m);
         ch[m] = '\0';
@@ -421,7 +427,11 @@ void imeCandDrawText(int x, int baseline, const char *s, bool invert) {
             s += 1;
             continue;
         }
-        const int m = (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        int m = (c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4));
+        // 同上（imeCandStrW）：残缺序列下别把 memcpy 的源读到结尾之后。
+        if (m > 1 && s[1] == '\0') m = 1;
+        else if (m > 2 && s[2] == '\0') m = 2;
+        else if (m > 3 && s[3] == '\0') m = 3;
         char ch[5];
         memcpy(ch, s, m);
         ch[m] = '\0';

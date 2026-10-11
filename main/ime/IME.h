@@ -234,6 +234,11 @@ public:
     // 主循环里每帧无脑重设的。宫格展开期间这个值归 setGridPaging 管，外来的一律先
     // 存起来，等面板收起再还回去 —— 否则每帧被改回 7，宫格就永远只有 3/3/1 个。
     void setPageSize(int n) {
+        // 下限兜底：>0 是这个值的三处用法共同的前提 —— vector::reserve(_pageSize)（转 size_t
+        // 后为 0 或天文数字：前者无妨，后者 length_error；-fno-exceptions 下直接 abort）、
+        // 分页循环 `i += _pageSize`（=0 死循环）、以及页内编号的取模。现存调用点都传 5/7，
+        // 这行只是不让一个手滑的值变成死循环/abort。
+        if (n < 1) n = 1;
         if (_gridPaging) { _pageSizeBase = n; return; }
         _pageSize = n;
     }

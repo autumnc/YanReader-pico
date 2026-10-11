@@ -1112,8 +1112,11 @@ void BtKeyboard::loadPairedDevices() {
             snprintf(name, sizeof(name), "%.31s", line);
         }
         for (int i = 0; i < 6; i++) {
-            unsigned int byte;
-            sscanf(hex + i * 2, "%02x", &byte);
+            // 必须初始化 + 看返回值：文件被截断/损坏时这一行的 12 个字符未必是十六
+            // 进制（解析失步后会把上一台的地址行或名字行当成本行的 bda），sscanf 失败
+            // 时 byte 会留着栈垃圾 → 拿一个随机地址去 connectBDA。
+            unsigned int byte = 0;
+            if (sscanf(hex + i * 2, "%02x", &byte) != 1) byte = 0;
             s_paired[s_paired_count].bda[i] = (uint8_t)byte;
         }
         s_paired[s_paired_count].addr_type = (esp_ble_addr_type_t)at;
@@ -1135,17 +1138,24 @@ bool BtKeyboard::removePairedDevice(const uint8_t *bda) {
         if (memcmp(s_paired[i].bda, bda, ESP_BD_ADDR_LEN) == 0) {
             for (int j = i; j < s_paired_count - 1; j++) s_paired[j] = s_paired[j + 1];
             s_paired_count--;
-            FILE *f = fopen("/sdcard/settings/bt_paired", "w");
-            if (!f) { ESP_LOGE(TAG, "Failed to save paired devices"); return true; }
+            // 与 savePairedDevice 同一套写法：拼好整份内容走 safeWriteFile（tmp+fsync+
+            // rename）。这里原来是 fopen("w") 就地截断重写 —— 删一台设备时若掉电/拔卡，
+            // 文件会停在 0 字节或半条记录，**没被删的那几台也一起丢**；而且 fopen 失败
+            // 时它已经改过内存、却 return true，界面报"已删除"、重启后设备又回来。
+            std::string content;
+            content.reserve((size_t)s_paired_count * 40);
+            char line[64];
             for (int k = 0; k < s_paired_count; k++) {
-                fprintf(f, "%02x%02x%02x%02x%02x%02x\n%d\n%s\n",
-                        s_paired[k].bda[0], s_paired[k].bda[1], s_paired[k].bda[2],
-                        s_paired[k].bda[3], s_paired[k].bda[4], s_paired[k].bda[5],
-                        (int)s_paired[k].addr_type, s_paired[k].name);
+                snprintf(line, sizeof(line), "%02x%02x%02x%02x%02x%02x\n%d\n%s\n",
+                         s_paired[k].bda[0], s_paired[k].bda[1], s_paired[k].bda[2],
+                         s_paired[k].bda[3], s_paired[k].bda[4], s_paired[k].bda[5],
+                         (int)s_paired[k].addr_type, s_paired[k].name);
+                content += line;
             }
-            fclose(f);
+            const bool saved = safeWriteFile("/sdcard/settings/bt_paired", content);
+            if (!saved) ESP_LOGE(TAG, "Failed to save paired devices (SD card write error)");
             ESP_LOGI(TAG, "Removed paired device, %d remaining", s_paired_count);
-            return true;
+            return saved;
         }
     }
     return false;

@@ -162,10 +162,19 @@ std::string JsonValue::serialize(int indent) const {
 
 // ── Parser ───────────────────────────────────────────────────────────────────
 
+// 嵌套深度上限。parseValue 与 parseArray/parseObject 是互递归的，原来完全没有上限：
+// 主机 -fstack-usage 实测每层 ≈304B（数组）/336B（对象），而调用它的任务栈只有 4~8KB
+// —— 几十层嵌套的畸形 JSON（HTTP 响应体、SD 卡上的文件都可能是）就能把栈打穿，
+// 越界写在栈上 = panic 重启。正常报文（DeepSeek / flomo / 词库 / GTD / 大纲 / 灵感）
+// 深度都 ≤8，16 留了一倍余量。超限即整份判失败（见 JsonValue::parse）。
+static const int kMaxJsonDepth = 16;
+
 struct ParseCtx {
     const char *p;
     size_t len;
     size_t pos;
+    int depth = 0;
+    bool failed = false;   // 畸形（嵌套超深 / 循环不前进）；parse() 见它即返回 null
 };
 
 static void skipWS(ParseCtx &c) {
@@ -254,7 +263,13 @@ static JsonValue parseArray(ParseCtx &c) {
     skipWS(c);
     if (c.pos < c.len && c.p[c.pos] == ']') { c.pos++; return arr; }
     while (c.pos < c.len) {
+        const size_t before = c.pos;
         arr.elements.push_back(parseValue(c));
+        // parseValue 遇到不认识的字符（`[x]`、`[1,]` 的尾逗号、截断后混进来的 `}` …）
+        // 既不消费也不前进，而本循环只在 ',' / ']' 上推进 —— 两个都不成立就原地打转，
+        // **死循环**（主机上实测 `[x]` 永不返回；卡住的任务不 yield，主任务上就是整机假死）。
+        // 这里认"没前进"为畸形输入，直接放弃整份解析。
+        if (c.failed || c.pos == before) { c.failed = true; return arr; }
         skipWS(c);
         if (c.pos >= c.len) break;
         if (c.p[c.pos] == ']') { c.pos++; return arr; }
@@ -291,8 +306,13 @@ static JsonValue parseValue(ParseCtx &c) {
     if (c.pos >= c.len) return JsonValue(nullptr);
     char ch = c.p[c.pos];
     if (ch == '"') return JsonValue(parseString(c));
-    if (ch == '{') return parseObject(c);
-    if (ch == '[') return parseArray(c);
+    if (ch == '{' || ch == '[') {
+        if (c.depth >= kMaxJsonDepth) { c.failed = true; return JsonValue(nullptr); }
+        c.depth++;
+        JsonValue v = (ch == '{') ? parseObject(c) : parseArray(c);
+        c.depth--;
+        return v;
+    }
     if (ch == 't' && peek(c, "true"))  { c.pos += 4; return JsonValue(true); }
     if (ch == 'f' && peek(c, "false")) { c.pos += 5; return JsonValue(false); }
     if (ch == 'n' && peek(c, "null"))  { c.pos += 4; return JsonValue(nullptr); }
@@ -305,7 +325,9 @@ JsonValue JsonValue::parse(const std::string &json) {
     c.p = json.c_str();
     c.len = json.size();
     c.pos = 0;
-    return parseValue(c);
+    JsonValue v = parseValue(c);
+    if (c.failed) return JsonValue(nullptr);   // 畸形输入：宁可"解析失败"也别交半份数据
+    return v;
 }
 
 // ── File I/O ─────────────────────────────────────────────────────────────────

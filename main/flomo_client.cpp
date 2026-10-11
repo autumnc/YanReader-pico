@@ -390,13 +390,15 @@ FlomoResult FlomoClient::send(const std::string &text) {
         }
     }
 
-    // Re-login if needed
+    // Re-login if needed。**从 success 处接着发，不能从头再来**：上面那轮已经成功
+    // 的 success 条在服务器上已经存在了，重发就是重复笔记；而且 success 会跟着再累加
+    // 一遍，"已发送N条到Flomo ✓"里的 N 能超过 chunks.size()（用户看到比实际条数多）。
     if (token.empty()) {
         token = login();
         if (!token.empty()) {
             setCachedToken(token);
-            for (auto &chunk : chunks) {
-                std::string htmlContent = textToHtml(chunk);
+            for (int i = success; i < (int)chunks.size(); i++) {
+                std::string htmlContent = textToHtml(chunks[i]);
                 htmlContent += "\n\n<p>#日记</p>";
                 if (createMemo(token, htmlContent)) {
                     success++;

@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <utility>
+#include <vector>
 #include <sys/stat.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
@@ -44,25 +46,39 @@ static void settingsFlushPendingNow() {
     }
     if (writes.empty()) return;
     mkdir(BASE_DIR, 0777);
+    std::vector<std::pair<std::string, PendingSettingWrite>> failed;
     for (const auto &kv : writes) {
         const std::string path = std::string(BASE_DIR) + "/" + kv.first;
         if (kv.second.erase) {
             remove(path.c_str());
         } else if (!safeWriteFile(path, kv.second.value)) {
             ESP_LOGE(TAG, "Failed to write %s", path.c_str());
+            failed.push_back({kv.first, kv.second});
         }
+    }
+    if (!failed.empty()) {
+        // 写失败的**要放回 pending**。原来就地丢掉，于是这次改的值只活在 s_cache（内存）
+        // 里、磁盘上还是旧值：本次会话看着一切正常，一重启就悄悄退回旧密码/旧 token，
+        // 用户只会觉得"改了没生效"。放回后由显式 flush()（关机/备份前必调）或下一次
+        // set() 再试。
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        for (auto &kv : failed) s_pendingWrites.emplace(kv.first, kv.second);
     }
 }
 
 static void settingsFlushTask(void *) {
-    while (true) {
+    // 来回最多几趟。写失败的值会被上面放回 pending，所以"SD 一直写不进去"能让这个循环
+    // 永远不停 —— 赌 8 趟（≈5.6s）之后收手，剩下的留给显式 flush()（关机/备份前一定调）
+    // 或下一次 set()。收手时也必须清 s_flushTaskRunning，否则此后再也没人调度。
+    for (int pass = 0; pass < 8; pass++) {
         vTaskDelay(pdMS_TO_TICKS(700));
         settingsFlushPendingNow();
         std::lock_guard<std::mutex> lock(s_cacheMutex);
-        if (s_pendingWrites.empty()) {
-            s_flushTaskRunning = false;
-            break;
-        }
+        if (s_pendingWrites.empty()) break;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        s_flushTaskRunning = false;
     }
     vTaskDelete(nullptr);
 }
@@ -111,9 +127,9 @@ std::string SettingsManager::get(const std::string &key) {
     std::string val;
     char buf[256];
     int n;
-    while ((n = fread(buf, 1, sizeof(buf) - 1, f)) > 0) {
-        buf[n] = 0;
-        val += buf;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        // 按长度 append：设置值里出现 0x00 时 `+= buf` 会截断（同 journal_storage）。
+        val.append(buf, static_cast<size_t>(n));
     }
     fclose(f);
     s_cache[key] = val;

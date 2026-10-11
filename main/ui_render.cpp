@@ -299,18 +299,27 @@ void ui_render_set_menu_only(bool enable) { s_menu_only.store(enable, std::memor
 // 了几次 I2C；按键的**按下沿**因此被记进手势状态机，抬手后的那一拍照常投递（晚一拍，
 // 但不会丢）。只采样，不投递——键照旧由主循环的 input_poll 取走。
 //
-// wait=0 时退化成"试一次就走"，与原来同义（pdMS_TO_TICKS(0) 的切片会让循环第一次就
-// 到期返回 -1）。
+// wait == 0 必须走**单独一条**"取不到就立刻返回"的真尝试。原来注释写的是
+// "wait=0 时退化成试一次就走"，但那段 deadline 写法在 wait=0 时 left 第一轮就等于 0，
+// 于是**还没调用过 xSemaphoreTake 就 return -1** —— 不是"试一次没成功"，是"一次都没试"。
+// 后果：两个 `ui_render_begin_frame_seeded_try(0)` 调用点（编辑器 VK 组合期差分帧、
+// 按下即反馈帧）恒失败，那两条路静默退回整屏 ui_clear()+重画，键帽永不反白、每键多花
+// 几十毫秒。头文件（ui_render.h:84）写的契约是"wait_ms 内取不到空闲缓冲就返回 -1"，
+// 这里按契约来。
 static int acquire_buffer(TickType_t wait) {
     if (!s_active.load(std::memory_order_acquire)) return -1;
-    const TickType_t deadline = xTaskGetTickCount() + wait;
-    for (;;) {
-        TickType_t left = deadline - xTaskGetTickCount();
-        if ((int32_t)left <= 0) return -1;
-        TickType_t slice = pdMS_TO_TICKS(10);
-        if (slice > left) slice = left;
-        if (xSemaphoreTake(s_free, slice) == pdTRUE) break;
-        input_tick_throttled();
+    if (wait == 0) {
+        if (xSemaphoreTake(s_free, 0) != pdTRUE) return -1;
+    } else {
+        const TickType_t deadline = xTaskGetTickCount() + wait;
+        for (;;) {
+            TickType_t left = deadline - xTaskGetTickCount();
+            if ((int32_t)left <= 0) return -1;
+            TickType_t slice = pdMS_TO_TICKS(10);
+            if (slice > left) slice = left;
+            if (xSemaphoreTake(s_free, slice) == pdTRUE) break;
+            input_tick_throttled();
+        }
     }
     int idx = -1;
     portENTER_CRITICAL(&s_free_mux);
@@ -1616,6 +1625,10 @@ uint8_t *ui_render_begin_frame(void) {
             // **阻塞**而不是自旋，两核的 idle 任务照常喂狗，看门狗根本不会复位，结果
             // 就是屏幕和系统一起永久死住，只能抠电池。能自救的动作只有一个：重启。
             ESP_LOGE(TAG, "渲染任务连续 6 秒未归还缓冲，判定卡死，重启恢复");
+            // 重启也是"离开路径"：设置现在是"改内存 + 延后 700ms 落盘"，那一笔可能还在
+            // 窗口里，esp_restart 不会替它收尾（同 main.cpp 关机前的 g_settings.flush()）。
+            // 崩在显示驱动上已经是残局，但别顺手把用户刚改的设置再丢一次。
+            g_settings.flush();
             esp_restart();
         }
         // 没有渲染任务（创建失败/未初始化）：core0 直接画 front_fb 是安全的，
@@ -1684,6 +1697,12 @@ void ui_render_drain(void) {
     // 队列空 + 空闲缓冲数到位 = 已提交的帧全推完了。
     for (int i = 0; i < 2000; i++) {
         if (uxQueueMessagesWaiting(s_q) == 0 && uxSemaphoreGetCount(s_free) >= target) return;
+        // 和 acquire_buffer 的等待循环同一条规矩：这段空转最长 4 秒（唤醒后叠一帧 from-white
+        // 整屏 GC16、晃动全刷、自适应转屏都会走到），而 cst836u 没有锁存寄存器 —— 一次点按要
+        // 成立就要求这两秒里有**一拍**采样落在手指按住的那段时间里。原来这里只 vTaskDelay，
+        // 用户在这期间点一下会整个消失（"点了没反应"），得再点一次。只采样不投递：键照旧由
+        // 主循环的 input_poll 取走（节奏晚一拍，但不会丢）。
+        input_tick_throttled();
         vTaskDelay(pdMS_TO_TICKS(2));
     }
     ESP_LOGW(TAG, "drain 超时");
@@ -1798,7 +1817,19 @@ void ui_render_begin_overlay(void) {
     if (!g_u8g2 || !s_active.load(std::memory_order_acquire)) return;
     if (s_taken >= 0 || s_sync_fb) return;  // 已经开着帧，直接往那块上画
     const int idx = acquire_buffer(pdMS_TO_TICKS(UI_RENDER_TAKE_MS));
-    if (idx < 0) return;
+    if (idx < 0) {
+        // 3 秒都取不到缓冲 = 渲染任务卡住了（队里还压着两帧整屏 GC16 那种）。这时**不能**
+        // 退回 front_fb 走同步推（那边 core1 正卡在 epdiy 里，两个任务撞进去会把驱动和
+        // 画面一起踩坏，见 ui_render_begin_frame 里那段说明），也不该在这儿重启（真卡死由
+        // 那条路 6 秒后判）。
+        //
+        // 但契约有缺口：函数返回 void，调用方（大纲/计划模式的十几处浮层）拿到的是"可以
+        // 往 g_u8g2 上画"，而 g_u8g2 此刻仍指着**上一帧那块已经交出去、正在被 core1 推的
+        // 缓冲** —— 那一小块补画会就地改掉在飞的一帧。触发条件苛刻（要连续 3 秒两缓冲都
+        // 占满），窗口尽头又是重启，故先不改造：至少留一条日志，让它别是静默的。
+        ESP_LOGE(TAG, "overlay 取不到缓冲（渲染任务疑似卡住），本次浮层补画放弃");
+        return;
+    }
     if (s_last_idx >= 0) {
         const int src = s_last_idx;
         if (src != idx) memcpy(s_fb[idx], s_fb[src], s_fb_size);

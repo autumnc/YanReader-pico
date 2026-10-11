@@ -1,6 +1,7 @@
 #include "webdav_client.h"
 #include "journal_storage.h"
 #include "settings_manager.h"
+#include "safe_file.h"
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
@@ -146,7 +147,12 @@ static std::string httpRequest(const std::string &url, const std::string &method
                  method == "HEAD" ? net::Method::Head :
                  net::Method::Propfind;
     req.timeout_ms = 30000;
-    req.cap = 2 * 1024 * 1024;  // 软上限，防止响应体把内存撑爆
+    // 响应体上限 2MB。**必须硬中止**：软截断交出去的"半份 PROPFIND 列表"会被同步
+    // 当成"远端文件全集"，尾部被砍掉的文件在 prevState 里有、在这份列表里没有 →
+    // 判成"远端已删" → 删掉本地日记（见 sync 的 localExists && !remoteExists 分支）。
+    // 下载同理：半截正文会被写进日记。超限一律按失败处理（下面那一支）。
+    req.cap = 2 * 1024 * 1024;
+    req.cap_hard = true;
     // 墙钟上限：挂住的对端会让同步任务永远停在读循环里（界面一直"同步中"）。
     // PROPFIND 响应可能较大，给 60s 宽裕些；PUT/DELETE 的响应本身很小，不受影响。
     req.deadline_ms = 60000;
@@ -162,11 +168,17 @@ static std::string httpRequest(const std::string &url, const std::string &method
         ESP_LOGW(TAG, "HTTP %s %s 失败: %s", method.c_str(), url.c_str(),
                  esp_err_to_name(resp.err));
         status = -static_cast<int>(resp.err);  // 用负的错误码表示网络错误
+    } else if (resp.truncated || resp.overflow) {
+        // 撞上 2MB 上限 = 这份响应是**残缺的**。绝不能交给调用方（见上面 cap_hard
+        // 处的说明：残缺的 PROPFIND 列表会让同步删掉本地日记）。按失败返回，
+        // 让 listFiles() 交回空表、sync 里那道"远端列表为空就中止"的保险接管。
+        ESP_LOGW(TAG, "HTTP %s %s 响应超过 %u 字节上限，按失败处理", method.c_str(), url.c_str(),
+                 static_cast<unsigned>(req.cap));
+        status = -static_cast<int>(ESP_ERR_INVALID_SIZE);
     } else {
         if (webdavDebugLogOn())
             ESP_LOGI(TAG, "HTTP %s %s status=%d bytes=%u", method.c_str(), url.c_str(), status,
                      static_cast<unsigned>(resp.got));
-        if (resp.truncated) ESP_LOGW(TAG, "Response body exceeds 2MB limit, truncating");
     }
     if (outStatusCode) *outStatusCode = status;
     return resp.body;
@@ -311,23 +323,21 @@ static time_t parseWebdavDate(const std::string &s) {
     struct tm tm = {};
     const char *ret = strptime(s.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &tm);
     if (!ret || *ret != '\0') return 0;
-    // Temporarily switch to UTC so mktime treats tm as UTC
-    char *oldTz = getenv("TZ");
-    std::string savedTz = oldTz ? oldTz : "";
-    setenv("TZ", "UTC0", 1);
-    tzset();
-    time_t t = mktime(&tm);
-    // Restore original timezone
-    if (!savedTz.empty()) setenv("TZ", savedTz.c_str(), 1);
-    else unsetenv("TZ");
-    tzset();
-    return t;
+    // 直接用 timegm 把 tm 当 UTC 算，**不要**再用 setenv("TZ","UTC0")+mktime 那一套：
+    // TZ 是进程级全局量，而同步任务（core1 的 worker）改它的时候主任务正在
+    // localtime() 造日记文件名 —— 改的这几百微秒里写下的日记会按 UTC 算，
+    // CST-8 下 00:00~08:00 的日记直接落到前一天（连续天数、hasEntry 跟着错位）。
+    return timegm(&tm);
 }
 
 // Load sync state from /sdcard/settings/sync_state.txt
 // Format: each line is "filename=unixtimestamp"
 static std::map<std::string, time_t> loadSyncState() {
     std::map<std::string, time_t> state;
+    // 原子写（safeWriteFileStream）是 .tmp → rename，且原文件先退到 .bak —— 万一在这一步
+    // 掉电，主文件可能不在而 .bak 还在。repairSafeWriteFile 把 .bak 扶正（settings 那边
+    // get() 同样先 repair）。不修的话状态表会静默变空，见 saveSyncState 处列的两处依赖。
+    repairSafeWriteFile("/sdcard/settings/sync_state.txt");
     FILE *f = fopen("/sdcard/settings/sync_state.txt", "r");
     if (!f) return state;
     char line[512];
@@ -345,14 +355,32 @@ static std::map<std::string, time_t> loadSyncState() {
     return state;
 }
 
+struct SyncStateCtx {
+    const std::map<std::string, time_t> *state;
+};
+
+static bool writeSyncStateChunk(FILE *tmp, void *ctx) {
+    const auto *c = static_cast<const SyncStateCtx *>(ctx);
+    for (const auto &kv : *c->state) {
+        if (fprintf(tmp, "%s=%lld\n", kv.first.c_str(), (long long)kv.second) < 0) return false;
+    }
+    return true;
+}
+
 static void saveSyncState(const std::map<std::string, time_t> &state) {
     mkdir("/sdcard/settings", 0777);
-    FILE *f = fopen("/sdcard/settings/sync_state.txt", "w");
-    if (!f) return;
-    for (auto &kv : state) {
-        fprintf(f, "%s=%lld\n", kv.first.c_str(), (long long)kv.second);
+    // 必须原子写。原来是 fopen("w")：先 truncate 再逐行写，中途掉电/写失败就留下一份
+    // **空的或截半的**状态文件 —— 而这张表有两处硬依赖：
+    //   1. sync 开头那道保险「远端列表为空 + 本地有文件 + prevState 非空 → 判网络异常并
+    //      中止」，prevState 空了它就不再拦，一次断网就能把本地日记全删光；
+    //   2. `inPrev` 决定「本地没有就是本地删的 → 删远端」还是「远端新增 → 下载」。状态
+    //      丢了以后，用户在本地删掉的日记会在下一轮当成"远端新增"重新下载回来。
+    // 走 safeWriteFileStream（.tmp → rename）后盘上要么是旧完整份、要么是新完整份。
+    // 顺带不用把整张表拼成一个 std::string（-fno-exceptions 下分配失败 = abort）。
+    SyncStateCtx ctx{&state};
+    if (!safeWriteFileStream("/sdcard/settings/sync_state.txt", writeSyncStateChunk, &ctx)) {
+        ESP_LOGW(TAG, "Failed to save sync state");
     }
-    fclose(f);
 }
 
 // ── Bidirectional sync ──────────────────────────────────────────────

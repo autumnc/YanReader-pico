@@ -432,17 +432,21 @@ static esp_err_t __attribute__((unused)) handler_list(httpd_req_t *req) {
         return ESP_OK;
     }
 
-    std::string json = "{\"path\":\"";
-    json += path;
-    json += "\",\"entries\":[";
-
+    // 锁里只留"必须串行化的 SD 访问"（readdir + stat）：这两步是真正碰卡的操作，别的任务
+    // （尤其 UI 线程落盘日记/进度）都堵在这把递归锁上。原来把 JSON 拼串、formatSize、
+    // imageMimeFor 这些纯内存/纯字符串的活也圈在临界区里，2000 个条目就是几百 KB 的
+    // 反复 +=（每次重新分配），白占着锁；现在改成先把条目收进 vector，出了锁再拼。
+    struct FmEntry {
+        std::string name;
+        bool isDir;
+        off_t size;
+    };
+    std::vector<FmEntry> entries;
     struct dirent *ent;
-    bool first = true;
     // 条目数上限：这个 JSON 在 PSRAM 里按目录大小线性长。正常目录几十上百项无感，
     // 但 SD 卡上堆了几千个文件时，一次列目录就是几百 KB 的字符串，且是在处理 HTTP
     // 请求的过程中分配。截断比把内存吃光好——反正这么长的列表在界面上也没法用。
     static constexpr int kMaxEntries = 2000;
-    int count = 0;
     bool truncated = false;
     while ((ent = readdir(dir)) != nullptr) {
         // "." 和 ".." 永远不列（后者是 readdir 给的真实条目，点进来会拼出 path + "/.."）；
@@ -450,40 +454,51 @@ static esp_err_t __attribute__((unused)) handler_list(httpd_req_t *req) {
         const char *nm = ent->d_name;
         if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0'))) continue;
         if (!showHidden && nm[0] == '.') continue;
-        if (count >= kMaxEntries) { truncated = true; break; }
-        count++;
-        std::string full = path + "/" + ent->d_name;
+        if (static_cast<int>(entries.size()) >= kMaxEntries) { truncated = true; break; }
+        FmEntry e;
+        e.name = ent->d_name;
+        e.isDir = false;
+        e.size = 0;
+        std::string full = path + "/" + e.name;
         struct stat st;
-        bool isDir = false;
-        off_t fsize = 0;
         if (stat(full.c_str(), &st) == 0) {
-            isDir = S_ISDIR(st.st_mode);
-            fsize = st.st_size;
+            e.isDir = S_ISDIR(st.st_mode);
+            e.size = st.st_size;
         }
-        if (!first) json += ",";
-        first = false;
-        json += "{\"name\":\"";
-        // escape JSON string
-        for (const char *p = ent->d_name; *p; p++) {
-            if (*p == '"' || *p == '\\') json += '\\';
-            json += *p;
-        }
-        json += "\",\"type\":\"";
-        json += isDir ? "dir" : "file";
-        json += "\",\"size\":\"";
-        json += formatSize(fsize);
-        json += "\"";
-        // 图片条目：前端据此多给「查看」按钮。standby 再细分一层 —— 只有解码器认的
-        // JPG/PNG 才给「设为待机」，别的（bmp/gif/webp）能看不能设。
-        if (!isDir && imageMimeFor(full)) {
-            json += ",\"image\":true";
-            if (isStandbyImagePath(full)) json += ",\"standby\":true";
-        }
-        json += "}";
+        entries.push_back(std::move(e));
     }
     closedir(dir);
     if (mtx) xSemaphoreGiveRecursive(mtx);
 
+    std::string json = "{\"path\":\"";
+    json += path;
+    json += "\",\"entries\":[";
+    bool first = true;
+    for (const auto &e : entries) {
+        if (!first) json += ",";
+        first = false;
+        json += "{\"name\":\"";
+        // escape JSON string
+        for (const char *p = e.name.c_str(); *p; p++) {
+            if (*p == '"' || *p == '\\') json += '\\';
+            json += *p;
+        }
+        json += "\",\"type\":\"";
+        json += e.isDir ? "dir" : "file";
+        json += "\",\"size\":\"";
+        json += formatSize(e.size);
+        json += "\"";
+        // 图片条目：前端据此多给「查看」按钮。standby 再细分一层 —— 只有解码器认的
+        // JPG/PNG 才给「设为待机」，别的（bmp/gif/webp）能看不能设。
+        if (!e.isDir) {
+            std::string full = path + "/" + e.name;
+            if (imageMimeFor(full)) {
+                json += ",\"image\":true";
+                if (isStandbyImagePath(full)) json += ",\"standby\":true";
+            }
+        }
+        json += "}";
+    }
     json += "],\"truncated\":";
     json += truncated ? "true" : "false";
     json += "}";

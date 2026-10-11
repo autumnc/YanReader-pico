@@ -762,7 +762,11 @@ enum { FM_OPEN = 0, FM_STANDBY, FM_COPY, FM_CUT, FM_PASTE, FM_RENAME, FM_DELETE,
 static int fileMenuActions(int *acts, int maxN) {
   const BookEntry *e = fmTarget();
   int n = 0;
-  if (e && e->kind != 4) acts[n++] = FM_OPEN;   // kind 4（其它文件）没有可打开的动作
+  // 没有目标条目（st.fmIdx 越界）就整个菜单空着 —— 下面那一串动作每一个都要拿条目
+  // （复制/剪切/重命名/删除/属性），原来只有「打开/设为待机」两项自己判了 e，其余无条件
+  // 挂上，于是菜单里会出现一堆按下去拿不到条目的项。判据与那两项同源。
+  if (!e) return 0;
+  if (e->kind != 4) acts[n++] = FM_OPEN;   // kind 4（其它文件）没有可打开的动作
   // 「设为待机画面」只对图片出现（kind 3 = 看图器认得的那三种后缀）。放在「打开」
   // 后面：打开是看，设为待机是留，先看后留。
   if (e && e->kind == 3) acts[n++] = FM_STANDBY;
@@ -837,7 +841,11 @@ void renderFileMenu() {
 // 从菜单里执行「打开」时先退回文件列表，再走 fbOpenEntry：目录/图片/书各自的模式
 // 切换由它负责，省得在这里再判断一遍。
 static void fmOpen() {
-  const BookEntry e = *fmTarget();
+  // 同 fmBeginRename / fmRenameConfirmed 的兜底：fmTarget() 在 st.fmIdx 越界时**明确**返回
+  // nullptr，原来这两处（还有下面的 fmDeleteConfirmed）是唯一直接解引用的地方。
+  const BookEntry *pe = fmTarget();
+  if (!pe) { fmBackToBrowser(); return; }
+  const BookEntry e = *pe;
   fmBackToBrowser();
   fbOpenEntry(e);
 }
@@ -887,7 +895,9 @@ static void fmCloseBookIf(const std::string &pathOrDir) {
 
 // 删除是不可逆的：菜单里第一次 Enter 只置位（标签变「确认删除」），再按一次才真删。
 static void fmDeleteConfirmed() {
-  const BookEntry e = *fmTarget();
+  const BookEntry *pe = fmTarget();
+  if (!pe) { fmBackToBrowser(); return; }
+  const BookEntry e = *pe;
   if (e.kind < 0) Storage.removeDir(e.path.c_str());
   else Storage.remove(e.path.c_str());
 

@@ -379,8 +379,11 @@ static bool flomoSyncWork(Store &work, std::string &status) {
 }
 
 // worker 任务：自己 load 一份库 → 干活 → 落盘 → 发结果。全程不画屏。
-static void flomoSyncTask(void *arg) {
-    (void)arg;
+// 真的活干在 flomoSyncBody 里：本任务以 vTaskDelete 收尾，FreeRTOS 删任务**不回卷
+// C++ 栈** —— 留在任务函数里的 `Store work`（整个笔记库，含每条正文）+ `std::string
+// status` 析构不会跑，**每同步一次漏一整库**（几千条笔记就是几百 KB）。搬进 body 后
+// 它们在返回时正常析构。顺带 MemoDb db / 库里那些 vector 也一样。（见 btInitTask。）
+static void flomoSyncBody() {
     const char *TAG = "FlomoSync";
     const int64_t t0 = esp_timer_get_time();
     ESP_LOGI(TAG, "同步开始");
@@ -406,6 +409,11 @@ static void flomoSyncTask(void *arg) {
     s_syncOk = ok;
     syncUnlock();
     s_syncState.store(FSYNC_DONE, std::memory_order_release);
+}
+
+static void flomoSyncTask(void *arg) {
+    (void)arg;
+    flomoSyncBody();
     vTaskDelete(nullptr);
 }
 

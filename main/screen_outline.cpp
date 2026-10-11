@@ -2035,6 +2035,13 @@ static bool olHandleConfirm(int &key, AppState &out, ScreenContext &ctx) {
                 }
                 rmdir(dir.c_str());
                 g.projects.erase(g.projects.begin() + g.confirmIdx);
+                // 删掉的可能是"当前正开着的"那个项目，也可能排在它前面 —— 两种都得把
+                // curProject 跟着挪：不挪的话它要么指到**另一个**项目上（此后 saveOutline /
+                // ensureContentFile 全写进别人的目录 = 静默改错文件），要么直接越界
+                // （g.projects[g.curProject] 的读取点里有几处没有上界检查）。挪到 -1 表示
+                // "手上这个项目已经没了"，交给下面回项目列表。
+                if (g.curProject == g.confirmIdx) g.curProject = -1;
+                else if (g.curProject > g.confirmIdx) g.curProject--;
                 if (g.sel >= (int)g.projects.size()) g.sel = (int)g.projects.size() - 1;
                 if (g.sel < 0) g.sel = 0;
                 ui_toast_show("已删除项目");
@@ -2050,7 +2057,11 @@ static bool olHandleConfirm(int &key, AppState &out, ScreenContext &ctx) {
                 saveOutline();
                 ui_toast_show("已清除关联");
             }
-            g.mode = M_BROWSE;
+            // 删项目只能从项目列表（M_PROJECTS）发起，确认后必须**回到那张列表**：
+            // M_BROWSE 画的是 g.nodes（可能还停在被删掉的、或另一个项目的那份，而它的文件
+            // 已经/不在这里了），在上面做任何编辑都会 saveOutline 进错目录。与下面的取消路径
+            // 同一口径（"取消"和"确认"都回项目列表）。
+            g.mode = (g.confirmAction == 2) ? M_PROJECTS : M_BROWSE;
         } else if (key == 0x1B) {
             // Cancelled
             g.mode = (g.confirmAction == 2) ? M_PROJECTS : M_BROWSE;
