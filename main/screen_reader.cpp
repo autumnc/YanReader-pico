@@ -1,8 +1,8 @@
 // screen_reader.cpp — 阅读模式（阅读器）移植。
 //
-// 按子应用拆文件（P3b）：微信读书已搬到 screen_reader_weread.cpp，共享的状态量与
-// 外壳原语在 screen_reader_internal.h。这个 TU 仍是阅读器本体（书架/翻页/目录/笔记/
-// 词典/设置/统计/文件管理）——往下拆的下一块见 docs/架构评审-2026-10-04.md 的 P3b。
+// 按子应用拆文件：微信读书已搬到 screen_reader_weread.cpp，共享的状态量与外壳原语在
+// screen_reader_internal.h。这个 TU 仍是阅读器本体（书架/翻页/目录/笔记/词典/设置/
+// 统计/文件管理）—— 继续拆的话，下一块从这里面的几屏入手。
 //
 // 用 read_pico 官方固件的 ui 库与底层驱动（epdiy 4bpp framebuffer + ttf_font），
 // 逻辑层复用 crossmux 的 lib/（Epub/Txt/Xtc/Section/Page/GfxRenderer/HalDisplay/

@@ -2,8 +2,7 @@
 
 Runs the **real** `main/ime/IME.cpp` (+ `yong_dict.cpp`, `yong_pinyin.cpp`) on Linux
 x86-64 with plain `g++`. No ESP-IDF, no CMake, no device, no flashing. This is the
-`tests/host/` convention the architecture review asks for
-(`docs/架构评审-2026-10-04.md:250`).
+`tests/host/` convention.
 
 It exists to reproduce and instrument the **"stray remainder" candidate/commit bug**
 (typing `zhege` and selecting 这个 left an extra `g` in the composition; `jiushi` →

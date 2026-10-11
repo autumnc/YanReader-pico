@@ -324,8 +324,7 @@ pjournal-pico/
 ├── tools/                      # make_logo_font.py
 └── docs/                       # 网页刷机台（GitHub Pages 站点，见「网页刷机」）
     ├── index.html flasher.js style.css   # 页面 / 刷写逻辑 / 样式（零构建、零 CDN）
-    ├── vendor/                 # esptool-js 0.7.0（vendored，含 Apache-2.0 LICENSE）
-    └── 架构评审-2026-10-04.md   # 分层评审 + 整改进度
+    └── vendor/                 # esptool-js 0.7.0（vendored，含 Apache-2.0 LICENSE）
 ```
 
 ### `main/` 主要模块
@@ -358,7 +357,7 @@ gfx/ font/                 # u8g2 shim + 图标字体 + ttf_font（stb_truetype�
 
 ## 架构分层
 
-来自 [`docs/架构评审-2026-10-04.md`](docs/架构评审-2026-10-04.md)（P0–P3 已完成）：
+四层的划分与依赖方向：
 
 ```
 应用层      main.cpp ──→ 各 screen_*.cpp（单向依赖，屏之间不互相 include 实现）

@@ -6,7 +6,7 @@
 //
 // 存在的唯一理由是 screen_reader.cpp 太大（12343 行、561KB），按子应用拆文件时要有个
 // 地方放"大家都要用的那部分"。第一个拆出去的是微信读书（screen_reader_weread.cpp）：
-// 它要读 st.we*、要画标题栏/底栏、要 switchTab/openBook。见 docs/架构评审-2026-10-04.md 的 P3b。
+// 它要读 st.we*、要画标题栏/底栏、要 switchTab/openBook。
 //
 // 拆的规矩（照着往下搬时别走样）：
 //   · 状态量留在 RdState 里**一份**，不按子应用切分 —— 它们互相纠缠（微读下载完要
