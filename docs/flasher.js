@@ -14,13 +14,26 @@
  *    所以改成查三处魔数（0x0 引导头 0xE9 / 0x8000 分区表 0xAA 0x50 / 0x10000 应用 0xE9）。
  *    这顺带多出一道闸：能挡下"误把 app-only 的 pjournal_pico.bin 刷到 0x0"这种会砖的操作。
  *
- * 3. 【刷完必须自己复位】writeFlash 走到 compress 那条路时收尾是
- *    flashDeflFinish(false, …)（reboot=false），**芯片留在 stub 里不自启**。所以下面显式调
- *    after("hard_reset")。用库默认那条而不是参考站的 custom_reset "R1|W100|R0"：
- *    HardReset 非 OTG 分支的实现是 `sleep(100); setRTS(false)` —— 只**松开** RTS、不动 DTR；
- *    而那句 custom_reset 是 `RTS 1 → 100ms → RTS 0`，只动 RTS、把 DTR 留在前一档，
- *    正是"USB 串口上给 RTS 脉冲"那个坑的形状（DTR 留错档 → 下次复位进下载模式）。
- *    *实机若发现刷完不重启，第一顺位换 after("soft_reset")，第二顺位才是那句 custom_reset。*
+ * 3. 【刷完必须自己复位，而且 after("hard_reset") 不够】writeFlash 走 compress 那条路时
+ *    收尾是 flashDeflFinish(false, …)（reboot=false），**芯片留在 stub 里不自启**。
+ *    ★ 实机验证过：`after("hard_reset")` 在这块板子上**不重启**（刷完得手动断电）。
+ *    两个原因，都是读 esptool-js 源码 + 对拍 esptool.py 得出的：
+ *      a) `after("hard_reset")` **不走** constructResetSequence —— 那条会自动挑 USB-JTAG
+ *         序列的路只在 connect/main 里用；after 直接拿 resetConstructors.hardReset。
+ *      b) 而 HardReset 非 OTG 分支的全部实现是 `sleep(100); setRTS(false)`。在 WebSerial
+ *         语义里 setRTS(false) = **放开** EN；可 EN 本来就是高的（连接时 UsbJtagSerialReset
+ *         收尾在 RTS=0,DTR=0），所以这一句等于什么都没做。
+ *    esptool.py 的 hard_reset()（esp_pylib/serial_reset.py）是「RTS 拉低(EN=LOW) → hold →
+ *    RTS 拉高(EN=HIGH)」，也就是**先断言、再放开**；它的 set_dtr_rts 注释写明 RTS↔EN、
+ *    DTR↔IO0（USB-Serial-JTAG 把这两根线模拟出来了）。所以这里用库自带的 custom_reset
+ *    通道发同一串：RESET_SEQUENCE = "D0|R1|W200|R0"。
+ *      · 前面补 D0：把 IO0 钉在高电平（= 正常启动，不用下载模式）
+ *      · W200：与 esptool.py 对"USB 内置外设"的 hold_delay 一致
+ *    （先前版本我批评过参考站 flasher.smn.icu 那句 custom_reset "R1|W100|R0"，说它
+ *     "只动 RTS、把 DTR 留在前一档"是坑。**那个批评是错的** —— 它正是"断言 EN 再放开"，
+ *     在这块板子上是对的；错的是库自带的 HardReset。留此存照。）
+ *    *实机若仍不重启：第一顺位把 W 调长或补一个 trailing "W200|D0"，第二顺位直接用
+ *     bundle 里导出的 UsbJtagSerialReset(transport).reset()，第三顺位 after("soft_reset")。*
  *
  * 4. 【resetConstructors 一个字都别传】isUsbJtagSerialPort()（VID 0x303A &&
  *    PID == USB_JTAG_SERIAL_PID）命中的设备，constructResetSequence() **会自动**走
@@ -59,6 +72,14 @@ const PARTITION_MAGIC0 = 0xaa;
 const PARTITION_MAGIC1 = 0x50;
 const OFFSET_PARTITION = 0x8000;
 const OFFSET_APP = 0x10000;
+
+// 刷完之后的复位序列（custom_reset 语法：D=DTR(IO0) R=RTS(EN) W=等待ms；1=断言=低电平）。
+// 为什么不是 after("hard_reset")：见文件头第 3 条 —— 库自带的 HardReset 只"放开" EN、
+// 从不断言，而 EN 本来就是高的，于是等于什么都没做（实机验证：芯片留在 stub 里不自启）。
+// esptool.py 的 hard_reset() 是「RTS 拉低(EN=LOW) → hold → RTS 拉高(EN=HIGH)」，
+// 这里照着写一遍；前面补 D0 把 IO0 钉在高电平（= 正常启动，不进下载模式）。
+const RESET_SEQUENCE = "D0|R1|W200|R0";
+const RESET_SETTLE_MS = 300; // 复位后等芯片开始启动再撒手（USB 口在复位期间会掉出总线）
 
 const $ = (id) => document.getElementById(id);
 
@@ -147,6 +168,8 @@ function showBanner(text) {
 function fmtSize(bytes) {
   return (bytes / 1048576).toFixed(2) + " MB（" + bytes.toLocaleString("en-US") + " 字节）";
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function refreshButtons() {
   el.btnConnect.disabled = busy || connected || !navigator.serial;
@@ -489,9 +512,16 @@ async function flash() {
     setStatus("校验通过，正在重启设备…");
 
     // ★ writeFlash 不会自己复位（compress 路径收尾 reboot=false），必须显式来一下。
-    await loader.after("hard_reset");
+    //   用 custom_reset 发 RESET_SEQUENCE —— after("hard_reset") 在这块板子上是空操作，
+    //   原因见文件头第 3 条。
+    await loader.after("custom_reset", undefined, RESET_SEQUENCE);
+    await sleep(RESET_SETTLE_MS); // 让复位走完、芯片开始启动，再放手端口
 
-    setStatus("✓ 刷写完成，设备正在重启 —— 屏幕刷新后即可拔线。", "ok");
+    setStatus(
+      "✓ 刷写完成，设备正在重启 —— 屏幕刷新后即可拔线。" +
+        "若 5 秒内屏幕毫无反应，拔掉 USB 线再插上（或关机重开）即可，固件已经写进去了。",
+      "ok"
+    );
     setProgress(1);
     await releasePort();
   } catch (e) {
