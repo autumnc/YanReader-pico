@@ -32,8 +32,11 @@
  *    （先前版本我批评过参考站 flasher.smn.icu 那句 custom_reset "R1|W100|R0"，说它
  *     "只动 RTS、把 DTR 留在前一档"是坑。**那个批评是错的** —— 它正是"断言 EN 再放开"，
  *     在这块板子上是对的；错的是库自带的 HardReset。留此存照。）
- *    *实机若仍不重启：第一顺位把 W 调长或补一个 trailing "W200|D0"，第二顺位直接用
- *     bundle 里导出的 UsbJtagSerialReset(transport).reset()，第三顺位 after("soft_reset")。*
+ *    ★ 2026-10-11 实机验证通过：在线上 GitHub Pages 刷完，设备**自己重启进书架**，
+ *      不必再手动断电 —— 这一串就是最终解。
+ *    *万一以后又不行（例如换了 esptool-js 版本）：第一顺位把 W 调长或补一个 trailing
+ *     "W200|D0"，第二顺位直接用 bundle 里导出的 UsbJtagSerialReset(transport).reset()，
+ *     第三顺位 after("soft_reset")。*
  *
  * 4. 【resetConstructors 一个字都别传】isUsbJtagSerialPort()（VID 0x303A &&
  *    PID == USB_JTAG_SERIAL_PID）命中的设备，constructResetSequence() **会自动**走
