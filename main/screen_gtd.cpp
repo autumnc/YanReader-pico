@@ -5878,7 +5878,7 @@ static AppState gtdHandleBrowse(int key, ScreenContext &ctx) {
 
 
 
-    // 计划模式是独立的一档模式（电源键在 阅读/写作/计划 之间轮换），Esc/返回
+    // 计划模式是独立的一档模式（长按中间确认键在 阅读/写作/计划 之间轮换），Esc/返回
     // 只在本模式内层层退回，最终停在计划模式主界面，不再掉回写作模式。
     if (key == 'q' || key == 'Q' || key == 0x1B) {
 
@@ -5910,7 +5910,7 @@ static AppState gtdHandleBrowse(int key, ScreenContext &ctx) {
 
         }
 
-        // 已在主界面最外层：留在计划模式。这里原本弹一条"电源键切换模式"的提示，
+        // 已在主界面最外层：留在计划模式。这里原本弹一条"长按中间键切换模式"的提示，
         // 但主界面按返回是高频动作，每次都蹦提示反而吵，直接静默留着即可。
         return APP_GTD;
 

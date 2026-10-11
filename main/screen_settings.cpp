@@ -93,9 +93,6 @@ static const SettingField SETTINGS_FIELDS[] = {
     // 正文横排/竖排）看混：这条管整屏转不转，那条管正文的书写方向。
     // 空串 = 跟随通用里的「屏幕方向」，进/出写作模式时套用/还原（screen_editor）。
     {"_writing_orientation", "写作模式方向", false, true, CAT_DISPLAY},
-    // 错相揭页：阅读器翻页时用 16 条带依次入相的"揭页"替代普通差分刷（约 1.1s）。
-    // 开着更好看但更慢，所以给个开关，默认开。
-    {"page_turn_anim", "翻页动画", false, false, CAT_DISPLAY},
     {"reader_perf_log", "翻页性能日志", false, false, CAT_DISPLAY},
     {"ui_perf_log", "界面性能日志", false, false, CAT_DISPLAY},
     {"webdav_debug_log", "WebDAV调试日志", false, false, CAT_DISPLAY},
@@ -453,7 +450,6 @@ static bool isToggleField(const char *key) {
            strcmp(key, "click_enabled") == 0 ||
            strcmp(key, "ime_sentence") == 0 ||
            strcmp(key, "ime_doc_context") == 0 || strcmp(key, "ime_candidate_highlight") == 0 ||
-           strcmp(key, "page_turn_anim") == 0 ||
            strcmp(key, "reader_perf_log") == 0 ||
            strcmp(key, "ui_perf_log") == 0 ||
            strcmp(key, "webdav_debug_log") == 0 ||
@@ -470,7 +466,6 @@ static bool toggleValue(const char *key) {
     if (strcmp(key, "ime_sentence") == 0) return v != "0";  // 默认开
     if (strcmp(key, "ime_doc_context") == 0) return v != "0";  // 默认开
     if (strcmp(key, "ime_candidate_highlight") == 0) return v == "1";  // 默认关
-    if (strcmp(key, "page_turn_anim") == 0) return v != "0";           // 默认开
     // 走访问器：它带"读不到新键就回退旧键 reader_night"的迁移逻辑。
     if (strcmp(key, "night_mode") == 0) return g_settings.nightMode();
     return v == "1";  // auto_save: 默认关

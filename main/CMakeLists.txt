@@ -131,7 +131,6 @@ idf_component_register(SRCS
         sdmmc
         esp_driver_sdmmc
         e0470_epaper_waveform
-        e0470_page_turn
         esp_hid
         bt
         nvs_flash

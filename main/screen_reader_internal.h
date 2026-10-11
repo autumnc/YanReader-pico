@@ -506,6 +506,12 @@ struct RdState {
   // 长按选中的词范围（当前页语言：words 下标）与浮层选择
   bool selActive = false;
   int selStart = 0, selEnd = 0;
+  // "按字"粒度专用的**词内码点下标**（-1 = 整词条，即按句/按段落与所有老路径）。
+  // 只在 selStart == selEnd 时有意义，表示"只选 words[selStart] 里的第 selCp 个码点"。
+  // 中文一个词条常是"一个字 + 粘连的标点"（如 "好。"），所以只按词条框不出"好"这一个字。
+  // 任何改变范围的路径（方向键/拖手柄/点选区内/重新锚定标注）都必须把它重置为 -1 ——
+  // 否则会把上一次的码点下标套到一个新词条上，框到一半就断开。
+  int selCp = -1;
   // 抓着哪个手柄（0=起点 1=终点 -1=没抓）。手柄画在行外，一次点按只能是"抓起来"，
   // 抓起来之后再点词，那一段才跳过去 —— 这样两端都能左右伸缩，而不是只有终点能动。
   int selGrab = -1;
@@ -824,12 +830,20 @@ struct RdWordHit {
   // 但 WAVY_UNDERLINE(256) / ALT2_FONT(512) 会被砍 —— 后果是 rdWarmPageText 永远读不到
   // ALT2 位（第三家族的字形从不预热），命中框宽度也会按错的面量。
   uint16_t style = 0;
+  // 这个词条用的**实际字体 id**（标题/正文/脚注可能不是同一个面，见 rdBuildPageText 里
+  // 的 lineFontId）。存下来是为了"按字"能把词条拆成单个码点的子矩形：量前缀宽必须跟
+  // 渲染同一个面同一个样式，否则字宽会和实际错开。从前只有绘制时才拿它，现在数据层也留一份。
+  int fontId = 0;
   std::string text;
 };
 
 struct RdPageText {
   std::vector<RdWordHit> words;   // 阅读顺序：行序 → 行内词序
   std::vector<int> lineFirst;     // 每行首个词的下标，末尾补 words.size()
+  // 每个词条所属的**段落块**编号（与 words 等长）。EPUB 用 Block 的同一性，TXT 用空行/
+  // 首行缩进切。只被"按段落"选字用；其它粒度不看它。空 vector = 这一页建不出来段落归属
+  // （老路径/异常），此时按段落退回"只选点中的那一个词条"。
+  std::vector<int> wordBlock;
   bool valid = false;
 };
 

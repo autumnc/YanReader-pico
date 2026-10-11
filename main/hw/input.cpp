@@ -418,8 +418,8 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
         key3_long_fired = false;
     } else if (key3_down && !key3_long_fired && (now - key3_down_us) >= LONG_PRESS_MS * 1000) {
         key3_long_fired = true;
-        ESP_LOGD(TAG, "KEY2 long press → standby");
-        key = KEY_LONG_CONFIRM;  // 长按中间键 = 待机（main.cpp 全局处理）
+        ESP_LOGD(TAG, "KEY2 long press → mode switch");
+        key = KEY_LONG_CONFIRM;  // 长按中间键 = 切换模式（main.cpp 全局处理）
     }
     if (key3_was_down && !key3_down && key == 0 && !key3_long_fired) {
         ESP_LOGD(TAG, "KEY3 release → confirm");
@@ -572,15 +572,20 @@ static bool shake_poll() {
 // ── 唤醒那一按的"抬手"要吞掉 ────────────────────────────────────────────────
 // 待机时按电源键：KEY_DOWN 把设备叫醒（enterLightSleep 里 take_key_wakeup 已经 ack），
 // 松手时 PMU 再补一个 KEY_SHORT —— 那个事件是**醒着的时候**才进队列的，若不拦就变成
-// "按一下电源键唤醒，顺带把模式转了一圈"（用户在待机画面按醒，回来发现换模式了）。
-// 登记时刻由 enterLightSleep 给（input_note_key_wake），这里只判时间窗。
+// "按一下电源键唤醒，顺带又睡回去"（电源键短按 = 待机）。登记时刻由 enterLightSleep
+// 给（input_note_key_wake），这里只判时间窗。
 //
-// 窗口 2s：唤醒路径是 epd_poweron + epd_clear + 恢复快照（约 1s 起步），用户一般在
-// 屏幕亮起来的瞬间松手，抬手事件稳稳落在窗内。窗口外一律照常上报 —— 真想切模式，
-// 再按一下就行（按一次被吞是可恢复的，反过来漏判就是"永远切不动/莫名切"的毛病）。
+// 窗口 4s：唤醒路径是 epd_poweron + epd_clear + 恢复快照（约 1s 起步），用户一般在
+// 屏幕亮起来的瞬间松手，抬手事件稳稳落在窗内。窗口外一律照常上报 —— 想再睡一次，
+// 松手之后再按一下就行（按一次被吞是可恢复的，漏判反而是"唤醒之后立刻又睡"，
+// 看起来像机器坏了，所以这里从 2s 放宽到 4s）。
+//
+// **放宽的代价是零**：s_wake_swallow 在下面消费者那一侧用完立刻置回 false，所以整个
+// 窗口只可能吃掉"唤醒后的第一个 KEY_SHORT"，而那个本来就是唤醒那一按的抬手；用户
+// 唤醒后再按一次电源键睡回去，那是第二个，照常上报。
 static bool s_wake_swallow = false;
 static int64_t s_wake_us = 0;
-#define WAKE_SWALLOW_US (2000 * 1000LL)
+#define WAKE_SWALLOW_US (4000 * 1000LL)
 
 void input_note_key_wake() {
     s_wake_swallow = true;
@@ -588,7 +593,7 @@ void input_note_key_wake() {
 }
 
 // 扫一遍 PMU 事件队列，把电源键的两个意图抽出来：
-//   短按                       → KEY_POWER（切模式）
+//   短按                       → KEY_POWER（待机）
 //   长按满 8s（KEY_FORCE_OFF） → KEY_POWER_HOLD（要关机了，抢在硬断电前铺关机页）
 // read_pico_pmu_take_key_short() 只认短按、其余事件一律静默 ack 丢掉 —— 8s 的关机警告
 // 就是这么丢的，等 PMU 满 10s 直接拉 EN 时主机已经没法铺画面了。所以自己走一遍队列
@@ -608,12 +613,12 @@ static int poll_pmu_key() {
         const uint8_t type = s->event.type;
         if (type == PMU_EVT_KEY_SHORT) {
             if (s_wake_swallow && esp_timer_get_time() - s_wake_us < WAKE_SWALLOW_US) {
-                // 唤醒那一按的抬手（见上面 input_note_key_wake 的说明）：只唤醒，不切模式。
-                ESP_LOGI(TAG, "吞掉唤醒那一按的抬手 id=%u held=%u（待机唤醒不切模式）", (unsigned)id,
+                // 唤醒那一按的抬手（见上面 input_note_key_wake 的说明）：只唤醒，不再睡回去。
+                ESP_LOGI(TAG, "吞掉唤醒那一按的抬手 id=%u held=%u（待机唤醒不再睡）", (unsigned)id,
                          (unsigned)s->event.arg0);
             } else {
                 if (s_wake_swallow) {
-                    // **登记过却超时** = 这一按被判成"唤醒之后的另一下"，会去切模式。
+                    // **登记过却超时** = 这一按被判成"唤醒之后的另一下"，会去待机。
                     // 把间隔和按键时长都打出来：窗口只差一点就说明还得再放宽，差很远就是
                     // 登记点/唤醒路径另有问题（正常情况下这条不该出现）。
                     ESP_LOGW(TAG, "唤醒抬手超出窗 %lldms（窗 %lldms, held=%u）→ 当短按上报",
@@ -664,7 +669,7 @@ int input_poll() {
     // 边缘返回的方向同理（只在 KEY_BACK 那一帧有意义）。
     s_back_valid = false;
     if (g_hw.touch == NULL) {
-        // 电源键短按仍可用（PMU 独立于触摸）→ 写作/阅读模式切换；长按满 8s → 关机预警。
+        // 电源键短按仍可用（PMU 独立于触摸）→ 待机；长按满 8s → 关机预警。
         const int pk = poll_pmu_key();
         if (pk != 0) return pk;
         return shake_poll() ? KEY_SHAKE : 0;
@@ -724,7 +729,7 @@ int input_poll() {
         if (key != 0) return key;
     }
 
-    // 电源键：短按 → 写作/阅读模式切换；长按满 8s → 关机预警（见 poll_pmu_key）。
+    // 电源键：短按 → 待机；长按满 8s → 关机预警（见 poll_pmu_key）。
     const int pk = poll_pmu_key();
     if (pk != 0) return pk;
 

@@ -731,7 +731,7 @@ static void ui_toast_draw() {
 
 void ui_commit() { ui_toast_draw(); ui_render_submit(false); }
 
-// 长按中间确认键：立即整屏 GC16 全刷。不重绘——帧缓冲里就是当前画面，全刷只是
+// 晃动机身：立即整屏 GC16 全刷。不重绘——帧缓冲里就是当前画面，全刷只是
 // 换 GC16 波形把它重画一遍，用来清掉局刷/DU 积累的残影。各模式通用（main.cpp）。
 void ui_full_refresh_now() { ui_render_full_refresh(); }
 

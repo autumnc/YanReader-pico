@@ -627,16 +627,16 @@ static void enterLightSleep(void) {
         settimeofday(&tv, NULL);
     }
 
-    // 唤醒用的是**电源键**，而按电源键在这台机器上还有"切模式"的含义。唤醒那一按的
-    // KEY_DOWN 已经被 take_key_wakeup ack 掉了，可松手时的 KEY_SHORT 会在我们醒着之后
-    // 才进队列 → 不拦的话就是"在待机画面按一下叫醒，回来发现模式被转了"。登记一次，
+    // 唤醒用的是**电源键**，而按电源键在这台机器上还有"待机"的含义（短按即睡）。唤醒
+    // 那一按的 KEY_DOWN 已经被 take_key_wakeup ack 掉了，可松手时的 KEY_SHORT 会在我们
+    // 醒着之后才进队列 → 不拦的话就是"按一下叫醒，松手又被自己送回待机"。登记一次，
     // 让它把紧接着的那个抬手事件吞掉（input.cpp 里有时间窗）。
     //
     // **登记点必须放在这一行，不能提前**：上面那段尾巴（epd_poweron + epd_clear +
     // ui_restore_snapshot 从白重绘）本身就要 1~2s，而 input.cpp 那边是"从登记起 N 秒内
     // 才算唤醒那一按的抬手"。登记在尾巴之前的话，用户看到画面亮起来再松手时窗口早就过
-    // 了 —— 抬手被当成正常短按上报，就是"按电源键唤醒顺带切了模式"（2026-10-08 反馈）。
-    // 登记在这里，窗口从"画面已经回来"起算，用户松手的那一下稳稳落在窗内。
+    // 了 —— 抬手被当成正常短按上报，就是"唤醒之后又立刻睡回去"（窗口因此已经从 2s
+    // 放宽到 4s）。登记在这里，窗口从"画面已经回来"起算，用户松手的那一下稳稳落在窗内。
     if (key_wake) input_note_key_wake();
 
     // 后台重新 init BLE + 自动重连键盘(即使休眠失败也恢复 BT 栈)
@@ -1059,7 +1059,7 @@ static_assert(sizeof(kScreens) / sizeof(kScreens[0]) == APP_QUIT + 1,
 
 // ── 界面生命周期：只有"进入"和"离开"两个事件 ────────────────────────────
 // s_activeScreen = **已经跑过 enter** 的那个界面。主循环里任何改了 currentState 的
-// 地方（电源键切模式、Ctrl+I 弹灵感、各屏 handle 的返回值）都不必自己记着"该不该
+// 地方（长按中间键切模式、Ctrl+I 弹灵感、各屏 handle 的返回值）都不必自己记着"该不该
 // init/收尾"——调一次 syncScreenLifecycle() 就行，它是幂等的：
 //   换了界面 → 先 leave 旧屏、再 enter 新屏；没换 → 什么都不做。
 // 调用点在派发**前后**各一次：前面那次收"派发之前就改了 currentState"的（切模式/
@@ -1377,7 +1377,7 @@ extern "C" void app_main() {
         ctx.prevState = APP_SETTINGS;  // 编辑器 Esc → 设置, 设置 Esc → 编辑器
         ctx.promptText = "";
     }
-    // 三种模式各自的"上次停留界面"：power 键在 阅读 → 写作 → 计划 → 阅读 间轮换。
+    // 三种模式各自的"上次停留界面"：长按中间键在 阅读 → 写作 → 计划 → 阅读 间轮换。
     // 计划模式目前只有 GTD(任务/项目)这一块，根界面就是 APP_GTD。
     static AppState s_writingState = APP_MAIN;
     static AppState s_planState = APP_GTD;
@@ -1513,10 +1513,42 @@ extern "C" void app_main() {
         // Check for key repeat events
         g_bt.checkKeyRepeat();
 
-        // 电源键短按 → 阅读/写作/计划三模式轮换（全局，最高优先级，不被任何界面吞掉）。
-        // **双击待机已取消**：300ms 的双击窗口对电源键太短，实际按不出来。待机改由
-        // 长按中间确认键触发（见下面那一段）。
+        // 电源键短按 → 待机（light sleep，任意键唤醒表盘由 standbyClockDraw 铺好）。
+        // 再按一下电源键就唤醒并回到原来那一页 —— 唤醒那一按的"抬手"由 hw/input.cpp 的
+        // 唤醒吞并窗口吃掉（input_note_key_wake / WAKE_SWALLOW_US），不会顺带触发动作。
+        // 沿革：待机本来是"电源键双击"，300ms 的窗口太短按不出来，于是改挂到长按中间
+        // 确认键；现在挂回电源键短按（长按中间键让给了模式轮换）。
         if (key == KEY_POWER) {
+            ESP_LOGI(TAG, "电源键短按 → 待机 (state=%d)", (int)currentState);
+            enterLightSleep();
+            s_last_activity_us = esp_timer_get_time();
+            key = 0;
+        }
+
+        // 电源键长按满 8s → 抢在 PMU 满 10s 硬断电之前把「已关机」铺满、刷 SD，然后
+        // 在这里等断电（不再往下走，否则主循环会把这页盖掉）。排在短按待机之后：
+        // 两者是同一条 PMU 事件队列里的不同事件，poll_pmu_key 已经分开。
+        if (key == KEY_POWER_HOLD) {
+            ESP_LOGW(TAG, "电源键长按 → 关机 (state=%d)", (int)currentState);
+            powerOffWithNotice();
+            key = 0;
+        }
+
+        // 长按中间确认键 → 阅读/写作/计划三模式轮换（全局，最高优先级，不被任何界面吞掉）。
+        // 它原来干的是"待机"，待机已经改由**电源键短按**触发（见上面那一段）；更早它还
+        // 干过"整屏 GC16 全刷"，那个动作改由**晃动机身**触发（见下面的 KEY_SHAKE 与
+        // hw/input.cpp 的 shake_poll）。
+        // 唯一的例外是阅读器里三个把这个键当**动作键**的子界面——词典下载（长按删词典）、
+        // 按键映射（长按解绑）、阅读统计里选中的是一本书时（长按删书）：它们的长按是
+        // 二次确认式的动作，被切模式吃掉功能就没了，所以放行给阅读器自己处理
+        // （screen_reader_long_confirm_is_action）。
+        //
+        // **`currentState == APP_READER` 这道门是必须的**：白名单读的是 st.mode，而
+        // screen_reader_exit() 不重置 st.mode。残留的 DictDl / KeyMap / Stats(选中书)
+        // 会让白名单在写作/计划的界面上也返回 true —— 长按被吃掉，而电源键现在是
+        // "待机"不是"切模式"，用户就**再也回不到阅读模式**（只能重启）。
+        if (key == KEY_LONG_CONFIRM &&
+            !(currentState == APP_READER && screen_reader_long_confirm_is_action())) {
             // 切模式前把共享的单行输入框选区会话收掉：它和编辑器一样把状态挂在
             // 文件级静态量上，带着跨模式会污染下一个界面（比如在编辑器里凭空多出
             // 一条按钮条——两边共用同一个 edit_menu 控件）。
@@ -1549,34 +1581,11 @@ extern "C" void app_main() {
             // 中间如果 next==0 会进 scrReader 而阅读器还没 init。所以这里先同步一次。
             const int64_t tSwitch = esp_timer_get_time();
             syncScreenLifecycle(currentState, ctx);
-            // 按下电源键（这一拍才开始处理）到新界面第一帧走完的总时长，含 leave(旧) +
+            // 长按中间键（这一拍才开始处理）到新界面第一帧走完的总时长，含 leave(旧) +
             // enter(新)。新界面是阅读器时它自己那本「开书拆账」同时打出来，两边一对就差
             // 出 leave 那一份 —— 否则"卡这一段"永远分不清是旧界面的收尾还是新界面的开局。
             ESP_LOGI(TAG, "切模式耗时: %lld ms (→ state %d)",
                      (long long)((esp_timer_get_time() - tSwitch) / 1000), (int)currentState);
-            key = 0;
-        }
-
-        // 电源键长按满 8s → 抢在 PMU 满 10s 硬断电之前把「已关机」铺满、刷 SD，然后
-        // 在这里等断电（不再往下走，否则主循环会把这页盖掉）。排在短按切模式之后：
-        // 两者是同一条 PMU 事件队列里的不同事件，poll_pmu_key 已经分开。
-        if (key == KEY_POWER_HOLD) {
-            ESP_LOGW(TAG, "电源键长按 → 关机 (state=%d)", (int)currentState);
-            powerOffWithNotice();
-            key = 0;
-        }
-
-        // 长按中间确认键 → 待机（light sleep，任意键唤醒表盘由 standbyClockDraw 铺好）。
-        // 它原来干的是"整屏 GC16 全刷"，那个动作已经改由**晃动机身**触发（见下面的
-        // KEY_SHAKE 与 hw/input.cpp 的 shake_poll）。
-        // 唯一的例外是阅读器里三个把这个键当**动作键**的子界面——词典管理（长按删词典）、
-        // 按键映射（长按解绑）、阅读统计里选中的是一本书时（长按删书）：它们的长按是
-        // 二次确认式的动作，被待机吃掉功能就没了，所以放行给阅读器自己处理
-        // （screen_reader_long_confirm_is_action）。
-        if (key == KEY_LONG_CONFIRM && !screen_reader_long_confirm_is_action()) {
-            ESP_LOGI(TAG, "长按确认键 → 待机 (state=%d)", (int)currentState);
-            enterLightSleep();
-            s_last_activity_us = esp_timer_get_time();
             key = 0;
         }
 
@@ -1831,7 +1840,7 @@ extern "C" void app_main() {
                             s_boot_wake_release_pending = false;
                         }
                         // 长按不再休眠: 已在上面的按下分支里发 KEY_BACK(long_fired 为真
-                        // 时整个释放分支都不会进来)。待机改由长按中间确认键触发。
+                        // 时整个释放分支都不会进来)。待机改由电源键短按触发。
                     }
                     btn_boot.last_release_us = now;
                     btn_boot.long_fired = false;
@@ -1925,7 +1934,7 @@ extern "C" void app_main() {
         if (key > 0 && currentState != APP_EDITOR && key != KEY_TOUCH_DRAG) typingClickPlay(1);
 
         // 界面生命周期收口（前半）：上面那些"在派发之前就改了 currentState"的地方
-        // （电源键切模式、Ctrl+I 弹灵感）在这一行得到 enter/leave。放在派发之前是因为
+        // （长按中间键切模式、Ctrl+I 弹灵感）在这一行得到 enter/leave。放在派发之前是因为
         // 各屏的 enter 里有"第一帧就要成立"的东西（阅读器重建 + 画首屏、计划模式定方向）。
         syncScreenLifecycle(currentState, ctx);
 

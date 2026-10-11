@@ -346,13 +346,18 @@ void handleStatsTab(int key) {
   }
 }
 
-// main.cpp 的全局「长按中间确认键 = 待机」要放行三个把它当**动作键**的子界面
+// main.cpp 的全局「长按中间确认键 = 切换模式」要放行三个把它当**动作键**的子界面
 // （见 pjournal_app.h 的声明）：
-//   ① 词典管理：长按 = 删本地词典（二次确认）；
+//   ① 词典下载：长按 = 删本地词典（二次确认）；
 //   ② 按键映射：长按 = 解绑当前动作；
 //   ③ 阅读统计主页：长按 = 从统计里删掉选中的那本书（二次确认）。
 // ③ 只在这一行确实是一本书（rdStatsRows 里 act==5 的行）时才放行——选中卡片/占位行
-// 时它的长按只是"回书架"的另一条路（Esc 也是同一条路），那种场合让给待机更合理。
+// 时它的长按只是"回书架"的另一条路（Esc 也是同一条路），那种场合让给切模式更合理。
+//
+// **调用方必须同时判 currentState == APP_READER**：本函数读 st.mode / st.statsSel，
+// 而这两个值在离开阅读器时不重置（screen_reader_exit 不碰 st.mode）。只看本函数的
+// 返回值，会让残留的 DictDl / KeyMap / Stats(选中书) 在写作/计划界面上也"放行"，
+// 于是长按被吃掉、切模式失效——而电源键已经是待机了，用户会回不到阅读模式。
 static bool rdStatsLongConfirmIsDelete() {
   std::vector<RdStatRow> rows;
   rdStatsRows(rows);

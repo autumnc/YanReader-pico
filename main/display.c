@@ -16,14 +16,12 @@
 
 #include "app_config.h"
 #include "e0470_epaper_waveform.h"
-#include "e0470_page_turn.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "hw/board_hw.h"  // board_hl()：自检页自推屏要自己拿 epdiy 句柄
 #include "longop.h"       // 欠载探针：把"当时谁在关中断"打进欠载日志
-#include "reader_page_turn.h"
 #include "reader_refresh_bridge.h"
 
 #ifndef E0470_GRAY8_TEXT_WAVEFORM
@@ -499,89 +497,21 @@ enum EpdDrawError update_display_gray8_status(EpdiyHighlevelState* hl) {
 #define DISPLAY_KIND_GRAY8_TEXT 4
 #define DISPLAY_KIND_STATUS 5
 
-// ── 错相揭页（翻页动画）────────────────────────────────────────────────
-// 阅读器翻页前用 reader_hint_page_turn() 放一个方向进来，这里**消费一次**：只有紧随
-// 其后的这一次刷新会走动画。做成一次性而不是"设了就一直有效"，是因为这个提示放在
-// 文件级静态里、阅读器那边又可能因为换章/图片页跳过这一帧 —— 留着不放就会在无关的
-// 一帧上突然放一段揭页动画。取走即清，语义最直白。
-static int s_turn_dir = -1;  // -1 = 无；否则是 e0470_turn_dir_t
-
-// 揭页只有一条梯：默认表 GL16（37 相、16 级灰，@stride6 = 127 拍 ≈ 1.06s）。它比原来
-// "正文页走黑白 DU 短梯"（0.29s）慢得多，是有意换观感的：黑白两级在整屏翻页时看着是
-// "啪一下硬切"，灰阶梯才是"淌过去"。曾经还想按"变化千分比 < 300‰"给正文页再分一条
-// 8 灰阶短梯（快 179ms），2026-10-07 删了 —— 那个判据实测是个硬币（见
-// e0470_page_turn_ex() 的注释），而且灰色揭页本来就有 ~0.9s 的地板，换梯子买不到多少。
-
-
-// 揭页失败时要退回安全时钟，而它的定义在下面（跟 guard_draw_result 在一起）。
+// 欠载时退回的安全时钟档。它的定义在下面（跟 guard_draw_result 在一起），
 // 这里先声明一次；C 的暂定定义 + 后面的带初值定义是合法的。
 // 跨核：写点有 core0（欠载恢复）与 guard_draw_result（两个核都会调），读点 display_pclk_mhz。
 // 原子化只为不出现"读到一半"的中间值 —— 最坏影响很小（同一次欠载里写两次同一个值），
 // 但和上面两个标志同一口径。
 static _Atomic int s_pclk_mhz;
 
-void reader_hint_page_turn(int dir) {
-    s_turn_dir = dir;
-}
-
-void reader_release_page_turn(void) {
-    e0470_page_turn_release();
-}
-
-// 揭页动画期间的补采回调（阅读器注册 input_tick，见 reader_page_turn.h）。
-// 在这里转一道手：阅读器不能 include e0470_page_turn.h（那会拖进 epdiy.h），
-// 跟 reader_hint_page_turn 同一个理由。
-void reader_page_turn_set_tick_hook(void (*hook)(void)) {
-    e0470_page_turn_set_tick_hook(hook);
-}
-
-// 逻辑全屏矩形。错相揭页的 area 参数是逻辑坐标，而 epd_full_screen() 给的是**物理**
-// 尺寸（epdiy 的 rotation 只存枚举、不换宽高），两者在竖屏下不同，所以这里显式用
+// 逻辑全屏矩形（自检页那条区域刷要用）。epd_full_screen() 给的是**物理**尺寸
+// （epdiy 的 rotation 只存枚举、不换宽高），竖屏下与逻辑尺寸不同，所以显式用
 // epd_rotated_*() 拿逻辑尺寸。
 static EpdRect logical_full_screen(void) {
     EpdRect a = { .x = 0, .y = 0,
                   .width = epd_rotated_display_width(),
                   .height = epd_rotated_display_height() };
     return a;
-}
-
-// 错相揭页：整屏 16 条带依次入相，差分只算一次，每拍换一张相位 LUT。
-// 它自己 epd_poweron()，但**不管扫描档位/预填** —— 那是调用方的活。
-// 失败时只把 pclk 退回安全值（欠载时）并还原档位，**不做恢复性的整屏重刷**：
-// 交给调用方回退到本档位本来该走的普通刷新，那样屏幕既能拿到新页面，
-// 又能顺带把欠载交给 guard_draw_result 统一处理。基准也还是干净的 ——
-// e0470 只在成功时 copy_front_to_back，highlevel.c 的回写同样只在成功后发生。
-static enum EpdDrawError update_display_page_turn(EpdiyHighlevelState* hl, e0470_turn_dir_t dir) {
-    // 揭页只有一条梯（默认表 GL16，见 s_turn_dir 上方）。扫描档位必须用快的：揭页每拍
-    // 一屏，喂数本来就是瓶颈，所以一律 FAST 档。预填行数仍受队列容量限制：32 行队列下
-    // 总槽位 2*(32-1)=62，取 44/56 都在安全线内。
-    const EpdWaveform* wf = &E0470_WAVEFORM;
-    const int mode = MODE_GL16;
-    read_pico_epd_use_scan(READ_PICO_EPD_SCAN_FAST);
-    epd_lcd_set_prefill_lines(s_bulk_io ? 56 : 44);
-    present_begin();
-    // 揭页内部也是 front/back 差分 + 成功时把 front 抄回 back，所以成对翻即可（同 hl_update）。
-    night_enter(hl);
-    enum EpdDrawError result = e0470_page_turn_ex(hl, logical_full_screen(), dir, wf, mode);
-    night_leave(hl);
-    // 不管成败都把档位/预填还原成常规 GL16 的值，下一次普通刷新才不会被这次带偏。
-    use_scan_for(&E0470_WAVEFORM, MODE_GL16);
-    rails_keepalive();
-    if (result == EPD_DRAW_SUCCESS) {
-        // 每个变化像素都完整走了一遍相位梯子，等价于整屏软刷，记进残影预算，否则翻页
-        // 动画会把"攒够几次升 GC16"的节拍拉长。它是 GL16 的整条相位梯（37 相、16 级灰），
-        // 来回扫的摆动与它替掉的那次差分正文刷同量级，所以和普通差分刷一样按 **1** 算。
-        // 以前正文页走的是跟随表 DU（8 相、黑白两级），没有那种大摆动、压残影明显更弱，
-        // 才特别按 2 算逼它早升 GC16 —— 换灰阶梯后那个理由不成立了。
-        ++s_soft_refreshes;
-        return result;
-    }
-    ESP_LOGW(TAG, "错相揭页未完成 (%d)，本次回退普通刷新", (int)result);
-    if (result & EPD_DRAW_EMPTY_LINE_QUEUE) {
-        s_pclk_mhz = DISPLAY_PCLK_SAFE_MHZ;
-        read_pico_epd_set_pclk(DISPLAY_PCLK_SAFE_MHZ);
-    }
-    return result;
 }
 
 enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
@@ -598,29 +528,17 @@ enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
     // 下面那条差分刷拿到的就是一张空 fb，画出来整页空白（用户侧：插图页翻下一页
     // 必白屏，手动全刷才恢复）。改走 update_display_from_white()：只把 back_fb
     // （差分参考帧）重置为白、front_fb 内容原样保留，一次整屏全像素 GC16 同时清掉
-    // 灰底 + 出图。出图后 back_fb == front_fb，下面那条差分刷和揭页动画都成了空
-    // 差分（走了也白走），所以这里清掉揭页方向后直接返回。
+    // 灰底 + 出图。出图后 back_fb == front_fb，下面那条差分刷成了空差分（走了也白走），
+    // 所以这里直接返回。
     if (display_take_white_exit() &&
         (kind == DISPLAY_KIND_HALF || kind == DISPLAY_KIND_FAST || kind == DISPLAY_KIND_GRAY8_TEXT ||
          kind == DISPLAY_KIND_STATUS)) {
         ESP_LOGI(TAG, "gray panel -> from-white full refresh (reset reference, keep content)");
-        s_turn_dir = -1;
         result = update_display_from_white(hl);
         guard_draw_result(hl, result);
         return result;
     }
 
-    // 待处理的揭页方向（一次性）。只用在下面两个"差分正文刷"档位上：
-    //   HALF(局刷 GL16) 与 GRAY8_TEXT(8 灰阶正文刷) 都是翻页会走到的档位；
-    //   FULL/GRAY8 是整屏全像素清账，动画替代它们反而清不掉残影；FAST 是用户显式
-    //   选了"极速"或实体键盘打字帧，再掺 1.1s 的动画就违背了那个选择。
-    const int turn = s_turn_dir;
-    s_turn_dir = -1;
-    if (turn >= 0 && (kind == DISPLAY_KIND_HALF || kind == DISPLAY_KIND_GRAY8_TEXT)) {
-        result = update_display_page_turn(hl, (e0470_turn_dir_t)turn);
-        if (result == EPD_DRAW_SUCCESS) return result;
-        // 失败就落到下面走这一档本来该走的普通刷新。
-    }
     switch (kind) {
         // 这几档**不能直接 return**：它们自己都不调 guard_draw_result，直接返回就绕过了
         // 欠载兜底 —— 一旦线队列供数不足（GRAY8_TEXT 正是阅读器正文翻页的默认档），
@@ -714,7 +632,7 @@ enum EpdDrawError update_display_area_with(
 // ── 灰阶自检页的自推屏（阅读器侧的裸声明桥，见 reader_refresh_bridge.h）────────
 //
 // 自检页要把**同一份 framebuffer** 用五条不同的刷法各推一遍、当场把耗时记下来，
-// 但它所在的那个 TU 不能 include display.h（EpdFont 冲突，见 reader_page_turn.h）。
+// 但它所在的那个 TU 不能 include display.h（EpdFont 冲突，见 reader_refresh_bridge.h）。
 // 所以波形/模式类型只在这里出现，阅读器那头只递一个 `which` 序号上来。
 //
 // 这五条正好把官方固件 app_refresh.c 里那几个按钮的刷法一一对上：
@@ -794,11 +712,6 @@ void reader_set_erase_pushes(int count) {
 int reader_erase_pushes(void) {
     return e0470_waveform_erase_pushes ? e0470_waveform_erase_pushes() : 0;
 }
-
-// 见 reader_refresh_bridge.h：共享软刷预算到点了没有。阅读器拿它决定"这一帧翻页要不
-// 要放弃揭页动画、让常规差分路去升级成整屏 GC16"。与上面 display_soft_refresh_due()
-// 是同一份账，只是绕开 display.h 那道 include 墙。
-int reader_soft_refresh_due(void) { return display_soft_refresh_due() ? 1 : 0; }
 
 // ── 清一块区域的残影（输入法那两行）────────────────────────────────────────
 //

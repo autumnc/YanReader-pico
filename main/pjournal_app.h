@@ -75,8 +75,8 @@ struct ScreenContext {
 #define KEY_SEARCH     0xA2
 #define KEY_HELP       0xA3
 #define KEY_REDO       0xA4
-// 中间电容键(KEY2)长按 → 待机（light sleep，main.cpp 里全局处理）。阅读器里有三个
-// 把它当动作键的子界面（删词典 / 解绑按键 / 删统计里的书）放行，见
+// 中间电容键(KEY2)长按 → 切换模式（阅读/写作/计划轮换，main.cpp 里全局处理）。
+// 阅读器里有三个把它当动作键的子界面（删词典 / 解绑按键 / 删统计里的书）放行，见
 // screen_reader_long_confirm_is_action()。
 #define KEY_LONG_CONFIRM 0xA5
 // 触摸拖动：手指在显示区按住移动时按帧上报，增量用 input_drag_xy() 取。
@@ -113,9 +113,9 @@ struct ScreenContext {
 #define KEY_PINCH_OUT  0xAE   // 两指张开 = 放大
 // 晃动机身 = 一次全刷（清残影）。由 hw/input.cpp 读 SC7A20H 加速度计判定，阈值与
 // 判定逻辑见那边；三个模式通用（阅读模式在自己的入口处认这个键，走它自己的全刷档）。
-// 这个键位原来是"长按中间确认键"，现在那个键改成待机了。
+// 这个键位原来是"长按中间确认键"，那个键已经改由 KEY_SHAKE 接管全刷、后来又让给了切模式。
 #define KEY_SHAKE      0xAF
-// 电源键短按 → 写作/阅读模式切换（阅读模式内同样切回写作）。
+// 电源键短按 → 待机（light sleep）；再短按一次唤醒。main.cpp 里全局处理。
 #define KEY_POWER      0xB0
 // 电源键**长按满 8s**：PMU 的 KEY_FORCE_OFF 警告事件（再满 10s 就自己拉 EN 硬断电了）。
 // 主机拿它当"要关机了"的信号，抢在那 2s 窗口里把「已关机」页铺满 —— 不铺的话屏上就
@@ -159,7 +159,9 @@ extern std::string g_flomoPendingText;
 extern AppState g_flomoReturnTo;
 
 // 阅读器当前子界面里，长按中间确认键是不是一个**动作**（删词典/解绑按键/删统计里的书）
-// 而不是"待机"。main.cpp 的全局"长按中间键 = 待机"靠它放行这三处，其余一律待机。
+// 而不是"切换模式"。main.cpp 的全局"长按中间键 = 切模式"靠它放行这三处，其余一律切模式。
+// **只在这三处、且当前确实在阅读器里**才该问它：它读的是 st.mode，而 st.mode 离开阅读器
+// 时不重置（见 main.cpp 那个全局块里的说明）。
 bool screen_reader_long_confirm_is_action();
 
 // 全局蓝牙开关（设置键 "bt_enabled"，默认开）。实现在 main.cpp——只有它管着 bt_init

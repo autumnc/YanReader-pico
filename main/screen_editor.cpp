@@ -4135,7 +4135,7 @@ bool app_editor_popup_active() {
            editMenuActive() || editMenuPickerActive();
 }
 
-// 离开编辑器时清掉触摸选区与它的弹层。电源键切模式（main.cpp）绕开了
+// 离开编辑器时清掉触摸选区与它的弹层。长按中间键切模式（main.cpp）绕开了
 // screen_editor_init，不清的话切回来还挂着上一次的选区/按钮条。
 void app_editor_leave_cleanup() {
     g_editor.hasSelection = false;
@@ -4289,7 +4289,7 @@ void screen_editor_leave(AppState next) {
         return;
     }
     if (next == APP_SYNC_SEND_FLOMO) return;   // 转发到 flomo：会话留着，回来接着用
-    // 切模式（电源键）走的是**另一条路**：它在派发之前就把 currentState 改了，本函数
+    // 切模式（长按中间确认键）走的是**另一条路**：它在派发之前就把 currentState 改了，本函数
     // 得到的 next 是另一个模式的落点（阅读/计划）。那种情况必须**保住**会话——原来的
     // main.cpp 里 `editorInited = false` 只写在 APP_EDITOR 的 case 体里，切模式那帧根本
     // 不进这个 case，所以它天然保住了会话（见 [[mode-switch-session]]）。现在 leave 被
@@ -4297,7 +4297,7 @@ void screen_editor_leave(AppState next) {
     if (appModeOfState(next) != appModeOfState(APP_EDITOR)) {
         // 切模式：会话留住，但触摸选区/按钮条/粘贴板列表这些"挂在屏幕上的东西"要收掉
         // （切回来是直接用留住的会话，不收就会挂上一次的选区）。这一句原来在 main.cpp
-        // 的电源键分支里（cur==1 && currentState==APP_EDITOR）。
+        // 的长按中间键分支里（cur==1 && currentState==APP_EDITOR）。
         app_editor_leave_cleanup();
         // 把方向还给全局（与 screen_gtd_exit 对称）：自适应/强制的那一档不能跟到别的
         // 模式去 —— 阅读/计划进来会各自套自己那份方向。

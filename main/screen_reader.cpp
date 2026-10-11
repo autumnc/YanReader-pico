@@ -16,7 +16,6 @@
 
 #include "screen_reader.h"
 #include "screen_reader_internal.h"  // RdState/共享原语（P3b 拆文件后的内部层）
-#include "reader_page_turn.h"  // 揭页提示：只有裸声明，不会拖进 epdiy.h
 #include "reader_refresh_bridge.h"  // 白底纪律记账 / 自检页自推屏（同样只有裸声明）
 #include "selection_handle.h"  // 选区手柄的形状（与写作模式共用同一份几何）
 #include "ui_render.h"   // ui_render_drain：进阅读器前等在飞的 UI 推屏收尾
@@ -456,6 +455,27 @@ static const char *kMarginLabels[3] = {"窄", "标准", "宽"};
 static const char *kImageScalingLabels[2] = {"最近邻", "双线性"};   // 下标 = st.imageBilinear
 static const char *kOrientNames[2] = {"竖屏", "横屏"};              // 下标 = 0 竖 / 1 横
 static const char *kOrientKeys[2] = {"portrait", "landscape"};
+
+// ── 选字粒度（阅读页 → 排版设定 → 选字粒度）──────────────────────────────
+// 长按正文选中文本时，反白（以及随之的词典/复制/高亮/笔记）按什么范围切：
+//   · 按字   —— 只框点中的那**一个**字。中文词条常是"一个字 + 粘连标点"（"好。"），
+//              要查的往往是单个字的词典，所以按字得能切进词条内部（见 selCp）。
+//   · 按句   —— 点中字所属的自然句（**默认，也是本设置出现之前的行为**）。
+//   · 按段落 —— 点中字所属的整个段落（EPUB 一个排版块；TXT 一个缩进段）。
+// 曾经还考虑过「按词」（按中文分词取词条），因中文分词不便实现已取消：星dict 只做精确
+// 匹配、没有随包中文词表，现分词要么阻塞长按热路径要么给出错的词条。
+// 只影响**长按那一刻的初始反白范围**，不改任何版式 —— 所以改档位不重排、不重开书。
+static const char *kSelGranNames[3] = {"按字", "按句", "按段落"};
+static const char *kSelGranKeys[3] = {"char", "sentence", "paragraph"};
+static const int kSelGranCount = 3;
+static const int kSelGranChar = 0, kSelGranSentence = 1, kSelGranParagraph = 2;
+static int selGranularity() {
+  const std::string k = g_settings.getString("reader_sel_gran", "sentence");
+  for (int i = 0; i < kSelGranCount; i++) {
+    if (k == kSelGranKeys[i]) return i;
+  }
+  return kSelGranSentence;  // 认不出 → 默认按句
+}
 
 // ── 样式解析：书籍内嵌 / 强制指定（设置 → 样式解析）────────────────────────
 // 书籍内嵌（默认）= 按书里 CSS 排：对齐、缩进、字号都听书的（用户在这三项上的
@@ -1620,22 +1640,10 @@ static void reopenBook() {
   }
 }
 
-// ── 错相揭页（翻页动画，设置 → 显示与版式 → 翻页动画）──────────────────
-// turnBook() 成功翻页后记下方向，renderAndPresent() 在决定刷新档位时消费它：
-// 只有"这一帧确实是翻页、且选中的是差分正文刷"才让推屏层走揭页动画。
-// 换章/全刷频率到点/进新界面首帧都是整屏 GC16 重画，方向会被丢掉（也不该动画）。
+// ── 翻页方向（预建/预渲染那一侧用）──────────────────────────────────────
+// turnBook() 成功翻页后记下方向，收尾那一趟按它决定"留档暖哪一侧、整帧预渲染画哪一页"。
+// 换章/全刷频率到点/进新界面首帧都各自整屏重画，方向会被下一步覆盖（也不影响它们）。
 static int s_pendingTurn = 0;  // 0=无，+1=向后翻，-1=向前翻
-static bool pageTurnAnimOn() { return g_settings.getString("page_turn_anim", "1") != "0"; }
-// e0470_turn_dir_t 的取值。本 TU 不能 include e0470_page_turn.h（它会拖进 epdiy.h），
-// 所以这边只能用裸数字；两边靠这条注释对齐。
-// 枚举顺序 ltr/rtl/ttb/btt = 0/1/2/3；现在只用前两个（横向扫），后两个留着对齐枚举。
-static const int kTurnLtr = 0, kTurnRtl = 1;
-
-// 揭页方向**一律横向**，不看排版方向：竖屏下书是纵向分页（一屏接一屏往下读），
-// 早先按排版方向选 TTB/BTT，看着是"一条带从下往上掀"——不像翻书页。用户要的是
-// 左右方向：往后翻 = 新页从右边揭过来（RTL），往前翻 = 从左边揭回来（LTR）。
-// 方向报错揭页会朝相反一侧扫，看着像"往回翻"，所以 delta 的符号别调反。
-static int turnDirFor(int delta) { return delta > 0 ? kTurnRtl : kTurnLtr; }
 
 // ── 翻页 ────────────────────────────────────────────────────────────────
 static bool turnEpub(int dir) {
@@ -2260,11 +2268,27 @@ RdPageText g_pageText;
 static RdPageText rdBuildPageText(const Page &page, int fontId, int xOffset, int yOffset) {
   RdPageText pt;
   pt.valid = true;
+  // 段落归属（"按段落"选字用）：**用排版引擎自己记的那一个段落边界**
+  // （TextBlock::isParagraphStart = "这一行是源段落的第一个渲染行"）。一个段落 = 从某个
+  // isParagraphStart 行起、到下一个 isParagraphStart 行之前的所有行；首页第一行若不是
+  // 段落起点（本页从某段中间开始），它照样开一段，好和它后面的续行归到一块。
+  //
+  // **绝不能用 Block 指针判"还在同一段"**：PageLine 各自持有一个 TextBlock，那是
+  // "一行"不是"一段"（Page.h 的类注释：a line from a block element），按指针判会让每行
+  // 各成一段，「按段落」就退化成「按行」。这一点实机验过。
+  // 这个标记跨页也在（.bin 里持久化，Section 的页格式版本为它抬过 81），
+  // 所以"一段横跨两页"这种情形也能正确切开。
+  int blkId = -1;
+  bool firstLine = true;
   for (const auto &el : page.elements) {
     if (el->getTag() != TAG_PageLine) continue;
     const auto &line = static_cast<const PageLine &>(*el);
     const auto &blk = line.getBlock();
     if (!blk || !blk->valid()) continue;
+    if (firstLine || blk->isParagraphStart()) {
+      blkId++;
+      firstLine = false;
+    }
     pt.lineFirst.push_back(static_cast<int>(pt.words.size()));
     // 与 PageLine::render 逐字对应：el->yPos 是**行顶**，这里的 y 是**基线**
     // （下面全部按 `w.y - asc` / `w.y - asc/2` 取上沿和字形中心）。少了这一跳 ascender，
@@ -2276,11 +2300,13 @@ static RdPageText rdBuildPageText(const Page &page, int fontId, int xOffset, int
       RdWordHit wh;
       wh.x = xOffset + el->xPos + blk->wordXpos(i);
       wh.style = static_cast<uint16_t>(blk->wordStyle(i));
+      wh.fontId = lineFontId;
       wh.y = baseY;
       wh.text = blk->wordText(i);
       // 宽度也按这一行的字体量：渲染用的就是它，用正文号量会让标题行的命中框横向也对不上。
       wh.w = g_rd.getTextWidth(lineFontId, wh.text.c_str(), static_cast<EpdFontFamily::Style>(wh.style));
       pt.words.push_back(std::move(wh));
+      pt.wordBlock.push_back(blkId);
     }
   }
   pt.lineFirst.push_back(static_cast<int>(pt.words.size()));
@@ -2294,8 +2320,29 @@ static RdPageText rdBuildPageTextTxt(const std::vector<std::string> &lines, int 
   RdPageText pt;
   pt.valid = true;
   int y = y0 + g_rd.getFontAscenderSize(fontId);
+  // 段落归属（"按段落"选字用）：TXT 没有排版块，段落边界只能从**行形状**推 ——
+  // 直接用全书共用的那一个判据（components/crossmux/lib/Txt/TxtParagraph.h；
+  // 段距补空行、章节识别走的也是它）：行首带缩进（空格/全角空格）起新段，空行之后也起新段。
+  // 这里只驱动它的状态机，**不再自己写一份判据** —— 两份判据一旦走岔，就会出现
+  // "段距按 A 断开、选字按 B 断开"这种最难查的不一致。
+  // 全篇既不缩进也不空行的 TXT 会把整页认成一段，那时「按段落」退化成「选整页」——
+  // 是降级不是错框。
+  txt_paragraph::State paraState(/*atFileStart=*/false);
+  int blkId = -1;
   for (const auto &seg : lines) {
     pt.lineFirst.push_back(static_cast<int>(pt.words.size()));
+    // 本行是不是"新段落的开头"。空行不承载词条，只把"下一行起新段"记进状态机。
+    const auto info = txt_paragraph::analyzeLine(reinterpret_cast<const uint8_t *>(seg.data()), seg.size());
+    if (info.kind == txt_paragraph::LineKind::Blank) {
+      paraState.noteBlankLine();
+      y += lineH;
+      continue;
+    }
+    // 本页第一个非空行总归要开一段（它可能正是某个跨页段落的续行 —— 那也归它自己那一段，
+    // 反正上一页的行不在这份表里）。starts 必须**无条件**先算出来：短路掉 consume()
+    // 就等于没推进状态机，那句 pending 会留给下一行，下一行又被误判成段首。
+    const bool starts = paraState.consume(info.kind);
+    if (blkId < 0 || starts) blkId++;
     int px = x;
     size_t i = 0;
     while (i < seg.size()) {
@@ -2304,12 +2351,14 @@ static RdPageText rdBuildPageTextTxt(const std::vector<std::string> &lines, int 
       RdWordHit wh;
       wh.x = px;
       wh.y = y;
+      wh.fontId = fontId;
       wh.text = seg.substr(i, n);
       int pw = g_rd.getTextWidth(fontId, seg.substr(0, i + n).c_str());
       wh.w = pw - (px - x);
       if (wh.w < 0) wh.w = 0;
       px = x + pw;
       pt.words.push_back(std::move(wh));
+      pt.wordBlock.push_back(blkId);
       i += n;
     }
     y += lineH;
@@ -2810,7 +2859,7 @@ static bool rdPrerenderOn() { return g_settings.getString("reader_prerender", "1
 
 // ── 常驻首帧：切模式回来那一拍，把这一页整帧贴回来 ────────────────────────
 // 上面那块 scratch 只赌"下一帧"（s_preKey 每帧重画都被清掉）。切模式是另一条路：用户在
-// 阅读页上按电源键走出去，过一会儿又走回来 —— 中间隔着另一个模式的整场绘制，回来时这一页
+// 阅读页上长按中间键走出去，过一会儿又走回来 —— 中间隔着另一个模式的整场绘制，回来时这一页
 // 的版式一个像素都没变，却要把"绘制"那一段从头做一遍。而且那一段**回回都是冷的**：这一趟
 // 的 Section 刚从 .bin 载入，字形缓存刚被 releaseBookFonts 清过，所以付的不只是绘制
 // （热的时候实测 205ms），是"冷排版 + 整页栅格化 + 绘制"一整套 —— 实测 319ms。
@@ -3297,6 +3346,38 @@ static void rdPrerenderTurnPage(bool afterTurn = false) {
 
 
 
+// 词条里有几个码点（"按字"要在词条内部数第几个字）。
+static int rdCpCount(const std::string &s) {
+  int n = 0;
+  size_t i = 0;
+  while (i < s.size()) {
+    int k = utf8Len(static_cast<unsigned char>(s[i]));
+    if (k < 1) k = 1;
+    i += static_cast<size_t>(k);
+    n++;
+  }
+  return n;
+}
+
+// 词条里第 k 个码点的字节区间 [b0, b1)。k 越界时返回 false。
+static bool rdCpByteRange(const std::string &s, int k, size_t &b0, size_t &b1) {
+  if (k < 0) return false;
+  size_t i = 0;
+  for (int c = 0; c < k; c++) {
+    if (i >= s.size()) return false;
+    int n = utf8Len(static_cast<unsigned char>(s[i]));
+    if (n < 1) n = 1;
+    i += static_cast<size_t>(n);
+  }
+  if (i >= s.size()) return false;
+  int n = utf8Len(static_cast<unsigned char>(s[i]));
+  if (n < 1) n = 1;
+  b0 = i;
+  b1 = i + static_cast<size_t>(n);
+  if (b1 > s.size()) b1 = s.size();
+  return true;
+}
+
 // 词序列 → 展示文本。中日韩之间不加空格（原文本来就没有），拉丁词之间补一个空格。
 static bool rdAsciiWordChar(char c) {
   return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
@@ -3311,6 +3392,21 @@ static std::string rdJoinWords(const RdPageText &pt, int a, int b) {
   }
   return s;
 }
+
+// 选区 → 展示文本。**这是选区文本的唯一出处**：词典、复制、高亮、笔记、浮层标题全都
+// 从这里取，保证"屏上反白的那一段"和"拿去查/存的"永远是同一段。
+// cp >= 0 且是单字范围（"按字"）：只取那一个词条里的第 cp 个码点 —— 中文词条常与标点
+// 粘连（"好。"），整条拿去做单字词典是查不到的。
+static std::string rdSelTextOf(const RdPageText &pt, int a, int b, int cp) {
+  if (cp >= 0 && a == b && a >= 0 && a < static_cast<int>(pt.words.size())) {
+    size_t b0 = 0, b1 = 0;
+    if (rdCpByteRange(pt.words[a].text, cp, b0, b1)) return pt.words[a].text.substr(b0, b1 - b0);
+  }
+  return rdJoinWords(pt, a, b);
+}
+
+// 当前选区的展示文本（给 rdSelActivate / 浮层标题用）。
+static std::string rdSelText() { return rdSelTextOf(g_pageText, st.selStart, st.selEnd, st.selCp); }
 
 // 在当页找回一段文字，返回起始词下标（找不到 -1），end 输出结束词下标。
 // 只做当页匹配：跨页的标注这一页就不画高亮，绝不画到别的句子上。
@@ -3328,6 +3424,17 @@ static int rdFindSpan(const RdPageText &pt, const std::string &target, int &end)
         if (s == target) { end = b; return a; }
         break;   // 同长度但不等：往后只会更长
       }
+    }
+  }
+  // 兜底：整串匹配不上时，找一个**词条内部含** target 的。这是"按字"存下的单字标注
+  // （"好"）在当页遇到粘连标点的词条（"好。"）时的唯一出路 —— 否则那枚标注在页面上
+  // 会永远画不出高亮。只认**单个非 ASCII 码点**的目标：ASCII 单字（"a"）会命中任何含它的
+  // 词（"cat"），假阳性太多，宁可让那种极少数情况不显示高亮。
+  // 命中后框的是**整个含它的词条**（标注层只有词条粒度的几何，画不出半截），
+  // 且当页多次出现时命中第一个 —— 与"按句标注命中第一句"是同一类取舍。
+  if (rdCpCount(target) == 1 && !target.empty() && (static_cast<unsigned char>(target[0]) & 0x80)) {
+    for (int a = 0; a < n; a++) {
+      if (pt.words[a].text.find(target) != std::string::npos) { end = a; return a; }
     }
   }
   return -1;
@@ -3387,6 +3494,53 @@ static void rdSentenceAt(const RdPageText &pt, int idx, int &a, int &b) {
   if (b >= n) b = n - 1;
 }
 
+// 点到的词所在的那一段落（同一段落块内向前/向后铺满）。wordBlock 对不上 words 长度时
+// （这一页没建段落归属）退化成"只选点中的那一个词条"，绝不框错范围。
+static void rdParagraphAt(const RdPageText &pt, int idx, int &a, int &b) {
+  const int n = static_cast<int>(pt.words.size());
+  if (n <= 0) { a = b = -1; return; }
+  idx = clampI(idx, 0, n - 1);
+  if (pt.wordBlock.size() != pt.words.size()) { a = b = idx; return; }
+  const int bid = pt.wordBlock[idx];
+  a = idx;
+  while (a > 0 && pt.wordBlock[a - 1] == bid) a--;
+  b = idx;
+  while (b + 1 < n && pt.wordBlock[b + 1] == bid) b++;
+  // 一个块最多占满一页的词（不跨页），所以不用再设上限。
+}
+
+// 词条内第 k 个码点的**子矩形**（相对屏幕的 x 与宽），给"按字"只反白一个字用。
+// 前缀宽度必须用这个词条**自己的字体与样式**量（wh.fontId / wh.style）—— 渲染那一行
+// 用的是 lineFontId，用正文号量标题行会让子矩形横向错开。
+static bool rdCpSubRect(const RdWordHit &wh, int k, int &x, int &w) {
+  size_t b0 = 0, b1 = 0;
+  if (!rdCpByteRange(wh.text, k, b0, b1)) return false;
+  const auto style = static_cast<EpdFontFamily::Style>(wh.style);
+  const int px0 = g_rd.getTextWidth(wh.fontId, wh.text.substr(0, b0).c_str(), style);
+  const int px1 = g_rd.getTextWidth(wh.fontId, wh.text.substr(0, b1).c_str(), style);
+  x = wh.x + px0;
+  w = px1 - px0;
+  return w > 0;
+}
+
+// 点在这一词条的哪个码点上（按"码点中心离点按处最近"挑；量不到宽度就退回第 0 个）。
+static int rdCpAtX(const RdWordHit &wh, int x) {
+  const int nc = rdCpCount(wh.text);
+  if (nc <= 0) return -1;
+  const auto style = static_cast<EpdFontFamily::Style>(wh.style);
+  int best = 0, bestD = 0;
+  for (int k = 0; k < nc; k++) {
+    size_t b0 = 0, b1 = 0;
+    if (!rdCpByteRange(wh.text, k, b0, b1)) break;
+    const int c0 = g_rd.getTextWidth(wh.fontId, wh.text.substr(0, b0).c_str(), style);
+    const int c1 = g_rd.getTextWidth(wh.fontId, wh.text.substr(0, b1).c_str(), style);
+    const int center = wh.x + (c0 + c1) / 2;
+    const int d = std::abs(x - center);
+    if (k == 0 || d < bestD) { bestD = d; best = k; }
+  }
+  return best;
+}
+
 // 屏幕点 → 词下标（同一行里挑最近的；行外返回 -1）。
 static int rdWordAtPoint(const RdPageText &pt, int fontId, int x, int y) {
   const int asc = g_rd.getFontAscenderSize(fontId);
@@ -3405,7 +3559,11 @@ static int rdWordAtPoint(const RdPageText &pt, int fontId, int x, int y) {
 }
 
 // 把 [a,b] 词范围画成反白高亮（黑底白字）：逐行找连续段，整段铺黑再把字重画成白的。
-static void rdDrawSpan(const RdPageText &pt, int fontId, int a, int b) {
+// cpOnly >= 0（"按字"）：只对**单个词条**生效，只反白它内部第 cpOnly 个码点 —— 中文
+// 一个词条常是"一个字 + 粘连标点"（"好。"），整词条铺黑框不住"就一个字"这件事。
+// 实现上不能沿用"整段铺黑 + 整词重画白字"：那样黑框外的字也变成白字，在白底上看不见。
+// 所以改成三截画 —— 前缀画黑、选中的那一个字画白、后缀画黑，各自落在自己的 x 上。
+static void rdDrawSpan(const RdPageText &pt, int fontId, int a, int b, int cpOnly = -1) {
   const int n = static_cast<int>(pt.words.size());
   if (a < 0 || b < a || b >= n) return;
   const int asc = g_rd.getFontAscenderSize(fontId);
@@ -3414,6 +3572,25 @@ static void rdDrawSpan(const RdPageText &pt, int fontId, int a, int b) {
   while (i <= b) {
     int j = i;
     while (j + 1 <= b && pt.words[j + 1].y == pt.words[i].y) j++;
+    // 一个字条目的"按字"：i == j 且 cpOnly 落在这个词条里。量不到子矩形就照常整词框。
+    if (cpOnly >= 0 && i == j) {
+      const RdWordHit &wh = pt.words[i];
+      int sx = 0, sw = 0;
+      size_t b0 = 0, b1 = 0;
+      if (rdCpSubRect(wh, cpOnly, sx, sw) && rdCpByteRange(wh.text, cpOnly, b0, b1)) {
+        const auto style = static_cast<EpdFontFamily::Style>(wh.style);
+        g_rd.fillRect(sx - 1, wh.y - asc - 2, sw + 2, lh + 2, true);
+        if (b0 > 0) g_rd.drawText(wh.fontId, wh.x, wh.y, wh.text.substr(0, b0).c_str(), true, style);
+        const int cx = wh.x + g_rd.getTextWidth(wh.fontId, wh.text.substr(0, b0).c_str(), style);
+        g_rd.drawText(wh.fontId, cx, wh.y, wh.text.substr(b0, b1 - b0).c_str(), false, style);
+        if (b1 < wh.text.size()) {
+          const int rx = wh.x + g_rd.getTextWidth(wh.fontId, wh.text.substr(0, b1).c_str(), style);
+          g_rd.drawText(wh.fontId, rx, wh.y, wh.text.substr(b1).c_str(), true, style);
+        }
+        i = j + 1;
+        continue;
+      }
+    }
     const int x0 = pt.words[i].x;
     const int x1 = pt.words[j].x + pt.words[j].w;
     if (x1 > x0) {
@@ -3589,7 +3766,7 @@ static void rdDrawSelPopup(const RdPageText &pt, int fontId) {
   g_rd.fillRect(bx, by, bw, bh, false);
   g_rd.drawRect(bx, by, bw, bh, true);
 
-  std::string t = rdJoinWords(pt, st.selStart, st.selEnd);
+  std::string t = rdSelTextOf(pt, st.selStart, st.selEnd, st.selCp);
   t = g_rd.truncatedText(uiFontId(), t.c_str(), bw - 2 * MARGIN);
   // 抬头居中（同下面几个按钮）：浮层里的文字一律居中，别一左一中。
   const int tw = g_rd.getTextWidth(uiFontId(), t.c_str());
@@ -3629,9 +3806,16 @@ static void rdSelHandleBoxes(const RdPageText &pt, int fontId, int *sx, int *sy,
   const int lh = g_rd.getLineHeight(fontId);
   const RdWordHit &a = pt.words[st.selStart];
   const RdWordHit &b = pt.words[st.selEnd];
-  *sx = a.x - RD_SEL_HANDLE;
+  int ax = a.x, bx = b.x, bw = b.w;
+  // "按字"：两个手柄贴在那一个字的子矩形上，而不是整个词条 —— 否则终点手柄会飘到
+  // 粘连的标点之后，看着像选了两三个字。
+  if (st.selCp >= 0 && st.selStart == st.selEnd) {
+    int hx = 0, hw = 0;
+    if (rdCpSubRect(a, st.selCp, hx, hw)) { ax = hx; bx = hx; bw = hw; }
+  }
+  *sx = ax - RD_SEL_HANDLE;
   *sy = a.y - asc - 2 - RD_SEL_HANDLE * 2;   // 首行上沿再往上一个手柄高
-  *ex = b.x + b.w - RD_SEL_HANDLE;
+  *ex = bx + bw - RD_SEL_HANDLE;
   *ey = b.y + (lh - asc) + 2;                // 末行下沿再往下一个手柄高
 }
 
@@ -3721,6 +3905,9 @@ static int rdSelDragStep(int fontId) {
   if (wi >= 0) {
     if (st.selDrag == 0) st.selStart = std::min(wi, st.selEnd);
     else st.selEnd = std::max(wi, st.selStart);
+    // 拖手柄 = 词粒度伸缩，"按字"那个词内偏移作废（否则会把一个字的下标套到新词条上，
+    // 框出一段对不上手指范围的子矩形）。
+    st.selCp = -1;
   }
   return st.selDrag;
 }
@@ -3733,7 +3920,8 @@ static void rdDrawOverlays(const RdPageText &pt, int fontId) {
     rdDrawSpan(pt, fontId, an.a, an.b);
   }
   if (st.selActive) {
-    rdDrawSpan(pt, fontId, st.selStart, st.selEnd);
+    // selCp >= 0（"按字"）时只反白那一个字；其余档是 -1（整词条范围）。
+    rdDrawSpan(pt, fontId, st.selStart, st.selEnd, st.selCp);
     rdDrawSelHandles(pt, fontId);
     if (st.selPopup) rdDrawSelPopup(pt, fontId);
   }
@@ -5266,11 +5454,11 @@ static DitherMode ditherModeOf(int idx) {
 
 // ── 阅读菜单：动作 + 动态条目 ───────────────────────────────────────────
 enum class MenuAct {
-  Toc, Font, FontFamily, FontWeight, Contrast, LineSpacing, ParaSpacing, Indent, Align, Margin, Image, ImageDither, ReadingLine, Night,
+  Toc, Font, FontFamily, FontWeight, Contrast, LineSpacing, ParaSpacing, Indent, Align, Margin, Image, ImageDither, ReadingLine, SelGranularity, Night,
   Orient,
   ToggleBookmark, Bookmarks, Footnotes, FootnoteBack, Percent, Qr, LayoutMenu,
   Dict, DictDl, ResDl, Weread, Wifi, Opds, NetShare, KeyMap, StatusBar, About, RefreshTest, Standby, UsbDrive,
-  ClockFace, ShelfStyle, RefreshStrategy, FullEvery, WhitePush, BlackPush, GhostMode, TurnAnim, PreRender, StyleSource, EmbeddedFont, AutoStandby,
+  ClockFace, ShelfStyle, RefreshStrategy, FullEvery, WhitePush, BlackPush, GhostMode, PreRender, StyleSource, EmbeddedFont, AutoStandby,
   ToShelf, Back
 };
 struct MenuItem { std::string label; MenuAct act; };
@@ -5501,6 +5689,10 @@ static std::vector<MenuItem> layoutMenuItems() {
   m.push_back({std::string("图片抖动: ") + kRdDitherNames[clampI(st.imageDither, 0, kRdDitherCount - 1)],
                MenuAct::ImageDither});
   m.push_back({std::string("阅读线: ") + kReadingLineNames[clampI(st.readingLine, 0, 3)], MenuAct::ReadingLine});
+  // 选字粒度：长按选文本时反白的范围（按字/按句/按段落）。挨着「阅读线」—— 两项都是
+  // "在阅读页上怎么用手指操作"的档位，不是版式（改它不重排）。
+  m.push_back({std::string("选字粒度: ") + kSelGranNames[clampI(selGranularity(), 0, kSelGranCount - 1)],
+               MenuAct::SelGranularity});
   return m;
 }
 
@@ -7098,9 +7290,8 @@ static void rdPinShimFb() {
 // render_context，这条"同一时刻只有一个推屏者"的规矩两边都守着。
 //
 // 两条硬规矩：
-//   1) **挂揭页动画的那一帧不走这条路**。动画期间 e0470 会回调 input_tick 补采触摸（见
-//      reader_page_turn_set_tick_hook），而 cst836u 只能在主循环那个任务里读 —— 动画必须
-//      留在主任务上同步跑。判据就是调用方手里那个 turnAnim。
+//   1) **区域刷那几帧不走这条路**（虚拟键盘 / 列表 / 自检页自推屏）—— 它们驱动的是
+//      一块矩形而不是整屏，提交接口只认整屏档位。
 //   2) 栈放 PSRAM（同 ui_render 的做法：内部 RAM 只剩几十 KB 的连续块）。代价是这个任务
 //      绝不能写 flash/NVS —— 写 flash 会临时关 cache，那一刻栈就读不到了。本任务只推屏，
 //      没有 NVS/SD/flash 操作，符合。
@@ -7114,7 +7305,7 @@ static HalDisplay::RefreshMode s_pushMode = HalDisplay::HALF_REFRESH;
 static int s_pushMs = 0;                        // 面板自己那一趟的墙钟（收尾那行日志要用）
 static bool s_pushOn = false;                   // 任务活着
 // "这一帧交出去了一趟、还没收"。收尾那句 rdPushWait 靠它判断该不该等 —— 走了同步推屏
-// 的那几帧（揭页动画/虚拟键盘/列表/自检页，以及任务建不出来时）这个位是 false，不能等，
+// 的那几帧（虚拟键盘/列表/自检页，以及任务建不出来时）这个位是 false，不能等，
 // 否则会挂在一个永远不会来的信号量上。
 static bool s_pushPending = false;
 
@@ -7167,9 +7358,8 @@ static int rdPushWait() {
 void renderCurrent() {
   rdPinShimFb();
   // 一帧分两段计时：**重画**（排版命中 + 字形栅格化 + 绘制，到推屏调用为止）与
-  // **推屏**（面板扫描；挂了揭页动画时就是那段动画的墙钟）。翻页那一帧收尾会打一行
-  // 拆开的耗时 —— 用户读到的"按下去卡一下"是前者，"动画顺不顺"是后者，混在一个
-  // 总数里就没法判断该往哪边使劲。
+  // **推屏**（面板扫描的墙钟）。翻页那一帧收尾会打一行拆开的耗时 —— 用户读到的
+  // "按下去卡一下"是前者，"屏多久变完"是后者，混在一个总数里就没法判断该往哪边使劲。
   const int64_t tDrawStartUs = esp_timer_get_time();
   // 虚拟键盘增量帧：这一拍只有键盘面板变了，上半屏一个像素都不用重画
   // （帧缓冲里留着的就是上一帧的内容，本来也该是它）。见 s_vk_incr_ok。
@@ -7313,11 +7503,10 @@ void renderCurrent() {
     s_chapterKey = key;
     s_chapterKnown = true;
   }
-  // 这一帧是不是"翻了一页"（错相揭页只认这个）。在这里就取走，因为下面判定刷新档位
-  // 时要拿它决定"临时降档"，而真正消费 s_pendingTurn 在更后面。
+  // 这一帧是不是"翻了一页"。在这里就取走，因为后面收尾要用它判方向，而真正消费
+  // s_pendingTurn 在更后面。
   const int pendingTurn = s_pendingTurn;
-  bool stratAuto = false;        // 本帧用的是"自适应"档（见下面的降档逻辑）
-  bool fullByCount = false;      // 本帧是"翻够页数强制全刷"那一页（下面降档要排除它）
+  bool fullByCount = false;      // 本帧是"翻够页数强制全刷"那一页
   HalDisplay::RefreshMode m;
   if (st.fullRefresh) {
     m = HalDisplay::FULL_REFRESH;          // 进入新界面首帧：清掉上一屏的残影
@@ -7332,7 +7521,6 @@ void renderCurrent() {
     m = HalDisplay::GRAY8_TEXT_REFRESH;
   } else if (st.mode == RdMode::Reading) {
     const int strat = refreshStrategy();
-    stratAuto = (strat == 3);
     // 全刷频率：选了 5/10/15/20 就每翻够这么多页清一次（与策略无关，但策略是
     // "全局"时本来就每页全刷，这一项没有意义，也不计数）。
     const int every = fullRefreshEvery();
@@ -7400,35 +7588,17 @@ void renderCurrent() {
   } else {
     m = physTyping ? HalDisplay::FAST_REFRESH : HalDisplay::HALF_REFRESH;
   }
-  // 错相揭页只替得掉差分刷（局刷 / 8 灰阶正文刷）。自适应档下正文翻页的变化量正好骑在
-  // 300‰ 的"全刷"分界上（实测 215–330‰），于是同一本书一页能动、下一页不能动——用户
-  // 侧就是"揭页时灵时不灵"。既然这一帧确实要翻页、也确实开着动画，就把档位降到可动画
-  // 的那一档：全刷 → 8 灰阶正文刷（同样是整屏差分、同样扫掉残影，只是 8 灰阶），
-  // 极速 DU → 局刷。**只动自适应**：全局/快刷是用户在设置里明选的档，不该被动画悄悄改写
-  // （明选"全局"的人要的就是每页全刷，揭页动画本来就不适合全刷）。
-  // 换章、全刷计数这两条走的是"该清就清"，不参与降档。
-  if (pendingTurn != 0 && stratAuto && !st.fullRefresh && !chapterChanged && !fullByCount &&
-      pageTurnAnimOn()) {
-    if (m == HalDisplay::FULL_REFRESH) m = HalDisplay::GRAY8_TEXT_REFRESH;
-    else if (m == HalDisplay::FAST_REFRESH) m = HalDisplay::HALF_REFRESH;
-  }
   // 两种全刷都是整屏全像素过 LUT，残影一并清掉，预算与页数计数归零。
   if (m == HalDisplay::FULL_REFRESH || m == HalDisplay::GRAY8_REFRESH) {
     s_ghostAccum = 0;
     s_pagesSinceFull = 0;
   }
-  // 错相揭页：这一帧是翻页、用户开着动画、且档位是差分正文刷（局刷/8 灰阶正文刷）时，
-  // 把方向交给推屏层，让它用 16 条带依次入相的揭页替代这一次普通差分刷。
-  // 其它档位（全刷/8 灰阶清账）与其它来由的帧（换章、进菜单、跳目录）都不动画 ——
-  // 前者动画替不掉清残影，后者本来就不是"翻一页"。
   const int turn = pendingTurn;
   s_pendingTurn = 0;
   // 记下这一次翻页的方向：后面那些空闲帧就按它决定"留档暖哪一侧、整帧预渲染画哪一页"
   // （见 s_turnDir）。放在这里而不是翻页处理那一段：那里有早退的分支，方向得在**每一帧**
   // 翻页都更新到，哪怕这一帧后来被别的条件挡下了（用户的手势已经表明了方向）。
   if (turn != 0) s_turnDir = (turn > 0) ? 1 : -1;
-  // 本帧有没有真的挂上揭页动画（收尾那行耗时日志要用）。
-  bool turnAnim = false;
   // 「残影治理: 16 灰阶正文」那一档：正文页本来的 8 灰阶正文刷换成**默认 37 相 GL16**
   // （display 侧的 HALF）—— 两者的擦除强度差一倍（10 相 vs 18 相），而自适应与局刷都会把
   // 整页文字判进 8 灰阶正文刷（日志实测：变化 235~296‰ 全落这一档），所以"旧字迹的浅影"
@@ -7438,26 +7608,10 @@ void renderCurrent() {
       m == HalDisplay::GRAY8_TEXT_REFRESH) {
     m = HalDisplay::HALF_REFRESH;
   }
-  if (turn != 0 && pageTurnAnimOn() &&
-      (m == HalDisplay::HALF_REFRESH || m == HalDisplay::GRAY8_TEXT_REFRESH)) {
-    // 揭页只有一条梯：默认表 GL16（37 相、16 级灰，@stride6 = 127 拍 ≈ 1.06s）。
-    // 曾经按这个 `frameChange` 再分出一条正文短梯（8 灰阶 30 相，快 179ms），
-    // 2026-10-07 删了：那个判据实测是个硬币（同一章正文页连续落在 217~354‰，300 正好
-    // 切在中间，同一章里一半的页走一条梯），而灰色揭页本来就有 ~0.9s 的地板，换梯子
-    // 买不到多少 —— 为 179ms 留个会误判、还让图片页可能落到 8 级灰出带状的判据不划算。
-    // 见 e0470_page_turn_ex() 的注释。
-    // 留着的这条是灰阶梯，这是刻意的：以前正文页走跟随表 DU（8 相、只有黑白两级），
-    // 快约 4 倍（0.29s），但看着是"啪一下硬切"而不是灰阶流淌 —— 快 ≠ 顺。跟随表是给
-    // 触摸笔迹跟手用的。
-    reader_hint_page_turn(turnDirFor(turn));
-    turnAnim = true;
-  }
   // 推屏前补采一次输入：阅读器整条绘制 + 推屏都在主循环那个任务里同步跑，上面这截
   // "重画"实测 571~1344ms，期间主循环一次触摸都不采，落在里面的点按整个丢掉（用户侧
-  // 就是"点了没反应"）。补采到的键暂存，下一次 input_poll() 取走。**只补这一次**：
-  // 下面 displayBuffer 内部的揭页动画（127 拍 ≈ 1s）不再插钩子——那是通用组件，为它开
-  // 一个回调口不值得，而且动画期间本来就该看动画。cst836u 不是线程安全的，这里就是
-  // 它允许被调的那个任务（阅读器不绕 core1，见 screen_reader_init 的说明）。
+  // 就是"点了没反应"）。补采到的键暂存，下一次 input_poll() 取走。cst836u 不是线程安全的，
+  // 这里就是它允许被调的那个任务（阅读器不绕 core1，见 screen_reader_init 的说明）。
   input_tick();
   const int64_t tPushStartUs = esp_timer_get_time();   // 上面都算"重画"，下面都算"推屏"
   bool rtPresented = false;   // 本帧是自检页的自推屏（下面收尾要再置一次 dirty，见尾注）
@@ -7490,10 +7644,8 @@ void renderCurrent() {
     // 整屏全刷（翻页全刷/换章/进界面首帧）把每个像素都驱动了一遍，虚拟键盘快档
     // 欠的那块正文已经干净了，把账销掉，免得停手时再白闪一次。
     if (m == HalDisplay::FULL_REFRESH) ui_render_reader_vk_settle_forget();
-    // 交给推屏任务（见 rdPushTask 上面那段）。两条不走异步：
-    //   · 挂揭页动画的这一帧 —— 动画里会回调 input_tick，那是主任务才能干的事；
-    //   · 任务建不出来 —— 退回同步推屏，慢但不错。
-    if (turnAnim || !rdPushSubmit(m)) g_rd.displayBuffer(m);
+    // 交给推屏任务（见 rdPushTask 上面那段）；任务建不出来就退回同步推屏，慢但不错。
+    if (!rdPushSubmit(m)) g_rd.displayBuffer(m);
   }
   // 异步时这里只是"交出去"的时刻，面板还没扫完（收尾那行日志的推屏毫秒由推屏任务自己报）。
   const int64_t tPushEndUs = esp_timer_get_time();
@@ -7555,13 +7707,11 @@ void renderCurrent() {
   const int panelMs = rdPushWait();
   const int tailMs = static_cast<int>((esp_timer_get_time() - tTailStartUs) / 1000);
   // 翻页那一帧把几段拆开记（见函数开头的计时说明）。只记翻页帧：菜单/列表那些帧
-  // 一帧一次会把日志淹掉，而这条要回答的问题只在翻页上。动画内部的账（相数、每拍
-  // 扫描耗时、墙钟）由 e0470_page_turn 自己打：`dir=… 梯=… ticks=… wall=…`。
-  // 判据是"用户按了翻页"（turn != 0），不是"动画挂上了" —— 换章那一帧动画会被跳过、
-  // 走的是一次全刷，那种帧的耗时同样要知道。
-  // 变化量也打出来：它决定档位（≥300‰ 走"局刷"而非"8灰阶正文刷"，也就是下面有没有
-  // 揭页动画），而 `自适应` 档之外它不打日志，曾经一整场会话每页都被判成"图片页"却
-  // 无从看出 —— 翻页这事上它是因，得记。它**不再**决定用哪条梯子（只剩一条了）。
+  // 一帧一次会把日志淹掉，而这条要回答的问题只在翻页上。判据是"用户按了翻页"
+  // （turn != 0）—— 换章那一帧走的是全刷，那种帧的耗时同样要知道。
+  // 变化量也打出来：它决定档位（≥300‰ 走"局刷"而非"8灰阶正文刷"），而 `自适应` 档
+  // 之外它不打日志，曾经一整场会话每页都被判成"图片页"却无从看出 —— 翻页这事上它是因，
+  // 得记。
   //
   // **推屏与备页是并行的**（推屏任务那条路，见 rdPushTask），所以这一行给的是
   // `max(推屏, 备页)` 而不是它们的和 —— 改之前是"重画 + 推屏 = 本帧"串着算的，
@@ -7573,16 +7723,16 @@ void renderCurrent() {
     const int frameMs = static_cast<int>((esp_timer_get_time() - tDrawStartUs) / 1000);
     const int pushMs = panelMs >= 0 ? panelMs
                                     : static_cast<int>((tPushEndUs - tPushStartUs) / 1000);
-    // 档位也用名字打（"无动画"那一支尤其要看得出它是不是掉到了全刷）。
+    // 档位也用名字打（看得出它是不是掉到了全刷）。
     const char *modeName = m == HalDisplay::FULL_REFRESH           ? "全刷"
                            : m == HalDisplay::GRAY8_REFRESH        ? "全刷8灰阶"
                            : m == HalDisplay::GRAY8_TEXT_REFRESH   ? "8灰阶正文刷"
                            : m == HalDisplay::FAST_REFRESH         ? "极速"
                            : m == HalDisplay::STATUS_REFRESH       ? "过渡屏"
                                                                    : "局刷";
-    ESP_LOGI(TAG, "翻页耗时: 变化 %d‰ + 重画 %d + max(推屏 %d, 备页 %d) = %d｜本帧 %d ms（%s，%s，跳相 %d）%s",
+    ESP_LOGI(TAG, "翻页耗时: 变化 %d‰ + 重画 %d + max(推屏 %d, 备页 %d) = %d｜本帧 %d ms（%s，跳相 %d）%s",
              frameChange, renderMs, pushMs, tailMs, renderMs + (pushMs > tailMs ? pushMs : tailMs),
-             frameMs, modeName, turnAnim ? "揭页·GL16 37相" : "无动画", reader_leading_skip(),
+             frameMs, modeName, reader_leading_skip(),
              rdPrerenderStateText().c_str());
     // 重画三段拆账。方案（空闲帧留档邻页排版 + 预热下一页字形）唯一的成功判据：
     // **排版**与**预热**这两栏在翻页这一拍上都该只剩零头 —— 排版来自留档（0ms），字形
@@ -7817,14 +7967,35 @@ static void gotoBookEnd() {
 }
 
 // ── 选中 / 标注 ─────────────────────────────────────────────────────────
-// 长按正文的某个词 → 选中它所在的那一句（直接可用的粒度，缩放由 ◀▶/点词微调），
-// 同时在屏底弹出动作条。点已标注的文字 → 弹同一条动作条（删/改/查）。
-static void rdBeginSelection(int wi) {
+// 长按正文的某个词 → 按「选字粒度」档位选中一段（按字 / 按句 / 按段落；见 selGranularity），
+// 缩放由 ◀▶/点词微调，同时在屏底弹出动作条。点已标注的文字 → 弹同一条动作条（删/改/查）。
+//
+// x 是点按的**横坐标**（纵坐标用不上）—— **只有「按字」用得上**：中文一个词条常是
+// "一个字 + 粘连标点"（"好。"），要点中"好"得知道点的是词条里的哪一个字，而这只能从
+// 点按的横向位置推（见 rdCpAtX）。传 -1 表示没有坐标（键盘/无点按路径），那时「按字」
+// 退回整个词条。
+static void rdBeginSelection(int wi, int x = -1) {
+  const int nw = static_cast<int>(g_pageText.words.size());
+  if (wi < 0 || wi >= nw) return;
   int a = wi, b = wi;
-  rdSentenceAt(g_pageText, wi, a, b);
+  int cp = -1;
+  const int gran = selGranularity();
+  if (gran == kSelGranChar) {
+    // 按字：范围就是这一个词条，再在它**内部**定位到第几个码点（rdCpAtX）。
+    // 词条只有一个码点时 cp=0，与"框整词条"看起来一样 —— 中文单字常与标点粘连，
+    // 真正的"一个字"要靠这个 cp 才能从"好。"里切出来。
+    a = b = wi;
+    if (x >= 0) cp = rdCpAtX(g_pageText.words[wi], x);
+    if (cp < 0) cp = 0;
+  } else if (gran == kSelGranParagraph) {
+    rdParagraphAt(g_pageText, wi, a, b);
+  } else {
+    rdSentenceAt(g_pageText, wi, a, b);
+  }
   st.selActive = true;
   st.selStart = a;
   st.selEnd = b;
+  st.selCp = cp;
   st.selGrab = -1;
   st.selDrag = -1;
   st.selDragActive = false;
@@ -7832,8 +8003,8 @@ static void rdBeginSelection(int wi) {
   st.selPopup = 1;
   st.selMenuSel = 0;
   st.selNoteIdx = -1;
-  // 选中的句子若正好就是某条已有标注，直接进"已标注"那一套（可以删/改/查）。
-  const std::string sel = rdJoinWords(g_pageText, a, b);
+  // 选中的这一段若正好就是某条已有标注，直接进"已标注"那一套（可以删/改/查）。
+  const std::string sel = rdSelTextOf(g_pageText, a, b, cp);
   for (const auto &an : rdAnchorsOnPage(g_pageText)) {
     if (st.notes[an.noteIdx].text == sel) {
       st.selNoteIdx = an.noteIdx;
@@ -7855,6 +8026,7 @@ static bool rdTapOnAnnotation(int x, int y) {
       st.selActive = true;
       st.selStart = an.a;
       st.selEnd = an.b;
+      st.selCp = -1;   // 重新锚定到已有标注：范围是词条级的，没有"词内第几个字"这回事
       st.selGrab = -1;
       st.selDrag = -1;
       st.selDragActive = false;
@@ -8213,7 +8385,8 @@ static void rdNoteCommit() {
 
 static void rdSelActivate() {
   const int sel = st.selMenuSel;
-  const std::string selText = rdJoinWords(g_pageText, st.selStart, st.selEnd);
+  // 选区文本走唯一出处 rdSelText()（"按字"档下就是那一个字，而不是含标点的整个词条）。
+  const std::string selText = rdSelText();
 
   // 3=复制 / 4=取消：两种浮层同一位置（见 rdPopupButtonLabel），所以先处理，
   // 不必再跟着 popup 分支走一遍。
@@ -8427,6 +8600,7 @@ static void handleReading(int key) {
                                             : +5;
       if (st.selGrab == 0) st.selStart = clampI(st.selStart + step, 0, st.selEnd);
       else st.selEnd = clampI(st.selEnd + step, st.selStart, std::max(0, nw - 1));
+      st.selCp = -1;   // 范围一动，"按字"那个词内偏移就作废（范围已不是单个词条/单字）
       st.dirty = 1;
       return;
     }
@@ -8463,6 +8637,7 @@ static void handleReading(int key) {
           else if (wi - st.selStart <= st.selEnd - wi) st.selStart = wi;
           else st.selEnd = wi;
           st.selGrab = -1;
+          st.selCp = -1;   // 点词改范围：同上，"按字"的单字偏移作废
           st.dirty = 1;
           return;
         }
@@ -8491,7 +8666,7 @@ static void handleReading(int key) {
     return;
   }
 
-  // ── 长按：先看是不是插图（图片页长按 = 全屏看图），不是再选中该词所在的一句 ──
+  // ── 长按：先看是不是插图（图片页长按 = 全屏看图），不是再按「选字粒度」选中一段 ──
   if (key == KEY_TOUCH_LONG) {
     int x, y;
     if (input_tap_xy(&x, &y)) {
@@ -8500,7 +8675,8 @@ static void handleReading(int key) {
       if (rdOpenImageAt(x, y)) return;
       if (g_pageText.valid) {
         const int wi = rdWordAtPoint(g_pageText, fontId, x, y);
-        if (wi >= 0) { rdBeginSelection(wi); return; }
+        // 把点按横坐标一并交给选区：只有「按字」档用它（在词条内部定位是第几个字）。
+        if (wi >= 0) { rdBeginSelection(wi, x); return; }
       }
     }
     return;   // 没落到文字/图片上（空白）：什么也不做
@@ -8534,7 +8710,7 @@ static void handleReading(int key) {
   if (key == KEY_DOWN || key == KEY_RIGHT || key == KEY_PAGE_DOWN) { turnBook(+1); return; }
   if (key == KEY_HOME) { gotoBookStart(); return; }
   if (key == KEY_END) { gotoBookEnd(); return; }
-  // 长按中间确认键不在这里：它现在是全局的"待机"（main.cpp），只有词典管理/按键映射/
+  // 长按中间确认键不在这里：它现在是全局的"切换模式"（main.cpp），只有词典下载/按键映射/
   // 统计删书这三个把它当动作键的子界面才被放行（screen_reader_long_confirm_is_action）。
   // 原来的"长按 = 全屏刷新"改由**晃动机身**触发，落点见 screen_reader_handle 顶部的
   // KEY_SHAKE 分支。
@@ -8766,6 +8942,7 @@ static void doMenuAction(MenuAct act) {
     case MenuAct::Margin:
     case MenuAct::Image:
     case MenuAct::ReadingLine:
+    case MenuAct::SelGranularity:
       openRdPick(static_cast<int>(act));
       break;
     case MenuAct::Indent:
@@ -8954,7 +9131,6 @@ static void doMenuAction(MenuAct act) {
     case MenuAct::WhitePush:
     case MenuAct::BlackPush:
     case MenuAct::GhostMode:
-    case MenuAct::TurnAnim:
     case MenuAct::PreRender:
     case MenuAct::ClockFace:
     case MenuAct::AutoStandby:
@@ -9100,16 +9276,17 @@ static std::vector<MenuItem> settingsItems() {
   m.push_back({std::string("压黑帧数: ") + blackPushName(blackPushFrames()), MenuAct::BlackPush});
   // 插图/书架封面的抖动档。它跟刷新策略一样是「屏幕怎么出画面」的档位，阅读页的
   // 「排版设定」子菜单里也有一条（挨着「图片: 双线性」）；两边写同一个键
-  // （reader_image_dither），改哪儿都算数（同「翻页动画」的惯例）。
+  // （reader_image_dither），改哪儿都算数。
   m.push_back({std::string("图片抖动: ") + kRdDitherNames[clampI(st.imageDither, 0, kRdDitherCount - 1)],
                MenuAct::ImageDither});
-  // 错相揭页开关。主界面的「设置 → 显示与版式 → 翻页动画」已经有这一项，但那个入口
-  // 要先退出阅读器；挑翻页动画来试的时候人就该在读书的地方，所以在设置标签里再放一份，
-  // 两边写同一个键（page_turn_anim），改哪儿都算数。
-  m.push_back({std::string("翻页动画: ") + (pageTurnAnimOn() ? "开" : "关"), MenuAct::TurnAnim});
   // 空闲帧预渲染开关（见 rdPrerenderTurnPage）。留着这一项是为了能 A/B：同一本书连翻
   // 几页，开与关各量一次「翻页耗时」里的"重画"。关掉只是回到"点下去才画"的老路。
   m.push_back({std::string("翻页预渲染: ") + (rdPrerenderOn() ? "开" : "关"), MenuAct::PreRender});
+  // 选字粒度：长按选文本的反白范围。**与「排版设定」里的那一行是同一个键、同一个动作**
+  // （reader_sel_gran / MenuAct::SelGranularity），照「图片抖动」的先例在两处
+  // 各放一行 —— 读书时在浮动菜单的「排版」里够得着，从设置标签进来也找得到，改哪儿都算数。
+  m.push_back({std::string("选字粒度: ") + kSelGranNames[clampI(selGranularity(), 0, kSelGranCount - 1)],
+               MenuAct::SelGranularity});
   m.push_back({std::string("阅读器方向: ") + (st.orientation == "portrait" ? "竖屏" : "横屏"), MenuAct::Orient});
   m.push_back({std::string("待机表盘: ") +
                    standbyFaceLabel(standbyFaceFromKey(g_settings.getString("clock_face").c_str())),
@@ -9404,11 +9581,6 @@ static void rdPickTable(int act, std::string &title, std::vector<std::string> &l
       title = "残影治理";
       for (int i = 0; i < kRdGhostCount; i++) add(kRdGhostNames[i], kRdGhostKeys[i]);
       break;
-    case MenuAct::TurnAnim:
-      title = "翻页动画";
-      add("开", "1");
-      add("关", "0");
-      break;
     case MenuAct::PreRender:
       title = "翻页预渲染";
       add("开", "1");
@@ -9461,6 +9633,11 @@ static void rdPickTable(int act, std::string &title, std::vector<std::string> &l
       title = "阅读线";
       for (int i = 0; i < 4; i++) add(kReadingLineNames[i], std::to_string(i));
       break;
+    case MenuAct::SelGranularity:
+      // 值就是档位下标（与 ReadingLine 同一惯例），applyRdPick 只做一次 atoi。
+      title = "选字粒度";
+      for (int i = 0; i < kSelGranCount; i++) add(kSelGranNames[i], std::to_string(i));
+      break;
     case MenuAct::Orient:
       title = "阅读器方向";
       for (int i = 0; i < 2; i++) add(kOrientNames[i], kOrientKeys[i]);
@@ -9501,7 +9678,6 @@ static std::string rdPickCurValue(int act) {
         if (kRdFullEveryValues[i] == v) return kRdFullEveryKeys[i];
       return kRdFullEveryKeys[0];
     }
-    case MenuAct::TurnAnim: return pageTurnAnimOn() ? "1" : "0";
     case MenuAct::PreRender: return rdPrerenderOn() ? "1" : "0";
     case MenuAct::WhitePush: {
       const int v = whitePushFrames();
@@ -9529,6 +9705,7 @@ static std::string rdPickCurValue(int act) {
     case MenuAct::Margin: return std::to_string(clampI(st.marginIdx, 0, 2));
     case MenuAct::Image: return st.imageBilinear ? "1" : "0";
     case MenuAct::ReadingLine: return std::to_string(clampI(st.readingLine, 0, 3));
+    case MenuAct::SelGranularity: return std::to_string(clampI(selGranularity(), 0, kSelGranCount - 1));
     case MenuAct::Orient: return st.orientation;
     default: return "";
   }
@@ -10298,6 +10475,19 @@ static void applyRdPick(int act, const std::string &value) {
       g_settings.setString("reader_reading_line", std::to_string(st.readingLine));
       st.fullRefresh = true;
       break;
+    case MenuAct::SelGranularity: {
+      // 同 ReadingLine：只影响长按那一刻取哪一段，版式一个字节没动，所以**不 reopenBook**
+      // （重排反而会把当前页丢掉、回到本节开头），落盘 + 重画当前页就够了。
+      const int g = clampI(atoi(value.c_str()), 0, kSelGranCount - 1);
+      g_settings.setString("reader_sel_gran", kSelGranKeys[g]);
+      rdShowFloat(std::string("选字粒度: ") + kSelGranNames[g],
+                  g == kSelGranChar ? "长按只框住点中的那一个字"
+                  : g == kSelGranParagraph ? "长按选中整个段落"
+                                           : "长按选中一小句",
+                  1500);
+      st.fullRefresh = true;
+      break;
+    }
     case MenuAct::Orient:
       // 方向不是"当前这本书"的属性：值存全局设置，落定后同时拨 epd 旋转与渲染器方向
       // 标志（applyReaderOrientation），页面几何全变所以还要重排。
@@ -10325,9 +10515,8 @@ static void applyRdPick(int act, const std::string &value) {
       break;
     }
     case MenuAct::GhostMode: {
-      // 四档改的都是**共享**的波形表（内容，不是指针），所以改完必须让缓存重展开：
-      // 揭页动画那套相位 LUT 用 e0470_waveform_generation() 判陈旧，两个 set 都会 +1。
-      // 不重排、不重开书。改完立刻落表，并顺手全刷一次，让 A/B 从干净的底起算。
+      // 四档改的都是**共享**的波形表（内容，不是指针），改完立刻落表，并顺手全刷一次，
+      // 让 A/B 从干净的底起算。不重排、不重开书。
       g_settings.setString("reader_ghost_mode", value);
       reader_set_black_pushes(ghostBlackPushes());
       reader_set_erase_pushes(ghostErasePushes());
@@ -10353,13 +10542,6 @@ static void applyRdPick(int act, const std::string &value) {
                   ghostMode() == 3 ? "白底先压回黑轨再推白 · 深度越大底越干净也越闪"
                                    : "当前残影治理档不用它（只有 +压黑 那一档读）",
                   1800);
-      st.fullRefresh = true;
-      break;
-    }
-    case MenuAct::TurnAnim: {
-      const bool on = (value == "1");
-      g_settings.setString("page_turn_anim", on ? "1" : "0");
-      rdShowFloat(on ? "翻页动画: 开" : "翻页动画: 关", "错相揭页 · 慢约 1 秒", 1500);
       st.fullRefresh = true;
       break;
     }
@@ -11767,7 +11949,7 @@ static void rdEnterSearch(RdMode m) {
 }
 
 // ── 模式切换返回点 ──────────────────────────────────────────────────────
-// 电源键短按切到写作/计划再切回来时，默认会一路重建成书架首页——正在读的书、翻到第
+// 长按中间确认键切到写作/计划再切回来时，默认会一路重建成书架首页——正在读的书、翻到第
 // 几页、停在哪个标签全丢。这里在退出前记下"当时在哪一屏"，重新进入时回到那一屏。
 // 只记能重建的东西（书按路径重开、页按序号重排），所以不影响退出时释放大对象的做法。
 // 子界面（菜单/目录/WiFi/OPDS/下载…）一律退回它的入口界面：那些界面的临时状态
@@ -11903,7 +12085,7 @@ static void rdRestoreReturnPoint() {
 // ── 公开入口 ────────────────────────────────────────────────────────────
 
 void screen_reader_init() {
-  // 这一次 init 是从按电源键切模式那一刻起、到阅读页上屏为止的**全部**耗时（屏在这段
+  // 这一次 init 是从长按中间键切模式那一刻起、到阅读页上屏为止的**全部**耗时（屏在这段
   // 里一动不动）。每次进入都起一次账 —— 见上面 rdTraceBegin 的说明。
   rdTraceBegin();
   // 阅读器整条绘制路径**绕过** core1 的渲染任务：GfxRenderer 画的就是 epdiy 的
@@ -11944,12 +12126,6 @@ void screen_reader_init() {
   // g_rd.begin() 之后 frameBuffer 才有效，立刻把 u8g2 shim 也钉上去（理由见 rdPinShimFb）。
   rdPinShimFb();
   rdTraceMark("g_rd.begin+方向+shim");
-
-  // 揭页动画期间每 8 拍补采一次输入。动画 ≈1.06s 是这一段同步阻塞里最长的一截，
-  // 期间没人读触摸控制器 —— 而点按必须"按下"与"抬手"各被采到一次，整段落在动画里的
-  // 点按一点痕迹都不留（用户侧："点了要等一会儿才翻页，这期间怎么点都一样"）。
-  // 回调在推屏那个任务里跑（就是本任务），cst836u 的约束满足。
-  reader_page_turn_set_tick_hook(&input_tick);
 
   // UI 字体（菜单/书架/词典）跟随写作模式共享字号；正文字体 5 档独立。
   // 像素高 ≈ 字号 * 2.1：22pt→46 / 20pt→42 / 18pt→38。阅读器的整套界面版式都从
@@ -12125,9 +12301,6 @@ void screen_reader_exit() {
   reader_set_white_pushes(kRdWhitePushValues[0]);
   reader_set_black_pushes(0);
   reader_set_erase_pushes(0);
-  // 错相揭页的 37KB 相位表只在阅读时按需分配，退出时还回 PSRAM。
-  // 留在原地也不会坏（下次进来会复用），但写作模式正缺 PSRAM。
-  reader_release_page_turn();
   // 先记下"现在在哪一屏"，下面就要把书和列表都释放掉了。
   rdSaveReturnPoint();
   // 恢复全局方向设置（写作模式可能为竖屏），由 main 的 ui_invalidate_snapshot
@@ -12270,7 +12443,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 晃动机身 = 一次全刷（hw/input.cpp 读加速度计判定，见那边的 shake_poll）。
   // **所有阅读器子界面通用**：只置"下一帧走全刷档"这一对标记，画面由各子界面自己
   // 照常重绘——这样清的是残影，不会把用户正在看的界面/浮层状态清掉。原来这个动作
-  // 挂在"长按中间确认键"上，那个键位现在改成待机了。
+  // 挂在"长按中间确认键"上，那个键位现在改成切换模式了。
   if (key == KEY_SHAKE) {
     st.fullRefresh = true;
     st.dirty = 1;
@@ -12282,7 +12455,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 要的语义；书本对象不释放，回书架再点开还是这一本。其余情况（弹了菜单/目录/
   // 书签/设置等子界面，或阅读页正开着选区）一律按 Esc 退一层——**不能**换成
   // KEY_LONG_CONFIRM，它在阅读器里的语义是「删词典 / 解绑按键 / 删统计里的书」，
-  // 会误删（其余场合它已经被 main.cpp 拿去当"待机"了）。
+  // 会误删（其余场合它已经被 main.cpp 拿去当"切换模式"了）。
   if (key == KEY_BACK) {
     // 脚注弹注开着时它也算"一层浮层"：划回来先收起弹注（转成 Esc，由弹注自己吃），
     // 而不是一路滑回书架。浮动菜单同理：开着时划回来先收菜单、不是直接回书架。

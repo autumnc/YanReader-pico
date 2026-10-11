@@ -56,7 +56,7 @@ bool app_editor_help_active();
 // 抢走，全局 IME 热键也不该插进来把菜单刷掉。
 bool app_editor_popup_active();
 
-// 离开编辑器时清掉触摸选区与弹层（电源键切模式绕开了 screen_editor_init）。
+// 离开编辑器时清掉触摸选区与弹层（长按中间键切模式绕开了 screen_editor_init）。
 void app_editor_leave_cleanup();
 
 // 步 5「按下即反馈」：编辑器空转的每一小段里调一次（main.cpp 的 scrEditor 空转循环，

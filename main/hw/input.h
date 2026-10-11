@@ -96,8 +96,8 @@ int input_poll();
 
 // 「刚刚是**因为电源键**才从待机唤醒的」。下一次 PMU 短按事件若落在一个很短的窗口里，
 // 就认定它是"唤醒那一按的抬手"直接吞掉，不上报 KEY_POWER。
-// 待机时按电源键只该把设备叫醒，不该顺带把模式转一圈：唤醒那一按 =
-// KEY_DOWN（key wake，read_pico_pmu_take_key_wakeup 已经 ack 掉）+ 松手时的 KEY_SHORT，
+// 电源键现在短按 = 待机，所以待机时按电源键只该把设备叫醒，不该顺带又睡回去：唤醒那一按
+// = KEY_DOWN（key wake，read_pico_pmu_take_key_wakeup 已经 ack 掉）+ 松手时的 KEY_SHORT，
 // 后者是睡着之后才进队列的，没人能代表它说"这是唤醒那一按"。所以由 enterLightSleep
 // 在判明真按键唤醒之后**主动登记一次**，剩下的交给时间窗（见 input.cpp）。
 void input_note_key_wake();

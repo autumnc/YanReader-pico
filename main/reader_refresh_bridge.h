@@ -4,8 +4,8 @@
  *
  * 阅读器 → 推屏层 的"白底参考帧纪律"提示，以及灰阶自检页的自推屏入口。
  *
- * 和 reader_page_turn.h 同样的理由单独一个头：阅读器那几个 TU **不能** include
- * display.h（display.h → epdiy.h → epd_internals.h，那里的 EpdFont typedef 与
+ * 单独一个头的理由：阅读器那几个 TU **不能** include display.h
+ * （display.h → epdiy.h → epd_internals.h，那里的 EpdFont typedef 与
  * crossmux 的 EpdFont(class) 在同一 TU 冲突）。这里只放不依赖 epdiy 的裸声明，
  * 实现在 display.c。
  *
@@ -110,13 +110,6 @@ void reader_set_erase_pushes(int count);
 
 /// 当前擦除加强档。
 int reader_erase_pushes(void);
-
-/// 共享软刷预算是不是该升级了（`s_soft_refreshes + 1 >= APP_GC16_EVERY`）。
-/// 阅读器只用它做一件事：**揭页动画那条路会吞掉升级** —— update_display_page_turn 记了
-/// 一笔 `++s_soft_refreshes` 就返回了，而升级判据在 hl_update_ex / update_display_gray8_text
-/// 里，于是"翻着翻着来一次整屏黑白整刷"在阅读模式下从来不会发生（自适应另有自己那笔
-/// s_ghostAccum，但局刷一分钱都不记）。到点这一帧不挂动画、让常规差分路去升级即可。
-int reader_soft_refresh_due(void);
 
 #ifdef __cplusplus
 }
