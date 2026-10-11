@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>研读 YanReader · 网页刷机</title>
+<meta name="description" content="在浏览器里给「研读 YanReader」（小纸 Pico · ESP32-S3 电子纸）刷写固件，不用装 ESP-IDF、esptool 或任何工具。">
+<meta name="color-scheme" content="light">
+<!-- 空 data: 图标，免得 404 干扰日志 -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<div class="banner err" id="env-banner" hidden></div>
+
+<header class="top">
+  <div class="brand">
+    <div class="mark" aria-hidden="true">研</div>
+    <div>
+      <h1>研读 YanReader</h1>
+      <p class="sub">小纸 Pico · ESP32-S3 电子纸固件刷写</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <button class="ghost" id="btn-help" type="button">使用帮助</button>
+  </div>
+</header>
+
+<main>
+
+  <section class="card">
+    <h2>固件</h2>
+    <p class="hint">本页只刷当前 Release 的整包（引导程序 + 分区表 + 应用，写到 <code>0x0</code>）。</p>
+    <dl class="kv">
+      <dt>版本</dt>      <dd id="fw-version">—</dd>
+      <dt>发布</dt>      <dd id="fw-tag">—</dd>
+      <dt>大小</dt>      <dd id="fw-size">—</dd>
+      <dt>sha256</dt>    <dd id="fw-sha">—</dd>
+    </dl>
+    <p id="fw-state">正在读取固件清单…</p>
+
+    <details class="local">
+      <summary>或：用本地 / 其它版本的固件文件</summary>
+      <p class="hint">
+        选一个整包 <code>.bin</code>，形如 <code>yanreader-&lt;版本&gt;-full.bin</code>（旧版本、自己编的、
+        别人 fork 的都可以）。会在这里就地重跑和线上固件<strong>完全相同的闸</strong>，不合格不写入。
+      </p>
+      <div class="local-row">
+        <label class="filebtn" for="file-input">选择 .bin 文件</label>
+        <input type="file" id="file-input" accept=".bin,application/octet-stream" hidden>
+        <button class="link" id="btn-use-online" type="button" hidden>改回用线上固件</button>
+      </div>
+      <p class="hint">
+        校验（可选）：粘贴预期的 sha256 或 md5，写前几位就够
+        <input type="text" id="expect-hash" placeholder="例如 419caee3" spellcheck="false" autocomplete="off">
+      </p>
+      <p id="file-state">未选择文件 —— 当前用线上固件。</p>
+      <dl class="kv" id="file-kv" hidden>
+        <dt>文件</dt>   <dd id="file-name">—</dd>
+        <dt>大小</dt>   <dd id="file-size">—</dd>
+        <dt>sha256</dt> <dd id="file-sha">—</dd>
+        <dt>md5</dt>    <dd id="file-md5">—</dd>
+      </dl>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>刷机</h2>
+    <p class="hint">Chrome / Edge（桌面版）打开本页 → 用 Type-C <strong>数据线</strong>连上设备 → 按顺序点两个按钮。</p>
+
+    <div class="step" id="step-1">
+      <div class="step-n">1</div>
+      <div class="step-body">
+        <p>连接设备。浏览器会弹出串口选择框，选中 <code>USB JTAG/serial debug unit</code>。</p>
+        <button id="btn-connect" type="button">连接设备</button>
+      </div>
+    </div>
+
+    <div class="step" id="step-2">
+      <div class="step-n">2</div>
+      <div class="step-body">
+        <p id="dev-info">开始刷写：写入固件 → 读回比对 MD5 → 重启进新固件。约 1 分钟，过程中<strong>不要拔线</strong>。</p>
+        <button class="primary" id="btn-flash" type="button" disabled>开始刷写</button>
+        <button class="ghost" id="btn-disconnect" type="button" hidden>断开</button>
+      </div>
+    </div>
+
+    <p id="status"></p>
+    <div class="bar idle" id="bar"><i id="bar-fill"></i></div>
+
+    <details class="log">
+      <summary>详细日志</summary>
+      <pre id="log"></pre>
+    </details>
+  </section>
+
+  <p class="note">
+    <strong>刷机不影响设备设置与 SD 卡内容</strong>（镜像里没有 NVS 分区，书、笔记、统计、WiFi 凭据都不动）。
+    刷完想回到出厂状态，见「使用帮助 → 刷机不会丢什么」。
+  </p>
+
+</main>
+
+<footer>
+  <span>固件来源：<a id="link-release" href="https://github.com/autumnc/YanReader-pico/releases/latest" rel="noopener">GitHub Releases</a></span>
+  <span><a id="link-repo" href="https://github.com/autumnc/YanReader-pico" rel="noopener">项目主页</a></span>
+  <button class="link" id="btn-help-2" type="button">使用帮助</button>
+</footer>
+
+<!-- ══════════════════════ 使用帮助 ══════════════════════ -->
+
+<aside class="overlay" id="help" hidden role="dialog" aria-modal="true" aria-labelledby="help-title">
+<div class="sheet">
+  <div class="sheet-head">
+    <h2 id="help-title">使用帮助</h2>
+    <button class="ghost" id="btn-help-close" type="button" style="margin-left:auto">关闭</button>
+  </div>
+  <div class="sheet-body">
+
+    <h3>这是什么</h3>
+    <p>
+      <strong>研读 YanReader</strong> 是「阅读 · 写作 · 计划」三合一的电子纸固件，跑在
+      <strong>Read Pico / 小纸 Pico</strong> 硬件上（ESP32-S3 + 7.5″ 电子纸）。
+      这个页面把它刷进设备 —— 不用装 ESP-IDF、esptool 或 Python，也不要用命令行。
+    </p>
+
+    <h3>一、浏览器要求</h3>
+    <ul>
+      <li>需要 <strong>Chrome 或 Edge</strong>（桌面版）；<strong>Android Chrome</strong> 也可以。</li>
+      <li><strong>Safari、Firefox、iOS 上任何浏览器都用不了</strong> —— 它们没有 WebSerial 接口，这是浏览器层面的限制。</li>
+      <li>页面必须是 <code>https://</code> 或 <code>localhost</code>（本站在 GitHub Pages 上是 https，满足）。</li>
+      <li>手机 / 平板需要一根 <strong>OTG 转接线</strong>才能接设备。</li>
+    </ul>
+
+    <h3>二、刷机步骤</h3>
+    <ol>
+      <li>用 <strong>Type-C 数据线</strong>把设备连到电脑。<em>纯充电线不行</em> —— 线里没有数据线芯，电脑根本看不到设备。</li>
+      <li>点「<strong>连接设备</strong>」，在弹出的串口列表里选
+        <code>USB JTAG/serial debug unit</code>（就是设备本身；它内置 USB，不需要额外驱动）。</li>
+      <li>连上后会显示芯片型号、flash 大小、MAC。确认是 <strong>ESP32-S3</strong> 再往下走。</li>
+      <li>点「<strong>开始刷写</strong>」，等进度条走满（约 1 分钟；写入之后还会读回 flash 比对 MD5，
+        这段进度条停在 100% 不动是正常的）。</li>
+      <li>出现「✓ 刷写完成」后设备会自己重启进新固件，<strong>不用手动断电</strong>。</li>
+    </ol>
+    <p><strong>刷写过程中不要拔线、不要关页面</strong>（页面会拦你一下）。中途断掉不会变砖 —— 再刷一遍就行。</p>
+    <p>
+      想刷<strong>别的版本</strong>（旧版本、自己编的、别人 fork 的）：在「固件」卡片里展开
+      「<strong>或：用本地 / 其它版本的固件文件</strong>」，选一个整包
+      <code>yanreader-&lt;版本&gt;-full.bin</code>。页面会就地重跑同样的闸（长度 / 三处魔数 /
+      你填的校验位），并且把算出来的 <code>sha256</code>、<code>md5</code> 显示出来给你核对。
+      <strong>别选 <code>pjournal_pico.bin</code></strong> —— 那是纯应用镜像，闸门会挡下它。
+    </p>
+
+    <h3>三、刷机不会丢什么</h3>
+    <ul>
+      <li>固件镜像里<strong>没有 NVS 分区</strong>，所以<strong>设备设置、WiFi 凭据都还在</strong>。</li>
+      <li>SD 卡上的东西（<code>settings/</code>、书、笔记、阅读进度、统计、词典、字体）<strong>完全不动</strong>。</li>
+      <li>刷完屏幕没变化是正常的 —— 设备本来就在跑同一个固件。</li>
+      <li>真想「恢复出厂设置」，得另外抹掉 flash（这一条会连 WiFi 凭据一起清掉，<strong>不可撤销</strong>）：
+        <pre><code>esptool.py --chip esp32s3 erase_flash</code></pre>
+        抹完再用本页面刷一遍固件。</li>
+    </ul>
+
+    <h3>四、刷完第一次开机</h3>
+    <ol>
+      <li>插一张 <strong>FAT32</strong> microSD 卡（设备没有内置存储，书和笔记都在卡上）。</li>
+      <li>开机动画（研读 · 研墨 · 研行）之后<strong>默认进阅读模式</strong>。</li>
+      <li>去 <strong>设置 → WiFi 管理</strong> 连上 WiFi —— 对时之后阅读统计和待机时钟才准。</li>
+      <li>把 <code>.epub</code> / <code>.txt</code> 放进 <code>/sdcard/books/</code>，回到书架标签会自动扫出封面。</li>
+      <li>装词典走 <strong>设置 → 词典下载</strong>；导出标注走 <strong>笔记</strong>标签页搜索栏右端的「导出」。</li>
+    </ol>
+
+    <h3>五、按键</h3>
+    <table class="keys">
+      <tr><th>操作</th><th>作用</th></tr>
+      <tr><td>电源键 短按</td><td><strong>进入待机</strong>，再短按一次唤醒并回到原来那一页</td></tr>
+      <tr><td>电源键 长按 8 秒</td><td>关机</td></tr>
+      <tr><td>电源键</td><td><strong>唯一的唤醒键</strong> —— 待机后电容键、触摸、晃动机身都唤不醒</td></tr>
+      <tr><td>左电容键 单击 / 双击</td><td>阅读页：上一页 / 上一章</td></tr>
+      <tr><td>右电容键 单击 / 双击</td><td>阅读页：下一页 / 下一章</td></tr>
+      <tr><td>中间电容键 按下 / 长按</td><td>回车确认 / <strong>三个模式轮换</strong>：阅读 → 写作 → 计划 → 阅读</td></tr>
+    </table>
+    <p>
+      长按中间键切模式，在阅读器某些「这个键是本界面动作键」的子界面里不生效（那时它执行该界面的动作）。
+      不按也没关系：<strong>自动待机</strong>到点会自己睡（时长在阅读模式的设置里调，0 = 关）。
+    </p>
+    <p><strong>晃一下机身</strong>（内置加速度计）= 全屏重刷清残影。它不是唤醒源。</p>
+
+    <h3>六、触摸手势</h3>
+    <table class="keys">
+      <tr><th>手势</th><th>作用</th></tr>
+      <tr><td>点按</td><td>回车确认。阅读页分三区：左 1/3 上一页、右 1/3 下一页、中间 1/3 开阅读菜单</td></tr>
+      <tr><td>左右滑</td><td>上一个 / 下一个</td></tr>
+      <tr><td>上下滑</td><td>整页滚动</td></tr>
+      <tr><td>从屏幕边缘起划的横划</td><td>返回</td></tr>
+      <tr><td>长按（≥ 600ms 不动）</td><td>阅读页 = 选文本（标注 / 笔记 / 查字典；范围看「选字粒度」，默认选句）</td></tr>
+      <tr><td>按住拖动</td><td>拖动 / 选择文本</td></tr>
+      <tr><td>双指捏合</td><td>缩放（<strong>只有图片查看器认</strong>，其它界面无作用）</td></tr>
+    </table>
+
+    <h3>七、三个模式</h3>
+    <h4>阅读（研读）</h4>
+    <p>
+      顶栏 5 个根标签：<strong>书架 / 文件 / 笔记 / 设置 / 统计</strong>。格式支持 EPUB（含内嵌图片、
+      CSS、脚注、目录）、TXT（GBK 自动识别）、XTC。阅读页点中间 1/3 出<strong>阅读菜单</strong>：
+      目录、排版设定（字号 / 字体 / 行距 / 段距 / 缩进 / 对齐 / 边距 / 阅读线 / 选字粒度）、书签、
+      脚注、跳转百分比、二维码、词典、返回。另有夜间反色、横竖屏切换、自定义状态栏、图片查看器、
+      OPDS 书库、WiFi 传书、阅读统计（时长 / 每日页数 / 热力图 / 连续天数）。
+      <strong>字号和字体不在设置里</strong> —— 它们是「这一本书的排版」，在阅读菜单的「排版设定」下。
+    </p>
+    <h4>写作（研墨）</h4>
+    <p>日记 / 自由写作、大纲写作、灵感库、AI 润色、Flomo 同步、WebDAV 同步、历史版本、Markdown 渲染、竖排书写。</p>
+    <h4>计划（研行）</h4>
+    <p>GTD 任务管理：任务 / 项目 / 日历 / 便签 / 筛选，可导出 Markdown。</p>
+    <h4>共用一套虚拟键盘</h4>
+    <p>
+      底部功能行是 <code>面板切换 · 空格 · 中/英 · 回车</code>，上面一行是
+      <code>布局 · Ctl · 方向键 · Shift · 退格</code>。键盘布局（26 / 14 / 18 / 9 键）在
+      <strong>设置 → 输入法 → 键盘布局</strong>里换；也能在<strong>设置 → 通用 → 蓝牙设备管理</strong>里
+      配对蓝牙键盘或翻页器。
+    </p>
+
+    <h3>八、SD 卡目录</h3>
+    <pre><code>/sdcard/
+├── books/                 # 书籍（EPUB / TXT / XTC）
+├── fonts/                 # 用户字体 &lt;name&gt;.ttf
+├── dictionaries/&lt;id&gt;/     # 已安装词典（StarDict）
+├── settings/              # 设备设置与状态（按键映射 / 剪贴板 / 同步状态…）
+├── pjournal/              # 日记正文
+├── outline/               # 大纲 / 灵感库
+├── gtd/                   # 计划模式数据
+├── flomo/                 # Flomo 本地库
+├── exports/               # 阅读标注导出
+├── .crossmux/             # 各书的排版 / 封面缓存
+├── reader_progress.txt    # 阅读进度
+├── reader_notes.txt       # 标注 / 笔记
+└── reader_stats.json      # 阅读统计</code></pre>
+    <p>
+      <code>.</code> 开头的目录是内部缓存，删掉只会让它重新生成（重排版 / 重抓封面）。
+      书的排版缓存按书独立，<strong>删书请走书架菜单的「删除本书」</strong>，它会连带清缓存。
+    </p>
+
+    <h3>九、常见问题</h3>
+    <h4>点「连接设备」没反应 / 列表里没有设备</h4>
+    <ul>
+      <li>确认用的是 <strong>Chrome 或 Edge</strong>（Safari / Firefox 没有 WebSerial，点了也不会有反应）。</li>
+      <li>确认是<strong>数据线</strong>而不是纯充电线。</li>
+      <li>关掉所有占用串口的程序：<code>idf.py monitor</code>、Arduino IDE 串口监视器、串口助手，
+        以及本机的 <code>cat /dev/ttyACM0</code>。同一时刻只能有一个程序打开串口。</li>
+      <li>列表里选的是 <code>USB JTAG/serial debug unit</code>；如果同时插了别的 USB 串口设备，注意别选错。</li>
+    </ul>
+    <h4>刷到一半失败 / 校验不通过</h4>
+    <ul>
+      <li>不会有问题，重新刷一遍即可（固件是整包写入，没有"刷一半"的中间状态）。</li>
+      <li>连续失败就换一根线、换一个 USB 口（尽量直插主板，别走 USB hub）。</li>
+    </ul>
+    <h4>刷完屏幕没变 / 设备不亮</h4>
+    <ul>
+      <li>「屏幕没变」多半是正常的：设备设置、SD 卡内容都不参与刷机，画面当然一样。</li>
+      <li>刷完设备会重新枚举 USB，<strong>串口节点名会变</strong>（<code>/dev/ttyACM0</code> 可能变成
+        <code>/dev/ttyACM1</code>），之前开着的 <code>idf.py monitor</code> 会失效，要重新开一个。</li>
+      <li>真黑屏：按一下电源键唤醒看看（可能只是睡过去了）；仍然不行就重刷一遍，或用
+        <code>erase_flash</code> 抹掉后重刷。</li>
+    </ul>
+    <h4>刷完能退回官方固件吗</h4>
+    <p>能。用本页面刷本项目任意版本的整包即可；要从本固件退回官方固件，用官方那套刷机方式重刷它的整包。</p>
+
+    <h3>十、不用网页、走命令行</h3>
+    <p>装了 Python 的话，也可以直接从 <a href="https://github.com/autumnc/YanReader-pico/releases" rel="noopener">Releases</a> 下载整包手动刷：</p>
+    <pre><code>pip install esptool
+
+# 整包（引导程序 + 分区表 + 应用）→ 0x0
+esptool.py --chip esp32s3 -b 460800 write_flash 0x0 yanreader-&lt;版本&gt;-full.bin
+
+# 或者只更新应用、不动引导程序 / 分区表 → 0x10000
+esptool.py --chip esp32s3 -b 460800 write_flash 0x10000 pjournal_pico.bin</code></pre>
+    <p><strong>不要把 <code>pjournal_pico.bin</code> 刷到 <code>0x0</code></strong>（它是纯应用镜像，没有引导头，
+    刷错地址设备起不来）。本页面的固件闸口会挡掉这种误操作。</p>
+    <p>接串口看日志（空闲时固件不打日志，按一下按键才有输出）：</p>
+    <pre><code>cat /dev/ttyACM0</code></pre>
+
+    <h3>十一、硬件与说明</h3>
+    <table class="keys">
+      <tr><th>主控</th><td>ESP32-S3（双核 240MHz，16MB flash，8MB Octal PSRAM）</td></tr>
+      <tr><th>屏幕</th><td>E0470A01 电子纸 1216 × 684</td></tr>
+      <tr><th>按键</th><td>3 个电容键（左 / 中 / 右）+ 电源键</td></tr>
+      <tr><th>触摸</th><td>CST836U 电容触摸</td></tr>
+      <tr><th>传感器</th><td>SC7A20H 加速度计（晃动机身 = 全刷清残影）</td></tr>
+      <tr><th>存储</th><td>microSD（FAT，UTF-8 长文件名）</td></tr>
+    </table>
+    <p class="note">
+      本项目是非官方的第三方固件，与硬件厂商无隶属关系；刷机有风险（但随时可以用同一个页面重刷）。
+      设备厂商的说明里写明「自行调整屏幕波形会使设备失去保修」—— 本固件包含波形相关改动，请知悉。
+    </p>
+
+  </div>
+</div>
+</aside>
+
+<script type="module" src="./flasher.js"></script>
+</body>
+</html>
