@@ -58,6 +58,11 @@ static const BackupEntry kEntries[] = {
     {"/sdcard/reader_progress.txt", "reader_progress.txt", false},
     {"/sdcard/reader_notes.txt", "reader_notes.txt", false},
     {"/sdcard/reader_stats.json", "reader_stats.json", false},
+    // 已保存的 WiFi 网络表。它是 WiFi 凭据的**真源**（阅读模式的 WiFi 管理和写模式
+    // 设置里那两行都读写它）。不备份的话，「从备份恢复」只换回了 settings/wifi_ssid，
+    // 表还是恢复前的 —— 恢复完两个模式显示的就是不同的网。明文密码的口子没变：
+    // settings/wifi_pass 本来就在备份里。
+    {"/sdcard/wifi_networks.txt", "wifi_networks.txt", false},
 };
 static const int kEntryCount = (int)(sizeof(kEntries) / sizeof(kEntries[0]));
 

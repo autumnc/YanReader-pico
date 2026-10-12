@@ -4,6 +4,7 @@
 #include "font_store.h"
 #include "ttf_font.h"
 #include "wifi_manager.h"
+#include "wifi_store.h"   // WiFi 那两行读写的是这张表（阅读模式的 WiFi 管理同一份）
 #include "opds_client.h"
 #include "flomo_client.h"
 #include "ime/IME.h"
@@ -319,6 +320,51 @@ static int fieldVisibleCount() {
     for (int i = 0; i < NUM_SETTINGS; i++)
         if (fieldShown(i)) n++;
     return n;
+}
+
+// ── WiFi 那两行：读写的是**网络表**，不是普通设置键 ──────────────────────
+// wifi_ssid / wifi_pass 看着是两行文本框，实际是同一张表（g_wifiStore，
+// /sdcard/wifi_networks.txt —— 阅读模式的「WiFi 管理」那张）的两面：值取表里
+// **最近用过的那个网络**。改哪一面都把整对 upsert 回表，阅读模式那边立刻看到。
+// 老的一对设置键仍在，但降级成镜像（由 WifiManager::savedRemember/savedForget 维护），
+// 因为 NTP/WebDAV/flomo/OPDS/传书/微读 那些按需连接的路径读的是它们。
+static bool isWifiNetField(const char *key) {
+    return strcmp(key, "wifi_ssid") == 0 || strcmp(key, "wifi_pass") == 0;
+}
+
+// 这一行显示什么 / 进编辑时缓冲区里装什么。普通键落 g_settings；WiFi 那两行落表。
+static std::string settingsFieldValue(const SettingField &f) {
+    if (strcmp(f.key, "wifi_ssid") == 0) return g_wifiStore.mostRecentSsid();
+    if (strcmp(f.key, "wifi_pass") == 0) return g_wifiStore.mostRecentPass();
+    return g_settings.getString(f.key);
+}
+
+static void settingsCommitField(const SettingField &f, const std::string &buf,
+                                ScreenContext &ctx) {
+    if (!isWifiNetField(f.key)) {
+        g_settings.setString(f.key, buf);
+        return;
+    }
+
+    if (strcmp(f.key, "wifi_ssid") == 0) {
+        if (buf.empty()) {
+            ctx.statusMessage = "WiFi SSID 不能为空";
+            return;
+        }
+        // 改成一个**表里已经存过**的名字时，别拿当前这个网的密码去覆盖它 —— 那是另一个
+        // 网络，密码多半不一样。保留它自己的密码，只把它挪到最前、把旧键重指过去。
+        const WifiSavedNet *ex = g_wifiStore.find(buf.c_str());
+        const std::string pass = ex ? ex->pass : g_wifiStore.mostRecentPass();
+        g_wifi.savedRemember(buf.c_str(), pass.c_str());
+    } else {
+        const std::string ssid = g_wifiStore.mostRecentSsid();
+        if (ssid.empty()) {
+            ctx.statusMessage = "先填 WiFi SSID";
+            return;
+        }
+        // 密码清空 = 记成开放网络，这是 remember() 本来的语义（open = 密码为空）。
+        g_wifi.savedRemember(ssid.c_str(), buf.c_str());
+    }
 }
 
 // ── 选项弹层：轮换制设置项 ────────────────────────────────────────────────
@@ -1834,7 +1880,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             editorVkAutoHide();
         } else if (key == 0x0A || key == 0x0D) {
             auto &f = SETTINGS_FIELDS[fieldAt(g_settingsState.selection)];
-            g_settings.setString(f.key, g_settingsState.editBuffer);
+            settingsCommitField(f, g_settingsState.editBuffer, ctx);
             g_settingsState.editing = false;
             g_settingsState.editBuffer.clear();
             g_settingsState.editCursor = 0;
@@ -1978,7 +2024,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                     g_settingsState.selection = fieldVisibleCount() - 1;
             }
         } else {
-            g_settingsState.editBuffer = g_settings.getString(f.key);
+            g_settingsState.editBuffer = settingsFieldValue(f);
             g_settingsState.editCursor = (int)g_settingsState.editBuffer.length();
             g_settingsState.editing = true;
             g_settingsState.imeActive = false;
@@ -2092,7 +2138,7 @@ static void drawBrowseListBody() {
             snprintf(buf, sizeof(buf), "%s:%s%s", f.label, toggleValue(f.key) ? "开" : "关",
                      restartRequiredField(f.key) ? " 重启" : "");
         } else {
-            std::string value = g_settings.getString(f.key);
+            std::string value = settingsFieldValue(f);
             std::string display;
             if (value.empty()) display = "(未设置)";
             else if (f.masked) display = "********";

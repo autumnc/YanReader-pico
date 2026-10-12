@@ -396,11 +396,16 @@ bool WifiManager::savedPassword(const char *ssid, std::string &outPass, bool *ou
 bool WifiManager::savedHas(const char *ssid) { return g_wifiStore.has(ssid); }
 
 bool WifiManager::savedRemember(const char *ssid, const char *pass) {
+    if (!ssid || !*ssid) return false;   // remember() 本来就会拒；先挡掉，别去动旧键
     const bool ok = g_wifiStore.remember(ssid, pass);
     // 镜像到旧键：NTP/WebDAV/flomo/OPDS/传书/微读 全读这两个键（见 ui_helpers 的
     // ensure_wifi_connected、main.cpp 的 ntpSyncBody…）。镜像了它们就一行都不用改。
-    g_settings.setWifiSsid(ssid ? ssid : "");
-    g_settings.setWifiPassword(pass ? pass : "");
+    //
+    // 镜像的是**表里归一化后**的那一对，而不是原始入参：SSID 超 32 字节 / 密码超 63 字节
+    // 会在 remember() 里被截，而旧键才是连接路径真正读的东西。两边不一致的症结是
+    // "设置页显示对了、就是连不上"，在设备上根本看不出是数据层的锅。
+    g_settings.setWifiSsid(g_wifiStore.mostRecentSsid());
+    g_settings.setWifiPassword(g_wifiStore.mostRecentPass());
     refreshSavedFlags();
     return ok;
 }
