@@ -1,10 +1,14 @@
 // screen_reader_subpages.cpp — 阅读「设置」标签下面那一族叶子界面。
 //
 // P3b 的第三个切片。这些都是从「设置」标签或阅读菜单点进去、**只出不进**的子界面：
-// 词典页（renderDict）、WiFi（renderWifi）、OPDS 书库、词典下载、字体下载、BLE 按键
-// 映射、自定义状态栏、关于页、WiFi 传书（NetShare）。每个都是「st.retMode 单层回退 +
-// st.fullRefresh/st.dirty 触发重绘」的三联形状，彼此不互相调用，主文件只在分发
-// （renderCurrent / screen_reader_handle）里认它们的入口。
+// 词典页（renderDict）、OPDS 书库、词典下载、字体下载、BLE 按键映射、自定义状态栏、
+// 关于页、WiFi 传书（NetShare）。每个都是「st.retMode 单层回退 + st.fullRefresh/
+// st.dirty 触发重绘」的三联形状，彼此不互相调用，主文件只在分发（renderCurrent /
+// screen_reader_handle）里认它们的入口。
+//
+// WiFi 管理（renderWifi/handleWifi）原来也在这儿，现已搬去 screen_reader_wifi.cpp
+// 单独成 TU —— 它从"四行表单"长成了带开关/扫描/已保存列表的独立界面，状态与几何都
+// 自成一套，混在这一族叶子界面里已经不合适了。
 //
 // 搬过来时**逻辑一行没改**：只动了 static、include，并把 20 个入口提到
 // screen_reader_internal.h；它们用到的阅读器原语（VK/IME 条、renderCurrent…）
@@ -103,124 +107,6 @@ void renderDict() {
                                     : "点查询框输入  Enter 查词  Esc 返回");
   }
   rdDrawVkIcon();
-}
-
-// ── WiFi 管理 ────────────────────────────────────────────────────────────
-static const int kWifiRows = 4;  // SSID / 密码 / 连接 / 断开
-
-void renderWifi() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  int top = drawTitle("WiFi 管理");
-  const ListView lv = flatMenuListView(kWifiRows, st.wifiField, rdListTop());
-  int itemH = lv.itemH;
-  // 状态行
-  std::string status;
-  if (st.wifiBusy) status = "连接中...";
-  else if (!st.wifiStatus.empty()) status = st.wifiStatus;
-  else if (g_wifi.isConnected()) { std::string ip = g_wifi.getIp(); status = ip.empty() ? "已连接" : ("已连接  IP " + ip); }
-  else status = "未连接";
-  drawLineText(MARGIN, top, status.c_str(), true);
-  int ly = lv.top;  // 状态行下的分隔线
-  g_rd.drawLine(0, ly, w, ly, true);
-  // 行
-  std::string rows[4];
-  rows[0] = "SSID: " + st.wifiSsidEdit;
-  rows[1] = "密码: " + std::string(st.wifiPassEdit.size(), '*');
-  rows[2] = "连接";
-  rows[3] = "断开";
-  for (int i = 0; i < 4; i++) {
-    int ry = ly + i * itemH;
-    if (i == st.wifiField) {
-      g_rd.fillRect(0, ry, w, itemH, true);
-      drawLineText(MARGIN, ry + 6, rows[i].c_str(), false);
-    } else {
-      drawLineText(MARGIN, ry + 6, rows[i].c_str(), true);
-    }
-  }
-  if (st.vkVisible) drawVk();
-  else drawFooter(st.wifiEditing ? "输入中  Enter 完成  Esc 取消" : "↑↓ 选择  Enter 编辑/执行  Esc 返回");
-  if (st.wifiEditing) {
-    drawRdImeBar();      // 蓝牙键盘打字：编码行 + 候选行
-    rdDrawVkIcon();      // 只有编辑字段（键盘可用）时才给开关
-  }
-}
-
-void handleWifi(int key) {
-  if (key == 0x1B) {
-    if (st.wifiEditing) {
-      IME::getInstance().cancelComposition();
-      st.wifiEditing = false;
-      st.vkVisible = false;
-      st.dirty = 1;
-    } else {
-      st.mode = st.retMode;
-      st.fullRefresh = true;
-      st.dirty = 1;
-    }
-    return;
-  }
-  if (st.wifiEditing) {
-    if (key == '\n') {
-      int x, y;
-      if (input_tap_xy(&x, &y)) {
-        // 状态栏右端的键盘图标（编辑态才画）：点一下开/收键盘。
-        if (rdVkIconHit(x, y)) {
-          rdToggleVk();
-          return;
-        }
-        if (st.vkVisible) {
-          vkTap(x, y);
-          st.dirty = 1;
-          return;
-        }
-      }
-      vkEnter();  // BLE/KEY3 回车 → 完成；键盘收起时的点按同样走"完成"
-      st.dirty = 1;
-      return;
-    }
-    if (key == 0x08) { feedVkBackspace(); st.dirty = 1; return; }
-    if (key >= 0x20 && key <= 0x7E) { feedVkKey(key); st.dirty = 1; return; }
-    return;
-  }
-  {  // 上下选择在 ui/list_view.h（与 renderWifi 共用同一个几何）
-    ListView lv = flatMenuListView(kWifiRows, st.wifiField, rdListTop());
-    if (listViewKey(lv, key)) { st.wifiField = lv.sel; st.wifiStatus.clear(); st.dirty = 1; return; }
-  }
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      const int row = listViewHitAt(flatMenuListView(kWifiRows, st.wifiField, rdListTop()), y);
-      if (row >= 0) st.wifiField = row;
-      st.wifiStatus.clear();
-    }
-    if (st.wifiField == 0 || st.wifiField == 1) {
-      // 进入编辑
-      st.wifiEditing = true;
-      rdVkWantShow();
-      st.dirty = 1;
-    } else if (st.wifiField == 2) {
-      // 连接（阻塞式，最多 10s，与写作模式设置页一致）。进度反馈在 readerWifiConnect
-      // 里：它先推"正在连接…"浮层，再让它每 ~250ms 回调重画一次秒数 —— 原来的写法
-      // 只设了 wifiBusy 就进阻塞段，那一帧根本没推上去（渲染在主循环里，而这里还没
-      // 返回），用户看到的就是"点了连接，屏幕一直不动"。
-      if (st.wifiSsidEdit.empty()) { st.wifiStatus = "SSID 为空"; st.dirty = 1; return; }
-      g_settings.setWifiSsid(st.wifiSsidEdit);
-      g_settings.setWifiPassword(st.wifiPassEdit);
-      g_wifi.begin();
-      const bool ok = readerWifiConnect(st.wifiSsidEdit.c_str(), st.wifiPassEdit.c_str());
-      // 失败时把 reason 码翻成人话贴出来：最常见的是"密码错"与"找不到该 SSID"，两者
-      // 的处理办法完全不同，笼统写"检查 SSID/密码"帮不上忙。
-      st.wifiStatus = ok ? ("已连接  IP " + g_wifi.getIp())
-                         : (std::string("连接失败: ") + g_wifi.lastReasonText());
-      st.dirty = 1;
-    } else if (st.wifiField == 3) {
-      g_wifi.disconnect();
-      st.wifiStatus = "已断开";
-      st.dirty = 1;
-    }
-    return;
-  }
 }
 
 // ── OPDS 书库 ───────────────────────────────────────────────────────────

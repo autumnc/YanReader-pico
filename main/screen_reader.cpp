@@ -6083,9 +6083,11 @@ void vkEnter() {
     doDictLookup();
     st.vkVisible = false;
   } else if (st.mode == RdMode::Wifi) {
-    g_settings.setWifiSsid(st.wifiSsidEdit);
-    g_settings.setWifiPassword(st.wifiPassEdit);
-    st.vkVisible = false;
+    // WiFi 密码屏：收键盘 + 交给界面自己去决定下一步（填完网络名就跳密码格，
+    // 填完密码才真去连 —— 见 screen_reader_wifi.cpp 的 wifiCommitEdit）。
+    // 落盘不再在这里做：新的 g_wifi.savedRemember 在连上之后写 g_wifiStore，
+    // 并顺带镜像旧键 wifi_ssid/wifi_pass。
+    wifiCommitEdit();
   } else if (st.mode == RdMode::Opds) {
     st.opdsEditing = false;
     st.vkVisible = false;
@@ -9052,13 +9054,9 @@ static void doMenuAction(MenuAct act) {
       st.fullRefresh = true;
       break;
     case MenuAct::Wifi:
-      st.wifiField = 0;
-      st.wifiEditing = false;
-      st.wifiBusy = false;
-      st.wifiStatus.clear();
-      st.wifiSsidEdit = g_settings.wifiSsid();
-      st.wifiPassEdit = g_settings.wifiPassword();
-      st.vkVisible = false;
+      // 界面态复位 + 懒加载已保存网络表 + 开关开着就起一次扫描，全在那边
+      // （screen_reader_wifi.cpp 的 rdWifiEnter）。这里只负责切模式。
+      rdWifiEnter();
       st.mode = RdMode::Wifi;
       st.fullRefresh = true;
       break;
@@ -12209,7 +12207,6 @@ void screen_reader_init() {
   st.wifiBusy = false;
   st.wifiSsidEdit.clear();
   st.wifiPassEdit.clear();
-  st.wifiStatus.clear();
   st.opdsUrl = g_settings.getString("opds_url");
   st.opdsUrlEdit.clear();
   st.opdsEntries.clear();
@@ -12436,7 +12433,10 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     // 症状就是"正在扫描目录..."一直挂着、点一下屏幕才恢复。
     const bool netTick = rdNetTick();
     const bool scanTick = rdFileScanIdleTick();
-    if (netTick || scanTick) renderCurrent();
+    //   · rdWifiIdleTick —— WiFi 管理的异步扫描落地（SCAN_DONE 只立旗、取回在 UI
+    //     线程）与连接态变化。同样是"只标脏"，所以同样要在这里自己收帧。
+    const bool wifiTick = rdWifiIdleTick();
+    if (netTick || scanTick || wifiTick) renderCurrent();
     return APP_READER;
   }
 
@@ -12492,13 +12492,14 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   }
 
   // 触摸长按：阅读页（选词/标注）、笔记列表（删除）、书签列表（删除）、文件浏览器
-  // （弹上下文菜单）、书架（弹出菜单并锁定长按的那一本）要拿到原始长按键——只有原始键才带
-  // 落点（input_tap_xy），展平成 0x1B 就分不出"长按的是哪一条"了。其余界面保持
-  // "长按=返回"的老语义。文件菜单/重命名/详情这三个界面里的长按仍按 Esc 处理
-  // （取消），所以只在 FileBrowser / Browser 这两处放行。
+  // （弹上下文菜单）、书架（弹出菜单并锁定长按的那一本）、WiFi 管理（长按某一行弹
+  // 连接/断开/忘记菜单）要拿到原始长按键——只有原始键才带落点（input_tap_xy），
+  // 展平成 0x1B 就分不出"长按的是哪一条"了。其余界面保持"长按=返回"的老语义。
+  // 文件菜单/重命名/详情这三个界面里的长按仍按 Esc 处理（取消），所以只在
+  // FileBrowser / Browser 这两处放行。
   if (key == KEY_TOUCH_LONG && st.mode != RdMode::Reading && st.mode != RdMode::Notes &&
       st.mode != RdMode::Bookmarks && st.mode != RdMode::FileBrowser &&
-      st.mode != RdMode::Browser && st.mode != RdMode::Stats)
+      st.mode != RdMode::Browser && st.mode != RdMode::Stats && st.mode != RdMode::Wifi)
     key = 0x1B;
 
   // 虚拟键盘候选行左右划翻页。放在分发之前：起点落在候选行的横滑是"划候选"，

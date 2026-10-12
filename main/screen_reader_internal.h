@@ -568,13 +568,14 @@ struct RdState {
   // 虚拟键盘
   bool vkVisible = false;
 
-  // WiFi 管理
-  int wifiField = 0;      // 0 SSID 1 密码 2 连接 3 断开
+  // WiFi 管理（界面本体在 screen_reader_wifi.cpp，状态在那边的 g_wui 里）。
+  // 这里只留 **VK/IME 胶水**要用的三个：vkTargetString 按 wifiField 选编辑目标、
+  // rdTypingScreen 看 wifiEditing、rdSelfTickingProgress 看 wifiBusy。
+  int wifiField = 0;      // 密码表单的光标：0 网络名 1 密码 2 连接
   bool wifiEditing = false;
   bool wifiBusy = false;
   std::string wifiSsidEdit;
   std::string wifiPassEdit;
-  std::string wifiStatus;
 
   // 资源下载（词典清单地址 / 字体下载地址 / 下载字体）。这三项原本挂在写作模式的
   // 设置页（screen_settings.cpp 的「资源下载」分类）下，但下载出来的词典和字体都是
@@ -743,8 +744,17 @@ std::string rdStatsDate(uint32_t epoch);
 void renderDict();
 void rdDictResetScroll();   // 换了词条/改了字号：作废折行缓存并回到首行
 void rdDictCacheClear();    // 词典文件变了（安装/删除）：作废查询缓存
+// WiFi 管理（安卓式：开关 / 扫描 / 连接 / 已保存）。界面本体与界面态在
+// screen_reader_wifi.cpp；主文件只认 renderWifi/handleWifi 两个入口，外加下面三个钩子：
+//   rdWifiEnter     —— 从阅读菜单进本页（复位 + 起扫描），替代原来在 MenuAct::Wifi 里
+//                      手写的那几行状态复位；
+//   wifiCommitEdit  —— VK/IME 的回车提交（vkEnter 调）；
+//   rdWifiIdleTick  —— 空闲帧推进（扫描结果落地 / 连接态变化），返回"该重绘"。
 void renderWifi();
 void handleWifi(int key);
+void rdWifiEnter();
+void wifiCommitEdit();
+bool rdWifiIdleTick();
 void opdsBeginLoad(const std::string &url);
 void renderOpds();
 void handleOpds(int key);

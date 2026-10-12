@@ -1,4 +1,7 @@
 #include "wifi_manager.h"
+#include "settings_manager.h"
+#include "wifi_store.h"
+#include <algorithm>
 #include <cstring>
 #include <vector>
 #include <esp_log.h>
@@ -76,8 +79,52 @@ static uint8_t s_last_reason = 0;   // 最近一次断开原因，供失败后�
 static EventGroupHandle_t s_wifi_event = NULL;
 const int WIFI_CONNECTED_BIT = BIT0;
 
+// 当前（最近一次）配置/连接的网络名，给"已连接"那一行打标记用。
+static std::string s_connected_ssid;
+
+// ── 异步扫描的落地缓冲 ───────────────────────────────────────────────────
+// SCAN_DONE 事件只把 s_scanDone 立起来（处理器里**不**碰堆，事件任务栈小），真正的
+// esp_wifi_scan_get_ap_records 取回放在 UI 线程的 scanPoll 里 —— 同一份结果也只有
+// 一个读者，不用加锁。
+static bool s_scan_running = false;   // esp_wifi_scan_start 已发起、SCAN_DONE 还没到
+static bool s_scan_done = false;      // SCAN_DONE 到了、结果还没被 scanPoll 取走
+static std::vector<WifiScanItem> s_scan_results;
+
+// 把"在已保存名单里"的标记按当前 g_wifiStore 刷一遍。扫完 / 记住 / 忘记之后都要刷，
+// 否则界面上会出现"刚连上却还写着需密码"或"刚忘了还写着已保存"。
+static void refreshSavedFlags() {
+    for (auto &it : s_scan_results) it.saved = g_wifiStore.has(it.ssid.c_str());
+}
+
+// 去重（同名 SSID 留最强）+ 按信号强 → 弱排序 + 填 saved 标记。
+static void buildScanItems(const std::vector<wifi_ap_record_t> &recs) {
+    s_scan_results.clear();
+    for (const auto &r : recs) {
+        const char *ssid = reinterpret_cast<const char *>(r.ssid);
+        if (!ssid[0]) continue;   // 隐藏 SSID 没有名字，列出来也没法选
+        int idx = -1;
+        for (size_t i = 0; i < s_scan_results.size(); i++) {
+            if (s_scan_results[i].ssid == ssid) { idx = static_cast<int>(i); break; }
+        }
+        if (idx >= 0 && r.rssi <= s_scan_results[idx].rssi) continue;   // 留最强的那条
+        WifiScanItem item;
+        item.ssid = ssid;
+        item.rssi = r.rssi;
+        item.authmode = static_cast<uint8_t>(r.authmode);
+        item.saved = g_wifiStore.has(ssid);
+        if (idx >= 0) s_scan_results[idx] = std::move(item);
+        else s_scan_results.push_back(std::move(item));
+    }
+    std::sort(s_scan_results.begin(), s_scan_results.end(),
+              [](const WifiScanItem &a, const WifiScanItem &b) { return a.rssi > b.rssi; });
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
+        // 只立旗：结果由 UI 线程的 scanPoll 取（见上面那段说明）。
+        s_scan_running = false;
+        s_scan_done = true;
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         // STA_START also fires during connect()'s esp_wifi_start(), but the new
         // config isn't applied yet — auto-connecting here would use the stale
         // flash config and block the subsequent set_config. Only reconnect after
@@ -190,6 +237,7 @@ bool WifiManager::connect(const char *ssid, const char *password, ConnectProgres
     // 新配置已生效，之后掉线才允许自动重连
     s_auto_reconnect = true;
     s_last_reason = 0;
+    s_connected_ssid = ssid;   // 记下目标网络名（给"已连接"那一行打标记）
     // WIFI_CONNECTED_BIT 全仓只有两个清点：下面等待循环的 xEventGroupWaitBits
     // （xClearOnExit=pdTRUE，命中即清）和这里。驱动**自己**重连时（掉线 → 回调里
     // esp_wifi_connect() → GOT_IP）也会置位，而那一刻没人在等，位就留在事件组里；
@@ -238,11 +286,135 @@ void WifiManager::disconnect() {
     s_auto_reconnect = false;
     esp_wifi_disconnect();
     s_connected = false;
+    s_connected_ssid.clear();
     // 连接位也必须清：它记的是"某次连接成功过"，不是"现在连着"。留着会骗过下一次
     // connect() 的等待循环（见 connect 里清位处那段说明）。
     if (s_wifi_event) xEventGroupClearBits(s_wifi_event, WIFI_CONNECTED_BIT);
     // Fully power down the radio; WiFi is only needed on demand
     if (esp_wifi_stop() == ESP_OK) _started = false;
+}
+
+const char *WifiManager::connectedSsid() { return s_connected_ssid.c_str(); }
+
+// ── 射频总开关 ───────────────────────────────────────────────────────────
+bool WifiManager::radioUp() { return _started; }
+
+// 持久化的开关意图。默认开：老机器从没写过这个键，行为应与从前完全一致（按需联网）。
+bool WifiManager::enabled() { return g_settings.getString("wifi_enabled", "1") != "0"; }
+
+void WifiManager::setEnabled(bool on) {
+    g_settings.setString("wifi_enabled", on ? "1" : "0");
+    if (on) {
+        if (!_inited) begin();
+        if (!_started) {
+            if (esp_wifi_start() != ESP_OK) {
+                ESP_LOGW(TAG, "esp_wifi_start 失败，射频没起来");
+            } else {
+                _started = true;
+            }
+        }
+        // 不在这里自动连接：见头文件 setEnabled 的说明（界面随后自己起扫描）。
+    } else {
+        scanStop();
+        disconnect();   // 停射频（disconnect 里 esp_wifi_stop）
+    }
+}
+
+// ── 异步扫描 ─────────────────────────────────────────────────────────────
+bool WifiManager::scanStart() {
+    if (!_inited) begin();
+    if (!_started) {
+        if (esp_wifi_start() != ESP_OK) {
+            ESP_LOGW(TAG, "扫描前起射频失败");
+            return false;
+        }
+        _started = true;
+    }
+    if (s_scan_running) return true;   // 已经在扫：忽略重入，界面继续显示"搜索中"
+
+    wifi_scan_config_t sc = {};
+    sc.show_hidden = true;
+    sc.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    // 默认每信道主动扫描的上限是 1500ms → 一轮 13 信道要 10s+，界面上"正在扫描"就太久。
+    // 收紧到 100~300ms/信道，一轮约 1.5~3s，"搜索中…"才是等得起的时间。
+    sc.scan_time.active.min = 100;
+    sc.scan_time.active.max = 300;
+
+    s_scan_results.clear();
+    s_scan_done = false;
+    const esp_err_t err = esp_wifi_scan_start(&sc, /*blocking=*/false);
+    s_scan_running = (err == ESP_OK);
+    if (!s_scan_running) ESP_LOGW(TAG, "esp_wifi_scan_start 失败: %s", esp_err_to_name(err));
+    return s_scan_running;
+}
+
+bool WifiManager::scanBusy() { return s_scan_running; }
+
+bool WifiManager::scanPoll() {
+    if (!s_scan_done) return false;
+    s_scan_done = false;
+
+    uint16_t num = 0;
+    if (esp_wifi_scan_get_ap_num(&num) != ESP_OK || num == 0) {
+        esp_wifi_clear_ap_list();
+        s_scan_results.clear();
+        return true;   // 扫完了但一条都没有：也算"变了"，界面要显示"未找到网络"
+    }
+    std::vector<wifi_ap_record_t> recs(num);
+    if (esp_wifi_scan_get_ap_records(&num, recs.data()) != ESP_OK) {
+        s_scan_results.clear();
+        return true;
+    }
+    buildScanItems(recs);   // get_ap_records 同时释放了驱动侧的 AP 列表缓冲
+    return true;
+}
+
+void WifiManager::scanStop() {
+    if (s_scan_running) esp_wifi_scan_stop();
+    s_scan_running = false;
+    s_scan_done = false;
+    s_scan_results.clear();
+}
+
+int WifiManager::scanCount() { return static_cast<int>(s_scan_results.size()); }
+
+const WifiScanItem &WifiManager::scanResult(int i) {
+    static const WifiScanItem kEmpty;
+    if (i < 0 || i >= static_cast<int>(s_scan_results.size())) return kEmpty;
+    return s_scan_results[i];
+}
+
+// ── 已保存网络 ───────────────────────────────────────────────────────────
+bool WifiManager::savedPassword(const char *ssid, std::string &outPass, bool *outOpen) {
+    const WifiSavedNet *n = g_wifiStore.find(ssid);
+    if (!n) return false;
+    outPass = n->pass;
+    if (outOpen) *outOpen = n->open;
+    return true;
+}
+
+bool WifiManager::savedHas(const char *ssid) { return g_wifiStore.has(ssid); }
+
+bool WifiManager::savedRemember(const char *ssid, const char *pass) {
+    const bool ok = g_wifiStore.remember(ssid, pass);
+    // 镜像到旧键：NTP/WebDAV/flomo/OPDS/传书/微读 全读这两个键（见 ui_helpers 的
+    // ensure_wifi_connected、main.cpp 的 ntpSyncBody…）。镜像了它们就一行都不用改。
+    g_settings.setWifiSsid(ssid ? ssid : "");
+    g_settings.setWifiPassword(pass ? pass : "");
+    refreshSavedFlags();
+    return ok;
+}
+
+bool WifiManager::savedForget(const char *ssid) {
+    const bool ok = g_wifiStore.forget(ssid);
+    // 忘掉的正是旧键指向的那个 → 重指到下一个最近用过的网络。留着不管，就是
+    // "NTP/OPDS 一直去连一个用户刚删掉的网"那个经典症状。
+    if (ssid && g_settings.wifiSsid() == ssid) {
+        g_settings.setWifiSsid(g_wifiStore.mostRecentSsid());
+        g_settings.setWifiPassword(g_wifiStore.mostRecentPass());
+    }
+    refreshSavedFlags();
+    return ok;
 }
 
 std::string WifiManager::getIp() {

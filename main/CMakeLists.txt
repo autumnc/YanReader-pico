@@ -68,6 +68,7 @@ idf_component_register(SRCS
     "settings_manager.cpp"
     "settings_backup.cpp"  # 配置+阅读记录备份/恢复到 TF 卡（设置·通用 分类里的两项）
     "wifi_manager.cpp"
+    "wifi_store.cpp"       # 已保存 WiFi 网络表（/sdcard/wifi_networks.txt，多网络）
     "webdav_client.cpp"
     "opds_client.cpp"
     "dictionary_store.cpp"
@@ -102,6 +103,7 @@ idf_component_register(SRCS
     "screen_reader_subpages.cpp" # 设置标签下的叶子子界面（P3b 从 screen_reader.cpp 拆出）
     "screen_reader_files.cpp"    # 「文件」标签：浏览器/文件菜单/图片查看器（P3b 拆出）
     "screen_reader_footnotes.cpp" # 正文脚注引擎（P3b 从 screen_reader.cpp 拆出）
+    "screen_reader_wifi.cpp"     # 安卓式 WiFi 管理界面（开关/扫描/连接/已保存）
     "reading_stats.cpp"
     # 硬件适配层
     "hw/board.cpp"
