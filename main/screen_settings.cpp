@@ -155,6 +155,10 @@ static const SettingField SETTINGS_FIELDS[] = {
     {"opds_url", "OPDS 目录地址", false, false, CAT_NET},
     {"_file_mgr", "文件管理", false, true, CAT_NET},
     {"file_mgr_token", "文件管理密码", true, false, CAT_NET},
+    // 微信读书官方 Skill/Gateway 的 API Key（wrk-…）：阅读模式微读的搜索/推荐/元数据
+    // 用它，走 i.weread.qq.com，独立于扫码登录那条 cookie 链路。真值只落设置文件，
+    // 不编译进固件。
+    {"weread_api_key", "微信读书 API Key", true, false, CAT_NET},
     // ── AI ──（原来的「语音识别服务/百度 Api·Secret Key」随语音听写一起去掉了：
     // 本机没有麦克风，VoiceInput 是桩，留着这些输入框只会让人以为能录音。）
     {"deepseek_key", "Deepseek Key", false, false, CAT_AI},
@@ -1501,6 +1505,14 @@ static void settingsEditLineTable(const std::vector<std::pair<int,int>> &lines, 
     bottom = editorVkVisible() ? editorVkTop() : SCREEN_H;
 }
 
+// 编辑屏里要不要给这个字段看明文。口令类字段一律画 '*'，于是**编辑屏里也看不到自己敲了
+// 什么**——6 位口令还能靠手感，30 个混合大小写的 API Key 不行：实测盲敲出来是 31 字符、
+// 前缀都不是 wrk-，服务端回"用户不存在"，而人无从校对。只对这一个字段放开。
+// 列表行仍然画 ********（见 renderSettings），明文只出现在编辑屏。
+static bool settingsEditShowsPlaintext(const SettingField &f) {
+    return std::string(f.key) == "weread_api_key";
+}
+
 // 字段编辑整屏重绘（含触摸选区的反白 + 按钮条）。
 static void drawSettingsEdit() {
     ui_clear();
@@ -1510,7 +1522,7 @@ static void drawSettingsEdit() {
     u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
 
     std::string display = g_settingsState.editBuffer;
-    if (f.masked) display = std::string(display.length(), '*');
+    if (f.masked && !settingsEditShowsPlaintext(f)) display = std::string(display.length(), '*');
 
     std::vector<std::pair<int,int>> lines;
     int textY = 0;
@@ -1545,8 +1557,8 @@ static void drawSettingsEdit() {
 
     // 触摸选区的反白 + 按钮条（会话没开就是空操作）。画在最上面：键盘在它下面。
     // 口令类字段（masked）不给触摸选区：显示的是 '*'，反白位置和真实字节对不上，
-    // 长按维持原来的"返回"。
-    if (!f.masked) {
+    // 长按维持原来的"返回"。给明文的字段（见 settingsEditShowsPlaintext）没有这个问题。
+    if (!f.masked || settingsEditShowsPlaintext(f)) {
         std::vector<TextSelLine> tl;
         int bottom = 0;
         settingsEditLineTable(lines, textY, tl, bottom);
@@ -1798,7 +1810,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
         // 排在这儿，"全选后直接打字"才能先把选区删掉、再把字符放给 IME 插进去。
         {
             auto &f = SETTINGS_FIELDS[fieldAt(g_settingsState.selection)];
-            if (!f.masked && (key == KEY_TOUCH_LONG || textSelActive())) {
+            if ((!f.masked || settingsEditShowsPlaintext(f)) && (key == KEY_TOUCH_LONG || textSelActive())) {
                 int tx = 0, ty = 0;
                 const bool hasTap = input_tap_xy(&tx, &ty);
                 std::string display = g_settingsState.editBuffer;
@@ -1844,7 +1856,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                 u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
 
                 std::string display = g_settingsState.editBuffer;
-                if (f.masked) display = std::string(display.length(), '*');
+                if (f.masked && !settingsEditShowsPlaintext(f)) display = std::string(display.length(), '*');
                 if (display.empty()) display = " ";
                 int textY = sepY + 4 + g_font.ascent();
                 int cx = g_font.textWidth(display.substr(0, g_settingsState.editCursor).c_str());

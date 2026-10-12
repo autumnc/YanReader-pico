@@ -6026,6 +6026,7 @@ static std::string *vkTargetString() {
   if (st.mode == RdMode::ShelfSearch) return &st.shelfQuery;
   if (st.mode == RdMode::NotesSearch) return &st.notesQuery;
   if (st.mode == RdMode::Dictionary) return &st.dictQuery;
+  if (st.mode == RdMode::WereadDiscover) return &st.weDiscQuery;
   if (st.mode == RdMode::Wifi) return (st.wifiField == 0) ? &st.wifiSsidEdit : &st.wifiPassEdit;
   if (st.mode == RdMode::ResDl) return &((st.resField == 0) ? st.resDictEdit : st.resFontEdit);
   if (st.mode == RdMode::Opds) return &st.opdsUrlEdit;
@@ -6110,6 +6111,10 @@ void vkEnter() {
   } else if (st.mode == RdMode::NotesSearch) {
     st.vkVisible = false;
     rdNotesSearchOpen();
+  } else if (st.mode == RdMode::WereadDiscover) {
+    // 发现页搜索框的回车：交给界面自己决定（光标在查询行=搜一次，在结果行=弹动作菜单）。
+    st.vkVisible = false;
+    handleWereadDiscover('\n');
   }
 }
 
@@ -6739,6 +6744,9 @@ static void jumpToPercent(int pct) {
   st.dirty = 1;
 }
 
+// 给微读「用云端进度」那一支用的薄封装（jumpToPercent 是 static，跨 TU 够不着）。
+void rdApplyProgressPercent(int pct) { jumpToPercent(pct); }
+
 // ── 二维码 ───────────────────────────────────────────────────────────────
 void prepareQr() {
   st.qrText.clear();
@@ -7010,6 +7018,7 @@ static void handleQr(int key) {
 static bool rdTypingScreen() {
   if (st.mode == RdMode::NoteEdit || st.mode == RdMode::Dictionary) return true;
   if (st.mode == RdMode::ShelfSearch || st.mode == RdMode::NotesSearch) return true;
+  if (st.mode == RdMode::WereadDiscover) return true;   // 发现页搜索框：要打拼音
   if (st.mode == RdMode::Wifi && st.wifiEditing) return true;
   if (st.mode == RdMode::Opds && st.opdsEditing) return true;
   if (st.mode == RdMode::ResDl && st.resEditing) return true;
@@ -7226,6 +7235,12 @@ static int ghostBlackPushes() { return ghostMode() == 3 ? blackPushFrames() : 0;
 // 与那三屏同样是"几秒重画一次、内容几乎不变"，同样不能走 GL16 全像素（每重画一次闪一屏）。
 static bool rdSelfTickingProgress() {
   if (st.wifiBusy) return true;
+  // 微读详情页也算：它在"取详情/补封面"那几拍里是自推的（weDrive 每拍可能标脏），
+  // 而且屏上大部分是静态文字——走 STATUS_REFRESH（GRAY8_TEXT 波形、不计残影预算）正合适。
+  // 笔记/划线页同理：Browse 任务只有 Complete 一个终止事件，中途靠"正在获取…"自推。
+  if (st.mode == RdMode::WereadDetail || st.mode == RdMode::WereadNotes ||
+      st.mode == RdMode::WereadSync || st.mode == RdMode::WereadDiscover)
+    return true;
   return st.mode == RdMode::WereadDl || st.mode == RdMode::DictDl || st.mode == RdMode::ResDl;
 }
 
@@ -7391,6 +7406,10 @@ void renderCurrent() {
     case RdMode::WereadQr: renderWereadQr(); break;
     case RdMode::WereadMenu: renderWereadMenu(); break;
     case RdMode::WereadDl: renderWereadDl(); break;
+    case RdMode::WereadDetail: renderWereadDetail(); break;
+    case RdMode::WereadNotes: renderWereadNotes(); break;
+    case RdMode::WereadSync: renderWereadSync(); break;
+    case RdMode::WereadDiscover: renderWereadDiscover(); break;
     case RdMode::Wifi: renderWifi(); break;
     case RdMode::ShelfMenu: renderShelfMenu(); break;
     case RdMode::ShelfInfo: renderShelfInfo(); break;
@@ -12574,6 +12593,10 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     case RdMode::WereadQr: handleWereadQr(key); break;
     case RdMode::WereadMenu: handleWereadMenu(key); break;
     case RdMode::WereadDl: handleWereadDl(key); break;
+    case RdMode::WereadDetail: handleWereadDetail(key); break;
+    case RdMode::WereadNotes: handleWereadNotes(key); break;
+    case RdMode::WereadSync: handleWereadSync(key); break;
+    case RdMode::WereadDiscover: handleWereadDiscover(key); break;
     case RdMode::ShelfSearch: handleShelfSearch(key); break;
     case RdMode::NotesSearch: handleNotesSearch(key); break;
     case RdMode::Wifi: handleWifi(key); break;

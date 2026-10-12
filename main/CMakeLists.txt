@@ -75,6 +75,7 @@ idf_component_register(SRCS
     "ble_keymap.cpp"
     "flomo_client.cpp"
     "deepseek_client.cpp"
+    "weread_skill_client.cpp"  # 微信读书官方 Skill/Gateway（API Key，搜索/推荐/元数据）
     "pcf85063.cpp"
     "chinese_almanac.cpp"
     "standby_clock.cpp"

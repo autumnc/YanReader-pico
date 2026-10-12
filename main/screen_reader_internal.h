@@ -36,6 +36,7 @@
 #include "opds_client.h"
 #include "tab_icons.h"
 #include "ui/list_view.h"
+#include "weread_skill_client.h"   // 发现页（搜索/推荐）的结果类型进了 RdState
 
 // Operation 约 8KB（内含 4KB 收发缓冲），内部 RAM 紧张，优先放 PSRAM。
 struct WeOpDeleter {
@@ -120,6 +121,10 @@ enum class RdMode {
   WereadQr,    // 扫码登录
   WereadMenu,  // 选中书目的操作菜单
   WereadDl,    // 缓存进度
+  WereadDetail,// 书籍详情（简介 / 出版社 / 分类 / 评分 / 字数）
+  WereadNotes, // 微读笔记/划线/书评（三段：热门划线/我的划线/热门书评）
+  WereadSync,  // 阅读进度同步（与本机/云端核对，需要选方向时给选择屏）
+  WereadDiscover, // 发现：官方 Skill API 的搜索 / 推荐（结果可进详情、可缓存整本）
   ShelfSearch, // 书架搜索（书名关键字过滤）
   NotesSearch, // 笔记搜索（原文/笔记正文/书名过滤）
   FileMenu,    // 文件长按弹出：打开/重命名/删除/详情
@@ -562,8 +567,70 @@ struct RdState {
   std::string weQrUrl;          // 登录二维码内容
   std::string weStatus;         // 状态/错误提示
   std::string weJobTitle;       // 当前任务的书名
-  int weKind = 0;               // 0=登录/书架 1=缓存整本，用于判断完成事件
+  int weKind = 0;               // 0=登录/书架 1=缓存整本 2=补封面 3=书籍详情 4=笔记/划线，判断完成事件
   bool weLoggedIn = false;      // 本地会话是否有效
+
+  // 书籍详情页（RdMode::WereadDetail）：头部读一次摊进 weDetailHeader，简介按宽度折成
+  // weDetailLines 缓存着滚（同笔记详情/词典页——逐帧重折会拖慢滚动）。
+  WeReadStore::BookDetailHeader weDetailHeader = {};
+  std::string weDetailIntro;                  // 头部之后那截简介（UTF-8，最多 64KB）
+  bool weDetailLoaded = false;                // detail.bin 是否已读进来（没读进来就画"获取中"）
+  int weDetailScroll = 0;                     // 简介滚动行偏移
+  int weDetailLinesW = -1;                    // 建表时的排版宽度；-1 = 需重建
+  std::vector<std::string> weDetailLines;     // 折好的简介行
+  // 当前在看的这本书的 bookId —— 不再从书架选中项推。发现页（RdMode::WereadDiscover）
+  // 也会进详情屏，那时这本多半根本不在书架上。
+  std::string weDetailBookId;
+  RdMode weDetailRet = RdMode::WereadMenu;    // 详情屏 Esc 回哪（书目菜单 / 发现页）
+
+  // 微读笔记/划线页（RdMode::WereadNotes）：进来看本地 browse 缓存，没有就起一个 Browse
+  // 任务（它一次抓 热门划线→我的划线→热门书评，且**只有 Complete 一个终止事件**，所以
+  // 加载态是"正在获取…"而不是进度条）。当前 kind 的折行表缓存着滚，切 kind/换宽度才重建。
+  bool weNotesLoaded = false;      // 缓存读进来了吗（没读进来就画加载态）
+  bool weNotesCacheValid = false;  // 本地确实有可用的 browse 缓存
+  int weNotesKind = 0;             // 0=热门划线 1=我的划线 2=热门书评
+  int weNotesScroll = 0;           // 滚动行偏移
+  int weNotesLinesW = -1;          // 建表时的排版宽度；-1 = 需重建
+  int weNotesLinesKind = -1;       // 建表对应的 kind；变了也要重建
+  uint32_t weNotesCounts[3] = {};  // 三类各自条数（tab 上显示）
+  bool weNotesReviewsLimited = false;  // 书评被截到前 50 条（库里 kCacheReviewsLimited）
+  // 一条笔记/划线/书评合成几行：头（章节名/作者）+ 正文折行 + 热度评分 + 间隔，
+  // 全部共用一个滚动偏移（同笔记详情页）。
+  struct RdWeNoteLine {
+    std::string text;
+    int kind = 0;   // 0=正文 1=条目头 2=热度/评分 3=间隔
+  };
+  std::vector<RdWeNoteLine> weNotesLines;  // 当前 kind 折好的行
+
+  // 阅读进度同步页（RdMode::WereadSync）：本机进度取自 ReadingStats（不必打开书），
+  // 云端进度由 Compare 那一拍回填。两端不同时给一个"用本机上传 / 用云端跳过去"的选择屏
+  // ——库里没有任务内方向注入，只能选完再起第二拍（UploadLocal / ApplyRemote）。
+  bool weSyncLoaded = false;        // 这一拍任务跑完了吗（没跑完画"核对中"）
+  int weSyncStage = 0;              // 0=核对中 1=选方向 2=结果
+  int weSyncSel = 0;                // 选择屏光标 0=用本机 1=用云端
+  int weSyncLocalPercent = 0;       // 本机进度百分比
+  int weSyncRemotePercent = 0;      // 云端进度百分比
+  WeReadClient::ProgressSyncMode weSyncMode = WeReadClient::ProgressSyncMode::Compare;
+  std::string weSyncStatus;         // 结果文案
+
+  // ── 发现页（RdMode::WereadDiscover）──────────────────────────────────────
+  // 官方 Skill/Gateway（i.weread.qq.com，API Key 在设置键 weread_api_key）的搜索与推荐。
+  // 两个 tab，各自的结果各自留；跑请求是**同步阻塞**的（同微读其它请求），发起前先刷一帧
+  // "正在搜索…"，回来再重画。结果项回车 → 动作菜单（看详情 / 缓存整本并阅读）。
+  std::string weDiscQuery;        // 搜索关键字（vkTargetString 的编辑目标）
+  int weDiscTab = 0;              // 0=搜索 1=推荐
+  int weDiscSel = 0;              // 光标所在的**虚拟行**：搜索 tab 的第 0 行是查询行，
+                                  // 结果从第 1 行起；推荐 tab 没有查询行，结果从第 0 行起
+  bool weDiscBusy = false;        // 请求在飞（画"正在…"，也是"这次按键别再发一次"的闸）
+  std::string weDiscStatus;       // 空结果 / 错误文案
+  int weDiscMenuSel = 0;          // 动作菜单光标
+  int weDiscMenuFor = -1;         // 动作菜单挂在第几条结果上（-1 = 菜单关着）
+  bool weDiscSearchLoaded = false;  // 搜索 tab 拉过了吗（没拉过画"输入关键字后回车"）
+  bool weDiscRecLoaded = false;     // 推荐 tab 拉过了吗（没拉过画"回车获取推荐"）
+  std::vector<WereadSkillClient::SearchItem> weDiscSearch;       // 搜索 tab 的结果
+  std::vector<WereadSkillClient::RecommendItem> weDiscRecommend; // 推荐 tab 的结果
+  // 任务从发现页起的时候，结束后回发现页而不是书目菜单（weAfterJobMode 读它）。
+  RdMode weJobRet = RdMode::WereadMenu;
 
   // 虚拟键盘
   bool vkVisible = false;
@@ -661,10 +728,18 @@ void renderWeread();
 void renderWereadQr();
 void renderWereadMenu();
 void renderWereadDl();
+void renderWereadDetail();
+void renderWereadNotes();
+void renderWereadSync();
+void renderWereadDiscover();
 void handleWeread(int key);
 void handleWereadQr(int key);
 void handleWereadMenu(int key);
 void handleWereadDl(int key);
+void handleWereadDetail(int key);
+void handleWereadNotes(int key);
+void handleWereadSync(int key);
+void handleWereadDiscover(int key);
 void weDrive();   // 推进一拍（联网请求同步阻塞，见 screen_reader_weread.cpp）
 
 // 微读「重新获取封面」把 epub 在原地换掉之后调它：把这本书的封面产物（书架缩略图
@@ -701,6 +776,9 @@ ListView flatMenuListView(int count, int sel, int top = coverTop());
 
 // 动作：打开一本书 / 确保联网 / 重扫书架 / 整屏重绘
 bool openBook(const std::string &path, int kind);
+// 跳到全书的某百分比处（微读「用云端进度」用；内部就是 jumpToPercent，会把 mode 设成
+// Reading）。要求书已经用 openBook 打开。
+void rdApplyProgressPercent(int pct);
 bool readerEnsureWifi(std::string &err);
 // 阻塞式连接 + 屏上"正在连接… N 秒"进度反馈（连接最长 10 秒，不给反馈用户会以为死机）。
 // 所有"先连 WiFi 再干活"的路径都该走它，不要直接调 g_wifi.connect()。
