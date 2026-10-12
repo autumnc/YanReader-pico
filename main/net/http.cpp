@@ -36,10 +36,12 @@ esp_http_client_config_t makeConfig(const Request &req) {
     cfg.url = req.url.c_str();
     cfg.method = toIdf(req.method);
     cfg.timeout_ms = req.timeout_ms;
-    if (req.skip_cert_check) {
-        cfg.skip_cert_common_name_check = true;
-        cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    }
+    // crt_bundle **始终**挂上——它是"信谁"，和"查不查 CN"是两件事。原来把两者绑在一个
+    // if 里，等于 `skip_cert_check = false` 会连信任根一起不挂，那个 false 就没法用。
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    // 注意：这一位在 IDF 里还顺带**关掉 SNI**（skip_common_name=true 时 esp-tls 连 SNI
+    // 都不发）。共享入口（CDN/网关）靠 SNI 路由，关掉可能落到错误的 vhost 上。
+    cfg.skip_cert_common_name_check = req.skip_cert_check;
     if (req.buffer_size > 0) cfg.buffer_size = req.buffer_size;
     cfg.max_redirection_count = req.max_redirects;
     return cfg;
