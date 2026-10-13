@@ -28,7 +28,9 @@ static const uint32_t TAB_ICON_SEARCH    = 0xF0349;  // md-magnify
 
 // ── 程序化绘制的标签图标（不是码点，只是 drawTabBar 的分派哨兵）──────────
 // 0 = 统计（柱状图，drawStatsTabIcon）、1 = 应用（九宫格，drawAppsTabIcon）。
-// 引进真字形要重裁 NF-Propo 子集，而当前环境没有 fontTools（见 subset_icon_font.py）。
+// 想换成真字形就得把码点加进 scripts/subset_icon_font.py 再重裁子集；重裁本身能跑 ——
+// pip 装不上 fontTools（PEP 668），但 `uv run --with fonttools -- python3
+// scripts/subset_icon_font.py` 可以（2026-10-13 的 APPS 组就是这么裁出来的）。
 static const uint32_t TAB_ICON_APPS_SENTINEL = 1;
 
 // ── 书架/笔记标签页顶部搜索栏右侧的动作图标 ─────────────────────────────
@@ -36,15 +38,21 @@ static const uint32_t TAB_ICON_APPS_SENTINEL = 1;
 // 的 SHELF_BAR 组）。
 static const uint32_t BAR_ICON_REFRESH   = 0xF0450;  // md-refresh 重新扫描书库
 
-// 微读（book_open_page_variant，复用 MENU 组已有的）。**书架栏上那枚已经删掉了**
-// （微读收进 1 号位「应用」标签之后没必要再挂一枚），现在只给应用页的微读入口用。
-static const uint32_t BAR_ICON_WEREAD    = 0xF05DA;  // md-book-open-page-variant 微读
+// ── 「应用」页两个入口的专用图标 ────────────────────────────────────────
+// 这两位是 2026-10-13 **用户自己画好加进 NF-Propo 源字体**的（不在 MDI 通用码位表里），
+// 再由 scripts/subset_icon_font.py 的 APPS 组裁进子集 —— 之前「微信读书」借的是
+// md-book-open-page-variant(0xF05DA)、「DeepSeek 对话」是程序化画的，两枚都只是"意思
+// 差不多"。换成专用图形后一眼就分得出谁是谁。**换 NF-Propo 时必须确认源字体里还有
+// 这两位**，否则 icon_font_draw_sized 会静默画成空白（日志里有一行 glyph missing）。
+static const uint32_t APP_ICON_WEREAD    = 0xF1AF3;  // 微信读书
+static const uint32_t APP_ICON_DEEPSEEK  = 0xF1AF4;  // DeepSeek 对话
 
 // ── 文件浏览页的浮动按钮（网络文件管理）──────────────────────────────────
 // 是新加进子集的（scripts/subset_icon_font.py 的 FAB 组）。
 static const uint32_t FAB_ICON_WEB       = 0xF059F;  // md-web 地球：浏览器打开传书
-// 眼睛（「显示隐藏文件」开关）：**子集里没有这个字形，也没有 fontTools 重裁**，
-// 由 gfx/icon_font.c 的 draw_prog() 按几何画（同 ◐/▸ 那几个的做法）。所以它只能走
+// 眼睛（「显示隐藏文件」开关）：**没进子集**（当初只是没裁，不是裁不了 —— 见上面
+// subset_icon_font.py 那条），由 gfx/icon_font.c 的 draw_prog() 按几何画
+// （同 ◐/▸ 那几个的做法）。所以它只能走
 // icon_font_draw()，**不能**用 icon_font_draw_sized()——后者找不到字形会直接返回空白。
 static const uint32_t FAB_ICON_EYE       = 0x1F441;  // 👁 眼睛：显示隐藏文件
 

@@ -150,3 +150,43 @@ DeepseekResult DeepseekClient::polishText(const std::string &text, const std::st
         "\"max_tokens\":2000,\"temperature\":0.3}";
     return runChat(body, cancel);
 }
+
+DeepseekResult DeepseekClient::chat(const std::string &system, const std::vector<DeepseekTurn> &turns,
+                                    std::atomic_bool *cancel, int maxTokens) {
+    if (g_settings.deepseekKey().empty()) {
+        return {false, "请先在设置中配置Deepseek Key"};
+    }
+    if (turns.empty()) {
+        return {false, "没有可发送的内容"};
+    }
+    if (maxTokens <= 0) maxTokens = 800;
+
+    // 用 deepseek-chat，**不要** reasoner：extractContent 抓的是第一个 "content":"，
+    // reasoner 会先吐 "reasoning_content"（前一个字符是 '_' 不是 '"'，不会真误命中），
+    // 但那条路的思考链既慢又长，对一块墨水屏没有意义。
+    // temperature 0.7：聊天要有人味，比润色（0.3）松一点。
+    std::string body;
+    body.reserve(system.size() + 256);
+    body += "{\"model\":\"deepseek-chat\",\"messages\":[";
+    bool first = true;
+    if (!system.empty()) {
+        body += "{\"role\":\"system\",\"content\":\"";
+        body += json_escape(system);
+        body += "\"}";
+        first = false;
+    }
+    for (const auto &t : turns) {
+        if (!first) body += ",";
+        first = false;
+        body += "{\"role\":\"";
+        // role 是调用方给的短字面量，但仍过一遍转义：拼坏 JSON 比多转一次便宜。
+        body += json_escape(t.role);
+        body += "\",\"content\":\"";
+        body += json_escape(t.content);
+        body += "\"}";
+    }
+    body += "],\"max_tokens\":";
+    body += std::to_string(maxTokens);
+    body += ",\"temperature\":0.7}";
+    return runChat(body, cancel);
+}

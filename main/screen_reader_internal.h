@@ -138,7 +138,8 @@ enum class RdMode {
   StatsProfile,// 阅读档案（4 轴雷达 + 总分）
   StatsAdjust, // 调整某本书某一天的阅读时长
   StatsSettings,// 统计设置（每日目标）
-  RefreshTest   // 灰阶自检页（16 级梯 / 细线 / 抖动三档对比 / 各刷法耗时，自推屏）
+  RefreshTest,  // 灰阶自检页（16 级梯 / 细线 / 抖动三档对比 / 各刷法耗时，自推屏）
+  AiChat        // AI 对话（两个入口：阅读页选区「问AI」带 ctx / 应用页「DeepSeek 对话」无 ctx）
 };
 
 // 主界面五个根标签：0=书架 1=应用 2=笔记 3=设置 4=统计。标签栏只画图标（tab_icons.h）。
@@ -459,6 +460,10 @@ struct RdState {
   int fontWeight = kDefaultFontWeightIdx;
   int contrast = kDefaultContrastIdx;
   int readingLine = 0;                      // 阅读线：0 无 1 虚线 2 点线 3 实线（正文行间引导线）
+  // 标注风格（存下来的标注 + 正在选的选区都按它画；档位定义见 kAnnotStyleNames）：
+  // 0 黑底反白 / 1 下划线 / 2 波浪线 / 3 灰底反白。与 readingLine 同一类 —— **只影响绘制**，
+  // 不改版式，所以改档只重画当前页、不 reopenBook。像它一样，这一位也必须进 rdHoldKey。
+  int annotStyle = 0;
   bool imageBilinear = true;                // 图片缩放：true 双线性 false 最近邻
   // 图片抖动档：0 有序 1 行扩散 2 关。存 int 而不是 DitherMode，这个头就不必
   // include crossmux 的 DitherUtils.h（档位序号与 kRdDitherKeys 一一对应）。
@@ -493,8 +498,12 @@ struct RdState {
     std::string path;    // 书路径（笔记列表按它分组）
     std::string book;    // 书名（列表显示）
     int spine = 0;       // 章节
-    int page = 0;        // 记下来时的页（跳转用，找不到再就近）
-    std::string text;    // 选中的原文
+    int page = 0;        // 记下来时的页（跳转用，找不到再就近）—— 跨页标注记的是**起点页**
+    // **跨页标注**的结束页（同一章内）。-1 = 老记录 / 单页标注：高亮走"整段文本在当页
+    // 匹配"那条老路。>= page 时改用"起点页取尾部 / 终点页取头部 / 中间页整页"的拼法
+    // （见 rdAnchorsOnPage），因为一段跨越几页的原文在**任何单独一页上都找不到**。
+    int endPage = -1;
+    std::string text;    // 选中的原文（跨页时是**整段**拼起来的全文）
     std::string note;    // 笔记正文（空 = 仅标注）
     int64_t time = 0;    // 记录时间
   };
@@ -507,6 +516,22 @@ struct RdState {
   // 空集合 = 全部折叠（默认态）。持久化在 g_settings 的 reader_notes_fold。
   std::set<std::string> notesOpen;
   int notesRowSel = 0;        // 行光标：**含书名分组行**，与 notesSel（笔记下标）分开
+
+  // ── AI 对话（选段问答 / 普通聊天共用一屏）──────────────────────────────
+  // 两个入口的唯一差别就是 aiCtx 空不空：非空 = 阅读页选区「问AI」，标题/system/正文抬头
+  // 都带【选段】；(空) = 应用页「DeepSeek 对话」，纯聊天。选段原文**进入时就从调用方拷进来**：
+  // g_pageText 是页内产物、换页就重建，晚了就没得拷。
+  std::string aiCtx, aiInput, aiStatus;
+  struct RdAiTurn {
+    std::string q, a;
+  };
+  std::vector<RdAiTurn> aiTurns;      // **唯一真源**：多轮历史（有上限，见 screen_reader_ai.cpp）
+  std::string aiTranscript;           // 由 aiTurns 合成的整篇文本（派生量，每次重建）
+  std::vector<std::string> aiLines;   // 折行缓存（同 dictLines 那套）
+  int aiLinesW = -1;                  // -1 = 缓存失效，需要重建
+  int aiScroll = 0, aiScrollMax = 0, aiPageLines = 1;
+  bool aiScrollToEnd = false;         // 下一帧渲染后滚到底（新提问/新回答落地）
+  bool aiBusy = false;                // 请求在飞（除 Esc 外吞键）
 
   // 长按选中的词范围（当前页语言：words 下标）与浮层选择
   bool selActive = false;
@@ -531,6 +556,25 @@ struct RdState {
   int selMenuSel = 0;
   int selNoteIdx = -1;     // 浮层对应的已有笔记下标（-1 = 新标注）
   int selPageSpine = -1;   // 选区所在章节（防止跨章误用）
+
+  // ── 跨页选区（**限定在同一章 / 同一份 TXT 内**）──────────────────────────
+  // 选区两端记的是绝对落点 (页, 页内词下标)：selLoPage/selLoWi ↔ selHiPage/selHiWi。
+  // 上面那两个 selStart/selEnd 退化成它们在**当前页上的投影**，由 rdSelSyncEnds() 在每次
+  // 渲染/按键前推出 —— 于是绘制、手柄、浮层、点词那些既有代码读的还是那两个下标，
+  // 完全不必知道"跨页"这回事。
+  // 页号口径与全仓别处一致：(bookKind == 0) ? st.page : st.txtPage（见 rdPosPage()）。
+  // 不变量：selLoPage < selHiPage，或两页相同而 selLoWi <= selHiWi。
+  int selLoPage = -1, selLoWi = 0;   // lo 端（起点）
+  int selHiPage = -1, selHiWi = 0;   // hi 端（终点）
+  // "拖出页边就能翻一页"这个动作的**待发位**：0 = 挂上了，非 0 = 刚翻过、还没重新挂上
+  // （值本身是那次翻页的时刻，ms/esp_timer 口径，只用来写日志）。
+  // 一次"拖到底"只翻一页：手指压在页脚上不动**不会**接着翻 —— 原来按时间冷却
+  // （700ms）放行第二次，实际用起来是"手指在页脚停两秒吃掉三四页"，用户报"过选、
+  // 选过页"。手指挪回正文栏里（或抬手重新拖一次）才重新挂上，见 rdSelDragStep。
+  int64_t selEdgeMs = 0;
+  // 从选区新建笔记时要把两端页号带到笔记编辑器那边去（那边已经离开阅读页，选区的
+  // 状态已经没了）。见 rdSelActivate 的「笔记」分支与 rdNoteCommit。
+  int notePendingPage = -1, notePendingEndPage = -1;
 
   // 笔记编辑器
   std::string noteEditBuf;
@@ -852,6 +896,23 @@ void handleRefreshTest(int key);
 void netShareConnect();
 void renderNetShare();
 void handleNetShare(int key);
+
+// ── AI 对话（screen_reader_ai.cpp）────────────────────────────────────────
+// **一个屏、两个入口**：阅读页选区动作条的「问AI」（ctx = 选中原文）与「应用」页的
+// 「DeepSeek 对话」（ctx 空，纯聊天）。ctx 空不空只影响标题 / system prompt / 正文抬头。
+// Esc 回哪由 from 决定（存进 st.retMode，回程按它三元）。
+// 未配 DeepSeek Key 时 rdAiChatBegin 返回 false（弹提示、不进屏），调用方据此决定是否清选区。
+bool rdAiChatBegin(const std::string &ctx, RdMode from);
+void rdAiChatSubmit();      // vkEnter 的回车提交（多轮连问，**不收键盘**）
+bool rdAiChatIdleTick();    // 空闲帧取件（返回是否该重绘）
+void renderAiChat();
+void handleAiChat(int key);
+
+// 「这一拍别走虚拟键盘增量帧，把整页重画一遍」（实现在 screen_reader.cpp 的 s_vkFullDrawReq）。
+// 异步内容（AI 的回答/错误）落地时由 aiPollResult 置位：增量帧的判据只看"键盘的目标串
+// 变没变"，看不见上半屏别处发生的变化，不置这一位就会出现"答案到了、屏上还挂着
+// 正在思考…"（而且 st.dirty 已被清，没有第二拍来补画）。
+void rdRequestWholeRepaint();
 
 // ── 阅读器的 VK / IME 条（留在 screen_reader.cpp）────────────────────────
 // 「设置」子界面（还有文件管理那一族）要在自己的输入框上打字，共用这份。

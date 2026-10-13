@@ -1887,6 +1887,12 @@ extern "C" void app_main() {
         // 未知键会上屏一个候选字）。其它界面一律清掉。
         if (key == KEY_TOUCH_DRAG && currentState != APP_GTD && currentState != APP_READER
             && currentState != APP_EDITOR) key = 0;
+        // 长按之后接着拖的那个键（KEY_TOUCH_LONG_DRAG）**只给阅读模式的选区**认
+        // （"长按选词 → 不抬手继续拖"，见 pjournal_app.h）。别的界面拿到的长按都是
+        // "弹菜单/弹按钮条"，菜单弹出来之后手指的残余移动不该变成滚屏/拖拽；写作模式
+        // 更危险——它的 IME 分支会把任何键喂给 g_ime，未知键会上屏一个候选字。所以
+        // 这条不像 KEY_TOUCH_DRAG 那样逐个界面放行，直接清掉。
+        if (key == KEY_TOUCH_LONG_DRAG && currentState != APP_READER) key = 0;
         // 触摸长按：计划模式（长按列表项弹编辑菜单）、写作模式的大纲（同款菜单）、
         // 阅读模式（长按选词标注）、编辑器（长按正文选字弹按钮条 / 长按状态栏左端的
         // 模式标记 = AI 提示词）和蓝牙管理（长按已配对设备弹连接/删除菜单）都要拿到
@@ -1930,8 +1936,10 @@ extern "C" void app_main() {
         // 要交给界面就响一声。两个例外：① 写作模式的编辑器自己有一套管得更细的规则
         // （整词上屏按字数连响，见 screen_editor.cpp），在这里再响一次会变成回声；
         // ② KEY_TOUCH_DRAG —— 计划模式列表的平滑滚动是"一次拖动连发很多帧"，逐帧响会变
-        // 成机关枪。开关本身在 typingClickPlay 内部的 typingClickEnabled() 把关。
-        if (key > 0 && currentState != APP_EDITOR && key != KEY_TOUCH_DRAG) typingClickPlay(1);
+        // 成机关枪（长按之后接着拖的那个键同理，它同样是逐帧的）。
+        // 开关本身在 typingClickPlay 内部的 typingClickEnabled() 把关。
+        if (key > 0 && currentState != APP_EDITOR && key != KEY_TOUCH_DRAG
+            && key != KEY_TOUCH_LONG_DRAG) typingClickPlay(1);
 
         // 界面生命周期收口（前半）：上面那些"在派发之前就改了 currentState"的地方
         // （长按中间键切模式、Ctrl+I 弹灵感）在这一行得到 enter/leave。放在派发之前是因为

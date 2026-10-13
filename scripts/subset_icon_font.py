@@ -70,7 +70,14 @@ SHELF_BAR = [0xF0450]   # md-refresh   刷新（重新扫描书库）
 # md-web 是个地球，比 wifi 图标更能说明"用浏览器打开"。
 FAB = [0xF059F]         # md-web   网络文件管理（浏览器传书）
 
-CHARSET = ASCII + FULLWIDTH + STATUS + INLINE + MENU + COMMON + KEYBOARD + TABS + SHELF_BAR + FAB
+# 「应用」页两个入口的专用图标 (main/tab_icons.h 的 APP_ICON_*)。
+# 2026-10-13 由用户新加进 NF-Propo 源字体（不在 MDI 的通用码位表里），
+# 比"借一枚通用图标"更贴题。**源字体里没有这两位，这里裁出来是空的** ——
+# 换 NF-Propo 时记得确认它们还在。
+APPS = [0xF1AF3,        # 微信读书
+        0xF1AF4]        # DeepSeek 对话
+
+CHARSET = ASCII + FULLWIDTH + STATUS + INLINE + MENU + COMMON + KEYBOARD + TABS + SHELF_BAR + FAB + APPS
 
 
 def main() -> int:

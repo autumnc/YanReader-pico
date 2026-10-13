@@ -184,6 +184,10 @@ void input_press_edge_discard() {
 // 翻页键由计划模式自己按"刚拖过"的状态吃掉。
 static bool s_dragging = false;
 static int s_drag_last_lx = 0, s_drag_last_ly = 0;   // 上次上报增量时的位置
+// 这一轮拖动是"长按之后接着拖"的那条手势（见 KEY_TOUCH_LONG_DRAG）：上报的是另一个
+// 键码，抬手时还要补一个空增量键当收尾 —— 长按那条路抬手**不产生任何键**（见下面
+// 抬手分支的 `if (!s_long_fired)`），没有收尾信号的话界面就永远不知道"拖完了"。
+static bool s_drag_after_long = false;
 #define DRAG_MIN_PX   18
 
 // "拖动过就不算点按"有个例外：手指点一下蹭出去 2~3mm 再回来，抬手点几乎还在
@@ -263,6 +267,7 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
         s_press_active = false;
         s_dragging = false;
         s_long_fired = false;
+        s_drag_after_long = false;
         s_press_edge_pending = false;
     }
 
@@ -279,6 +284,7 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
             s_press_active = false;
             s_dragging = false;
             s_long_fired = false;
+            s_drag_after_long = false;
             // 单指状态机被捏合接管，那个还没被读走的按下沿也一并作废 —— 否则它会作为
             // "刚按下"喂给虚拟键盘的按下反馈，给一个正在做缩放手势的指头反白一个键。
             s_press_edge_pending = false;
@@ -300,6 +306,7 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
         if (!s_press_active) {
             s_press_active = true;
             s_long_fired = false;
+            s_drag_after_long = false;
             s_press_us = now;
             s_press_raw_x = px;
             s_press_raw_y = py;
@@ -318,8 +325,15 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
             int64_t dt_ms = (now - s_press_us) / 1000;
             // 移动超过阈值就进入拖动：以按下点为基准播下"上次上报位置"，
             // 于是这一帧的首个增量已经包含按下到现在的全部位移。
-            if (!s_dragging && !s_long_fired && (abs(dx) >= DRAG_MIN_PX || abs(dy) >= DRAG_MIN_PX)) {
+            //
+            // 长按**已经烧过**之后手指还没抬、又继续移动，也进这一支：那是"长按 + 接着拖"
+            // 一个连续手势（手机上选文字就是这么用的）。上报换成 KEY_TOUCH_LONG_DRAG：
+            // 别的界面把长按当"弹菜单"，菜单弹出来之后手指的残余移动不该变成滚屏/拖拽。
+            // 阈值照旧按按下点算 —— 按住不动那 600ms 里手指基本没动，所以"长按之后还得
+            // 再挪出 DRAG_MIN_PX"才起拖，手感与普通拖动一致。
+            if (!s_dragging && (abs(dx) >= DRAG_MIN_PX || abs(dy) >= DRAG_MIN_PX)) {
                 s_dragging = true;
+                s_drag_after_long = s_long_fired;
                 s_drag_last_lx = s_press_lx;
                 s_drag_last_ly = s_press_ly;
             }
@@ -332,7 +346,7 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
                     s_drag_dx = ddx;
                     s_drag_dy = ddy;
                     s_drag_valid = true;
-                    key = KEY_TOUCH_DRAG;
+                    key = s_drag_after_long ? KEY_TOUCH_LONG_DRAG : KEY_TOUCH_DRAG;
                     // 拖动帧也发布按下点：阅读模式要在"手指刚拖起来"的那一帧判断
                     // 抓的是哪个选区手柄（手还没离开按下点，就近认），光有增量认不出。
                     // 与抬手产生的键同一套语义——只对产生它的这一帧有效。
@@ -391,6 +405,12 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
                 }
             }
         }
+        // 长按之后接着拖的那条手势（s_drag_after_long）：抬手时**不**补点按/滑动
+        // （上面那支整个跳过），但界面得知道"拖完了"——补一个**空增量**的同码键当收尾
+        // 信号（这一帧没走过移动分支，input_drag_xy() 便没有增量可取）。不补的话收尾
+        // 全靠下一个键，而那个键会被界面当成"拖动的尾巴"吃掉：用户看到的是"拖完选区
+        // 之后，第一下点浮层按钮没反应"。
+        if (s_drag_after_long) key = KEY_TOUCH_LONG_DRAG;
         // 抬手产生的按键（点按/上下滑/左右滑）都带上按下点：滑动那两种键本身
         // 不带坐标，要按"从哪儿开始划"区分语义的界面（虚拟键盘候选行）靠它。
         if (key != 0) s_press_origin_valid = true;
@@ -401,6 +421,7 @@ static int poll_touch_gesture(cst836u_touch_t *touch) {
         s_press_active = false;
         s_long_fired = false;
         s_dragging = false;
+        s_drag_after_long = false;
     }
 
     // 电容键 KEY2(中间)：按下→释放算一次确认；按住 ≥600ms 触发一次"长按确认"。

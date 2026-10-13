@@ -99,6 +99,7 @@ idf_component_register(SRCS
     "markdown_render.cpp"
     "vertical_layout.cpp"
     "screen_reader.cpp"
+    "screen_reader_ai.cpp"       # AI 对话（阅读页选区「问AI」/ 应用页「DeepSeek 对话」两个入口共用）
     "screen_reader_weread.cpp"   # 微信读书子应用（P3b 从 screen_reader.cpp 拆出）
     "screen_reader_stats.cpp"    # 「统计」标签与 8 个子界面（P3b 从 screen_reader.cpp 拆出）
     "screen_reader_subpages.cpp" # 设置标签下的叶子子界面（P3b 从 screen_reader.cpp 拆出）
@@ -154,7 +155,7 @@ idf_component_register(SRCS
 )
 
 # 本工程是独立项目，版本号不复用 pjournal 那条线：从 1.0.0 重新起算。
-target_compile_definitions(${COMPONENT_LIB} PRIVATE YAN_READER_VERSION="1.7.1")
+target_compile_definitions(${COMPONENT_LIB} PRIVATE YAN_READER_VERSION="1.8.0")
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PJOURNAL_IME_ENABLE_PINYIN=$<BOOL:${PJOURNAL_IME_ENABLE_PINYIN}>
     PJOURNAL_IME_ENABLE_LIANGFEN=$<BOOL:${PJOURNAL_IME_ENABLE_LIANGFEN}>
