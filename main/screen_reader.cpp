@@ -188,6 +188,19 @@ int statusTop() { return g_rd.getScreenHeight() - footerH() - RD_BOTTOM_INSET; }
 // 全局改它会连环炸，所以这里只给标签页单开一个底边，两者互不影响。
 int tabBottom() { return g_rd.getScreenHeight() - RD_BOTTOM_INSET; }
 
+// 阅读页**正文栏**的下边界：状态栏显示时就是状态带的上沿（= statusTop()），
+// 「状态栏: 隐藏」时正文一直排到屏底留白（= tabBottom()）—— 隐藏了却还在屏底留一条
+// 空白，看着就是"没隐藏干净"。
+//
+// 它同时是排版基准（viewportHeight / linesPerPage / XTC 的缩放），所以读者改这一档
+// **必须重排**（applyRdPick 里跟着走 reopenBook()，与字号/行距那一批一样）；改完
+// 每页的字数变了，页码与书签也要按新版式重算。
+//
+// 与 rdBodyBottom() 不是一回事：那个是"虚拟键盘 / 输入法条 / 提示行三选一"，还要给
+// 目录、词典、AI 对话这些**有自己页脚**的子界面用 —— 它们的页脚照旧画在 statusTop()，
+// 正文底边不能跟着状态栏一起长（会长进页脚里）。
+int rdPaneBottom() { return (sbCount("reader_sb_on", 0, 2) == 1) ? tabBottom() : statusTop(); }
+
 // 顶栏底边（分隔线所在）。文字标题栏和图标标签栏共用同一条线，所以 coverTop()
 // 只有一个值，两种顶栏可以互换着用。取两者里更靠下的那个：标签图标（56px）比
 // UI 行高（42px）大，靠这条把正文起点一起往下让，图标才不会被分隔线切到。
@@ -660,7 +673,10 @@ static ReaderRenderSpec makeSpec() {
   spec.firstLineIndent = embedded ? 0 : static_cast<uint8_t>(st.indentMode);
   spec.paragraphAlignment = embedded ? static_cast<uint8_t>(CssTextAlign::None) : kAlignSpec[clampI(st.alignMode, 0, 3)];
   spec.viewportWidth = w - 2 * bodyMargin();
-  spec.viewportHeight = statusTop() - RD_BODY_TOP - MARGIN;
+  // 正文栏底边 = rdPaneBottom()（状态栏隐藏时排到屏底）。这一项进 section 文件的
+  // 排版缓存键（Section.cpp 序列化 + 比对），所以「状态栏: 隐藏」一改，这一章会自动
+  // 按新高度重排一次。
+  spec.viewportHeight = rdPaneBottom() - RD_BODY_TOP - MARGIN;
   spec.hyphenationEnabled = false;
   spec.embeddedStyle = embedded;
   spec.imageRendering = 0;
@@ -694,7 +710,7 @@ static void applyCssFontLadder() {
 
 static int linesPerPage() {
   int lh = static_cast<int>(g_rd.getLineHeight(BODY_FONT_ID_BASE + st.fontLevel) * st.lineSpacing + 0.5f);
-  int usable = statusTop() - RD_BODY_TOP - MARGIN;
+  int usable = rdPaneBottom() - RD_BODY_TOP - MARGIN;   // 与 buildSpec 同一个底边
   return std::max(1, usable / lh);
 }
 
@@ -713,20 +729,6 @@ static int totalPages() {
 static void rdSortShelfByRecency();
 
 // ── 书架扫描 ────────────────────────────────────────────────────────────
-// 扫描时装作看不见的文件：应用自己的数据也是 .txt，落在 /sdcard 根目录下会被
-// 当成一本书摆上书架（"阅读进度"reader_progress.txt 就这么上架的）。
-//   reader_progress.txt  阅读位置记忆（见 kProgressPath）
-//   reader_notes.txt     阅读笔记（见 kNotesPath）
-//   N.txt (0..9)         快捷编辑的草稿（quick_edit.cpp 的 quickEditFilePath）
-// 只按文件名判、不改这些文件的落盘位置：位置一挪，老设备上的记录就找不回来了。
-static bool isInternalShelfFile(const std::string &name) {
-  if (name == "reader_progress.txt" || name == "reader_notes.txt") return true;
-  if (name.size() == 5 && name[1] == '.' && name[0] >= '0' && name[0] <= '9' &&
-      name.compare(2, 3, "txt") == 0)
-    return true;  // 0.txt..9.txt：快捷编辑草稿，不是书
-  return false;
-}
-
 // ── 书架空闲预建的状态（实现见 fdShelfIdlePrebuild，几百行之后）──────────────
 // 放在这里而不是实现旁边：scanBooks() 得能把"全都建好了"这条结论作废，而它在前面。
 // 三件事：用户最后一次按键的时刻（空闲窗口的锚）、这个窗口是否已经做过一本、
@@ -739,13 +741,15 @@ static bool s_rdShelfPrebuildExhausted = false;
 void scanBooks() {
   st.books.clear();
   s_rdShelfPrebuildExhausted = false;   // 书目变了，重新找一遍待建的书
-  // /sdcard/WeRead 是微信读书缓存整本后的落盘目录（finalBookPath 前缀）。
-  // books/Books 两种大小写都列是因为卡上的目录名不统一；但 FATFS 的 LFN 查找是
-  // 大小写不敏感的（没有 CONFIG_FATFS_CASE_SENSITIVE），两者打开的是**同一个**目录，
-  // 条目名也一模一样，只是拼出来的路径字符串不同 → 同一本书在书架上变成两行。
-  // 所以去重的键必须是**全小写路径**：/sdcard/books/X.epub 与 /sdcard/Books/X.epub
-  // 折叠成同一个键，而 /sdcard/X.epub 与 /sdcard/books/X.epub（不同文件）仍是两个键。
-  const char *dirs[] = {"/sdcard", "/sdcard/books", "/sdcard/Books", "/sdcard/WeRead", nullptr};
+  // **书架只认下面这几个目录，不再扫 /sdcard 根目录。**
+  // 根目录底下混着应用自己的数据，而它们的落盘位置**不能改**（改了老设备上的记录就
+  // 找不回来），于是以前只能靠一张文件名黑名单把它们从书架上摘掉：reader_progress.txt、
+  // reader_notes.txt、0.txt..9.txt 快捷编辑草稿…每多一个落盘就多一条要维护的规则，而且
+  // 别人往根目录丢一个 txt 就凭空多一本"书"。改成"书的来源就是这几个目录"：写入侧本来
+  // 也是这么约定的（WiFi 传书落到 /sdcard/books，见 screen_reader_subpages.cpp）。
+  // 根目录上的书现在只从「文件」标签页进（那里本来就是全盘浏览），不再上书架。
+  const char *dirs[] = {"/sdcard/books", "/sdcard/Books", "/sdcard/book",
+                        "/sdcard/WeRead", nullptr};
   std::set<std::string> seen;
   for (int d = 0; dirs[d]; d++) {
     DIR *dp = opendir(dirs[d]);
@@ -754,13 +758,16 @@ void scanBooks() {
     while ((e = readdir(dp)) != nullptr) {
       std::string name = e->d_name;
       if (name == "." || name == "..") continue;
-      if (isInternalShelfFile(name)) continue;  // 应用自己的数据文件，不是书
       std::string full = std::string(dirs[d]) + "/" + name;
       int kind = -1;
       if (endsWith(name, ".epub")) kind = 0;
       else if (endsWith(name, ".txt")) kind = 1;
       else if (endsWith(name, ".xtc")) kind = 2;
       if (kind < 0) continue;
+      // 去重的键必须是**全小写路径**：FATFS 的 LFN 查找是大小写不敏感的（没有
+      // CONFIG_FATFS_CASE_SENSITIVE），books 与 Books 打开的是**同一个**目录、条目名
+      // 也一模一样，只是拼出来的路径字符串不同 → 同一本书会在书架上变成两行。
+      // 全小写之后两者折叠成一个键。（book 与 books 是真不同的名字，仍是两个目录。）
       std::string key = full;
       for (char &c : key) c = (char)tolower((unsigned char)c);
       if (!seen.insert(key).second) continue;  // 同一个文件（books/Books 是同一个目录）
@@ -2189,6 +2196,10 @@ static bool readerLocalNow(struct tm &out) {
 // + 屏底进度条（占 RD_BOTTOM_INSET 留白，不与文字打架）。
 static void drawStatusBand(int y) {
   int w = g_rd.getScreenWidth();
+  // 「状态栏: 隐藏」——整条都不画（连上面那道分隔线一起，它也是带子的一部分）。
+  // **带子腾出来的高度归正文**：正文栏的底边是 rdPaneBottom()，隐藏时它落到屏底，
+  // 每页多排几行（重排由 applyRdPick 那一条走 reopenBook 触发）。这里只是"不画"。
+  if (sbCount("reader_sb_on", 0, 2) == 1) return;
   g_rd.drawLine(0, y, w, y, true);
 
   int textY = y + 4;
@@ -3050,10 +3061,18 @@ static bool rdLiveLayerUp() { return st.selActive || st.vkVisible; }
 // 全是廉价标量，进了键就把这几条都变成"键不符 → 照原路现画"，代价只是一次本该发生的
 // 重画。**以后再加"只重画不重排"的档，必须往这儿补一位**，否则就是这个 bug 的新一份拷贝。
 static std::string rdHoldKey(int spine, int page) {
+  // 状态栏那几项（开关 + 标题/页码/百分比/进度条/粗细/电量/时钟）也画在正文层里
+  // （renderEpubPage 末尾的 drawReaderStatus），所以**改一格，留档的那张"干净页"图就
+  // 不成立了** —— 不补这一位，症状与上面注释里那批一模一样：把「状态栏」设成隐藏，
+  // 回阅读页画面纹丝不动，得翻一页才生效。值都是 0..2 的个位数，直接拼成一串
+  //（个位数相连没有歧义，不必逐项加 `|` 字段把键越拼越长）。
+  std::string sb;
+  for (int i = 0; i < kSbRowCount; i++)
+    sb += std::to_string(sbCount(kSbRows[i].key, kSbRows[i].def, kSbRows[i].nameCount));
   return rdLayoutKey(spine, page) + "|n" + std::to_string(st.notes.size()) + "|w" +
          std::to_string(st.fontWeight) + "|c" + std::to_string(st.contrast) + "|l" +
          std::to_string(st.readingLine) + "|d" + std::to_string(st.imageDither) + "|a" +
-         std::to_string(st.annotStyle);
+         std::to_string(st.annotStyle) + "|b" + sb;
 }
 
 // 生产侧（renderCurrent 里正文层画完、浮层之前那一点调）。
@@ -4326,7 +4345,10 @@ static int rdSelDragStep(int fontId) {
   // 报障「拖动到底部并没有往下翻页」就是这个：手指停在浮层上沿(≈1110)，离 1182 差 70px。
   // 所以浮层开着时改用它的上沿当界；浮层没开（理论上不会，选区在时它恒开）退回原判据。
   constexpr int EDGE = 20;
-  int botLine = rdBodyBottom() + EDGE;
+  // 「拖出正文区」的底边要跟着正文栏走：状态栏隐藏时正文排到屏底（rdPaneBottom()），
+  // 用 rdBodyBottom()（它只认状态带上沿）会让"拖到底部翻页"在正文中间就触发。
+  // 打字中（输入法条占着下半屏）仍用 rdBodyBottom() 那一套。
+  int botLine = (rdImeBarOn() ? rdBodyBottom() : rdPaneBottom()) + EDGE;
   {
     int pbx, pby, pbw, pbh;
     rdPopupRect(&pbx, &pby, &pbw, &pbh);
@@ -4646,7 +4668,7 @@ static void renderXtcPage() {
     return;
   }
   int vw = g_rd.getScreenWidth() - 2 * bodyMargin();
-  int vh = statusTop() - RD_BODY_TOP - MARGIN;
+  int vh = rdPaneBottom() - RD_BODY_TOP - MARGIN;   // 状态栏隐藏时这一页图也放大到屏底
   float scale = std::min(static_cast<float>(vw) / w, static_cast<float>(vh) / h);
   int dw = static_cast<int>(w * scale), dh = static_cast<int>(h * scale);
   int ox = (g_rd.getScreenWidth() - dw) / 2, oy = RD_BODY_TOP;
@@ -9864,7 +9886,9 @@ static std::vector<MenuItem> settingsItems() {
   m.push_back({"词典下载", MenuAct::DictDl});
   m.push_back({"资源下载", MenuAct::ResDl});
   m.push_back({"按键映射", MenuAct::KeyMap});
-  m.push_back({"状态栏", MenuAct::StatusBar});
+  // 状态栏：标签直接写出"显示/隐藏"（这一屏的其余条目也都是"名字: 现用档"的写法），
+  // 免得整条被关掉之后在这里看不出来。
+  m.push_back({std::string("状态栏: ") + kSbOnNames[sbCount("reader_sb_on", 0, 2)], MenuAct::StatusBar});
   m.push_back({std::string("书架风格: ") + kShelfStyleNames[static_cast<int>(shelfStyle())], MenuAct::ShelfStyle});
   m.push_back({std::string("样式解析: ") + kStyleSrcNames[styleSource()], MenuAct::StyleSource});
   m.push_back({std::string("内嵌字体: ") + kEmbFontNames[embeddedFontMode()], MenuAct::EmbeddedFont});
@@ -10178,6 +10202,14 @@ static void rdPickTable(int act, std::string &title, std::vector<std::string> &l
     labels.push_back(label);
     values.push_back(value);
   };
+  // 「状态栏」设置页那几行（kSbPickBase + 行号）：档位表就是 kSbRows，不在两处各写
+  // 一份 —— 设置页行上的标签与弹层里的选项因此永远一致。值就是档位下标。
+  if (act >= kSbPickBase && act < kSbPickBase + kSbRowCount) {
+    const RdSbRow &r = kSbRows[act - kSbPickBase];
+    title = r.label;
+    for (int i = 0; i < r.nameCount; i++) add(r.names[i], std::to_string(i));
+    return;
+  }
   switch (static_cast<MenuAct>(act)) {
     case MenuAct::Font:
       // 字号档（kBodyPx 的像素高就是用户看得懂的那个数，菜单标签一直这么写）。
@@ -10323,6 +10355,11 @@ static void rdPickFill(int act) {
 
 // 这一项现在是什么值（用来把弹层的选中行落在当前档上，并画那个 ●）。
 static std::string rdPickCurValue(int act) {
+  // 「状态栏」设置页那几行（同 rdPickTable 的分支）：现用档 = settings 里那个下标。
+  if (act >= kSbPickBase && act < kSbPickBase + kSbRowCount) {
+    const RdSbRow &r = kSbRows[act - kSbPickBase];
+    return std::to_string(sbCount(r.key, r.def, r.nameCount));
+  }
   switch (static_cast<MenuAct>(act)) {
     case MenuAct::Font: return std::to_string(st.fontLevel);
     case MenuAct::FontWeight: return std::to_string(clampI(st.fontWeight, 0, kFontWeightCount - 1));
@@ -10989,6 +11026,10 @@ static void openRdPick(int act) {
   st.dirty = 1;
 }
 
+// 给「状态栏」设置页（screen_reader_subpages.cpp）用：openRdPick 是文件内 static，
+// 那个 TU 调不到，所以转一手。本文件内的调用一律直接走 openRdPick，不绕这一层。
+void rdOpenPick(int act) { openRdPick(act); }
+
 static void closeRdPick() {
   st.pickOpen = false;
   st.pickAct = -1;
@@ -11004,6 +11045,26 @@ static void closeRdPick() {
 // 落定后按条目把值写回去。动作照搬原来 doMenuAction 里循环版本的收尾
 // （改值 → 落盘 → reopenBook/标全刷），只是现在是"一次跳到目标档"。
 static void applyRdPick(int act, const std::string &value) {
+  // 「状态栏」设置页那几行（同 rdPickTable 的分支）：值就是档位下标，写回它自己的键。
+  // 状态带画在阅读页上、这一屏看不见，所以只标脏（列表行上的标签变了），不重排、
+  // 不整屏重画；回阅读页时 handleStatusBarSet 的 Esc 那一条已经置了 fullRefresh。
+  if (act >= kSbPickBase && act < kSbPickBase + kSbRowCount) {
+    const int row = act - kSbPickBase;
+    const RdSbRow &r = kSbRows[row];
+    g_settings.setString(r.key, value);
+    // 第 0 行（显示/隐藏）改的是**正文栏的下边界**：rdPaneBottom() 一动，
+    // viewportHeight / linesPerPage 跟着动，每页字数全变 —— 必须重排，与字号/行距
+    // 同一批（reopenBook 保留当前页，作废邻页与常驻首帧那两份留档）。不重排的话
+    // 正文还是按旧高度排的，屏底那 54px 该填的字根本没排出来。
+    // 其余几项只改状态带画什么，版式一个字节没动，标脏重画当前页就够
+    //（键里有它们，见 rdHoldKey）。
+    if (row == 0) {
+      reopenBook();
+      st.fullRefresh = true;
+    }
+    st.dirty = 1;
+    return;
+  }
   switch (static_cast<MenuAct>(act)) {
     case MenuAct::Font:
       // 一次跳到目标档（原来要按好几次才轮到）。值就是档位下标。

@@ -111,6 +111,47 @@ inline constexpr int RD_TOP_INSET = 28;    // 顶部留白(标题起始)，原 8
 inline constexpr int RD_BODY_TOP = 50;     // 正文起始，原 MARGIN(30)，整体下移 20px
 inline constexpr int RD_BOTTOM_INSET = 4;  // 底部留白(状态栏下方)，原 24，状态栏下移 20px
 
+// ── 阅读页底部状态栏：每一项的档位表 ────────────────────────────────────
+// 设置页（RdMode::StatusBar，screen_reader_subpages.cpp）与弹层选择
+// （screen_reader.cpp 的 openRdPick）**共用这一张**：加一项/加一档/改个标签只动
+// 这里一处，两边不会各写一份而对不上。names[] 的下标就是存进 settings 的值。
+//
+// 第 0 行恒是"整条状态栏显示不显示"的开关，**必须排第一**：关掉之后设置页只留
+// 这一行（底下那七项设置了也看不见，留着只会让人以为设置没生效），而"可见的恒是
+// 表的前缀"这一点让行号与表下标始终相等，不必再维护一张映射表（见 sbRowCount）。
+// 它也是唯一一项**改版式**的：关掉之后正文栏一直排到屏底（rdPaneBottom()），
+// 所以 applyRdPick 里它单独走 reopenBook() 重排，其余七项只重画。
+struct RdSbRow {
+  const char *key;
+  const char *label;
+  int def;
+  const char *const *names;
+  int nameCount;
+};
+inline constexpr const char *kSbOnNames[2] = {"显示", "隐藏"};
+inline constexpr const char *kSbTitleNames[3] = {"书名", "章节", "隐藏"};
+inline constexpr const char *kSbPageNames[3] = {"章节", "全书", "隐藏"};
+inline constexpr const char *kSbShowNames[2] = {"显示", "隐藏"};
+inline constexpr const char *kSbBarNames[3] = {"全书", "章节", "隐藏"};
+inline constexpr const char *kSbThickNames[3] = {"细", "中", "粗"};
+inline constexpr const char *kSbClockNames[3] = {"隐藏", "右侧", "左侧"};
+inline constexpr RdSbRow kSbRows[] = {
+    {"reader_sb_on", "状态栏", 0, kSbOnNames, 2},
+    {"reader_sb_title", "标题", 0, kSbTitleNames, 3},
+    {"reader_sb_page", "页码", 1, kSbPageNames, 3},
+    {"reader_sb_pct", "百分比", 0, kSbShowNames, 2},
+    {"reader_sb_bar", "进度条", 2, kSbBarNames, 3},
+    {"reader_sb_thick", "进度条粗细", 1, kSbThickNames, 3},
+    {"reader_sb_batt", "电量", 0, kSbShowNames, 2},
+    {"reader_sb_clock", "时钟", 0, kSbClockNames, 3},
+};
+inline constexpr int kSbRowCount = static_cast<int>(sizeof(kSbRows) / sizeof(kSbRows[0]));
+
+// 「状态栏」设置页那几行也复用同一个弹层（st.pickAct）：act 取 9000 + 行号，故意
+// 落在 MenuAct 之外 —— screen_reader.cpp 的 rdPickTable / rdPickCurValue / applyRdPick
+// 三个 switch 都在 switch **之前**先判这一段，MenuAct 那批一行都不用改。
+inline constexpr int kSbPickBase = 9000;
+
 
 // ── 阅读器状态 ──────────────────────────────────────────────────────────
 enum class RdMode {
@@ -889,6 +930,9 @@ void renderKeyMap();
 void handleKeyMap(int key);
 void renderStatusBarSet();
 void handleStatusBarSet(int key);
+// 「状态栏」设置页在另一个 TU，开弹层（openRdPick，定义在 screen_reader.cpp）要转一手。
+// act 用 kSbPickBase + 行号。同文件里的调用直接走 openRdPick，不绕这一层。
+void rdOpenPick(int act);
 void renderAbout();
 void handleAbout(int key);
 void renderRefreshTest();   // 灰阶自检页（16 级梯 / 抖动对比 / 各刷法耗时，自推屏）

@@ -992,41 +992,28 @@ void handleKeyMap(int key) {
 }
 
 // ── 自定义状态栏（设置界面）──────────────────────────────────────────────
-// 逐行选择阅读页底部状态栏显示的内容。左右键（或 Enter）轮转取值，Esc 存盘返回——
-// 每改一项立刻写 settings，回到阅读页即生效。
-static const char *const kSbTitleNames[] = {"书名", "章节", "隐藏"};
-static const char *const kSbPageNames[] = {"章节", "全书", "隐藏"};
-static const char *const kSbShowNames[] = {"显示", "隐藏"};
-static const char *const kSbBarNames[] = {"全书", "章节", "隐藏"};
-static const char *const kSbThickNames[] = {"细", "中", "粗"};
-static const char *const kSbClockNames[] = {"隐藏", "右侧", "左侧"};
-
-struct SbRow {
-  const char *key;
-  const char *label;
-  int def;
-  const char *const *names;
-  int nameCount;
-};
-static const SbRow kSbRows[] = {
-    {"reader_sb_title", "标题", 0, kSbTitleNames, 3},
-    {"reader_sb_page", "页码", 1, kSbPageNames, 3},
-    {"reader_sb_pct", "百分比", 0, kSbShowNames, 2},
-    {"reader_sb_bar", "进度条", 2, kSbBarNames, 3},
-    {"reader_sb_thick", "进度条粗细", 1, kSbThickNames, 3},
-    {"reader_sb_batt", "电量", 0, kSbShowNames, 2},
-    {"reader_sb_clock", "时钟", 0, kSbClockNames, 3},
-};
-static const int kSbRowCount = static_cast<int>(sizeof(kSbRows) / sizeof(kSbRows[0]));
+// 逐行选择阅读页底部状态栏显示的内容。**点一行（或回车）弹出可选档位**——原来是
+// 左右键/回车"轮换"（每按一次换下一档）：触屏上点一行只把光标挪过去、不改值，看着
+// 就是"点了没反应"；而且有哪些档位、现在是哪一档得按一圈才知道。弹层一次列全、
+// 现用档前面点一个 ●（复用 openRdPick 那一套，与「设置」标签的轮换条目同一份实现）。
+//
+// 档位表在 screen_reader_internal.h 的 kSbRows（与弹层共用，别在这里再抄一份）。
+// 第 0 行是"整条状态栏显示不显示"的开关，关掉后底下那七项不再显示。
+static int sbRowCount() {
+  // 状态栏关掉（第 0 行 == 1 = 隐藏）时只剩开关这一行。可见的恒是表的前缀，
+  // 所以"行号 == 表下标"，不必再维护一张映射表。
+  const RdSbRow &r0 = kSbRows[0];
+  return (sbCount(r0.key, r0.def, r0.nameCount) == 1) ? 1 : kSbRowCount;
+}
 
 // 自定义状态栏：居中式窗口，渲染与点按命中共用（以前两边各写一遍式子）。
 static ListView sbListView() {
   ListView lv;
   lv.top = coverTop();  // == drawTitle 的返回值
   lv.itemH = uiLineHeight() + 12;
-  lv.count = kSbRowCount;
+  lv.count = sbRowCount();
   lv.rows = std::max(1, (statusTop() - lv.top - 8) / lv.itemH);
-  lv.sel = st.sbSel;
+  lv.sel = clampI(st.sbSel, 0, lv.count - 1);  // 刚把状态栏关掉时旧光标可能越界
   listViewCenter(lv);
   return lv;
 }
@@ -1042,18 +1029,18 @@ void renderStatusBarSet() {
   int start = lv.first;
   for (int i = 0; i < maxRows && start + i < n; i++) {
     int idx = start + i;
-    const SbRow &r = kSbRows[idx];
+    const RdSbRow &r = kSbRows[idx];
     int v = sbCount(r.key, r.def, r.nameCount);
     int y = lv.top + i * itemH;
     std::string txt = fitWidth(std::string(r.label) + ":  " + r.names[v], w - 2 * MARGIN);
-    if (idx == st.sbSel) {
+    if (idx == lv.sel) {
       g_rd.fillRect(0, y, w, itemH, true);
       drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, txt.c_str(), false);
     } else {
       drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, txt.c_str(), true);
     }
   }
-  drawFooter("↑↓ 选择  ←→/Enter 修改  Esc 返回阅读");
+  drawFooter("↑↓ 选择  Enter 修改  Esc 返回阅读");
 }
 
 void handleStatusBarSet(int key) {
@@ -1065,29 +1052,26 @@ void handleStatusBarSet(int key) {
     st.dirty = 1;
     return;
   }
-  {  // 上下/首尾在 ui/list_view.h（7 项 < 翻页步长 8，PAGE 仍是到首/到尾）
+  {  // 上下/首尾在 ui/list_view.h
     ListView lv = sbListView();
     if (listViewKey(lv, key)) { st.sbSel = lv.sel; st.dirty = 1; return; }
   }
 
-  if (key != KEY_LEFT && key != KEY_RIGHT && key != '\n') return;
-
+  // 点按 / 回车 / 左右键都开弹层（左右键留着当"打开"用，老手势不至于变成没反应）。
+  if (key != '\n' && key != KEY_LEFT && key != KEY_RIGHT) return;
   if (key == '\n') {
     int x, y;
-    if (input_tap_xy(&x, &y)) {  // 点按：先选中该行，不直接改值
+    if (input_tap_xy(&x, &y)) {  // 点按：先选中该行，再弹它的档位
       const int row = listViewHitAt(sbListView(), y);
-      if (row >= 0) st.sbSel = row;
-      st.dirty = 1;
-      return;
+      if (row < 0) return;  // 点在标题/页脚上：这一次点按不算
+      st.sbSel = row;
     }
   }
-
-  const SbRow &r = kSbRows[st.sbSel];
-  int v = sbCount(r.key, r.def, r.nameCount);
-  int d = (key == KEY_LEFT) ? -1 : 1;  // Enter 等同 +1（轮转）
-  v = (v + d + r.nameCount) % r.nameCount;
-  g_settings.setString(r.key, std::to_string(v));
-  st.dirty = 1;
+  // 落定不在这里：弹层的 Enter/点按 → applyRdPick 写回 settings（见 screen_reader.cpp）。
+  // 光标按"这一屏现在有几行"夹一次：把状态栏刚关掉的那一下，st.sbSel 可能还停在
+  // 底下那几行上（可见行只剩第 0 行），不夹就会弹出"进度条粗细"那一格的档位。
+  st.sbSel = clampI(st.sbSel, 0, sbRowCount() - 1);
+  rdOpenPick(kSbPickBase + st.sbSel);
 }
 
 // ── 关于 ────────────────────────────────────────────────────────────────
