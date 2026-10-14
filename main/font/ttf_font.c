@@ -64,7 +64,29 @@ static void ttf_free(void* ptr, void* userdata) {
 // 给别的模块留的 PSRAM：缓存只在"空闲量高于这个"时继续长，低于就停在当前大小
 // (只淘汰到刚好放下新字形，不缩回)——缩回去只会让图像反复重光栅化。
 // 1.5MB 是阅读器的经验水位(图片/解压/OPDS 缓冲)。参考 cache_reserve()。
+//
+// ⚠ 上面那句"不缩"只描述了**留量线以上**。线上以下 room 归零，cache_reserve() 的
+//   判据是"cache_bytes + extra > limit"，而 limit 恰好等于进入时的 cache_bytes ——
+//   于是**每插入一个字形就淘汰掉同等字节**；缓存只剩 2K(=一个字形)时等于每次插入都
+//   整块冲光。这不是 bug 而是那条判据的自然后果，但"不缩"这个说法让人以为缓存会
+//   冻住在当前大小，实际是冻住在**零**。要治它得给缓存一个地板(见 ttf_font.c 的
+//   TTF_PAGE_BITMAP_BYTES 那段讨论)，本轮先只把"装不下就别暖"这条止损做掉。
 #define TTF_CACHE_RESERVE (1536 * 1024)
+// 一页字形在位图缓存里的**总字节** —— 判"这一趟栅格化预热划不划算"的线。
+//
+// 为什么需要这条线：设一页去重后 N 个字形、缓存装得下 K 个，那么
+//   热身+绘制 = N（热身时缓存是空的，全 miss）+ (N−K)（被热身挤出去的那些绘制时要重来）
+//   不热身   = N
+// **K < N 时热身严格更亏**，亏 N−K 次栅格化。不是"收益打折"，是净亏。
+//
+// 数值是**量出来的**，不是推的：内嵌关那一档稳态缓存 634–712–794K、位图命中 96%、
+// 每页去重后约 440 字 → 约 1.45KB/字。也就是说内嵌关那档的稳态缓存**正好就是一页**，
+// 这就是它 96% 命中的来源。取 440×1.45K ≈ 640K。
+// 判据用"≥ 一整页"，因为真正的需求是**整页**都要装下：预热是按 384 字节一块分很多次
+// 调的，只判单块(约 130 字 ≈ 190K)会把"装得下半页"误判成够用。
+// ⚠ 与未来的地板必须成对调：地板 < 这条线时预热永远是白做，地板 ≥ 这条线时预热才回本
+//   （那时 warm_raster_skip 必须回到 0，这是一个自洽的双向检验点）。
+#define TTF_PAGE_BITMAP_BYTES (640 * 1024)
 // UI 面的字形缓存上限。内建面常驻 flash(font_mem != NULL)，未命中 = memcpy + 光栅，
 // 没有 SD I/O —— 淘汰只花 CPU 不花毫秒。一个菜单/设置/对话框屏约需 100-200 个
 // 不同 CJK@38-46px(≈2.1KB/位图) ≈ 250-400KB，512KB 留约 2 倍余量。
@@ -74,11 +96,25 @@ static void ttf_free(void* ptr, void* userdata) {
 // 的比例小、字面重复度高，1MB 足够罩住一章；真正的额度仍由 cache_reserve() 按空闲量
 // 现算，这里只是天花板。
 #define TTF_ALT_CACHE_LIMIT (1024 * 1024)
-// 次字面的 SD 块缓存与合并读窗口。它是**配角**：正文走内容面，那才是每页的大头，
-// 所以这里给 48 槽(192KB)而不是内容面的 128 槽(512KB) —— 主面的字形缓存才是决定
-// 翻页速度的东西，不能让它被配角挤掉。
-#define TTF_ALT_IO_SLOTS 48
-#define TTF_ALT_IO_RUN_MAX 8
+// 两个"书内家族"面(次家族/三家族)的 SD 块缓存与合并读窗口。它们都是**配角**：正文
+// 走内容面，那才是每页的大头，所以给的比内容面(128 槽/512KB)小得多 —— 主面的字形
+// 缓存才是决定翻页速度的东西，不能让它被配角挤掉。
+//
+// 数值是**量出来的**，判据是新加的 `轮峰`(= io_flush_touches 去重之后的单轮载入峰值，
+// 见 ttf_face_stats_t)：一轮超过槽数的部分就是最早载入的那几块**当场被自己挤走**，
+// 下一趟绘制再当白读重来 —— 正文面 96→128 当年修的就是这个毛病，别在配角上重犯。
+// 实测(/tmp/turn_font6_20261014.log；晋书 307925051 两面 + 1190208750)：
+//   次家族 轮峰 max 8（n=3 轮）/ 三家族 轮峰 max 4（n=10 轮）——两者都只有 48 的零头。
+// 于是各留 3~4 倍余量：次家族 24 槽、三家族 16 槽。合计 2×224KB → 112+80KB，省下
+// 256KB **全部落进"开书那一刻的 room"**，也就是位图缓存能不能长到一页
+// (TTF_PAGE_BITMAP_BYTES) 的那笔钱，而那正是绘制的开销来源：同机实测晋书的位图缓存
+// 被冻在 142K、另一本冻在 473K，绘制的 1000ms vs 700ms 差的就是它。
+// ⚠ 样本薄：次家族只在晋书里出现，只有 3 轮。所以是"留 3 倍"而不是贴着 8 给。
+//   `轮峰` 超过对应槽数就是挤掉过的直接证据，再往下砍之前先看那个数。
+#define TTF_ALT_IO_SLOTS 24
+#define TTF_ALT_IO_RUN_MAX 4
+#define TTF_ALT2_IO_SLOTS 16
+#define TTF_ALT2_IO_RUN_MAX 4
 // 哈希桶数。/ Hash buckets.
 #define TTF_CACHE_BUCKETS 256
 // 两档字号的像素高，对齐 ui_kit 正文/标题。/ Small/large px, matches ui_kit body/title.
@@ -121,6 +157,10 @@ static void ttf_free(void* ptr, void* userdata) {
 #define TTF_IO_RUN_MAX 32
 // 相邻被碰块之间最多隔几块也并进同一次读(中间几块一起读掉，用白读换掉一次寻道)。
 #define TTF_IO_GAP_BLOCKS 2
+// 块缓存分配失败之后的退避窗口：这段时间内不再反复尝试(与不再反复打 WARN)。
+// 取 2 秒与主循环里"翻页提速缓冲要不到就隔 2s 重试"同一套口径 —— 那几块要的是
+// 一整块连续 PSRAM，失败原因也同源(碎片化)，所以用同一个时间尺度。
+#define TTF_IO_RETRY_US (2 * 1000 * 1000)
 #define TTF_PREFETCH_MAX 512
 #define TTF_GATHER_MAX 512
 // glyf+gvar 整表映射的预留与硬顶。/ Reserve and hard cap for whole-table glyf+gvar maps.
@@ -293,6 +333,13 @@ typedef struct ttf_face {
     uint32_t f_gvar_ram_len;
     uint8_t* f_io_data;
     uint8_t* f_io_run_buf;
+    // 块缓存上次**没要到**之后，允许再试的时刻(us；0 = 随时可以试)。见 io_ensure()。
+    // 为什么是"退避"而不是"放弃"：io_data==NULL 的读路径每读一块都会调回 io_ensure()，
+    // 不挡住就是低内存下每次块读一条 WARN；但**永久放弃的代价比日志刷屏大得多** ——
+    // 这一轮要不到多半只是临时的碎片化(一页图片解码/一段网络缓冲正占着 largest)，
+    // 永久放弃等于把整本书退化到逐块直读，那是每页几十~几百 ms，而且没有任何提示。
+    // ttf_face_purge_io() 把它清回 0，因为那是一次**显式**释放，之后当然该立刻再试。
+    int64_t f_io_retry_at_us;
     uint32_t f_io_base[TTF_IO_SLOTS];
     uint16_t f_io_fill[TTF_IO_SLOTS];
     uint16_t f_io_age[TTF_IO_SLOTS];
@@ -358,13 +405,18 @@ static void face_defaults(ttf_face_t* f, int role) {
     f->f_wght_def = TTF_WGHT_DEF;
     f->f_wght_max = TTF_WGHT_MAX;
     f->f_current_weight = TTF_WGHT_DEF;
-    // 两个"书内家族"槽同待遇（都是零星出现的注文/引文，量比正文小）。
+    // 两个"书内家族"槽**字形缓存**同待遇（都是零星出现的注文/引文，量比正文小）；
+    // **io 槽位不同档**，见 TTF_ALT_IO_SLOTS —— 那个数只能按量出来的 `轮峰` 给。
     const bool is_book_alt = (role == TTF_ROLE_CONTENT_ALT || role == TTF_ROLE_CONTENT_ALT2);
     f->f_cache_limit = (role == TTF_ROLE_UI)     ? TTF_UI_CACHE_LIMIT
                        : is_book_alt             ? TTF_ALT_CACHE_LIMIT
                                                  : TTF_CACHE_LIMIT;
-    f->f_io_slots   = is_book_alt ? TTF_ALT_IO_SLOTS   : TTF_IO_SLOTS;
-    f->f_io_run_max = is_book_alt ? TTF_ALT_IO_RUN_MAX : TTF_IO_RUN_MAX;
+    f->f_io_slots   = role == TTF_ROLE_CONTENT_ALT  ? TTF_ALT_IO_SLOTS
+                      : role == TTF_ROLE_CONTENT_ALT2 ? TTF_ALT2_IO_SLOTS
+                                                      : TTF_IO_SLOTS;
+    f->f_io_run_max = role == TTF_ROLE_CONTENT_ALT  ? TTF_ALT_IO_RUN_MAX
+                      : role == TTF_ROLE_CONTENT_ALT2 ? TTF_ALT2_IO_RUN_MAX
+                                                      : TTF_IO_RUN_MAX;
 }
 
 static ttf_face_t s_faces[TTF_ROLE_COUNT];
@@ -392,6 +444,7 @@ static ttf_face_t* s_cur = &s_faces[TTF_ROLE_CONTENT];
 #define gvar_ram_len          (s_cur->f_gvar_ram_len)
 #define io_data               (s_cur->f_io_data)
 #define io_run_buf            (s_cur->f_io_run_buf)
+#define io_retry_at_us        (s_cur->f_io_retry_at_us)
 #define io_base               (s_cur->f_io_base)
 #define io_fill               (s_cur->f_io_fill)
 #define io_age                (s_cur->f_io_age)
@@ -431,6 +484,41 @@ static ttf_face_t* s_cur = &s_faces[TTF_ROLE_CONTENT];
 // 本面实际开几个 IO 槽 / 合并窗口多大（面未初始化时退回编译期上限，保证循环不越界）。
 static int io_slot_count(void) { return io_slots > 0 ? io_slots : TTF_IO_SLOTS; }
 static int io_run_cap(void) { return io_run_max > 0 ? io_run_max : TTF_IO_RUN_MAX; }
+
+/* ---- 临时诊断：字形路径的计数（只给 reader_perf_log 那条日志用）------------
+ * 内嵌多字体的书翻页慢，量出来的每一笔都指向"每画一个字就从 SD 取一次轮廓"
+ * （见 ttf_perf_line() 的注释）。这组计数就是为了把这句话证实/证伪：一次翻页
+ * 里 打包(真要读轮廓) / 块命中·未命中(块缓存) / 段读·白读(合并读进来其实已在
+ * 缓存里的块) / 位图命中·未命中(字形位图缓存) 各是多少次。
+ *
+ * 全部只在取数时读，绘制与缓存逻辑一行不改；逐字面分开记，因为内嵌多字体那一
+ * 档怀疑就在内容面，而替补面(家族面/内建)会把这个数摊薄。
+ * ────────────────────────────────────────────────────────────────────────── */
+typedef struct {
+    uint32_t pack_read;    // pack_glyph_tree 真去 file_read_at 取轮廓
+    uint32_t pack_memo;    // pack_glyph_tree 单格备忘命中（省掉这次取）
+    uint32_t io_hit;       // io_load_block: 块已在缓存
+    uint32_t io_miss;      // io_load_block: 真的读了一个 4KB 块
+    uint32_t run_reads;    // io_load_run: 无条件整段读的次数（span ≥ 2）
+    uint32_t run_blocks;   // io_load_run: 这些整段读一共读进多少块
+    uint32_t run_waste;    // 其中**本来就在缓存里**的块数 —— 纯白读
+    uint32_t bmp_hit;      // get_glyph: 字形位图缓存命中（不碰轮廓）
+    uint32_t bmp_miss;     // get_glyph: 走 rasterize_glyph
+    uint32_t warm_skip;    // warm_text_io: 位图命中，跳过（连块都不查）
+    uint32_t warm_touch;   // warm_text_io: 位图没命中，要去碰块
+    // 位图缓存装不下一页时 ttf_raster_text_px 早退的次数（见 TTF_PAGE_BITMAP_BYTES）。
+    // 它是"缓存装不下一页"的直接证据：0 = 有缓存可暖（那一趟热身是回本的），
+    // 每趟 +1 = 整场都在白烧 CPU。地板改上去之后它必须回到 0。
+    uint32_t warm_raster_skip;
+    // io_flush_touches 去重之后一轮最多载入多少块的历史峰值。判"槽位够不够装下一轮"
+    // 只能靠它：同一轮里 io_load_run 给新块最新 age，所以超过槽数的部分就是**最早载入
+    // 的那几块当场被自己挤走**，下一趟绘制再当白读重来（96→128 那次修的就是这个）。
+    // 注意 段N读M块 是**累计和**（N 次 run 共读 M 块），不是单轮峰值，别拿它判槽位。
+    uint16_t flush_peak;
+} ttf_face_stats_t;
+
+static ttf_face_stats_t s_stats[TTF_ROLE_COUNT];
+#define STATS (s_stats[s_cur - s_faces])
 
 /* ---- 与字面无关的全局：不进上面的结构 ---- */
 extern const uint8_t builtin_ttf_start[] asm("_binary_builtin_ttf_start");
@@ -564,6 +652,12 @@ static bool io_ensure(void) {
     const size_t slots = (size_t)io_slot_count();
     const size_t run_max = (size_t)io_run_cap();
     if (io_data == NULL) {
+        // 要过一次没要来就退避(见 f_io_retry_at_us)：io_data==NULL 的读路径
+        // (io_load_block / file_read_at / io_flush_touches / warm_text_io)每读一块都会
+        // 调回这里，不挡就是"每次块读一条 WARN"，也在拿一次注定失败的分配去磨堆。
+        // **但不永久放弃** —— 失败多半是临时的碎片化，放弃一整本书的代价远大于一条日志。
+        const int64_t now = esp_timer_get_time();
+        if (io_retry_at_us != 0 && now < io_retry_at_us) return false;
         io_data = heap_caps_malloc(
             slots * TTF_IO_BLOCK,
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
@@ -571,13 +665,15 @@ static bool io_ensure(void) {
         if (io_data == NULL) {
             // 不致命(fallback 是逐次直读)，但会静默失去全部预取收益 —— 记一笔，
             // 免得对着"整页预取: 无块可读"猜半天。多半是 PSRAM 碎片化下
-            // 要不到这么大一块连续内存。
+            // 要不到这么大一块连续内存。频率由退避窗口兜住(每 2 秒最多一条)。
             ESP_LOGW(
-                TAG, "块缓存分配失败(%dKB 连续 PSRAM)，本轮走直读",
+                TAG, "块缓存分配失败(%dKB 连续 PSRAM)，稍后重试，其间走直读",
                 (int)(slots * TTF_IO_BLOCK / 1024)
             );
+            io_retry_at_us = now + TTF_IO_RETRY_US;
             return false;
         }
+        io_retry_at_us = 0;
         io_reset();
     }
     if (io_run_buf == NULL) {
@@ -629,6 +725,9 @@ static size_t ttf_face_purge_io(ttf_face_t* f) {
     // 槽位表跟着作废：留着旧块号，下一次分配回来时会拿它当"已经在缓存里"用。
     f->f_touch_n = 0;
     f->f_io_clock = 0;
+    // 这是一次**显式**释放（关书/低内存兜底），不是"要不到就没了"：把退避窗口清掉，
+    // 下一次 io_ensure 立刻就能再试一次。见 f_io_retry_at_us 的说明。
+    f->f_io_retry_at_us = 0;
     for (int i = 0; i < TTF_IO_SLOTS; i++) {
         f->f_io_base[i] = UINT32_MAX;
         f->f_io_fill[i] = 0;
@@ -706,7 +805,10 @@ static int io_victim(void) {
 }
 
 static bool io_load_block(uint32_t base) {
-    if (io_find(base) >= 0) return true;
+    if (io_find(base) >= 0) {
+        STATS.io_hit++;
+        return true;
+    }
     if (io_data == NULL && !io_ensure()) return false;
     int slot = io_victim();
     uint8_t* dst = io_data + (size_t)slot * TTF_IO_BLOCK;
@@ -724,6 +826,7 @@ static bool io_load_block(uint32_t base) {
         font_file_pos = UINT32_MAX;
         return false;
     }
+    STATS.io_miss++;
     font_file_pos = base + (uint32_t)got;
     io_base[slot] = base;
     io_fill[slot] = (uint16_t)got;
@@ -783,7 +886,11 @@ static int u32_cmp(const void* a, const void* b) {
 static bool io_load_run(uint32_t base, int blocks) {
     if (blocks <= 1) return io_load_block(base);
     if (blocks > io_run_cap()) blocks = io_run_cap();
-    if (io_run_buf == NULL
+    // io_data 这一问**目前恒假**(io_data 与 io_run_buf 同生同死：都在 io_ensure 里分配、
+    // 都由 ttf_face_purge_io 一起放掉)，但这两块内存由两个函数管，而下面那几行 memcpy
+    // 是直接写 io_data 的 —— 留着它，免得以后哪条路只放 io_data 就变成空指针写。
+    if (io_data == NULL
+        || io_run_buf == NULL
         || !io_read_raw(base, io_run_buf, (size_t)blocks * TTF_IO_BLOCK)) {
         bool ok = true;
         for (int i = 0; i < blocks; i++) {
@@ -791,9 +898,14 @@ static bool io_load_run(uint32_t base, int blocks) {
         }
         return ok;
     }
+    STATS.run_reads++;
+    STATS.run_blocks += (uint32_t)blocks;
     for (int i = 0; i < blocks; i++) {
         uint32_t b = base + (uint32_t)i * TTF_IO_BLOCK;
-        if (io_find(b) >= 0) continue;
+        if (io_find(b) >= 0) {
+            STATS.run_waste++;   // 刚从 SD 读回来的这一块，本来就在缓存里
+            continue;
+        }
         int slot = io_victim();
         memcpy(
             io_data + (size_t)slot * TTF_IO_BLOCK,
@@ -820,6 +932,10 @@ static void io_flush_touches(void) {
             touch_blocks[w++] = touch_blocks[i];
         }
     }
+    // 去重之后**这一轮**要去碰多少块 —— 槽位够不够的判据只能是它，不能拿
+    // `段N读M块` 那个**累计和**去判（N 次 run 共读 M 块，均值 2~3 块/轮，看均值会
+    // 以为槽位绰绰有余）。超过槽数的部分是同轮内被自己挤走的，下一趟绘制再当白读重来。
+    if (w > (int)STATS.flush_peak) STATS.flush_peak = (uint16_t)w;
     int i = 0;
     while (i < w) {
         int j = i + 1;
@@ -1779,6 +1895,7 @@ static bool load_variation(const uint8_t* header, size_t header_len) {
 // 把当前字形及其复合引用从 SD 填进工作字体的 glyf 窗口，并改写 loca。
 static bool pack_glyph_tree(int root_gid) {
     if (root_gid == packed_root && current_weight == packed_weight) {
+        STATS.pack_memo++;
         return true;
     }
     if (root_gid < 0 || root_gid >= num_glyphs) return true;
@@ -1800,6 +1917,7 @@ static bool pack_glyph_tree(int root_gid) {
             return false;
         }
         uint8_t* blob = arena + packed;
+        if (len > 0) STATS.pack_read++;
         if (len > 0
             && !file_read_at(file_glyf_off + file_glyph_off(gid), blob, len)) {
             return false;
@@ -2053,8 +2171,7 @@ static void cache_reset(void) {
     }
 }
 
-static void cache_evict_one(void) {
-    glyph_entry_t* victim = lru_tail;
+static void cache_evict(glyph_entry_t* victim) {
     if (victim == NULL) return;
     lru_detach(victim);
 
@@ -2075,19 +2192,81 @@ static void cache_evict_one(void) {
 
 // 当前这一刻的字形缓存额度。静态上限只是天花板；实际额度还要看 PSRAM 真剩多少，
 // 因为图片解码/解压窗口/网络缓冲跟我们抢的是同一块内存（阅读器一页 XTC 能要 4MB）。
-// 规则：空闲量高于 TTF_CACHE_RESERVE 时，允许长到"刚好把空闲压到留量线"；
-// 已经低于留量线就停在当前占用不变 —— **不缩**，缩了下一帧还得重新光栅化。
-static size_t cache_effective_limit(void) {
-    size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    size_t room = free_bytes > TTF_CACHE_RESERVE ? free_bytes - TTF_CACHE_RESERVE : 0;
-    size_t room_ceiling = cache_bytes + room;
-    return room_ceiling < cache_limit ? room_ceiling : cache_limit;
+// 规则：空闲量高于 TTF_CACHE_RESERVE 时，允许长到"刚好把空闲压到留量线"。
+//
+// ⚠ 低于留量线时 room 归零、limit 正好等于当前占用，于是"腾地方"就成了每次插入都要
+//   做的事 —— 这时候**怎么腾**决定生死，见 cache_reserve() 那段。
+//
+// 算式只此一份，对**任意**字面求值（不依赖 s_cur）：ttf_perf_line() 要逐字面报"额度"，
+// 在那儿照抄一遍迟早与本处分家。cache_effective_limit() 就是它的 s_cur 版。
+static size_t cache_effective_limit_of(const ttf_face_t* f) {
+    const size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t room = free_bytes > TTF_CACHE_RESERVE ? free_bytes - TTF_CACHE_RESERVE : 0;
+    const size_t room_ceiling = f->f_cache_bytes + room;
+    return room_ceiling < f->f_cache_limit ? room_ceiling : f->f_cache_limit;
+}
+
+static size_t cache_effective_limit(void) { return cache_effective_limit_of(s_cur); }
+
+// 位图缓存**还能再装多少**。判"这一趟栅格化预热值不值得做"只能用这个：
+// cache_effective_limit() 在 room==0 时恰好等于 cache_bytes，"额度 ≥ 当前占用"恒真
+// —— 拿它直接比等于没判（这条早退一直没做出来就是因为这一点）。
+static size_t cache_headroom(void) {
+    const size_t limit = cache_effective_limit();
+    return limit > cache_bytes ? limit - cache_bytes : 0;
+}
+
+// 按**字节**挑一个牺牲品：腾出来的量最接近还差多少(need)。只给零余量那条路用，见下。
+// 从最老的一端(lru_tail)往新扫，同样接近时先淘汰老的 —— 同尺寸条目上这条退化成纯 LRU，
+// 而 CJK 正文绝大多数条目尺寸相近，所以常见情况下与老行为一致。
+// 找不到单个够大的就退到"挑最大的"，差额下一轮回补。
+static glyph_entry_t* cache_pick_bestfit(size_t need) {
+    glyph_entry_t* best = NULL;
+    size_t best_size = 0;
+    for (glyph_entry_t* e = lru_tail; e != NULL; e = e->lru_prev) {
+        const size_t sz = e->bitmap_bytes + sizeof(*e);
+        if (sz < need) continue;
+        if (best == NULL || sz < best_size) {
+            best = e;
+            best_size = sz;
+            if (sz == need) break;
+        }
+    }
+    if (best != NULL) return best;
+    size_t max_size = 0;
+    for (glyph_entry_t* e = lru_tail; e != NULL; e = e->lru_prev) {
+        const size_t sz = e->bitmap_bytes + sizeof(*e);
+        if (sz > max_size) {
+            max_size = sz;
+            best = e;
+        }
+    }
+    return best;
 }
 
 static void cache_reserve(size_t extra) {
     const size_t limit = cache_effective_limit();
+    if (cache_bytes + extra <= limit) return;   // 有余量，直接插（正常那一档）
+    if (limit <= cache_bytes) {
+        // 零余量：额度正好等于当前占用，插一个就得腾出等量字节。**这里不能按 LRU 整条腾**：
+        // 条目是 1.8KB 级的 CJK，而新字形常常只有一两百字节（标点/拉丁/空白），按条目腾
+        // 每插一个净缩水 v−extra，一拍就能啃掉一两百 KB，最后只剩一个格子、位图命中归 0
+        // （实测 275K→210K→66K→2K→0K，位图 103/157→0/166，绘制 668→1380ms）。
+        // 触发它的不是别人，是**我们自己的帧缓冲**：常驻首帧 2×415872 + 预渲染备用帧缓冲
+        // 415872 = 1.24MB，落在 free≈1.5MB 的窗口里就把 free 压到留量线以下。
+        // 所以这里改成按字节 best-fit 腾：Σv ≈ extra，缓存**保持原大小并且还能继续轮换**
+        // （比"冻住不插"好：新页的字形照样进得来，命中的那部分跟着页走）。
+        while (lru_tail != NULL && cache_bytes + extra > limit) {
+            const size_t need = cache_bytes + extra - limit;
+            glyph_entry_t* victim = cache_pick_bestfit(need);
+            if (victim == NULL) break;
+            cache_evict(victim);
+        }
+        return;
+    }
+    // 有增长空间：按 LRU 腾到装得下为止（这条路的命中率是 96–99% 那档，别动它）。
     while (lru_tail != NULL && cache_bytes + extra > limit) {
-        cache_evict_one();
+        cache_evict(lru_tail);
     }
 }
 
@@ -2239,6 +2418,7 @@ static bool synth_merge(int gid, float scale, const float* ox, const float* oy, 
 }
 
 static glyph_entry_t* rasterize_glyph(uint32_t codepoint, int pixel_height) {
+    STATS.bmp_miss++;
     int gid = stbtt_FindGlyphIndex(&font_info, (int)codepoint);
     if (!pack_glyph_tree(gid)) return NULL;
 
@@ -2350,7 +2530,10 @@ static const glyph_entry_t* get_glyph(uint32_t codepoint, int pixel_height) {
     if (!font_ready) return NULL;
     pixel_height = clamp_px(pixel_height);
     glyph_entry_t* entry = cache_lookup(codepoint, pixel_height);
-    if (entry != NULL) return entry;
+    if (entry != NULL) {
+        STATS.bmp_hit++;
+        return entry;
+    }
     // 本面没有这个字形(.notdef)：别把豆腐块栅进本面缓存，换个能画出它的面
     // (见 fallback_role_for)，字形与缓存都记在**那一面**上。条目跨 face_leave
     // 依然有效(缓存挂在字面结构上，与 s_cur 无关)，寿命与本面字形完全一样 ——
@@ -2396,7 +2579,11 @@ static void warm_text_io(int pixel_height, const char* text) {
         }
         if (dup) continue;
         cps[seen++] = cp;
-        if (cache_lookup(cp, pixel_height) != NULL) continue;
+        if (cache_lookup(cp, pixel_height) != NULL) {
+            STATS.warm_skip++;
+            continue;
+        }
+        STATS.warm_touch++;
         int gid = stbtt_FindGlyphIndex(&font_info, (int)cp);
         if (gid < 0 || gid >= num_glyphs) continue;
         io_touch(file_glyf_off + file_glyph_off(gid), file_glyph_len(gid));
@@ -2498,6 +2685,61 @@ int ttf_ascender_px(int pixel_height) {
     if (!font_ready) return 0;
     pixel_height = clamp_px(pixel_height);
     return (int)lroundf(raw_ascent_units * font_scale_px(pixel_height));
+}
+
+// 临时诊断：把上一步的字形路径计数取出来、清零、格式化成一行。
+// **读的就是"上一次调用到现在"这一段**，所以调用点就是分段点（一趟预渲染 / 一次翻页）。
+// 逐字面分开：内嵌多字体那一档怀疑就在"正文"面（st），家族面/内建面会把数摊薄。
+// 末尾带上 PSRAM 余量与 cache_reserve 之上的空档（room）—— 位图缓存的额度就是它，
+// room 塌到 0 意味着任何一次插入都把整个字形缓存冲掉（见 cache_effective_limit）。
+void ttf_perf_line(char* out, size_t n) {
+    if (out == NULL || n == 0) return;
+    out[0] = '\0';
+    size_t off = 0;
+    static const char* const kRoleName[TTF_ROLE_COUNT] = {"正文", "界面", "次家族", "三家族"};
+    for (int r = 0; r < TTF_ROLE_COUNT; r++) {
+        ttf_face_stats_t* s = &s_stats[r];
+        const bool any = s->pack_read || s->pack_memo || s->io_hit || s->io_miss
+                         || s->run_reads || s->bmp_hit || s->bmp_miss || s->warm_skip
+                         || s->warm_touch || s->warm_raster_skip || s->flush_peak;
+        if (!any) continue;
+        char seg[288];
+        // 末尾两个数是判"缓存饿死"的直读：**额度 == 缓存 就是零余量**（room 归零），
+        // 此时 ttf_raster_text_px 已早退、绘制里每个字形都重新栅格化。`轮峰` 见
+        // ttf_face_stats_t 的说明（判槽位只能用去重后的单轮峰值，不能用段N读M块那个累计和）。
+        snprintf(
+            seg, sizeof(seg),
+            "%s%s 打包%u(备忘%u) 块%u中%u 段%u读%u块白读%u 位图%u中%u 预热跳%u碰%u弃%u 轮峰%u 缓存%uK/额度%uK",
+            off ? " | " : "", kRoleName[r], (unsigned)s->pack_read, (unsigned)s->pack_memo,
+            (unsigned)(s->io_hit + s->io_miss), (unsigned)s->io_hit, (unsigned)s->run_reads,
+            (unsigned)s->run_blocks, (unsigned)s->run_waste,
+            (unsigned)(s->bmp_hit + s->bmp_miss), (unsigned)s->bmp_hit,
+            (unsigned)s->warm_skip, (unsigned)s->warm_touch, (unsigned)s->warm_raster_skip,
+            (unsigned)s->flush_peak,
+            (unsigned)(s_faces[r].f_cache_bytes / 1024),
+            (unsigned)(cache_effective_limit_of(&s_faces[r]) / 1024)
+        );
+        const size_t l = strlen(seg);
+        // 清零放在"装不下就 break"**之前**：装不下只是这一行日志里少一段，计数不能留着
+        // 不带走的 —— 留着下一次会当成新发生的再报一遍，那段数就再也分不清是哪一段的了。
+        memset(s, 0, sizeof(*s));
+        if (off + l + 1 > n) break;
+        memcpy(out + off, seg, l + 1);
+        off += l;
+    }
+    const size_t freeb = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t room = freeb > TTF_CACHE_RESERVE ? freeb - TTF_CACHE_RESERVE : 0;
+    // `room` 是**全局**的（free − 留量线），单看它会读错：room 归零 ≠ 位图缓存没用上。
+    // 正文面**还能再装多少**才是判据（= 该面的 额度 − 缓存，与 P2 早退用的是同一个量），
+    // 它 < TTF_PAGE_BITMAP_BYTES 时那一趟栅格化预热已经被早退掉（见 warm_raster_skip）。
+    const size_t ch = s_faces[TTF_ROLE_CONTENT].f_cache_bytes;
+    const size_t clim = cache_effective_limit_of(&s_faces[TTF_ROLE_CONTENT]);
+    char tail[96];
+    snprintf(tail, sizeof(tail), "%sPSRAM free %uK room %uK 正文还装%uK", off ? " | " : "",
+             (unsigned)(freeb / 1024), (unsigned)(room / 1024),
+             (unsigned)((clim > ch ? clim - ch : 0) / 1024));
+    const size_t tl = strlen(tail);
+    if (off + tl + 1 <= n) memcpy(out + off, tail, tl + 1);
 }
 
 void ttf_font_cache_clear(void) {
@@ -2714,6 +2956,9 @@ static esp_err_t book_alt_open(int role, const char* path) {
         // 这里退到"没开"，ttf_set_role(该面) 随后会自动走内容面。
         face_enter(role);
         face_unload();
+        // 同 book_alt_close：面都卸了，它可能已经要到的块缓存不该留在这儿 ——
+        // 否则"打开失败"这一支会把一次分配漏到下一次开书(close 那份责任)。
+        ttf_face_purge_io(s_cur);
         face_leave(prev);
     }
     return e;
@@ -2722,6 +2967,19 @@ static esp_err_t book_alt_open(int role, const char* path) {
 static void book_alt_close(int role) {
     ttf_face_t* prev = face_enter(role);
     face_unload();
+    // 家族面是配角：它那 96KB(24×4KB + 4×4KB) + 两张 2KB 表的块缓存在 face_unload 里
+    // **不会被放掉** —— io_unmap 只管 glyf/gvar 的整表映射，io_reset 只清槽位表。
+    // 于是关掉之后这块一直攥着，两面合计 ~200KB，而"开书那一刻的 room"本来就只够
+    // 让位图缓存长到一半(实测晋书 142K vs 同机另一本 473K)。这是一整场开机"位图命中
+    // 偏低"的起点，也是"重启才快"的正面解 —— 换书/退出阅读必须走这里，重开时
+    // io_ensure() 会重新要一块。
+    //
+    // 复用 ttf_face_purge_io 而不是就地 free：它连槽位表一起作废(否则重开时会拿旧块号
+    // 当"已经在缓存里")，也顺手清掉分配失败留下的退避窗口(下一次 io_ensure 立刻能试)。
+    // ⚠ 不要挪进 face_unload()：内容面也走那条路(face_open 一进来就 face_unload)，
+    // 那会让换字体时 640KB 反复 alloc/free；build_working_font 的 OOM 兜底也刚好在
+    // 同一条路上，那边要的是"先腾出来、后面自己再长回去"。
+    ttf_face_purge_io(s_cur);
     face_leave(prev);
 }
 
@@ -2835,6 +3093,20 @@ void ttf_warm_text_px(int pixel_height, const char* text) {
 
 void ttf_raster_text_px(int pixel_height, const char* text) {
     if (!font_ready || text == NULL) return;
+    // 装不下一页就别栅：K < N 时热身是**净亏**（亏 N−K 次栅格化），推导见
+    // TTF_PAGE_BITMAP_BYTES。实测那一档 预热跳2碰372 之后紧接着绘制 位图425中0 ——
+    // 刚暖的 372 个字形一个都没留下，而它们花的 CPU 是实打实的（约 3.3ms/字）。
+    //
+    // 判据用"这一页装得下吗"而不是"现在还有余量吗"：后者在 room==0 时恒真（见
+    // cache_headroom）。所以这里量的是 cache_headroom()，它已经是"额度 − 当前占用"。
+    //
+    // **只砍位图这一半，io 预热（ttf_warm_text_px）一个字都不动**：块缓存不受留量线
+    // 影响（128 槽常驻），实测 块722中698 = 96.7% 命中，那 698 次命中正是 io 预热
+    // 换来的 —— 砍了它，下面的绘制就退化成上百次带 lseek 的随机 4KB 读。
+    if (cache_headroom() < TTF_PAGE_BITMAP_BYTES) {
+        STATS.warm_raster_skip++;
+        return;
+    }
     pixel_height = clamp_px(pixel_height);
     const char* cursor = text;
     // 不做去重表：同一个码点第二次进来就是一次 cache_lookup 命中，比维护去重表便宜，

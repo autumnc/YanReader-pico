@@ -197,6 +197,13 @@ void ttf_body_ink_end(void);
 
 void ttf_font_cache_clear(void);
 
+/// 临时诊断（只给 reader_perf_log 那条日志用）：把**上一次调用到现在**的字形路径计数
+/// 取出来、清零并格式化一行。逐字面分开报（正文/界面/次家族/三家族），字段含义见
+/// ttf_font.c 的 ttf_face_stats_t：打包=真去取轮廓的次数、块命中=块缓存、段读/白读=
+/// 合并读把已在缓存里的块又读了一遍、位图命中=字形位图缓存、预热跳/碰=每个词那趟
+/// warm_text_io 里有多少码点因位图命中而完全不碰块缓存。末尾附 PSRAM 余量与 room。
+void ttf_perf_line(char* out, size_t n);
+
 #ifdef __cplusplus
 }
 #endif

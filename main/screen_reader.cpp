@@ -1923,6 +1923,17 @@ static bool rdPerfLogOn() {
   return g_settings.getString("reader_perf_log", "0") == "1";
 }
 
+// 临时诊断（与 ttf_perf_line 配套）：把**上一次打点到这一次**之间的字形路径计数打一行，
+// 并清零。三个阶段各打一次（空闲帧留档 / 预渲染 / 翻页那一拍），于是同一页上的三段
+// 计数可以直接对着看"哪个阶段的块读取真的没被消掉"。只在 reader_perf_log 打开时才花这
+// 点时间。定位：内嵌多字体的书翻页慢 —— 见 ttf_face_stats_t 的字段说明。
+static void rdLogFontStats(const char* what) {
+  if (!rdPerfLogOn()) return;
+  char buf[768];
+  ttf_perf_line(buf, sizeof(buf));
+  ESP_LOGI(TAG, "字形路径[%s]: %s", what, buf);
+}
+
 static bool rdPrebuildShouldYield() {
   return input_pending_key() != 0 ||
          (s_rdPrebuildDeadlineUs > 0 && esp_timer_get_time() >= s_rdPrebuildDeadlineUs);
@@ -2852,6 +2863,8 @@ static void rdPrepareAheadPages() {
     ESP_LOGI(TAG, "空闲帧留档: [%s %d]排版 %d + 字形 %d；[%s %d]排版 %d ms（-1 = 这一趟没做）",
              dir > 0 ? "下一页" : "上一页", dp, fwdLayoutMs, fwdWarmMs,
              dir > 0 ? "上一页" : "下一页", op, backLayoutMs);
+    // 这一行只剩"排版 + 字形"（翻页那一拍的绘制已在 tTailStartUs 处取过数、清了零）。
+    rdLogFontStats("留档");
   }
 }
 
@@ -3372,6 +3385,11 @@ static void rdPrerenderTurnPage(bool afterTurn = false) {
   const bool aborted = s_imgPresentSkipped;   // 图片解码被点按打断：这一趟只画了半张
   s_imgPresentSkipped = false;
   const int ms = static_cast<int>((esp_timer_get_time() - t0) / 1000);
+  // 这一趟自己的拆账。**必须在下面 restore 之前取** —— 它们正是 renderReading 刚写下的那一套
+  // （restore 是给外层的，见函数头"画完原样还回去"）。有了它，"整帧 530ms" 才能回答"贵在哪
+  // 一栏"：排版那一栏非 0 = 这一趟没吃到留档、在现读现建（那一栏就是 ~350ms 的由来）；
+  // 排版/预热都是零头而整帧仍然几百 ms = 钱花在绘制上（图片解码/滤镜，与字形无关）。
+  const int preLayoutMs = s_subLayoutMs, preWarmMs = s_subWarmMs, preHit = s_subLayoutHit;
 
   st.page = savePage;
   st.txtPage = saveTxtPage;
@@ -3395,8 +3413,15 @@ static void rdPrerenderTurnPage(bool afterTurn = false) {
   // 才敢用 memcpy 顶替绘制。
   slot->prerendered = true;
   s_preKey = key;
-  ESP_LOGI(TAG, "预渲染: [%s] 整帧 %d ms（下一拍翻%s页只剩 memcpy）", where.c_str(), ms,
+  ESP_LOGI(TAG, "预渲染: [%s] 整帧 %d ms（排版 %d + 预热 %d + 绘制 %d，%s；下一拍翻%s页只剩 memcpy）",
+           where.c_str(), ms, preLayoutMs, preWarmMs, ms - preLayoutMs - preWarmMs,
+           preHit == 1   ? "排版命中下一页留档"
+           : preHit == 2 ? "排版命中上一页留档"
+           : preHit == 3 ? "整帧命中预渲染"
+           : preHit == 4 ? "整帧命中常驻首帧"
+                         : "排版现读现建",
            dir > 0 ? "下一" : "上一");
+  rdLogFontStats("预渲染");
 }
 
 
@@ -8203,6 +8228,10 @@ void renderCurrent() {
   // 差分刷很便宜）。放在 st.dirty = 0 之后，否则会被上面那行清掉。
   if (rtPresented) st.dirty = 1;
   const int64_t tTailStartUs = esp_timer_get_time();
+  // 这一拍的**绘制**到此结束（推屏已交出去），尾部的留档/预渲染还没开始 —— 正是取"翻页这一
+  // 拍花了多少次取轮廓/读块"的干净时点。放在尾部之后取会把留档的账一起算进来（而那条日志
+  // 本来就是拆开看的：重画 / 留档 / 预渲染 各一笔）。
+  if (turn != 0 && rdPerfLogOn()) rdLogFontStats("翻页");
   // 这一帧已经推出去了，用户正盯着新页看 —— 正是把排版余量补回来的空档。
   // 但如果按键/触摸已经排队，先把控制权还给主循环；连续翻页时这 30ms 比预建更值钱。
   //
