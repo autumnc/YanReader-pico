@@ -254,6 +254,33 @@ static void use_scan_for(const EpdWaveform* waveform, enum EpdDrawMode mode) {
 // 整体错一拍：该来的黑白整刷晚一帧，或者刚清完又白闪一帧。原子化后 RMW 不丢。
 static _Atomic int s_soft_refreshes;
 
+// 「面板状态可疑」闸门 —— 推屏欠载那一趟留下的**永久残影**，只有它能收场。
+//
+// 欠载那一趟（EPD_DRAW_EMPTY_LINE_QUEUE）供数断了，被饿死的行喂的是"保持"，屏上留着
+// 上一帧的像素；而 highlevel 只在成功时才把 front_fb 抄进 back_fb（highlevel.c 那条
+// 守卫：宁可让 back_fb 保持旧的，也不能用一个假基准）。**于是面板上的实际内容已经不等于
+// back_fb，而且没有任何人知道差在哪。**
+//
+// 这条裂缝本来下一趟就能自愈 —— 只要下一趟把整屏重驱动一遍。**但差分刷的驱动范围不是
+// 从"面板实际状态"算的，是从 {front != back} 现算的**：epd_hl_update_screen/_area 每一趟
+// 都先 memset 掉 dirty_lines/dirty_columns，再由 epd_difference_image_base 重新标
+// （render.c）。于是"面板上留着旧像素、而 back 与 front 恰好一致"的那些像素**从此再也
+// 进不了任何一趟的驱动范围**，编出来正好是 (15,15)（GL16 里全保持）—— 残影永久钉在屏上。
+// 用户侧就是："前一页还没清，后页直接叠上去，而且后续再翻页仍然是这样，手动全刷一次
+// 就好了"（手动/自动全刷都是整屏全像素 GC16，每格都是完整梯子，从什么状态被丢下的都能
+// 落回目标灰度 —— 只有它能清）。
+//
+// 触发条件很紧：欠载**连着两次**（第一趟 + guard_draw_result 兜底的那记整屏 GC16 也欠载）。
+// 兜底只试一次、不成就算了 —— 这就是那条裂缝的入口。所以这里补的正是"再挂一笔账"：
+// 兜底亦欠载就置位，**下一趟刷屏不问档位、直接整屏全像素 GC16 重锚**；重锚成功就落闸，
+// 再欠载就继续挂着、再下一拍接着试（欠载是 SD/词库把供数线程挡住造成的，退开一拍正好
+// 让积压排空，比当场死磕更容易成）。
+//
+// 只在 update_display_reader 里消费：阅读模式所有推屏都经它（s_mode_refresh）。
+// 别的出口（ui_render 那一族）不消费也不清除 —— 它们照样只驱动 {front != back}，
+// 既修不了也不会更坏，把账留给下一次进阅读模式时收。
+static _Atomic bool s_ref_suspect;
+
 // 所有按 fb 刷屏的出口都经这里。GL16 必须全像素（白底补 1 帧靠它打到）。
 // 差分刷攒够 APP_GC16_EVERY 次就把这一次升为全像素 GC16：区域、fb 都不变，只换模式，
 // 屏上内容仍由 fb 决定，不会丢；全像素是为了让未变化像素也过一遍 LUT，否则压不掉灰底。
@@ -516,6 +543,23 @@ static EpdRect logical_full_screen(void) {
 
 enum EpdDrawError update_display_reader(EpdiyHighlevelState* hl, int kind) {
     enum EpdDrawError result;
+
+    // 面板状态可疑（上一趟推屏欠载、兜底那一记整屏 GC16 也欠载）→ 这一趟**不问档位**，
+    // 直接整屏全像素 GC16 重锚。理由见 s_ref_suspect：面板上留下的那部分残影不会自愈，
+    // 只有"每个像素都过一遍完整梯子"能收场，而这是阅读模式所有推屏的唯一收口。
+    //
+    // 顺手把白底那笔账取掉：重锚本身就是整屏 GC16（把面板驱到 front_fb 的目标灰度），
+    // 面板不再处于中灰，back_fb 也被 highlevel 在成功时抄成 front_fb —— 那份"参考帧是
+    // 中灰、下一趟差分要先铺白"的账已经不成立了。不取掉的话，下一趟还要白花一次整屏白。
+    // 万一这一记又欠载：guard_draw_result 会把账重新挂上，下一趟接着重锚（白底那笔账
+    // 那时也已无意义 —— 面板状态是"未知"，不是"中灰"）。
+    if (atomic_exchange(&s_ref_suspect, false)) {
+        display_take_white_exit();
+        ESP_LOGW(TAG, "参考帧可疑（上一趟推屏欠载且兜底未成）：整屏 GC16 重锚");
+        result = update_display_full(hl);
+        guard_draw_result(hl, result);
+        return result;
+    }
 
     // 白底参考帧纪律：上一帧在面板上留下了中灰（插图页/图片查看器/自检页），
     // 而这一帧要走差分刷 —— 那就是拿着中间灰当参考帧，先 GC16 铺一屏白再从白底
@@ -793,6 +837,13 @@ void guard_draw_result(EpdiyHighlevelState* hl, enum EpdDrawError result) {
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     enum EpdDrawError r2 = update_display_full(hl);
     s_soft_refreshes = 0;
-    ESP_LOGW(TAG, "line queue underrun, pclk back to %d MHz（整屏 GC16 重推 result=%d）",
-             DISPLAY_PCLK_SAFE_MHZ, (int)r2);
+    // 兜底这一记也没成 —— 面板上的内容现在**没有任何人知道**，而它不会自愈（理由见
+    // s_ref_suspect）：差分刷的驱动范围只覆盖 {front != back}，屏上那些"留着旧像素、
+    // back 却和 front 一致"的地方再也进不了任何一趟的驱动，残影永久留下。挂账，
+    // 下一趟刷屏整屏全像素 GC16 重锚。
+    const bool still_broken = (r2 & EPD_DRAW_EMPTY_LINE_QUEUE) != 0;
+    if (still_broken) atomic_store(&s_ref_suspect, true);
+    ESP_LOGW(TAG, "line queue underrun, pclk back to %d MHz（整屏 GC16 重推 result=%d%s）",
+             DISPLAY_PCLK_SAFE_MHZ, (int)r2,
+             still_broken ? "，兜底亦欠载 → 下一趟整屏重锚" : "");
 }
