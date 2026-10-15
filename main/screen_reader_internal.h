@@ -111,6 +111,11 @@ inline constexpr int RD_TOP_INSET = 28;    // 顶部留白(标题起始)，原 8
 inline constexpr int RD_BODY_TOP = 50;     // 正文起始，原 MARGIN(30)，整体下移 20px
 inline constexpr int RD_BOTTOM_INSET = 4;  // 底部留白(状态栏下方)，原 24，状态栏下移 20px
 
+// 阅读页右上角"这一页有书签"那枚实心书签（画在 [0, RD_BODY_TOP) 这条安全带里）。
+// 字形来自 NF-Propo 子集，见 scripts/subset_icon_font.py 的 BOOKMARK 组与
+// main/gfx/icon_font.h（不走字体 id 体系，直接喂给 icon_font_draw*）。
+inline constexpr uint32_t RD_ICON_BOOKMARK = 0xF00C0;   // md-bookmark（实心）
+
 // ── 阅读页底部状态栏：每一项的档位表 ────────────────────────────────────
 // 设置页（RdMode::StatusBar，screen_reader_subpages.cpp）与弹层选择
 // （screen_reader.cpp 的 openRdPick）**共用这一张**：加一项/加一档/改个标签只动
@@ -155,7 +160,7 @@ inline constexpr int kSbPickBase = 9000;
 
 // ── 阅读器状态 ──────────────────────────────────────────────────────────
 enum class RdMode {
-  Browser, Reading, Toc, Menu, LayoutMenu, Bookmarks, Footnotes, Percent, Qr, Dictionary, Weread, Wifi,
+  Browser, Reading, Toc, Menu, LayoutMenu, Footnotes, Percent, Qr, Dictionary, Weread, Wifi,
   Apps,        // 1 号根标签「应用」的图标入口页（文件管理 / 微信读书 / 字典）
   ShelfMenu, ShelfInfo, Recent, FileBrowser, Image, Opds, NetShare, DictDl, ResDl, KeyMap, StatusBar, About,
   Settings, Notes, NoteEdit, NoteDetail,
@@ -359,7 +364,13 @@ struct RdState {
   int tocSel = 0;
 
   // menu
+  // 「书签」页（RdMode::Menu）的选中**行**：行表是「书签(N) 分组行 + 本书书签子行 + 工具项」
+  // 拼出来的（见 rdBookMenuRows），所以它是行号不是条目号 —— 折叠一下行号的含义就变了。
   int menuSel = 0;
+  int menuScroll = 0;      // 该页首个可见行（行高不一，只能按行滚，同 notesScroll）
+  // 该页的分组行展开着没有。**默认展开**：这一页主要就是来看本书书签的，进来先给列表。
+  // 不持久化 —— 每次 openMenu() 重置（折叠只是这一趟里的临时动作，不新增 settings 键）。
+  bool bookMenuOpen = true;
   // 「排版设定」子菜单的选中行。和 menuSel 分开存：从子菜单退回来时父菜单的光标要落回
   // 「排版设定」那一行，两者同时有意义，共用一个变量就必然要丢一个。
   int layoutSel = 0;
@@ -419,10 +430,11 @@ struct RdState {
     std::string summary;
   };
   std::vector<RdBookmark> bookmarks;
-  int bookmarkSel = 0;
   // 书签删除的二次确认（照笔记列表 noteDelArm 那套）：长按一次挂起、再长按同一条才真删，
-  // 免得误触直接丢书签。全屏「书签」页一套、浮动菜单「笔记」tab 一套（行号是两个不同的
-  // 下标空间：前者是 st.bookmarks 的下标，后者是 st.sheetRows 的下标，不能合并）。
+  // 免得误触直接丢书签。「书签」菜单页一套、浮动菜单「笔记」tab 一套（两个不同的下标空间：
+  // 前者是 rdBookMenuRows 造出来的**行号**，后者是 st.sheetRows 的下标，不能合并）。
+  // 挂起态存的是行号而不是书签下标 —— 长按之后行表可能被重建（折叠/删除），按行号才对得上
+  // 用户眼前看到的那一行。
   bool bookmarkDelArm = false;
   int bookmarkDelIdx = -1;
   bool sheetDelArm = false;

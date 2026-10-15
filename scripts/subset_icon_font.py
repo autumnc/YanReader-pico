@@ -66,6 +66,10 @@ TABS = [0xF125F,   # md-bookshelf           书架
 # 微读图标复用 MENU 组里的 0xF05DA(book_open_page_variant)，不重复列。
 SHELF_BAR = [0xF0450]   # md-refresh   刷新（重新扫描书库）
 
+# 阅读页右上角那枚"这一页有书签"的标记 (main/screen_reader_internal.h 的 RD_ICON_BOOKMARK)。
+# 只要**实心**那一枚：没书签就是不画，不需要空心配对。
+BOOKMARK = [0xF00C0]    # md-bookmark  实心书签
+
 # 文件浏览页的浮动按钮 (main/tab_icons.h 的 FAB_ICON_*)：网络文件管理。
 # md-web 是个地球，比 wifi 图标更能说明"用浏览器打开"。
 FAB = [0xF059F]         # md-web   网络文件管理（浏览器传书）
@@ -77,7 +81,8 @@ FAB = [0xF059F]         # md-web   网络文件管理（浏览器传书）
 APPS = [0xF1AF3,        # 微信读书
         0xF1AF4]        # DeepSeek 对话
 
-CHARSET = ASCII + FULLWIDTH + STATUS + INLINE + MENU + COMMON + KEYBOARD + TABS + SHELF_BAR + FAB + APPS
+CHARSET = (ASCII + FULLWIDTH + STATUS + INLINE + MENU + COMMON + KEYBOARD + TABS +
+           SHELF_BAR + FAB + APPS + BOOKMARK)
 
 
 def main() -> int:

@@ -5977,7 +5977,7 @@ static DitherMode ditherModeOf(int idx) {
 enum class MenuAct {
   Toc, Font, FontFamily, FontWeight, Contrast, LineSpacing, ParaSpacing, Indent, Align, Margin, Image, ImageDither, ReadingLine, SelGranularity, Night,
   Orient,
-  ToggleBookmark, Bookmarks, Footnotes, FootnoteBack, Percent, Qr, LayoutMenu,
+  ToggleBookmark, Footnotes, FootnoteBack, Percent, Qr, LayoutMenu,
   Dict, DictDl, ResDl, Weread, Wifi, Opds, NetShare, KeyMap, StatusBar, About, RefreshTest, Standby, UsbDrive,
   ClockFace, ShelfStyle, RefreshStrategy, FullEvery, WhitePush, BlackPush, GhostMode, PreRender, StyleSource, EmbeddedFont, AutoStandby,
   AnnotStyle,
@@ -6017,16 +6017,33 @@ static bool currentPageHasFootnotes() {
   return page && !page->footnotes.empty();
 }
 
-static bool isCurrentBookmarked() {
+// ── 书签身份：这一条是不是"当前这一页"的 ────────────────────────────────
+// epub 的身份是 (章, 页内可见文本偏移) —— 偏移才是"重排不失效"的那把钥匙；txt/xtc 就是页号。
+// **唯一的判据**：右上角那枚图标、加、删、菜单里的「添加/删除书签」全走这里。各写一份
+// 就会出"图标说有、删除却删掉别的页"。
+static bool bmHere(const RdState::RdBookmark &b) {
   if (st.bookPath.empty()) return false;
-  uint32_t off = (st.bookKind == 0) ? currentVisibleOffset() : 0;
-  for (auto &b : st.bookmarks) {
-    if (b.path != st.bookPath || b.kind != st.bookKind) continue;
-    if (st.bookKind == 0) { if (b.spine == st.spineIndex && b.offset == off) return true; }
-    else if (b.page == curPage()) return true;
-  }
-  return false;
+  if (b.path != st.bookPath || b.kind != st.bookKind) return false;
+  if (st.bookKind != 0) return b.page == curPage();
+  if (b.spine != st.spineIndex) return false;
+  // UINT32_MAX = "这一页没有可见偏移记录"（见 RdState::pageInfoOffset 的注释）—— 它是**哨兵，
+  // 不是身份**：同一章里所有没有记录的页都会拿到同一个它，直接比它就会让这些页塌成同一个
+  // 身份，第 5 页的书签在第 9 页也亮图标、在第 9 页上滑还会把第 5 页那条删掉。所以**两边
+  // 都有真偏移才比偏移**，否则退回比页号：存哨兵的那些条目本来就只在它被创建的那一页有
+  // 意义（重排后跟不了文字走 —— 存的就是哨兵，无解），这样至少不会认错人。
+  const uint32_t off = currentVisibleOffset();
+  if (off == UINT32_MAX || b.offset == UINT32_MAX) return b.page == curPage();
+  return b.offset == off;
 }
+
+// 当前页那条书签在 st.bookmarks 里的下标；-1 = 这一页没有。
+static int curBmIdx() {
+  for (size_t i = 0; i < st.bookmarks.size(); ++i)
+    if (bmHere(st.bookmarks[i])) return static_cast<int>(i);
+  return -1;
+}
+
+static bool isCurrentBookmarked() { return curBmIdx() >= 0; }
 
 // ── 导出标注 / 书签（Markdown 落 SD）───────────────────────────────────
 // 入口在**笔记标签页**搜索栏右端的「导出」按钮上，导的是**全部书**的笔记 + 书签：
@@ -6222,17 +6239,53 @@ static std::vector<MenuItem> layoutMenuItems() {
   return m;
 }
 
-// 「书签」全屏页的条目（RdMode::Menu）。原来是阅读页正中点一下进的"阅读菜单"；现在那一指
-// 归**浮动阅读菜单**了，这一页只从浮动菜单顶栏的「书签」按钮进，所以只留与**当前这本书**
-// 有关的书签/标注操作与工具（目录/排版设定搬去浮动菜单的 tab，返回书架/返回阅读由浮动
-// 菜单的顶栏与"再点一下"承接 —— 见 plan 的入口对照表：老项一个都没少，只是换了入口）。
+// ── 折叠方框（「书签」页的分组行 + 「笔记」页的书名行共用）──────────────────
+// 右端一个方块：展开是「−」、折叠时再加一竖成「+」（两条实心矩形拼，同文件浏览器画浮标
+// 那套）。**整行都可点**，这个方块只负责画 —— 所以不需要命中函数，但标签截断要知道它
+// 左边在哪（rdFoldBtnLeft）。
+static int rdFoldBtnLeft() {
+  return g_rd.getScreenWidth() - MARGIN - uiLineHeight();
+}
+
+static void rdDrawFoldBtn(int y, int h, bool open, bool dark) {
+  const int bs = std::min(h - 8, uiLineHeight());
+  const int bx = rdFoldBtnLeft();
+  const int by = y + (h - bs) / 2;
+  g_rd.drawRect(bx, by, bs, bs, dark);
+  const int t = std::max(2, bs / 8);       // 线宽
+  const int pad = bs / 4;
+  g_rd.fillRect(bx + pad, by + bs / 2 - t / 2, bs - 2 * pad, t, dark);             // 「−」
+  if (!open) g_rd.fillRect(bx + bs / 2 - t / 2, by + pad, t, bs - 2 * pad, dark);  // 再加一竖 → 「+」
+}
+
+// ── 「书签」页（RdMode::Menu）────────────────────────────────────────────
+// 从浮动阅读菜单顶栏的「书签」按钮进。内容 = 一条**可折叠**的书签分组行（展开时挂着
+// **本书**的书签，两行一条：章名 / 位置读数）+ 若干工具项。别的书的书签在这屏任何状态下
+// 都不出现 —— 筛选只在 rdBookMenuRows 里做一次，绘制/按键/命中三路吃同一张行表。
+//
 // 系统级条目（WiFi/传书/OPDS/按键映射/状态栏/方向/待机/关于）本来就在主界面「设置」标签，
 // 这里不再重复。导出标注是**跨书**的，入口在笔记标签页搜索栏右端（见 rdExportAnnot）。
-static std::vector<MenuItem> menuItems() {
-  char buf[64];
+//
+// 为什么不用 titleListView：子行两行文字、分组行与工具项一行，**行高不一**。ui/list_view.h
+// 的头注释明确把这种列表排除在外（"没有 itemH 可言"），所以照笔记页那族写（rdNoteRowH /
+// rdNoteRowAtY / rdNotePageRows 的变行高窗口）。
+struct RdMenuRow {
+  int kind = 2;                           // 0 = 书签分组行, 1 = 书签子行, 2 = 工具项
+  int bmIdx = -1;                         // kind==1：st.bookmarks 的**全局**下标（跳转/删除要它）
+  int nkids = 0;                          // kind==0：本书书签条数（0 = 没得折叠，不画方框）
+  MenuAct act = MenuAct::ToggleBookmark;  // kind==2
+  std::string label;                      // kind==0/2（子行的两行文字现取，不进这里）
+};
+
+// 这几个定义在本文件后段（书签列表/跳转那一段）—— 这一页要用。
+static void rdBookmarkRowLines(const RdState::RdBookmark &b, std::string &l1, std::string &l2);
+static void gotoBookmark(int idx);
+static void rdDeleteBookmark(int idx);
+
+// 这一页的工具项（**不含**书签行 —— 它由 rdBookMenuRows 造）。原来是 menuItems() 的第一项，
+// 现在折叠行自己就是那一条，所以 MenuAct::Bookmarks 整个没了。
+static std::vector<MenuItem> rdBookMenuTools() {
   std::vector<MenuItem> m;
-  snprintf(buf, sizeof(buf), "书签(%d)", static_cast<int>(st.bookmarks.size()));
-  m.push_back({buf, MenuAct::Bookmarks});
   m.push_back({isCurrentBookmarked() ? "删除书签" : "添加书签", MenuAct::ToggleBookmark});
   if (currentPageHasFootnotes()) m.push_back({"脚注", MenuAct::Footnotes});
   if (st.footnoteRetValid) m.push_back({"返回脚注跳转前", MenuAct::FootnoteBack});
@@ -6242,8 +6295,162 @@ static std::vector<MenuItem> menuItems() {
   return m;
 }
 
-// 菜单列表的绘制（阅读菜单与排版子菜单共用一套几何：绘制和点按命中都从 titleListView
-// 取，两处写岔了就会"看到的行"和"点到的行"错位）。
+// 本书书签在 st.bookmarks 里的全局下标（顺序即表顺序）。路径用**精确相等**判 ——
+// 与浮动菜单「笔记」tab 的筛选同一个口径（见 rdSheetBuildRows 的 case 2）。
+static void rdBookMenuMine(std::vector<int> &out) {
+  out.clear();
+  for (int i = 0; i < static_cast<int>(st.bookmarks.size()); i++) {
+    if (st.bookmarks[i].path == st.bookPath) out.push_back(i);
+  }
+}
+
+static std::vector<RdMenuRow> rdBookMenuRows() {
+  std::vector<RdMenuRow> rows;
+  std::vector<int> mine;
+  rdBookMenuMine(mine);
+  {
+    RdMenuRow h;
+    h.kind = 0;
+    h.nkids = static_cast<int>(mine.size());
+    char buf[64];
+    snprintf(buf, sizeof(buf), "书签 (%d)", h.nkids);
+    h.label = buf;
+    rows.push_back(h);
+  }
+  if (st.bookMenuOpen) {
+    for (int idx : mine) {
+      RdMenuRow r;
+      r.kind = 1;
+      r.bmIdx = idx;
+      rows.push_back(r);
+    }
+  }
+  for (const auto &it : rdBookMenuTools()) {
+    RdMenuRow r;
+    r.kind = 2;
+    r.act = it.act;
+    r.label = it.label;
+    rows.push_back(r);
+  }
+  return rows;
+}
+
+static int rdBookMenuRowH(const RdMenuRow &r) {
+  return (r.kind == 1) ? (uiLineHeight() * 2 + 8) : (uiLineHeight() + 12);
+}
+
+// 这一页的行窗口：**总高装得下就居中**（保住短清单的观感，与「排版设定」那页一致），
+// 装不下才从 coverTop() 起排并滚动（跟着选中的行走）。绘制/命中/翻页三路共用这**一个**
+// 函数 —— 各自算就会"看到的行"和"点到的行"错位（居中与滚动两种起排点不同，最容易分家）。
+// 返回首个可见行号，它的 y 写进 *topY。
+static int rdBookMenuWindow(const std::vector<RdMenuRow> &rows, int sel, int &topY) {
+  const int n = static_cast<int>(rows.size());
+  const int top = coverTop();
+  if (n == 0) {
+    topY = top;
+    return 0;
+  }
+  int total = 0;
+  for (const auto &r : rows) total += rdBookMenuRowH(r);
+  const int avail = statusTop() - top - 8;
+  if (total <= avail) {          // 装得下：居中，不滚
+    topY = top + (avail - total) / 2;
+    return 0;
+  }
+  topY = top;
+  sel = clampI(sel, 0, n - 1);
+  st.menuScroll = clampI(st.menuScroll, 0, n - 1);
+  if (st.menuScroll > sel) st.menuScroll = sel;
+  // 向下滚到选中行完全可见为止（行高不一，只能逐行累加）。
+  while (st.menuScroll < sel) {
+    int y = top;
+    for (int i = st.menuScroll; i <= sel; i++) y += rdBookMenuRowH(rows[i]);
+    if (y <= statusTop()) break;
+    st.menuScroll++;
+  }
+  return st.menuScroll;
+}
+
+// 点按落在哪一行（返回**行号**，-1 = 没命中）。行表由调用方传进来（点按路径上要连用两次：
+// 先认行、再取行里的书签），避免每一下点按都重算一遍行表。
+static int rdBookMenuRowAtY(const std::vector<RdMenuRow> &rows, int ty) {
+  int y = 0;
+  const int first = rdBookMenuWindow(rows, st.menuSel, y);
+  for (int i = first; i < static_cast<int>(rows.size()); i++) {
+    const int h = rdBookMenuRowH(rows[i]);
+    if (ty >= y && ty < y + h) return i;
+    y += h;
+    if (y > statusTop()) break;
+  }
+  return -1;
+}
+
+// 一屏装得下几行（行高不一，只能从 from 起逐行累加）。dir > 0 向下列、dir < 0 向上列。
+static int rdBookMenuPageRows(const std::vector<RdMenuRow> &rows, int from, int dir) {
+  const int bottom = statusTop();
+  int y = coverTop(), n = 0;
+  if (dir > 0) {
+    for (int i = from; i < static_cast<int>(rows.size()); i++) {
+      y += rdBookMenuRowH(rows[i]);
+      if (y > bottom) break;
+      n++;
+    }
+  } else {
+    for (int i = from; i >= 0; i--) {
+      y += rdBookMenuRowH(rows[i]);
+      if (y > bottom) break;
+      n++;
+    }
+  }
+  return n > 0 ? n : 1;
+}
+
+static void renderMenu() {
+  g_rd.clearScreen();
+  const int w = g_rd.getScreenWidth();
+  const int lh = uiLineHeight();
+  drawTitle("书签");
+  const auto rows = rdBookMenuRows();
+  const int n = static_cast<int>(rows.size());
+  st.menuSel = clampI(st.menuSel, 0, n - 1);
+  int y = 0;
+  const int first = rdBookMenuWindow(rows, st.menuSel, y);
+  for (int i = first; i < n; i++) {
+    const int h = rdBookMenuRowH(rows[i]);
+    if (y + h > statusTop()) break;
+    const bool sel = (i == st.menuSel);
+    if (sel) g_rd.fillRect(0, y, w, h, true);
+    if (rows[i].kind == 0) {
+      // 分组行：标签要给右端的折叠方框让位，不然长标签会被方框压住。
+      const std::string lab = rows[i].nkids > 0
+                                  ? fitWidth(rows[i].label, rdFoldBtnLeft() - MARGIN - 12)
+                                  : rows[i].label;
+      drawLineText(MARGIN, y + (h - lh) / 2, lab.c_str(), !sel);
+      // 本书一条书签都没有时不画方框 —— 给了方框就是"点了不动"，比没有更糟。
+      if (rows[i].nkids > 0) rdDrawFoldBtn(y, h, st.bookMenuOpen, !sel);
+      g_rd.drawLine(MARGIN, y + h - 3, w - MARGIN, y + h - 3, true);
+    } else if (rows[i].kind == 1) {
+      // 子行两条：第一行章名、第二行位置读数（与浮动菜单「笔记」tab 同一份取数）。
+      std::string l1, l2;
+      rdBookmarkRowLines(st.bookmarks[rows[i].bmIdx], l1, l2);
+      const int maxW = w - 2 * MARGIN - 12;
+      const std::string t1 =
+          g_rd.truncatedText(uiFontId(), l1.c_str(), maxW, EpdFontFamily::REGULAR);
+      const std::string t2 =
+          g_rd.truncatedText(uiFontId(), l2.c_str(), maxW, EpdFontFamily::REGULAR);
+      drawLineText(MARGIN + 10, y + 3, t1.c_str(), !sel);
+      drawLineText(MARGIN + 10, y + 3 + lh + 2, t2.c_str(), !sel);
+    } else {
+      drawLineText(MARGIN, y + (h - lh) / 2, rows[i].label.c_str(), !sel);
+    }
+    y += h;
+  }
+  drawFooter("↑↓ 选择  Enter 展开/跳转  长按删除  Esc 返回");
+}
+
+// 等行高菜单列表的绘制（**只剩「排版设定」一屏在用**：「书签」页改成折叠行后行高不一，
+// 走 rdBookMenuRows 那套）。绘制和点按命中都从 titleListView 取，两处写岔了就会
+// "看到的行"和"点到的行"错位。
 static void rdDrawMenuList(const std::vector<MenuItem> &items, const char *title, int sel) {
   g_rd.clearScreen();
   const int w = g_rd.getScreenWidth();
@@ -6283,7 +6490,6 @@ static int rdMenuListKey(const std::vector<MenuItem> &items, int &sel, int key) 
   return clampI(sel, 0, n - 1);
 }
 
-static void renderMenu() { rdDrawMenuList(menuItems(), "书签", st.menuSel); }
 static void renderLayoutMenu() { rdDrawMenuList(layoutMenuItems(), "排版设定", st.layoutSel); }
 
 // ── 词典 ────────────────────────────────────────────────────────────────
@@ -6862,37 +7068,48 @@ static void loadBookmarks() {
   }
 }
 
-static void toggleBookmark() {
-  if (st.bookPath.empty()) return;
-  uint32_t off = (st.bookKind == 0) ? currentVisibleOffset() : 0;
-  for (auto it = st.bookmarks.begin(); it != st.bookmarks.end(); ++it) {
-    if (it->path == st.bookPath && it->kind == st.bookKind &&
-        ((st.bookKind == 0) ? (it->spine == st.spineIndex && it->offset == off) : (it->page == curPage()))) {
-      st.bookmarks.erase(it);
-      saveBookmarks();
-      return;
-    }
-  }
+// 在当前页加一条书签。**已经有了就什么都不做**（静默），返回"真的加了吗" ——
+// 阅读页的竖滑手势靠这个返回值决定要不要重画（没得可做时一个像素都不动）。
+static bool rdAddBookmarkHere() {
+  if (st.bookPath.empty()) return false;
+  if (curBmIdx() >= 0) return false;   // 判据与图标、删除同一份（见 bmHere）
   RdState::RdBookmark b;
   b.path = st.bookPath;
   b.kind = st.bookKind;
   b.spine = st.spineIndex;
-  b.offset = off;
+  b.offset = (st.bookKind == 0) ? currentVisibleOffset() : 0;
   b.page = curPage();
   b.percent = totalPages() > 1 ? static_cast<float>(curPage()) / (totalPages() - 1) : 0.0f;
   b.summary = currentPageSummary();
   st.bookmarks.push_back(b);
   saveBookmarks();
+  return true;
 }
 
-// 按下标删一条书签（长按删除的两条路——全屏「书签」页与浮动菜单「笔记」tab——共用）。
+// 删掉当前页那条书签。**没有就什么都不做**（静默），返回"真的删了吗"。
+static bool rdDeleteBookmarkHere() {
+  const int i = curBmIdx();
+  if (i < 0) return false;
+  st.bookmarks.erase(st.bookmarks.begin() + i);
+  saveBookmarks();
+  return true;
+}
+
+// 菜单里的「添加/删除书签」（handleMenu 的 MenuAct::ToggleBookmark）走这条 ——
+// 删得掉就删、删不掉就加，与拆分前的 toggleBookmark 逐值等价。菜单那条路是"换页"，
+// 加/删完照样整屏刷（调用方置 st.fullRefresh），不用这里的返回值。
+static void toggleBookmark() {
+  if (!rdDeleteBookmarkHere()) rdAddBookmarkHere();
+}
+
+// 按下标删一条书签（长按删除的两条路 —— 「书签」页与浮动菜单「笔记」tab —— 共用）。
 // 落盘走 saveBookmarks()（整表重写，与 toggleBookmark 的加/删同一个出口）。
+// **不管光标**：两个调用方各自夹自己的行游标（笔记 tab 走 rdSheetBuildRows，书签页自己夹
+// menuSel）—— 表删一条会让它们那套行号整体前移，在这里夹一个 st.bookmarks 的下标是错的。
 static void rdDeleteBookmark(int idx) {
   if (idx < 0 || idx >= static_cast<int>(st.bookmarks.size())) return;
   st.bookmarks.erase(st.bookmarks.begin() + idx);
   saveBookmarks();
-  st.bookmarkSel =
-      clampI(st.bookmarkSel, 0, std::max(0, static_cast<int>(st.bookmarks.size()) - 1));
 }
 
 // 把 epub 当前 spine 排到 target 页为止（跳转书签/脚注/百分比用）。
@@ -7333,11 +7550,8 @@ static void renderQr() {
 }
 
 // ── 书签/脚注/百分比/二维码 界面 ─────────────────────────────────────────
-// 书签 / 脚注两屏的列表几何（行高 8，居中式窗口）。渲染与点按命中共用。
-static ListView bookmarkListView() {
-  return titleListView(static_cast<int>(st.bookmarks.size()), st.bookmarkSel, uiLineHeight() + 8, statusTop());
-}
-
+// 脚注屏的列表几何（行高 8，居中式窗口）。渲染与点按命中共用。
+// （书签原来是和它并列的一屏，2026-10-15 并进「书签」页的折叠行了 —— 见 rdBookMenuRows。）
 static ListView footnoteListView() {
   return titleListView(static_cast<int>(st.footnoteNums.size()), st.footnoteSel, uiLineHeight() + 8, statusTop());
 }
@@ -7375,92 +7589,26 @@ static bool rdBookmarkSummaryIsPageOnly(const RdState::RdBookmark &b) {
          b.summary.find_first_not_of("0123456789/") == std::string::npos;
 }
 
-static void renderBookmarks() {
-  g_rd.clearScreen();
-  int w = g_rd.getScreenWidth();
-  drawTitle("书签");
-  if (st.bookmarks.empty()) {
-    drawCenteredLine(g_rd.getScreenHeight() / 2, "暂无书签");
-    drawFooter("Esc 返回");
+// 一条书签画成两行：第一行章名（拿不到就退回摘要），第二行位置读数。
+// **口径只有这一份** —— 「书签」页的子行与浮动菜单「笔记」tab 都调它（原来两边各写了一遍，
+// 改一处忘一处就会两块屏对不上）。
+static void rdBookmarkRowLines(const RdState::RdBookmark &b, std::string &l1, std::string &l2) {
+  const std::string chap = rdBookmarkChapterLabel(b);
+  char pc[24];
+  snprintf(pc, sizeof(pc), "%d%%", static_cast<int>(b.percent * 100.0f + 0.5f));
+  if (chap.empty()) {
+    l1 = b.summary.empty() ? "（书签）" : b.summary;
+    l2 = pc;
     return;
   }
-  const ListView lv = bookmarkListView();
-  int itemH = lv.itemH;
-  int maxRows = lv.rows;
-  int start = lv.first;
-  for (int i = 0; i < maxRows && start + i < static_cast<int>(st.bookmarks.size()); i++) {
-    int idx = start + i;
-    auto &b = st.bookmarks[idx];
-    // 行 = 「章节名 · 位置」：原来只有 "%d%%  12/200"，认不出是哪一章，也不够直观。
-    // 章节名打头（截断时先丢的也是尾巴，不会把"哪一章"丢掉）；接着是位置读数 ——
-    // epub 的 summary 就是"章内第几页/共几页"，和百分比是同一件事的两种写法，凑成一组
-    // "5/12  45%"；TXT 的 summary 是一段原文，跟在百分比后面。
-    const std::string chap = rdBookmarkChapterLabel(b);
-    char pct[16];
-    snprintf(pct, sizeof(pct), "%d%%", static_cast<int>(b.percent * 100.0f + 0.5f));
-    std::string text;
-    if (!b.summary.empty() && rdBookmarkSummaryIsPageOnly(b)) {
-      text = chap.empty() ? std::string() : (chap + "  ");
-      text += b.summary + "  " + pct;
-    } else {
-      if (!chap.empty()) text = chap + "  ";
-      text += pct;
-      if (!b.summary.empty()) text += "  " + b.summary;
-    }
-    const std::string line = g_rd.truncatedText(uiFontId(), text.c_str(), w - 2 * MARGIN);
-    int y = lv.top + i * itemH;
-    if (idx == st.bookmarkSel) { g_rd.fillRect(0, y, w, itemH, true); drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, line.c_str(), false); }
-    else drawLineText(MARGIN, y + (itemH - uiLineHeight()) / 2, line.c_str(), true);
-  }
-  drawFooter("↑↓ 选择  Enter 跳转  长按删除  Esc 返回");
-}
-
-static void handleBookmarks(int key) {
-  int n = static_cast<int>(st.bookmarks.size());
-  if (key == 0x1B) {
-    st.mode = RdMode::Menu;
-    st.bookmarkDelArm = false;
-    st.fullRefresh = true;
-    st.dirty = 1;
-    return;
-  }
-  if (key == KEY_TOUCH_LONG) {  // 长按 = 删除（二次确认，误触不至于直接丢书签）
-    // 删哪一条必须**按落点认**，不能按 st.bookmarkSel —— 长按的行不一定就是光标那一行。
-    const bool armed = st.bookmarkDelArm;
-    const int armedIdx = st.bookmarkDelIdx;
-    st.bookmarkDelArm = false;
-    st.bookmarkDelIdx = -1;
-    int x, y;
-    if (!input_tap_xy(&x, &y)) { st.dirty = 1; return; }
-    const int row = listViewHitAt(bookmarkListView(), y);
-    if (row < 0 || row >= n) { st.dirty = 1; return; }
-    st.bookmarkSel = row;
-    if (armed && armedIdx == row) {
-      rdDeleteBookmark(row);
-      rdShowFloat("已删除书签", "", 2000);
-    } else {
-      st.bookmarkDelArm = true;
-      st.bookmarkDelIdx = row;
-      rdShowFloat("再长按一次删除该书签", "", 3000);
-    }
-    st.dirty = 1;
-    return;
-  }
-  st.bookmarkDelArm = false;  // 按别的键 = 撤销删除的挂起态
-  if (n == 0) return;
-  {  // 上下/翻页在 ui/list_view.h（与 renderBookmarks 共用同一个几何）
-    ListView lv = bookmarkListView();
-    if (listViewKey(lv, key)) { st.bookmarkSel = lv.sel; st.dirty = 1; return; }
-  }
-  if (key == '\n') {
-    int x, y;
-    if (input_tap_xy(&x, &y)) {
-      const int row = listViewHitAt(bookmarkListView(), y);
-      if (row >= 0) st.bookmarkSel = row;
-    }
-    gotoBookmark(st.bookmarkSel);
-    st.dirty = 1;
-    return;
+  l1 = chap;
+  // epub 的 summary 是"章内第几页/共几页"，和百分比凑成一组；TXT 的 summary 是一段原文，
+  // 跟在百分比后面（见 rdBookmarkSummaryIsPageOnly）。
+  if (!b.summary.empty() && rdBookmarkSummaryIsPageOnly(b)) {
+    l2 = b.summary + "  " + pc;
+  } else {
+    l2 = pc;
+    if (!b.summary.empty()) l2 += "  " + b.summary;
   }
 }
 
@@ -7626,6 +7774,21 @@ static int fullRefreshEvery() {
 }
 // 自上次全刷以来推过的阅读页数（只数阅读页翻页，菜单/列表不算）。
 static int s_pagesSinceFull = 0;
+
+// 这一帧是"快捷书签帧"（阅读页竖滑加/删书签，见 handleReading 里那一段）。给这一帧单开一条
+// 刷新档位：底下的正文一个像素没动、只在右上角多了（或少了）一个图标，与浮动菜单帧同类 ——
+// 不能走翻页那条自适应分档，更不能替"全刷频率 N 页"记账（连点五下不该吃一次整屏闪）。
+// 由 renderCurrent 开头读后清（那一条早退会提前 return，在末尾清会把标志漂到下一帧）。
+static bool s_bmFrame = false;
+
+// 这一拍这一下是**触屏竖滑**（不是 BLE 翻页器 / 蓝牙键盘 / 电容键产生的同名翻页键）。
+// 与 s_vk_incr_ok 同样在 screen_reader_handle 开头每拍清一次 —— 跨拍留着的话，下一次
+// 实体键的 PAGE_UP 会被当成触屏下滑、把翻页变成加书签。
+// 为什么非要这个标志：`input_press_xy()` 是**读后清除**的（hw/input.h），而"T9 候选面板
+// 竖滑"那一段对**每一个**竖滑键帧都已经调过它（即使面板没吃这个键、rdVkSwipeScroll 返回
+// false，按下点也已经被吃掉），所以 handleReading 里再读恒为 false。只能在那一处顺手记。
+// 触屏才有按下点，实体键天然读不到 —— 这正是区分两种来源的依据。
+static bool s_touchVertSwipe = false;
 
 // ── 白推帧数（设置 → 白推帧数）────────────────────────────────────────────
 // 局刷残影的那个旋钮，改的是波形表里「不变的白底」（15→15）挂几相白推。
@@ -7916,12 +8079,58 @@ static int rdPushWait() {
   return s_pushMs;
 }
 
+// 阅读页右上角那枚"这一页有书签"的实心书签。**浮层，不是正文层的像素** —— 必须画在
+// rdHoldCapture() 之后：常驻首帧与预渲染备页存的都是"这一页干净的样子"，图标一旦进正文层
+// 就会被烤进去，而它们的失效键（rdHoldKey / s_preKey）都不知道"这一页有没有书签"，
+// 于是"滑一下加书签，贴回来的还是旧像素、图标不出现"，且 rdHoldCapture 又把旧像素按同一个
+// 键重存一遍 → 过期状态粘住，要翻一页才自愈。画成浮层 = 留档里永远只有干净正文页，
+// 一处失效逻辑都不用加。
+//
+// 位置锚的是**屏**不是正文栏：顶部安全带 [0, RD_BODY_TOP) 本来就空着（阅读页没有顶栏，
+// 页眉在屏底），将来改页边距档位它也不跟着跑。右缘与状态栏右侧组同一列（w - MARGIN）。
+// 画在 rdSheetDraw 之前：浮动菜单顶上那张卡（sheetTopCardBox）盖得住它，菜单开着时
+// 不必另加判断。画在 applyNightMode 之前：夜间反色会连着图标一起反，黑底白书签。
+static void rdDrawBookmarkMark() {
+  if (st.mode != RdMode::Reading) return;
+  if (st.selActive) return;   // 选字的反白/手柄/动作浮层画在正文层里，别跟它们叠
+  // 偏移**只认渲染时顺手采下的那份缓存**（RdState::pageInfo*）。这一句是**每帧**跑的，
+  // 而 currentVisibleOffset() 在缓存未命中时会开 section 文件读偏移 LUT
+  // （Section::getVisibleTextOffsetForPage）—— 落到"页没读出来"的残局里就是每帧一次 SD 读。
+  // 缓存没热就不画：下一帧页面画出来了自然对上（正常路径下 renderEpubPage / 留档回贴都会
+  // 顺手把这两格填上，所以真跳过的基本只有异常帧）。txt/xtc 的身份是页号，没有这回事。
+  if (st.bookKind == 0 && !pageInfoCached()) return;
+  if (!isCurrentBookmarked()) return;
+  // 子集里没有这枚字形（main/assets/icon_font.ttf 没重生成）时不画，并只报一次 ——
+  // icon_font_draw_sized 的 missing 分支是**每次调用**一条 ESP_LOGW，每帧刷屏。
+  if (!icon_font_is_icon(RD_ICON_BOOKMARK)) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      ESP_LOGW(TAG, "书签图标 0x%X 不在字体子集里（scripts/subset_icon_font.py 没重跑？）",
+               (unsigned)RD_ICON_BOOKMARK);
+    }
+    return;
+  }
+  uint8_t *fb = g_rd.getFrameBuffer();   // **现取**：预渲染那几路也是 memcpy 进这一块
+  if (fb == nullptr) return;
+  // 大小取安全带高的 3/5（50 → 30），与标签栏图标（56 / 84）同一比例。**不跟 uiLineHeight()
+  // 跑**：那个随用户选的界面字号变，一枚"这页有书签"的标记没有理由跟着改大小。
+  const int px = RD_BODY_TOP * 3 / 5;
+  icon_font_draw_sized(fb, g_rd.getScreenWidth() - MARGIN - px, (RD_BODY_TOP - px) / 2,
+                       px, px, RD_ICON_BOOKMARK, /*invert=*/false, px);
+}
+
 void renderCurrent() {
   rdPinShimFb();
   // 一帧分两段计时：**重画**（排版命中 + 字形栅格化 + 绘制，到推屏调用为止）与
   // **推屏**（面板扫描的墙钟）。翻页那一帧收尾会打一行拆开的耗时 —— 用户读到的
   // "按下去卡一下"是前者，"屏多久变完"是后者，混在一个总数里就没法判断该往哪边使劲。
   const int64_t tDrawStartUs = esp_timer_get_time();
+  // 快捷书签帧标志：**在开头**读后清。下面"图片解码被打断"那条会提前 return（它自己置
+  // st.dirty=1 让下一帧重画），在末尾清的话标志会漂到下一帧，把一次正常翻页误判成书签帧。
+  // 宁可丢一次（那一帧不推屏、下一帧照原样重来）也不误判。
+  const bool bmFrame = s_bmFrame;
+  s_bmFrame = false;
   // 虚拟键盘增量帧：这一拍只有键盘面板变了，上半屏一个像素都不用重画
   // （帧缓冲里留着的就是上一帧的内容，本来也该是它）。见 s_vk_incr_ok。
   const bool vkIncr = s_vk_incr_ok && !s_vkFullDrawReq && st.vkVisible && !st.fullRefresh &&
@@ -7941,7 +8150,6 @@ void renderCurrent() {
     case RdMode::Toc: renderToc(); break;
     case RdMode::Menu: renderMenu(); break;
     case RdMode::LayoutMenu: renderLayoutMenu(); break;
-    case RdMode::Bookmarks: renderBookmarks(); break;
     case RdMode::Footnotes: renderFootnotes(); break;
     case RdMode::Percent: renderPercent(); break;
     case RdMode::Qr: renderQr(); break;
@@ -7992,6 +8200,8 @@ void renderCurrent() {
   // 常驻首帧：正文层刚画完、下面那些浮层还没叠上来，此刻帧缓冲里正是"这一页干净的样子"，
   // 存一份下来（切模式回来那一拍 memcpy 顶替绘制，见 rdHoldCapture）。
   rdHoldCapture();
+  // 右上角那枚书签标记：浮层的第一笔（为什么必须在这儿见 rdDrawBookmarkMark 的说明）。
+  rdDrawBookmarkMark();
   // 浮动阅读菜单的两张卡：也是"盖在正文页上的一层"，与脚注弹注同一层。**必须画在
   // rdHoldCapture 之后**（否则会被烤进常驻首帧，之后每次开菜单都贴出上一次的卡）、
   // **drawFootnotePopup 之前**（脚注弹注与档位弹层要能盖在卡上）。
@@ -8076,11 +8286,12 @@ void renderCurrent() {
   HalDisplay::RefreshMode m;
   if (st.fullRefresh) {
     m = HalDisplay::FULL_REFRESH;          // 进入新界面首帧：清掉上一屏的残影
-  } else if (sheetVisible()) {
+  } else if (sheetVisible() || bmFrame) {
     // 浮动阅读菜单帧：浮层底下的正文一个像素没动，只有两张卡在变 —— 与脚注弹注同类。
+    // 快捷书签帧（s_bmFrame）走同一条：底下正文也一个像素没动，只在右上角多了/少了一枚图标。
     // 档位固定取正文表 GRAY8_TEXT（30 相、不闪，比 GL16 的 37 相省约 80ms），**不采样
-    // 分档、不累计、不动 s_pagesSinceFull** —— 开合菜单不是翻页，不能替"全刷频率 N 页"
-    // 那本账 +1（否则设了 5 页的人开合五次菜单就来一次整屏黑白闪）。
+    // 分档、不累计、不动 s_pagesSinceFull** —— 开合菜单不是翻页、加删书签也不是，
+    // 不能替"全刷频率 N 页"那本账 +1（否则设了 5 页的人开合五次菜单就来一次整屏黑白闪）。
     // 上面那个 `st.mode == RdMode::Reading` 的块（:7018）已经量过 frameChange 并把
     // s_prevSample 推成了当前帧（菜单帧的模式就是 Reading，条件必然成立），所以这里
     // 不必、也不该再采一次 —— 再采一次等于拿当前帧与自己比，白白扫一遍帧缓冲。
@@ -8461,14 +8672,20 @@ static void handleBrowser(int key) {
   }
 }
 
-// 「书签」全屏页（RdMode::Menu）。原来是阅读页正中点一下进的"阅读菜单"，现在那一指归
-// 浮动菜单了；这一页只从浮动菜单顶栏的「书签」按钮进，条目见 menuItems()（本书签列表 +
-// 工具）。进来时先收掉浮动菜单，Esc 一路回阅读页（不再是"菜单还开着"）。
+// 「书签」页（RdMode::Menu）。原来是阅读页正中点一下进的"阅读菜单"，现在那一指归
+// 浮动菜单了；这一页只从浮动菜单顶栏的「书签」按钮进，内容见 rdBookMenuRows（一条可折叠
+// 的本书书签行 + 工具）。进来时先收掉浮动菜单，Esc 一路回阅读页（不再是"菜单还开着"）。
 static void openMenu() {
   st.sheetOpen = false;
   st.sheetReturn = false;
   st.mode = RdMode::Menu;
   st.menuSel = 0;
+  st.menuScroll = 0;
+  // 折叠态**不持久化**：每次进来都回到展开（这一页主要就是来看本书书签的），折叠只是
+  // 这一趟里的临时动作 —— 也因此不必新增 settings 键。
+  st.bookMenuOpen = true;
+  st.bookmarkDelArm = false;
+  st.bookmarkDelIdx = -1;
   st.fullRefresh = true;
   st.dirty = 1;
 }
@@ -9380,6 +9597,22 @@ static void handleReading(int key) {
   // 双击左右电容键 = 跳上/下一章（由 main.cpp 的电容键双击分支产生）。
   if (key == KEY_NEXT_CHAPTER) { jumpChapter(+1); return; }
   if (key == KEY_PREV_CHAPTER) { jumpChapter(-1); return; }
+  // ── 阅读页竖滑 = 快捷书签（下滑 = 加、上滑 = 删）──────────────────────────
+  // 只认**触屏**竖滑（s_touchVertSwipe，见它的说明）：BLE 翻页器与蓝牙键盘也产
+  // KEY_PAGE_UP/DOWN，不区分就等于把实体翻页键改成了书签键。
+  // 命中就**整下吃掉**：不管有没有真加上/删掉，也不退回翻页（用户拍定"静默不做"——
+  // 已经加过还下滑、本来就没有还上滑，都一个像素都不动、一次刷新都不花）。
+  // 加/删的实时反馈就是右上角那枚实心书签本身（出现/消失），不发浮动提示。
+  if (s_touchVertSwipe && (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN)) {
+    s_touchVertSwipe = false;
+    const bool add = (key == KEY_PAGE_UP);   // 手指下滑 → dy>0 → KEY_PAGE_UP（hw/input.cpp）
+    const bool changed = add ? rdAddBookmarkHere() : rdDeleteBookmarkHere();
+    if (changed) {
+      st.dirty = 1;
+      s_bmFrame = true;   // 浮层只多了/少了一枚图标，走菜单帧那条固定档位（见 renderCurrent）
+    }
+    return;
+  }
   if (key == KEY_UP || key == KEY_LEFT || key == KEY_PAGE_UP) { turnBook(-1); return; }
   if (key == KEY_DOWN || key == KEY_RIGHT || key == KEY_PAGE_DOWN) { turnBook(+1); return; }
   if (key == KEY_HOME) { gotoBookStart(); return; }
@@ -9650,11 +9883,6 @@ static void doMenuAction(MenuAct act) {
       toggleBookmark();
       st.fullRefresh = true;
       break;
-    case MenuAct::Bookmarks:
-      st.bookmarkSel = 0;
-      st.mode = RdMode::Bookmarks;
-      st.fullRefresh = true;
-      break;
     case MenuAct::LayoutMenu:
       // 排版子菜单：只是换个列表画，动作还是上面那一批 case，底下不用加任何东西。
       st.layoutSel = 0;
@@ -9854,12 +10082,87 @@ static void doMenuAction(MenuAct act) {
 }
 
 static void handleMenu(int key) {
+  // 长按删除的挂起态：除了"接着再长按一次"，任何别的按键都撤销它（同笔记列表/浮动菜单那套）。
+  if (key != KEY_TOUCH_LONG) {
+    st.bookmarkDelArm = false;
+    st.bookmarkDelIdx = -1;
+  }
+  auto rows = rdBookMenuRows();
+  const int n = static_cast<int>(rows.size());
+
+  if (key == KEY_TOUCH_LONG) {
+    // 长按 = 删除本书书签（二次确认，误触不至于直接丢）。删哪一条必须**按落点认**，
+    // 不能按 st.menuSel —— 长按的那一行不一定就是光标那一行。
+    const bool armed = st.bookmarkDelArm;
+    const int armedIdx = st.bookmarkDelIdx;
+    st.bookmarkDelArm = false;
+    st.bookmarkDelIdx = -1;
+    int x = 0, y = 0;
+    const int row = input_tap_xy(&x, &y) ? rdBookMenuRowAtY(rows, y) : -1;
+    if (row < 0 || rows[row].kind != 1) {
+      // 落在子行之外：保持这一页**老的长按语义（=返回）**。这一页原来长按哪儿都是回阅读页
+      // （长按在上游被展平成 Esc），加了书签子行之后别让其余位置把手势吞掉。
+      st.mode = RdMode::Reading;
+      st.fullRefresh = true;
+      st.dirty = 1;
+      return;
+    }
+    if (armed && armedIdx == row) {
+      rdDeleteBookmark(rows[row].bmIdx);
+      const auto after = rdBookMenuRows();   // 行表跟着 st.bookmarks 变，光标按新行数夹一下
+      st.menuSel = clampI(st.menuSel, 0, std::max(0, static_cast<int>(after.size()) - 1));
+      rdShowFloat("已删除书签", "", 2000);
+    } else {
+      st.bookmarkDelArm = true;
+      st.bookmarkDelIdx = row;
+      rdShowFloat("再长按一次删除该书签", "", 3000);
+    }
+    st.dirty = 1;
+    return;
+  }
+
   if (key == 0x1B) { st.mode = RdMode::Reading; st.fullRefresh = true; st.dirty = 1; return; }
-  auto items = menuItems();
-  const int row = rdMenuListKey(items, st.menuSel, key);
-  if (row < 0) return;
-  st.retMode = RdMode::Menu;  // 从这里进的子界面，Esc 回阅读菜单
-  doMenuAction(items[row].act);
+
+  if (key == KEY_UP || key == KEY_DOWN) {
+    st.menuSel = clampI(st.menuSel + (key == KEY_DOWN ? 1 : -1), 0, n - 1);
+    st.dirty = 1;
+    return;
+  }
+  // 触摸上下滑 = 整页翻（与其余列表同一条规矩）。整表一屏放得下就没得翻，吃掉这一划。
+  if (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+    if (n > 0 && rdBookMenuPageRows(rows, 0, +1) < n) {
+      const int dir = (key == KEY_PAGE_DOWN) ? +1 : -1;
+      st.menuSel =
+          clampI(st.menuSel + dir * rdBookMenuPageRows(rows, st.menuSel, dir), 0, n - 1);
+    }
+    st.dirty = 1;
+    return;
+  }
+  if (key != '\n') return;
+
+  int x = 0, y = 0;
+  int row = st.menuSel;
+  if (input_tap_xy(&x, &y)) {
+    const int hit = rdBookMenuRowAtY(rows, y);
+    if (hit >= 0) row = hit;   // 点哪行就确认哪行，不用先上下移到它
+  }
+  if (row < 0 || row >= n) return;
+  if (rows[row].kind == 0) {          // 分组行：整行可点，切展开/折叠
+    if (rows[row].nkids == 0) return;  // 没得折（本书一条书签都没有）
+    st.bookMenuOpen = !st.bookMenuOpen;
+    // 行号是屏幕位置，展开会把后面所有行整体下移，保住旧值等于让光标跳到别处去
+    // （同 rdNoteToggleBook）。分组行恒是 0 号，所以重锚就是回 0。
+    st.menuSel = 0;
+    st.dirty = 1;
+    return;
+  }
+  if (rows[row].kind == 1) {          // 子行：跳到那一页（gotoBookmark 自己把 mode 置回阅读页）
+    gotoBookmark(rows[row].bmIdx);
+    return;
+  }
+  st.menuSel = row;
+  st.retMode = RdMode::Menu;  // 从这里进的子界面，Esc 回这一页
+  doMenuAction(rows[row].act);
   st.dirty = 1;
 }
 
@@ -10629,24 +10932,9 @@ static void rdSheetBuildRows() {
         RdSheetRow r;
         r.level = 0;  // 0 = 书签
         r.idx = i;
-        // 第一行 = 章节名（拿不到就退回摘要），第二行 = 位置读数 —— 与全屏书签页同一个
-        // 口径（见 rdBookmarkChapterLabel / rdBookmarkSummaryIsPageOnly）：epub 的
-        // summary 是"章内第几页/共几页"，和百分比凑成"5/12  45%"；TXT 是"45%  原文"。
-        const std::string chap = rdBookmarkChapterLabel(b);
-        char pc[24];
-        snprintf(pc, sizeof(pc), "%d%%", static_cast<int>(b.percent * 100.0f + 0.5f));
-        if (chap.empty()) {
-          r.label = b.summary.empty() ? "（书签）" : b.summary;
-          r.value = pc;
-        } else {
-          r.label = chap;
-          if (!b.summary.empty() && rdBookmarkSummaryIsPageOnly(b)) {
-            r.value = b.summary + "  " + pc;
-          } else {
-            r.value = pc;
-            if (!b.summary.empty()) r.value += "  " + b.summary;
-          }
-        }
+        // 第一行 = 章名、第二行 = 位置读数。「书签」页的书签子行是**同一份**取数
+        // （rdBookmarkRowLines），别在这儿再写一遍 —— 两块屏对不上就是这么来的。
+        rdBookmarkRowLines(b, r.label, r.value);
         st.sheetRows.push_back(r);
       }
       for (int i = 0; i < static_cast<int>(st.notes.size()); i++) {
@@ -10983,7 +11271,7 @@ static bool rdSheetHandle(int key) {
       if (i == 0) {  // 返回 → 书架
         rdSheetClose();
         gotoBookshelf();
-      } else if (i == 1) {  // 书签 → 全屏的书签/工具页（RdMode::Menu，见 menuItems）
+      } else if (i == 1) {  // 书签 → 「书签」页（RdMode::Menu，见 rdBookMenuRows）
         openMenu();  // 它自己收掉浮动菜单并置 sheetReturn=false（Esc 回阅读页）
       } else {  // 设置 → 阅读模式的系统设置
         rdSheetClose();
@@ -11468,7 +11756,7 @@ static void handleDict(int key) {
     st.vkVisible = false;
     // 从「应用」标签的字典图标进来的，Esc 回那一页；其余入口（长按选词 → 查字典、
     // 阅读菜单 → 查词典）都从**阅读页**出发，就回阅读页。
-    // 原先其余一律回 RdMode::Menu —— 而 Menu 就是那个全屏的「书签」页（见 menuItems），
+    // 原先其余一律回 RdMode::Menu —— 而 Menu 就是那个「书签」页（见 rdBookMenuRows），
     // 所以查完字典一按退出会被丢进书签界面，而不是回到刚才读的那一页。
     if (st.retMode == RdMode::Apps) {
       st.mode = RdMode::Apps;
@@ -11628,23 +11916,8 @@ static int rdNoteRowH(const RdNoteRow &r) {
   return (r.noteIdx < 0) ? (uiLineHeight() + 10) : (uiLineHeight() * 2 + 8);
 }
 
-// 分组行右端的展开/折叠按钮：一个方块，展开时是「−」、折叠时是「+」（两条实心矩形拼，
-// 同文件浏览器画浮标那套）。**整行都可点**，这个方块只负责画——所以不需要命中函数，
-// 但标签截断要知道它左边在哪（rdNoteFoldBtnLeft）。
-static int rdNoteFoldBtnLeft() {
-  return g_rd.getScreenWidth() - MARGIN - uiLineHeight();
-}
-
-static void rdDrawFoldBtn(int y, int h, bool open, bool dark) {
-  const int bs = std::min(h - 8, uiLineHeight());
-  const int bx = rdNoteFoldBtnLeft();
-  const int by = y + (h - bs) / 2;
-  g_rd.drawRect(bx, by, bs, bs, dark);
-  const int t = std::max(2, bs / 8);       // 线宽
-  const int pad = bs / 4;
-  g_rd.fillRect(bx + pad, by + bs / 2 - t / 2, bs - 2 * pad, t, dark);             // 「−」
-  if (!open) g_rd.fillRect(bx + bs / 2 - t / 2, by + pad, t, bs - 2 * pad, dark);  // 再加一竖 → 「+」
-}
+// 折叠方框（rdFoldBtnLeft / rdDrawFoldBtn）搬去了文件前段的「书签」页那一节 —— 两个页面
+// 共用它，放在第一次用到的地方，别在这儿再定义一份。
 
 // 点按落在哪一行（返回**行下标**，-1 = 没命中）。行表由调用方传进来（点按路径上要连用
 // 两次：先认行、再取行里的笔记），避免每一下点按都重算一遍分组。
@@ -11731,7 +12004,7 @@ static void renderNotes() {
       // 分组行就是书名，同样交给用户字体（理由与状态栏一致）。标签要给右端的折叠
       // 按钮让位，不然长书名会被按钮压住。
       const bool open = rdNoteBookOpen(rows[i].bookKey);
-      const std::string lab = fitWidth(rows[i].label, rdNoteFoldBtnLeft() - MARGIN - 12);
+      const std::string lab = fitWidth(rows[i].label, rdFoldBtnLeft() - MARGIN - 12);
       drawLineText(MARGIN, y + 4, lab.c_str(), !sel, uiFontId());
       rdDrawFoldBtn(y, h, open, !sel);
       g_rd.drawLine(MARGIN, y + h - 3, w - MARGIN, y + h - 3, true);
@@ -12763,11 +13036,10 @@ static void rdSaveReturnPoint() {
   const bool hasBook = st.bookKind >= 0 && !st.bookPath.empty();
   switch (st.mode) {
     case RdMode::Reading:     r.mode = RdMode::Reading; break;
-    // 目录 / 书签 / 百分比定位都是"依附于当前书"的界面：重建路径与阅读页完全相同
+    // 目录 / 百分比定位都是"依附于当前书"的界面：重建路径与阅读页完全相同
     // （重开那本书 + 跳回原页），只是最后停在的界面不同，所以原样记下来。
-    // 选中行（tocSel / bookmarkSel）本来就在 st 静态里，退出时没被清，回来直接续上。
+    // 选中行（tocSel）本来就在 st 静态里，退出时没被清，回来直接续上。
     case RdMode::Toc:         r.mode = RdMode::Toc; break;
-    case RdMode::Bookmarks:   r.mode = RdMode::Bookmarks; break;
     case RdMode::Percent:     r.mode = RdMode::Percent; break;
     case RdMode::Recent:      r.mode = RdMode::Recent; break;
     case RdMode::FileBrowser: r.mode = RdMode::FileBrowser; break;
@@ -12798,9 +13070,9 @@ static void rdRestoreReturnPoint() {
   const RdReturn r = s_return;
 
   // 有书：重开后跳回原来的章节/页。跳页复用书签那套 buildToPage。
-  // 目录/书签/百分比定位依附于当前书，走同一条重建路径，只是最后停的界面交给 r.mode。
+  // 目录/百分比定位依附于当前书，走同一条重建路径，只是最后停的界面交给 r.mode。
   const bool needBook = r.mode == RdMode::Reading || r.mode == RdMode::Toc ||
-                        r.mode == RdMode::Bookmarks || r.mode == RdMode::Percent;
+                        r.mode == RdMode::Percent;
   if (needBook && r.bookKind >= 0 && !r.bookPath.empty() &&
       openBook(r.bookPath, r.bookKind)) {
     if (r.bookKind == 0) {
@@ -12812,8 +13084,6 @@ static void rdRestoreReturnPoint() {
       rdTraceMark("buildToPage(逐页排到目标页)");
       // 目录选中行夹一下界就够（条目本身按书重建，行号在原书里没变）。
       if (st.epub) st.tocSel = clampI(st.tocSel, 0, std::max(0, st.epub->getTocItemsCount() - 1));
-      st.bookmarkSel = clampI(st.bookmarkSel, 0,
-                              std::max(0, static_cast<int>(st.bookmarks.size()) - 1));
     } else if (r.bookKind == 1) {
       st.txtPage = clampI(r.txtPage, 0, std::max(0, totalPages() - 1));
     } else if (r.bookKind == 2) {
@@ -13135,6 +13405,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 一拍只认**这一拍**里 vkTap 设下的"可以走增量帧"。跨拍留着的话，中途任何别的
   // 状态变化（另一次分发改的东西）都会被那面"只重画键盘"的旗子瞒过去。
   s_vk_incr_ok = false;
+  s_touchVertSwipe = false;   // 同上，每拍清一次（见 s_touchVertSwipe）
 
   // 虚拟键盘"上屏刷法=快"欠下的正文那块：停手到点就在这儿坐实（区域 GC16，约 336ms）。
   // **放在所有早退之前**：下面还有两条 VK 滑动早退（候选行横划/面板竖滑）和一个
@@ -13275,14 +13546,16 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
                       : (right ? KEY_UP : KEY_DOWN);   // 其它界面照旧
   }
 
-  // 触摸长按：阅读页（选词/标注）、笔记列表（删除）、书签列表（删除）、文件浏览器
-  // （弹上下文菜单）、书架（弹出菜单并锁定长按的那一本）、WiFi 管理（长按某一行弹
+  // 触摸长按：阅读页（选词/标注）、笔记列表（删除）、「书签」页（长按书签行删除）、
+  // 文件浏览器（弹上下文菜单）、书架（弹出菜单并锁定长按的那一本）、WiFi 管理（长按某一行弹
   // 连接/断开/忘记菜单）要拿到原始长按键——只有原始键才带落点（input_tap_xy），
-  // 展平成 0x1B 就分不出"长按的是哪一条"了。其余界面保持"长按=返回"的老语义。
-  // 文件菜单/重命名/详情这三个界面里的长按仍按 Esc 处理（取消），所以只在
-  // FileBrowser / Browser 这两处放行。
+  // 展平成 0x1B 就分不出"长按的是哪一条"了。其余界面保持"长按=返回"的老语义 ——
+  // 这一串之外**一个都不许加**：每加一个就少一个"长按返回"，所以只放行真的按落点办事的。
+  // 文件菜单/重命名/详情这三个界面里的长按仍按 Esc 处理（取消），所以不在这一串里。
+  // （「书签」页只在**书签子行**上把长按当删除，其余位置 handleMenu 自己还原成"返回"，
+  //   所以放行它不会丢掉这一页原来的长按语义。）
   if (key == KEY_TOUCH_LONG && st.mode != RdMode::Reading && st.mode != RdMode::Notes &&
-      st.mode != RdMode::Bookmarks && st.mode != RdMode::FileBrowser &&
+      st.mode != RdMode::Menu && st.mode != RdMode::FileBrowser &&
       st.mode != RdMode::Browser && st.mode != RdMode::Stats && st.mode != RdMode::Wifi)
     key = 0x1B;
 
@@ -13305,14 +13578,20 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
     int px = 0, py = 0;
     const bool next = (key == KEY_DOWN || key == KEY_PAGE_DOWN);
-    if (input_press_xy(&px, &py) &&
-        rdVkSwipeScroll(px, py, next ? +1 : -1)) {
+    // 按下点**先取下来**再判面板吃不吃（原来写在 if 的条件里，面板不吃时那个点就白丢了，
+    // 而 handleReading 里的快捷书签手势只认触屏 —— 它读的就是这个点，见 s_touchVertSwipe）。
+    const bool fromTouch = input_press_xy(&px, &py);
+    if (fromTouch && rdVkSwipeScroll(px, py, next ? +1 : -1)) {
       // 面板整块换内容，和点开面板/换读音一样走全刷（局刷的残影在宫格线上最明显）。
       st.fullRefresh = true;
       st.dirty = 1;
       renderCurrent();
       return APP_READER;
     }
+    // 触屏竖滑的翻页键：记下"这一下是手划的"。只认 PAGE_*，因为触摸竖滑产生的就是
+    // 这两位（KEY_UP/DOWN 是**别的**来源：BLE 翻页器、键盘，或者上面 selActive 那几屏
+    // 的回退）；点按不会产生翻页键，所以 fromTouch 与 PAGE_* 同时成立 = 竖滑。
+    if (fromTouch && (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN)) s_touchVertSwipe = true;
   }
 
   // 触摸上下滑的翻页键（KEY_PAGE_UP/DOWN，主循环不再替阅读模式回退成单步）：
@@ -13348,7 +13627,6 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     case RdMode::Toc: handleToc(key); break;
     case RdMode::Menu: handleMenu(key); break;
     case RdMode::LayoutMenu: handleLayoutMenu(key); break;
-    case RdMode::Bookmarks: handleBookmarks(key); break;
     case RdMode::Footnotes: handleFootnotes(key); break;
     case RdMode::Percent: handlePercent(key); break;
     case RdMode::Qr: handleQr(key); break;
