@@ -1045,6 +1045,12 @@ struct RdWordHit {
 struct RdPageText {
   std::vector<RdWordHit> words;   // 阅读顺序：行序 → 行内词序
   std::vector<int> lineFirst;     // 每行首个词的下标，末尾补 words.size()
+  // 每行的**基线** y（与"行"一一对应：长度 = lineFirst.size() - 1，末尾**不**补）。
+  // 为什么不让阅读线自己从词表推：空行（TXT 的空行、段距补出来的那一行）没有任何词，
+  // lineFirst 对它只能给出首尾相等，事后反推只能靠"上一行 + 标称行距"——连着两个空行
+  // 或者空行后面跟着段距就反推不出来。排版那一刻这个 y 是现成的（PageLine::yPos 加上
+  // ascender / TXT 的 y 推进），顺手存一份最省事也最准。
+  std::vector<int> lineBase;
   // 每个词条所属的**段落块**编号（与 words 等长）。EPUB 用 Block 的同一性，TXT 用空行/
   // 首行缩进切。只被"按段落"选字用；其它粒度不看它。空 vector = 这一页建不出来段落归属
   // （老路径/异常），此时按段落退回"只选点中的那一个词条"。

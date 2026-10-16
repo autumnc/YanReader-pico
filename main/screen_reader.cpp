@@ -2352,6 +2352,7 @@ static RdPageText rdBuildPageText(const Page &page, int fontId, int xOffset, int
     // 用这一行自己的字体号，和渲染侧同一个来源（CSS 放大过的标题字号不同）。
     const int lineFontId = blk->renderFontId() ? blk->renderFontId() : fontId;
     const int baseY = yOffset + el->yPos + g_rd.getFontAscenderSize(lineFontId);
+    pt.lineBase.push_back(baseY);  // 阅读线的落点按行存（含无词的空行，见 RdPageText）
     for (uint16_t i = 0; i < blk->wordCount(); i++) {
       RdWordHit wh;
       wh.x = xOffset + el->xPos + blk->wordXpos(i);
@@ -2387,6 +2388,7 @@ static RdPageText rdBuildPageTextTxt(const std::vector<std::string> &lines, int 
   int blkId = -1;
   for (const auto &seg : lines) {
     pt.lineFirst.push_back(static_cast<int>(pt.words.size()));
+    pt.lineBase.push_back(y);  // 空行也有一条：阅读线要按行画，空行下面是空的也得有线
     // 本行是不是"新段落的开头"。空行不承载词条，只把"下一行起新段"记进状态机。
     const auto info = txt_paragraph::analyzeLine(reinterpret_cast<const uint8_t *>(seg.data()), seg.size());
     if (info.kind == txt_paragraph::LineKind::Blank) {
@@ -4444,20 +4446,27 @@ static void rdDrawOverlays(const RdPageText &pt, int fontId) {
 }
 
 // ── 阅读线（正文行间引导线）──────────────────────────────────────────────
-// 每行正文下面一条 1px 中灰线，垫在**这一行的字形盒底**和**下一行的盒顶**之间，
-// 给横向阅读一个落点参照（抄自参考固件 book_layout_draw_page 的同名功能）。
+// **每一行**正文下面一条 1px 中灰线 —— 排版排出来的每一行都有，包括没有字的空行
+// （TXT 的空行就是段距，即"这一行的位置有一个行高、没有一个字"）—— 垫在**这一行的
+// 字形盒底**和**下一行的盒顶**之间，给横向阅读一个落点参照（抄自参考固件
+// book_layout_draw_page 的同名功能）。
 // 线拉满整个正文栏宽，不随行内文字长短伸缩 —— 参考线的作用是"这一行读到哪"，不是
 // 标出文字范围。虚线 19 实 12 空、点线 2 实 11 空，与参考固件同参数。
 //
 // 用真灰度 0x80（GfxRenderer::drawPixelInk）而不是布尔黑：阅读线不该抢正文的对比度。
 // GL16/GC16/8 灰阶三张表都带灰度阶；只有"快刷 DU"的相位簿灰阶少，那一档下它会重一点。
 //
-// 纵向位置用**实际**行距（下一行基线 − 本行基线）算，不直接用标称值：书里 CSS 的
-// line-height、段距都会改它，用标称值会在这些书上歪到贴着字。差值大得离谱（跨块/
-// 跨图片/最后一行）时退回标称行距。
+// 纵向位置**只看本行自己的基线**：每行一条，落在"这一行的字形盒底"往下半个行距余量
+// 的地方。一行一算、全页同一个偏移，所以行距一致的部分就是一组等距的线。
+//
+// 不要改回"量下一行基线 − 本行基线"（那是前一版的写法，看着"更跟版式"，实际是几处
+// 不平整的来源）：那个差值里除了本行行距，还混着下一行的位置。下一行是段距补出来的
+// 空行、是段末、或者是张图，差值就凭空变大，这一行的线被拽到两行中间去 —— 用户看到
+// 的就是"线忽高忽低"。空行曾经直接 `continue` 掉，于是段距那一格连一条线都没有。
+// 现在按行取基线（见 RdPageText::lineBase），空行也有自己的一条。
 static void rdDrawReadingLines(int fontId) {
   if (st.readingLine <= 0 || st.bookKind == 2) return;  // XTC 是整页位图，没有"行"
-  if (!g_pageText.valid || g_pageText.words.empty()) return;
+  if (!g_pageText.valid || g_pageText.lineBase.empty()) return;
   const int asc = g_rd.getFontAscenderSize(fontId);
   const int boxH = g_rd.getLineHeight(fontId);  // 字体自带行盒高（asc + desc）
   if (boxH <= 0) return;
@@ -4474,19 +4483,18 @@ static void rdDrawReadingLines(int fontId) {
   // 更是只剩一丝，"几乎看不清"。0x40 是明显更深的中灰，跟正文的纯黑还差好几级，
   // 不会喧宾夺主，但压得住底噪。
   const uint8_t ink = 0x40;
-  const int lines = static_cast<int>(g_pageText.lineFirst.size()) - 1;
-  for (int li = 0; li < lines; li++) {
-    const int a = g_pageText.lineFirst[li], b = g_pageText.lineFirst[li + 1];
-    if (b <= a) continue;  // 空行（TXT 的空段落）没有词，也就没有线
-    const int baseY = g_pageText.words[a].y;
-    int gap = pitch;
-    if (li + 1 < lines) {
-      const int nextBase = g_pageText.words[g_pageText.lineFirst[li + 1]].y;
-      const int d = nextBase - baseY;
-      if (d > 0 && d <= boxH * 3) gap = d;
-    }
-    const int gy = baseY + desc + std::max(0, gap - boxH) / 2;
-    if (gy < 0 || gy >= g_rd.getScreenHeight()) continue;
+  // 基线 → 引导线：先走完字形盒（asc + desc），再走"行距余下那一半"（pitch − boxH）。
+  // 行距 1.0 时第二项为 0，线正好压在行盒底；行距越松，线越靠两行中间 —— 与前一版
+  // 在"正常行距"下的落点完全一致，改的只是它不再被下一行的位置带跑。
+  // 偏移一律按**正文字体**算（标题行的字更大也只管按行给一条）：整页一个偏移是"均匀"
+  // 的前提；按每行自己的字体算，标题行与正文行就会各有一套间距。
+  const int off = desc + std::max(0, pitch - boxH) / 2;
+  const int screenH = g_rd.getScreenHeight();
+  // 逐行画：lineBase 一行一条（空行也在内），所以"每行下面一条"是字面意义上的。
+  const int baseN = static_cast<int>(g_pageText.lineBase.size());
+  for (int li = 0; li < baseN; li++) {
+    const int gy = g_pageText.lineBase[li] + off;
+    if (gy < 0 || gy >= screenH) continue;   // 最后一行可能落到屏外（正文区之外）
     for (int x = x0; x < x1; x += period) {
       const int run = std::min(dash, x1 - x);
       for (int k = 0; k < run; k++) g_rd.drawPixelInk(x + k, gy, ink);
