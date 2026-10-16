@@ -238,7 +238,9 @@ std::string SettingsManager::orientation() { return getString("orientation", "la
 void SettingsManager::setOrientation(const std::string &v) { setString("orientation", v); }
 // 阅读器方向与全局屏幕方向各自独立：改这个不旋转主界面（否则设置界面本身会转过去），
 // 只有阅读模式进/出时 applyReaderOrientation()/board_restore_orientation() 才应用。
-std::string SettingsManager::readerOrientation() { return getString("reader_orientation", "landscape"); }
+// **默认竖屏**：这台机器是当竖读器用的（正文 684 宽 × 1216 高），横屏只留给编辑器/主界面。
+// 改默认值之前存过这个键的用户不受影响（存的还是他挑的那档）；没碰过这项的从竖屏起。
+std::string SettingsManager::readerOrientation() { return getString("reader_orientation", "portrait"); }
 void SettingsManager::setReaderOrientation(const std::string &v) { setString("reader_orientation", v); }
 // 全设备夜间反色。旧键 reader_night 是阅读器专用的，首次读不到新键时回退过去，
 // 免得用户之前开的夜间就这么丢了。

@@ -6069,7 +6069,8 @@ bool IME::handleKeyImpl(int key, std::string &out) {
             return true;
         }
         if (key == '\n') {
-            out = _page.size() > 0 ? _page[_sel] : (_code.length() > 1 ? _code.substr(1) : "");
+            // 同主态：回车只上屏编码（v 模式下就是 'v' 后面那截），选字归空格/数字键。
+            out = _code.length() > 1 ? _code.substr(1) : "";
             _lastCommitChar.clear();
             _lastCommitText.clear();
             reset();
@@ -6288,17 +6289,18 @@ bool IME::handleKeyImpl(int key, std::string &out) {
         return true;
     }
     if (key == '\n') {
-        if (_highlightSelectMode && _page.size() > 0) {
-            commit(_sel, out);
-        } else {
-            // 回车 = "把我敲的先原样送进去"（普通拼音上屏原始编码）。但歧义布局续接之后
-            // 敲的只是**余码**，已经上屏的那截还在 _ambigCommitted 里 —— 只吐 _code 就等于
-            // 把用户挑好的字扔掉、换成一串拉丁字母。接回来，与 commit() 的收尾同一口径。
-            out = _ambigCommitted + _code;
-            _ambigCommitted.clear();
-            clearLearningContext();
-            reset();
-        }
+        // 回车 = "把我敲的先原样送进去"（普通拼音上屏原始编码）。**没有例外**：以前
+        // 「候选高亮」那一档下回车会上屏高亮的候选，于是同一句话里"回车"的语义跟着
+        // 一个显示开关走 —— 用户侧就是"有时候回车把字选了、有时候把拼音送上去了"。
+        // 选字一律归空格（同档下它选的就是高亮那个，见上面 _page.size() > 0 那支）和
+        // 数字键，回车只干这一件事。
+        // 歧义布局续接之后敲的只是**余码**，已经上屏的那截还在 _ambigCommitted 里 ——
+        // 只吐 _code 就等于把用户挑好的字扔掉、换成一串拉丁字母。接回来，与 commit()
+        // 的收尾同一口径。
+        out = _ambigCommitted + _code;
+        _ambigCommitted.clear();
+        clearLearningContext();
+        reset();
         return true;
     }
     if (key == '\b') {

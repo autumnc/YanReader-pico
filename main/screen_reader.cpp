@@ -13163,10 +13163,12 @@ void screen_reader_init() {
   // 一部分可能根本不在阅读器这边，账本上能看出来。
   rdTraceMark("ui_render drain");
 
-  // 阅读器方向：默认横屏 1216×684，可在菜单里切竖屏；退出时 board_restore_orientation
-  // 恢复全局方向设置。applyReaderOrientation 同时设 epd 旋转与渲染器方向标志。
-  st.orientation = g_settings.getString("reader_orientation", "landscape");
-  if (st.orientation != "portrait" && st.orientation != "landscape") st.orientation = "landscape";
+  // 阅读器方向：**默认竖屏 684×1216**（这台机器是当竖读器用的），可在菜单里切横屏；
+  // 退出时 board_restore_orientation 恢复全局方向设置。applyReaderOrientation 同时设 epd
+  // 旋转与渲染器方向标志。默认值必须与 settings_manager 的 readerOrientation() 一致 ——
+  // 两处各写一份是历史遗留，读的是同一个键。
+  st.orientation = g_settings.getString("reader_orientation", "portrait");
+  if (st.orientation != "portrait" && st.orientation != "landscape") st.orientation = "portrait";
 
   // 关键：g_rd.begin() 在 LANDSCAPE 旋转下捕获 panelWidth/panelHeight（物理 1216×684），
   // 方向标志据此映射逻辑宽高。若在竖屏下 begin()，panelWidth/Height 会互换、逻辑尺寸错乱
