@@ -733,7 +733,7 @@ void rdToggleVk();
 int vkVkTop();
 void rdDrawVkIcon();
 bool rdVkIconHit(int x, int y);
-void feedVkKey(int c);
+void feedVkKey(int c, bool fromVk);   // 默认值在 screen_reader_internal.h
 void feedVkBackspace();
 bool rdImeBarOn();
 int rdBodyBottom();          // 正文可用底边（虚拟键盘 / 输入法条 / 提示行三选一）

@@ -66,6 +66,9 @@ static int64_t s_consumer_press_us = 0;
 // 主机在 main.cpp 的非阅读界面兜底分支里把它翻成 ui_full_refresh_now()。
 // 必须与 pjournal_app.h 的同名宏一致。
 #define KEY_SHAKE      0xAF
+// Win/Cmd 键**单击**（按下又抬手，中间没按别的键）→ 输入法「字母键选字」待选。
+// 必须与 pjournal_app.h 的同名宏一致。
+#define KEY_META_TAP   0xB3
 // Ctrl+0-9 → 快捷编辑文件切换 (0x90-0x99)
 #define KEY_FILE_BASE 0x90
 
@@ -129,6 +132,9 @@ static bool s_connecting = false;  // 新增：标记正在连接中
 static int64_t s_connect_started_us = 0;  // 本次连接尝试的起始时刻(仅在 s_connecting 为真时有意义)
 static bool s_deiniting = false;   // deinit 进行中:阻止重连逻辑再发起新连接尝试
 static bool s_shift_tap_armed = false;  // 左Shift 单击检测武装标记
+// Win/Cmd 单击检测的武装标记。和上面那个一模一样的一套（按下武装、期间按了别的键就撤、
+// 松开时仍武装才发键）：Win+字母是系统组合键，只有"单按一下"才是我们要的。
+static bool s_gui_tap_armed = false;
 static int s_kb_battery = -1;           // 键盘电池电量 %，-1=未知/未连接
 
 // 低电提示：键盘电量掉到 KB_LOW_BATT_PCT 以下时置一次待发标记，UI 主循环取走即清。
@@ -301,6 +307,7 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
         memset(s_key_press_time, 0, MAX_KEYS * sizeof(int64_t));
         memset(s_last_repeat_time, 0, MAX_KEYS * sizeof(int64_t));
         s_shift_tap_armed = false;
+        s_gui_tap_armed = false;
         if (s_self) s_self->setConnected(false);
         ESP_LOGI(TAG, "Keyboard disconnected (rsn=0x%x)", param->close.reason);
         break;
@@ -330,6 +337,11 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
         bool lshiftNow = (mod & 0x02) != 0;
         bool lshiftWas = (s_last_mod & 0x02) != 0;
         if (lshiftNow && !lshiftWas) s_shift_tap_armed = true;
+        // Win/Cmd 单击检测：同上一模一样的判据。GUI 位是 0x08(左) | 0x80(右)，
+        // 与 shift(0x22)/ctrl(0x11)/alt(0x44) 不重叠，单独判不会互相干扰。
+        bool guiNow = (mod & 0x88) != 0;
+        bool guiWas = (s_last_mod & 0x88) != 0;
+        if (guiNow && !guiWas) s_gui_tap_armed = true;
         const uint8_t *keys = (len >= HID_REPORT_LEN) ? (data + 2) : (data + 1);
         int nkeys = (len >= HID_REPORT_LEN) ? 6 : ((int)len - 1);
         if (nkeys > MAX_KEYS) nkeys = MAX_KEYS;
@@ -358,6 +370,7 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
             // If new key press, record time and send event
             if (!old) {
                 s_shift_tap_armed = false;  // 与Shift组合使用的按键按下, 取消单击
+                s_gui_tap_armed = false;    // 与Win组合使用的按键按下, 取消单击
                 // Find empty slot for this new key
                 for (int j = 0; j < MAX_KEYS; j++) {
                     if (s_last_keys[j] == 0) {
@@ -464,6 +477,14 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                 pushKey(ev);
             }
             s_shift_tap_armed = false;
+        }
+        // Win/Cmd 抬手：单按（期间没按别的键）才发键。用途见 pjournal_app.h 的 KEY_META_TAP。
+        if (!guiNow && guiWas) {
+            if (s_gui_tap_armed) {
+                uint8_t ev = KEY_META_TAP;
+                pushKey(ev);
+            }
+            s_gui_tap_armed = false;
         }
 
         s_last_mod = mod;

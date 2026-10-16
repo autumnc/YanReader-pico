@@ -19,6 +19,19 @@ public:
 
     bool active() const { return _active; }
     void setActive(bool on);
+
+    // ── 「字母键选字」待选（实体键盘：Win/Cmd 单击，见 pjournal_app.h 的 KEY_META_TAP）──
+    // 有候选时按一下 Win → 待选中：候选条序号由 1..9 换成 q..o，下一个字母直接选中并上屏。
+    // 实现上**只是把这一次按键的字母翻译成数字**（handleKeyImpl 最前面一处），所以现有
+    // 每一处数字选字分支（主态/联想/英文组合/v 模式/歧义键）一行都不用改。
+    // 一次性：任何一次按键都会结束待选；再按一次 Win 也取消（开关式）。
+    // **只在实体键盘上会进入**：bt_keyboard 发的 KEY_META_TAP 是唯一入口，虚拟键盘的
+    // 字符键走 disarmLetterSelect() 主动撤掉（见 screen_reader 的 vkTap / 编辑器的 VK 点按）。
+    bool letterSelectArmed() const { return _letterSelArmed; }
+    void disarmLetterSelect() { _letterSelArmed = false; }
+    // 字母→序号的唯一一份表（"qwertyuio"）：handleKeyImpl 的翻译和 drawIMEUI 的标签
+    // 都读它，不会各写一份慢慢漂移。
+    static const char *letterSelKeys();
     void toggle() { setActive(!_active); }
 
     bool fullwidth() const { return _fullwidth; }
@@ -321,6 +334,7 @@ private:
 
     bool _loaded = false;
     bool _active = false;
+    bool _letterSelArmed = false;   // 见 letterSelectArmed()
 
     const uint8_t *_blob = nullptr;
     size_t _blobSize = 0;

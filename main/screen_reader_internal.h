@@ -978,7 +978,9 @@ void rdDrawVkIcon();
 bool rdVkIconHit(int x, int y);
 bool rdVkWantShow();
 void drawRdImeBar();
-void feedVkKey(int c);
+// fromVk = 这个字符是屏幕键盘点出来的（不是实体键盘敲的）：会撤掉 Win 键的「字母键选字」
+// 待选，让那条功能只作用于实体键盘。物理键盘那几处调用点不传，默认 false。
+void feedVkKey(int c, bool fromVk = false);
 void feedVkBackspace();
 void vkEnter();
 void vkTap(int x, int y);

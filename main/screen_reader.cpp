@@ -6789,10 +6789,14 @@ static void commitVk(const std::string &s) {
   if (st.mode == RdMode::ShelfSearch || st.mode == RdMode::NotesSearch) st.searchSel = 0;
 }
 
-void feedVkKey(int c) {
+void feedVkKey(int c, bool fromVk) {
   // 输入法优先，没接住的可打印 ASCII 当裸字符 —— 这条规矩写作/计划/阅读三处一样，
   // 收在 ime_field 里（少了它，数字面板上的 1..9/0 一个也打不出来）。
   // 这里不碰 st.dirty：所有调用点在 vkTap/按键处理里都已经置过了。
+  // fromVk = 这个字符是**屏幕键盘点出来的**：那不算"实体键盘输入"，先撤掉 Win 键留下的
+  // 「字母键选字」待选（见 IME::disarmLetterSelect），否则屏上点个 q 会去选第 1 条候选 ——
+  // 用户要的是这条功能只作用于实体键盘。
+  if (fromVk) IME::getInstance().disarmLetterSelect();
   std::string out;
   if (imeFieldKeyText(IME::getInstance(), c, /*multiline=*/false, out)) commitVk(out);
 }
@@ -6969,7 +6973,8 @@ void vkTap(int x, int y) {
       // 写作模式拿它们当快捷键，阅读模式没有对应动作——在门口丢掉，别让它们
       // 落到输入法的特殊分支上(如预测模式的 0x04 是"拒绝候选")。
       if (k < 0x20) return;
-      feedVkKey(k);
+      // fromVk=true：屏幕键盘敲出来的字符不算实体键盘输入（撤掉 Win 键的字母键选字待选）
+      feedVkKey(k, /*fromVk=*/true);
       return;
   }
 }
@@ -13621,6 +13626,21 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
 
   // 网络传输心跳（按键帧和空闲帧都过这里）。放分发之前：它只置 st.dirty，不碰键。
   rdNetTick();
+
+  // 实体键盘按了 Win/Cmd（单击）→ 输入法「字母键选字」待选（见 IME::letterSelectArmed）。
+  // 钩子放在**分发之前**：下面各打字界面（笔记/词典/书架搜索/笔记搜索/WiFi/OPDS/改名/
+  // AI 对话）各有各的按键表，0xB3 它们一个都不认识；这一处就把它们全盖住了。
+  // 放 rdNetTick 之后是为了不漏心跳；被跳过的尾巴只有 rdStatsNoteActivity()（它只对
+  // RdMode::Reading 记账，而打字界面不是 Reading）。
+  // 输入法没开时 handleKey 返回 false：在阅读页上按 Win 就是一次纯粹的空转，无副作用。
+  if (key == KEY_META_TAP) {
+    std::string metaOut;
+    if (IME::getInstance().handleKey(key, metaOut)) {
+      st.dirty = 1;
+      renderCurrent();   // 候选条序号要立刻换成字母（这一步就是"按下去看得见"）
+    }
+    return APP_READER;
+  }
 
   // 统计：记下分发前的模式。这一键哪怕把界面切走了（打开菜单/目录），
   // 按下它的那一刻人还在阅读页，也算一次阅读交互。

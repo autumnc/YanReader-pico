@@ -3313,6 +3313,10 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
                 // 这一拍够不够格走"只补画候选带 + 两个键帽"的差分路（键这边先判；正文那边
                 // 还要核帧指纹，见 IME 分支的 vkDelta）。
                 s_vkTapDelta = editorVkDeltaEligible(k, hit);
+                // 屏幕键盘敲出来的字符键不算"实体键盘输入"：先撤掉 Win 键留下的
+                // 「字母键选字」待选（见 IME::disarmLetterSelect），否则屏上点个 q 会去选
+                // 第 1 条候选 —— 那条功能只作用于实体键盘。
+                if (k >= 0x20 && k <= 0x7E) g_ime.disarmLetterSelect();
                 // 这五类键的动作会把键面本身重画成新状态（标签换字、反白翻转），
                 // 按下前那份几何再叠上去就是两个标签摞一起（中英切换时"拼""英"叠字）。
                 // 候选数字键同理：上屏后候选栏整排换新（多半是空的），按下前那份

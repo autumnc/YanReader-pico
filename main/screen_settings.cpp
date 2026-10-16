@@ -122,6 +122,9 @@ static const SettingField SETTINGS_FIELDS[] = {
     {"_ime_commit_mode", "上屏刷法", false, true, CAT_IME},
     {"ime_sentence", "整句候选", false, false, CAT_IME},
     {"ime_doc_context", "正文词优先", false, false, CAT_IME},
+    // 实体键盘专用：有候选时按一下 Win/Cmd，候选序号换成 q..o，按字母直接选字上屏
+    // （见 IME::letterSelectArmed）。虚拟键盘不受影响，所以这条跟着"实体键盘"走。
+    {"ime_meta_letter_sel", "Win键字母选字", false, false, CAT_IME},
     {"_dict_mgr", "词库管理", false, true, CAT_IME},
     // ── 打字机模式 ──
     // 输入模式开关和它的按键音效设置放一起：以前平铺时它们紧挨着，拆开分类后
@@ -500,6 +503,7 @@ static bool isToggleField(const char *key) {
            strcmp(key, "click_enabled") == 0 ||
            strcmp(key, "ime_sentence") == 0 ||
            strcmp(key, "ime_doc_context") == 0 || strcmp(key, "ime_candidate_highlight") == 0 ||
+           strcmp(key, "ime_meta_letter_sel") == 0 ||
            strcmp(key, "reader_perf_log") == 0 ||
            strcmp(key, "ui_perf_log") == 0 ||
            strcmp(key, "webdav_debug_log") == 0 ||
@@ -515,6 +519,7 @@ static bool toggleValue(const char *key) {
     if (strcmp(key, "click_enabled") == 0) return g_settings.typingClickEnabled();
     if (strcmp(key, "ime_sentence") == 0) return v != "0";  // 默认开
     if (strcmp(key, "ime_doc_context") == 0) return v != "0";  // 默认开
+    if (strcmp(key, "ime_meta_letter_sel") == 0) return v != "0";  // 默认开
     if (strcmp(key, "ime_candidate_highlight") == 0) return v == "1";  // 默认关
     // 走访问器：它带"读不到新键就回退旧键 reader_night"的迁移逻辑。
     if (strcmp(key, "night_mode") == 0) return g_settings.nightMode();

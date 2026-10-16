@@ -729,6 +729,11 @@ bool editorVkPumpTap(bool imeActive, int *outKey, bool *outTurnImeOn) {
         if (!imeActive) { if (outTurnImeOn) *outTurnImeOn = true; }
         else IME::getInstance().toggleEnglish();
     } else if (k > 0) {
+        // 屏幕键盘敲出来的字符键不算"实体键盘输入"：先撤掉 Win 键留下的「字母键选字」
+        // 待选（见 IME::disarmLetterSelect），否则屏上点个 q 会去选第 1 条候选 ——
+        // 那条功能只作用于实体键盘。这里是写作/计划/设置那几处 VK 点按的唯一出口
+        // （编辑器和阅读模式各有自己的那份，见 screen_editor / screen_reader 的 vkTap）。
+        if (k >= 0x20 && k <= 0x7E) IME::getInstance().disarmLetterSelect();
         if (outKey) *outKey = k;
     }
     // EVK_CTRL/EVK_SHIFT/EVK_T9/EVK_LAYOUT/EVK_SEP/EVK_CLEAR/EVK_NOOP：动作已在命中

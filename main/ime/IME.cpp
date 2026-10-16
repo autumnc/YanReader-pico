@@ -7,8 +7,10 @@
 #include "longop.h"  // 欠载探针：词库落盘也是"顺手写卡"的名录之一
 #include "hw/input.h"   // input_tick_throttled：整表落盘的写循环里补采触摸（见那里的说明）
 #include "settings_manager.h"
+#include "pjournal_app.h"   // KEY_META_TAP（实键盘 Win 单击，见 handleKeyImpl）
 #include <cstring>
 #include <cstdio>
+#include <cctype>
 #include <algorithm>
 #include <ctime>
 #include <cstdlib>
@@ -3266,6 +3268,9 @@ void IME::reset() {
     }
     _deleteMode = false;
     _vMode = false;
+    // 待选（Win 单击）跟着组合一起收：组合没了就没有候选可选，留着旗子只会让下一次
+    // 组合的第一个字母被当成选字键（用户没按 Win 却"丢了一个字母"）。
+    _letterSelArmed = false;
     _sel = 0;
     _fixedCandidatePaging = false;
     _candidateLimit = MAX_CANDIDATES;
@@ -5870,9 +5875,44 @@ bool IME::handleKey(int key, std::string &out) {
     return handled;
 }
 
+// 「字母键选字」待选期间，候选条第 N 条对应的字母。顺序就是键盘上排 q w e r t y u i o。
+// **只此一份**：翻译（下面 handleKeyImpl）和标签（ui_helpers 的 drawIMEUI）都读它，
+// 两处各写一遍迟早对不上（改字母集时只改了一处 = 按了标签上的字母选不中），所以做成
+// 静态访问器。待选本身见 IME.h 的 letterSelectArmed()。
+const char *IME::letterSelKeys() { return "qwertyuio"; }
+
 bool IME::handleKeyImpl(int key, std::string &out) {
     if (!_active) return false;
     flushUserDictSaves(false);
+
+    // ── 实体键盘的「字母键选字」（有候选时按一下 Win，见 pjournal_app.h 的 KEY_META_TAP）──
+    // 放在所有分支之前，是因为它要改的正是**这一次按键被当作哪个键**：待选期间 q..o 就
+    // 当成 1..9。这样下面每一处数字选字分支（歧义键/英文组合/主态/联想/v 模式）原样生效，
+    // 一行都不用改 —— 待选不是"输入法多了个模式"，是"这一次输入重解释一下"。
+    // 反向的边界也收在这一处：**取消待选**不需要另写，下面那句无条件清旗就是它
+    // （任何一次按键都结束待选，退格/回车/Esc 因此天然就是取消）。
+    if (key == KEY_META_TAP) {
+        // 开关式：再按一下取消。只在"候选真的是靠数字键选"的那些状态里开 —— 有候选
+        // （_page 空就没得选）、且不在 v 模式/删除态（那两处不吃数字选字，把字母吃成
+        // 数字没有意义）。开关关掉时只是不进入待选，照样吃掉这个键码（它不能被漏给宿主）。
+        const bool selState = !_page.empty() && !_vMode && !_lfMode && !_deleteMode;
+        _letterSelArmed = selState && !_letterSelArmed && g_settings.imeMetaLetterSel();
+        return true;
+    }
+    if (_letterSelArmed) {
+        _letterSelArmed = false;   // 一次性：不管这一下选中没有，待选都用掉了
+        // 只翻译 ASCII 字母（大小写都收：Shift+q 打出来的 'Q' 同样算选字）。
+        // 其它键码（翻页/方向/EVK 那些 >0x7F 的）不碰。
+        if (key > 0 && key < 0x80) {
+            const char *letters = letterSelKeys();
+            const char c = (char)tolower((unsigned char)key);
+            for (int i = 0; letters[i]; i++) {
+                if (c == letters[i]) { key = '1' + i; break; }
+            }
+        }
+        // 不在 q..o 里的键（a/z/p…）照常往下走：待选结束了，它回到自己本来的语义
+        // （当拼音字母接着打），只是这一次没选字。
+    }
     // 虚拟键盘的「一键多字母」键（14/18/9 键布局）走这条支路。物理键盘永远不发这些码，
     // 所以对实体键盘零影响。放在最前：由 handleAmbigKey 统一收口模式冲突。
     if (key >= KEY_AMBIG_BASE) return handleAmbigKey(key - KEY_AMBIG_BASE, out);
