@@ -46,25 +46,34 @@ static inline void lut_set(uint8_t (*data)[16][4], int f, int to, int from, int 
     data[f][to][from / 4] = (uint8_t)((data[f][to][from / 4] & ~(3 << shift)) | (v << shift));
 }
 
-void e0470_follow_lut_build(int frames, uint8_t (*dst)[16][4]) {
+// 跟随公式本体：两个方向各有一个"满推"次数，推动次数 = ceil(diff · 满推 / 15)（至少 1）。
+// 满推次数按表长封顶（短表：连续 DU 单帧、连调 dufr n）。
+// / The follow formula itself: one full-push budget per direction, push count =
+// ceil(diff · budget / 15), at least 1; both budgets cap at the table length.
+static void follow_lut_build_capped(
+    int frames, int black_budget, int white_budget, uint8_t (*dst)[16][4]
+) {
     memset(dst, 0, (size_t)frames * 16 * 4);
-    // 两个方向各有自己的满推次数；短表（连续 DU 单帧、连调 dufr n）按表长封顶。
-    // / Each direction has its own full-push count; short tables (1-frame
-    // continuous DU, live-tune dufr n) cap at the table length.
-    const int black_max = frames < E0470_FOLLOW_BLACK_FRAMES ? frames : E0470_FOLLOW_BLACK_FRAMES;
-    const int white_max = frames < E0470_FOLLOW_WHITE_FRAMES ? frames : E0470_FOLLOW_WHITE_FRAMES;
+    if (black_budget > frames) black_budget = frames;
+    if (white_budget > frames) white_budget = frames;
     for (int to = 0; to < 16; to++) {
         for (int from = 0; from < 16; from++) {
             if (to == from) continue;
             const int diff = to > from ? to - from : from - to;
             const int action = to > from ? 2 : 1;  // 往白推 0b10，往黑推 0b01 / 0b10 erase, 0b01 darken
-            const int budget = action == 2 ? white_max : black_max;
+            const int budget = action == 2 ? white_budget : black_budget;
             // 推动次数 = ceil(diff · 满推 / 15)，至少 1：差得远多推，差得近少推。
             // / Push count = ceil(diff · full / 15), at least 1: far travels more, near travels less.
             const int pushes = (diff * budget + 14) / 15;
             for (int f = 0; f < pushes; f++) lut_or(dst, f, to, from, action);
         }
     }
+}
+
+void e0470_follow_lut_build(int frames, uint8_t (*dst)[16][4]) {
+    follow_lut_build_capped(
+        frames, E0470_FOLLOW_BLACK_FRAMES, E0470_FOLLOW_WHITE_FRAMES, dst
+    );
 }
 
 /* ---- 跟随 DU：开机按公式生成 / Follow DU: built at boot ---- */
@@ -88,6 +97,32 @@ const EpdWaveform E0470_FOLLOW_WAVEFORM = {
     .mode_data = e0470_follow_modes,
     .temp_intervals = e0470_intervals,
 };
+
+/* ---- 「打字残影」表（输入法那两行自己那一拍）/ IME strip table ---- */
+// 见头文件那段：跟随公式，但**擦白那一侧的满推 = 相数 n**（压黑那侧仍是 7）。
+// 相数运行时可改，所以 phases 结构体本身不能是 const（`.phases` 要跟着变），
+// 但波形对象对外仍然是 const —— 与 continuous_du 那份的写法一致。
+static uint8_t e0470_ime_data[E0470_IME_FRAMES_MAX][16][4];
+static EpdWaveformPhases e0470_ime_phases = {
+    .phases = E0470_FOLLOW_FRAMES,
+    .phase_times = NULL,
+    .luts = (const uint8_t*)&e0470_ime_data[0],
+};
+static const EpdWaveformPhases* e0470_ime_ranges[] = { &e0470_ime_phases };
+static const EpdWaveformMode e0470_ime_mode = {
+    .type = 1,  // MODE_DU / MODE_DU
+    .temp_ranges = 1,
+    .range_data = &e0470_ime_ranges[0],
+};
+static const EpdWaveformMode* e0470_ime_modes[] = { &e0470_ime_mode };
+const EpdWaveform E0470_IME_WAVEFORM = {
+    .num_modes = 1,
+    .num_temp_ranges = 1,
+    .mode_data = e0470_ime_modes,
+    .temp_intervals = e0470_intervals,
+};
+
+static int s_ime_frames = E0470_FOLLOW_FRAMES;
 
 /* ---- 阈值 DU / Threshold DU ---- */
 // 源表只认目标 0/15。中间灰按 50/50 切开，暗的走整段到黑、亮的走整段到白。
@@ -433,9 +468,41 @@ int e0470_waveform_erase_pushes(void) {
     return s_erase_pushes;
 }
 
+// 「打字残影」表 = 跟随公式 + 擦白满推 = n。返回值是真正的相数（夹过、且按表长封顶）。
+static int e0470_ime_apply(int n) {
+    if (n < E0470_FOLLOW_FRAMES) n = E0470_FOLLOW_FRAMES;
+    if (n > E0470_IME_FRAMES_MAX) n = E0470_IME_FRAMES_MAX;
+    // 擦白满推给到相数本身，第 0 相就在推 —— 表里没有一个空相，也不吃"前导保持跳过"。
+    follow_lut_build_capped(n, E0470_FOLLOW_BLACK_FRAMES, n, e0470_ime_data);
+    e0470_ime_phases.phases = n;
+    return n;
+}
+
+void e0470_waveform_set_ime_frames(int n) {
+    const int want = n < E0470_FOLLOW_FRAMES
+                         ? E0470_FOLLOW_FRAMES
+                         : (n > E0470_IME_FRAMES_MAX ? E0470_IME_FRAMES_MAX : n);
+    if (want == s_ime_frames) return;
+    s_ime_frames = e0470_ime_apply(want);
+    // 表内容变了 → 生成号要动（拿这些表展开过 LUT 的缓存方靠它判陈旧，见
+    // e0470_waveform_generation）。
+    s_wf_gen++;
+    ESP_LOGI(
+        TAG, "打字残影表 = %d 相（≈ %d ms/键；%d 相 = 跟随表 = 现状）", s_ime_frames,
+        (s_ime_frames * E0470_WAVEFORM_FRAME_US + 500) / 1000, E0470_FOLLOW_FRAMES
+    );
+}
+
+int e0470_waveform_ime_frames(void) {
+    return s_ime_frames;
+}
+
 void e0470_waveform_init(void) {
     e0470_follow_lut_build(E0470_FOLLOW_FRAMES, e0470_follow_data);
     e0470_complete_du_build();
+    // 「打字残影」表先按默认相数建一份（调用方只在 n > 8 时才用它，但别留一张全空的表
+    // 在那儿 —— 万一有别的调用点直接拿它推屏，全空 = 整屏不驱动 = 什么都看不见）。
+    s_ime_frames = e0470_ime_apply(E0470_FOLLOW_FRAMES);
 
     const e0470_trim_t trim = {
         .erase_max = E0470_TRIM_ERASE_MAX,

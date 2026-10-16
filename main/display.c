@@ -757,6 +757,12 @@ int reader_erase_pushes(void) {
     return e0470_waveform_erase_pushes ? e0470_waveform_erase_pushes() : 0;
 }
 
+// 见 reader_refresh_bridge.h：「打字残影」—— 输入法那两行自己那一拍用几张相的跟随表。
+// 薄壳纯粹是给"摸不到 epdiy/波形类型"的那两个 TU（main.cpp / screen_settings.cpp）用。
+void reader_set_ime_frames(int n) {
+    e0470_waveform_set_ime_frames(n);
+}
+
 // ── 清一块区域的残影（输入法那两行）────────────────────────────────────────
 //
 // **必须是 GC16，不能是 GL16。** 这是实测踩出来的：很长一段时间里输入法编码区/候选区

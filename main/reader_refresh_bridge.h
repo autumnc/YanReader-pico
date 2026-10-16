@@ -24,6 +24,8 @@
 
 #pragma once
 
+#include <stdlib.h>   // atoi（reader_ime_frames_for_mode）
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -110,6 +112,30 @@ void reader_set_erase_pushes(int count);
 
 /// 当前擦除加强档。
 int reader_erase_pushes(void);
+
+/// 「打字残影」= 输入法那两行**自己那一拍**（逐键、矩形只有输入法条）用几张相的跟随表。
+///
+/// 8 = 跟随表 8 相（改动前的行为，逐字节一致）；> 8 = E0470_IME_WAVEFORM，同一条公式，
+/// 只把擦白那一侧的满推从 8 抬到 n（见波形头那段）。**相数就是时间**：n × 11.09ms，
+/// 区域刷不省时间，所以这个旋钮的代价是线性的、按每一键付。
+///
+/// 表是共享的（波形组件里就一张），所以挂/摘必须在两个点上成对：开机（main.cpp）与
+/// 改设置那一下（screen_settings 的 pickerApply —— 那个键**不能只写设置**）。
+/// **阅读模式出门不用管**：这条只动编辑器打字那一拍用的表，阅读器自己的「残影治理」
+/// 用的是另一套旋钮（reader_set_erase_pushes / white / black，见上面）。
+/// / "Typing ghost": how many phases the IME strip's own frame uses. 8 = the follow
+/// table (unchanged behaviour); > 8 = the IME table with the white budget raised to n.
+void reader_set_ime_frames(int n);
+
+/// 设置值（"8" / "12" / …）→ 相数；认不出或空 = 8（现状）。开机与改设置共用这一份映射。
+/// 上限不在这里夹 —— 波形组件自己会夹到 [8, E0470_IME_FRAMES_MAX]。
+/// / Settings string → phase count. Unknown/empty = 8. The upper clamp lives in the
+/// waveform component.
+static inline int reader_ime_frames_for_mode(const char *mode) {
+    if (mode == NULL || mode[0] == '\0') return 8;
+    const int n = atoi(mode);
+    return n > 8 ? n : 8;
+}
 
 #ifdef __cplusplus
 }

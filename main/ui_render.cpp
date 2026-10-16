@@ -37,6 +37,8 @@ static_assert(EPD_ROT_LANDSCAPE == 0 && EPD_ROT_PORTRAIT == 1 &&
                   EPD_ROT_INVERTED_LANDSCAPE == 2 && EPD_ROT_INVERTED_PORTRAIT == 3,
               "fb_scan_window.h 的 rot 取值与 epdiy 的 EpdRotation 不一致");
 #include "ime/IME.h"   // g_ime.composing()（区域判定在 core0 侧算，见 ui_render_submit）
+#include "reader_refresh_bridge.h"   // reader_leading_skip()（打字帧日志里的「跳相」）、
+                                     // reader_ime_frames_for_mode()（「打字残影」的相数映射）
 #include "settings_manager.h"   // imeCleanMode()（同样只在 core0 侧读，见 ime_clean_policy）
 #include "u8g2_shim.h"
 
@@ -174,6 +176,12 @@ struct UiJob {
     // （约 56ms，但跟随表推力只有阈值表的 1/4，刚上屏的字先发灰，得靠停顿那次区域 GC16
     // 坐实 —— 见 render_present 第 2 条路与 note_ime_clean 的 extra 参数）。
     bool ime_commit_fast;
+    // **编码区+候选区自己那一拍**（逐键、矩形只有输入法那两行）用几张相的跟随表刷
+    // （设置项 ime_ghost_mode，见 ime_ghost_mode_policy）。8 = 跟随表（现状）；
+    // > 8 = E0470_IME_WAVEFORM，同一条公式只把擦白满推抬到 n。**相数就是时间**。
+    // 与 ime_commit_fast 是**两拍不同的事**：那个管"正文跟着上屏那一拍"，这个只管
+    // 输入法那两行自己的重画（见 flush_deferred 的 else 支）。
+    int ime_ghost;
     bool force_full; // 强制整屏 GC16
     // core0 申报"输入法面板顶线（ime_top）**以上**一个像素都没动"（false = 没申报）。
     // 由 ui_render_note_ime_above_clean() 填（在 ui_render_submit 里取走并清空）。
@@ -211,6 +219,24 @@ static bool ime_commit_fast_policy(void) {
     return g_settings.imeCommitMode() == "fast";
 }
 
+// 设置项 ime_ghost_mode → "编码区+候选区自己那一拍"用几张相的跟随表（见 flush_deferred 的
+// else 支）。症状是**手不停的时候**就能看见的那层残影：候选栏每敲一键整排换字、编码行跟着变，
+// 而那一拍走的是跟随表 DU（8 相，推力只有阈值表的 1/4），旧候选/旧编码擦不干净就留在那儿。
+//
+// 一度试过"换 GL16 表"（8 灰阶正文表 + 擦除加强 / 37 相默认表）：**效果确实好，但太慢**
+// （+86ms 起，实测每键 330 / 410ms），用户结论是"没有实用性"。根因是这台硬件的**剂量 ∝ 面板
+// 时间**（每相 11.09ms，区域刷不省时间），所以擦除推力与时间是同一个旋钮，躲不掉。
+//
+// 现在改成**只把"擦白那一侧"的满推从 8 抬到 n** 的那张表（E0470_IME_WAVEFORM，见波形组件）：
+// 老字迹（老黑字 → 白）吃到的推白相数**恰好 = n**，没有一相是浪费的，代价也恰好 = n × 11.09ms。
+// 8 = 跟随表（改动前的行为，逐字节一致）；> 8 换那张表。实机扫档的结论是
+// **12 与 16 相都还将就，超过 16 相对中文输入没有意义**（每键 133 / 177ms），
+// 所以菜单与表的上限都停在 16；8 是地板（= 跟随表本身，再往下只会比现状更弱）。
+// 同样**只在 core0 侧调**（两个 job 组装点），渲染任务不碰 g_settings。
+static int ime_ghost_mode_policy(void) {
+    return reader_ime_frames_for_mode(g_settings.imeGhostMode().c_str());
+}
+
 // ── 两块工作缓冲的所有权 ─────────────────────────────────────────────────
 // 信号量记"有几块空闲"，free_list 记"具体是哪几块"（短临界区，不阻塞）。
 // 只要渲染任务结束时按它处理的那一块归还，core0 就不会拿到在推的那一块。
@@ -246,6 +272,7 @@ static uint8_t *s_defer_cur;
 static EpdRect s_defer_rect;
 static EpdRect s_defer_cand;   // 本次合并窗口的编码区候选区矩形（core0 提交时带上来的）
 static bool s_defer_commit;    // 本次合并窗口是"上屏"那一拍（要顺手清一遍候选区）
+static int  s_defer_ghost;     // 本次合并窗口"输入法两行用几张相"（见 ime_ghost_mode_policy）
 static int64_t s_defer_stamp_us;  // 扣住那一帧的提交时刻（只为计时）
 // 「提交→推屏」拆账用的两个中间时刻（只为计时）：只有"提交"到"推屏开始"之间那三件事
 // —— 队列唤醒、diff_bounding_rect、copy_to_front —— 需要分开看谁贵。见 flush_deferred 的日志。
@@ -760,6 +787,7 @@ static void render_present(const UiJob &job, uint8_t *cur, int rel_idx) {
         // 上屏那一拍 flush 时把区域扩到候选区、换 8 灰阶正文表。**这不是清残影**
         // （GL16 白→白不驱动，见 display.c），清残影一律走 ime_clean_tick 的区域 GC16。
         s_defer_commit = job.ime_commit;
+        s_defer_ghost = job.ime_ghost;   // 这一拍输入法那两行用几张相（提交时采的档）
         ime_clean_arm(IME_CLEAN_PAUSE_US);   // 输入法条动过一下 = 用户还在打字，清理期限往后推
         if (!s_ime_deferred) {
             s_ime_deferred = true;
@@ -1043,8 +1071,10 @@ static void flush_deferred() {
     s_defer_cur = nullptr;
     const EpdRect cand = s_defer_cand;
     const bool commit = s_defer_commit;
+    const int ghost = s_defer_ghost;
     s_defer_cand = EpdRect{0, 0, 0, 0};
     s_defer_commit = false;
+    s_defer_ghost = 0;
     if (idx < 0 || !cur) return;
     EpdiyHighlevelState *hl = board_hl();
     copy_to_front(hl, cur);
@@ -1064,18 +1094,34 @@ static void flush_deferred() {
                      r.x, r.y, r.width, r.height, (long long)((esp_timer_get_time() - t0) / 1000),
                      (long long)((t0 - s_defer_stamp_us) / 1000), q_ms, diff_ms, copy_ms);
     } else {
-        guard_draw_result(hl, update_display_area_with(hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, s_defer_rect));
-        // "提交→推屏"就是队列 + 差分开销。刷屏那一截是面板的物理时间（8 相 @FAST），
+        // ── 编码区+候选区**自己那一拍**（设置项「打字残影」，默认 8 = 现状）──────────
+        // 这一拍只动输入法那两行：矩形 s_defer_rect 是这一帧在面板内的差分包围盒
+        // （render_present 里 `d.y >= job.ime_top` 那支扣下来的），正文一个像素都不在
+        // 里面。8 = 跟随表 DU（改动前的行为）；> 8 换 E0470_IME_WAVEFORM —— 同一条公式，
+        // 只把擦白那一侧的满推从 8 抬到 n（老黑字 → 白 恰好吃 n 相）。两者都只驱动**变化
+        // 像素**（不变 = 保持），所以矩形只限制驱动范围、**不额外花时间**：代价就是相数，
+        // 每相 11.09ms，按每一键付（n × 11.09ms）。
+        const EpdRect r = s_defer_rect;
+        if (ghost > 8) {
+            guard_draw_result(hl, update_display_area_with(hl, &E0470_IME_WAVEFORM, MODE_DU, r));
+        } else {
+            guard_draw_result(hl, update_display_area_with(
+                hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, r));
+        }
+        // "提交→推屏"就是队列 + 差分开销。刷屏那一截是面板的物理时间（n 相 @FAST），
         // 和区域大小无关；要判断"还能不能快"看的是**提交之前**那段（见编辑器的「打字耗时」）。
+        // 带 相=/跳相=：实测耗时应该 ≈ 相 × 11.09ms，对不上（或跳相一直等于相数）说明表没换对。
         if (uiPerfLogOn())
-            ESP_LOGI(TAG, "打字帧: 输入法条 %d,%d %dx%d 刷屏 %lldms（提交→推屏 %lld = 排队 %lld + 差分 %lld + 拷贝 %lld）",
-                     s_defer_rect.x, s_defer_rect.y, s_defer_rect.width, s_defer_rect.height,
-                     (long long)((esp_timer_get_time() - t0) / 1000),
+            ESP_LOGI(TAG, "打字帧: 输入法条 %d,%d %dx%d 刷屏 %lldms（相=%d 跳相=%d 提交→推屏 %lld = 排队 %lld + 差分 %lld + 拷贝 %lld）",
+                     r.x, r.y, r.width, r.height,
+                     (long long)((esp_timer_get_time() - t0) / 1000), ghost, reader_leading_skip(),
                      (long long)((t0 - s_defer_stamp_us) / 1000), q_ms, diff_ms, copy_ms);
     }
     // 菜单型界面不记账（见 ui_render_set_menu_only）：设置页的输入法条也会走到这条 flush，
     // 但那种屏攒出来的账不留给后面的界面 —— 它自己永远等不到"两个开关都关"的那一拍，
     // 只会跟着用户走到别的界面才炸成一次整屏 GC16。
+    // 账照记：> 8 只是把这一张表的推力抬上来，走的仍是跟随 DU 的**差分**路（只驱动变化
+    // 像素），弱推力的性质没变 —— 攒够 FOLLOW_GC16_EVERY 拍照样得整屏 GC16 重锚一次。
     if (!s_menu_only.load(std::memory_order_relaxed) &&
         ++s_follow_partials >= FOLLOW_GC16_EVERY) {
         s_follow_partials = 0;
@@ -1549,6 +1595,7 @@ static void submit_sync(uint8_t *fb, bool force_full) {
     job.ime_no_clean = (pol & IME_CLEAN_NO_GC16) != 0;
     job.ime_count = (pol == 0);   // 「计数清」：不挑事件，只按打字拍数攒（唯一的兜底档）
     job.ime_commit_fast = ime_commit_fast_policy();
+    job.ime_ghost = ime_ghost_mode_policy();
     render_present(job, fb, -1);
 }
 
@@ -1678,6 +1725,7 @@ void ui_render_submit(bool force_full) {
     job.ime_no_clean = (pol & IME_CLEAN_NO_GC16) != 0;
     job.ime_count = (pol == 0);   // 「计数清」：不挑事件，只按打字拍数攒（唯一的兜底档）
     job.ime_commit_fast = ime_commit_fast_policy();
+    job.ime_ghost = ime_ghost_mode_policy();
     job.stamp_us = esp_timer_get_time();
     const int idx = s_taken;
     s_last_drawn_idx = idx;   // 供 ui_render_begin_frame_seeded 取"上一帧的像素"（见其声明处）

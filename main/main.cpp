@@ -2,6 +2,7 @@
 #include "bt_keyboard.h"
 #include "wifi_manager.h"
 #include "settings_manager.h"
+#include "reader_refresh_bridge.h"   // reader_set_ime_frames（「打字残影」的相数，开机按设置挂）
 #include "quick_edit.h"
 #include "journal_storage.h"
 #include "webdav_client.h"
@@ -1188,6 +1189,14 @@ extern "C" void app_main() {
     // 套用全设备夜间反色（在推屏唯一出口 HalDisplay::displayBuffer 处逐帧取反）。
     // 必须在第一帧之前设好，否则开机首屏按日间画、之后才翻黑。
     board_set_night(g_settings.nightMode());
+
+    // 「打字残影」：输入法那两行自己那一拍用几张相的表（设置项 ime_ghost_mode）。
+    // 开机按存的那一档把表建好。不在这里建的话，重启之后档位要等用户重新进设置选一次
+    // 才生效 —— 而界面上显示的还是那一档，看着像没生效。
+    // 另一处（改设置那一下）见 screen_settings 的 pickerApply，两处共用
+    // reader_ime_frames_for_mode 这一份映射。阅读模式那边**不用**管它（那是另一套旋钮）。
+    // 必须在 read_pico_init()（上面的 board_init）之后：波形表在那一步才生成。
+    reader_set_ime_frames(reader_ime_frames_for_mode(g_settings.imeGhostMode().c_str()));
 
     // Initialize input (touch/3-key/PMU) after read_pico_init.
     input_init();

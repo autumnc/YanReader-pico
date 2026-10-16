@@ -206,6 +206,60 @@ int e0470_waveform_erase_pushes(void);
 #define E0470_GRAY8_TEXT_ERASE_PUSHES_DEFAULT 0
 #endif
 
+/// ── 「打字残影」表：输入法那两行**自己那一拍**专用的跟随 DU ─────────────────────
+///
+/// 由来：逐键那一拍（编码行 + 候选行，矩形只有面板那两行）走的是 8 相跟随表 DU，
+/// 实测 90ms/键。它的 `to=15` 行对 `from<15` 只推 `E0470_FOLLOW_WHITE_FRAMES`（8）次
+/// ——与 8 灰阶正文表的 10 次同量级，都够不到白轨，于是"上一拍那排候选/那截编码"擦不干净，
+/// **手不停的时候**就是那层旧字痕。
+///
+/// 上机实测（2026-10-16）：把这一拍换成高推力的表**效果确实有**（8 灰阶 + 擦除加强借满 =
+/// 21 次推白、37 相默认表 = 18 次，用户："效果可以"），但 330/410ms **按每一键付**，用户：
+/// "响应太慢，没有实用性"。这一张就是按这个结论造的：**只买推力，不买废相**。
+///
+/// 它和 `E0470_FOLLOW_WAVEFORM` 是同一个公式（`to != from` 就往目标侧推，推的次数 =
+/// `ceil(差 · 满推 / 15)`），差别只有一处：**擦白那一侧的"满推"不再是 8 而是 n**（= 相数）。
+/// 压黑那一侧仍是跟随表的 7 —— 残影是"旧黑字退不到白"，只放大擦除方向；
+/// 新字的黑与现状逐位一致，所以这一档开了以后**屏幕上唯一会变的就是旧字痕**。
+///
+/// 代价就是时间，而且没有别的办法：**本机上剂量 ∝ 面板时间**
+/// （每相 = 一个整帧 = 11090µs 的标定行周期 × 701 行，见 read_pico_epd_timing.c；
+/// 区域刷不省时间，见 [[reader-body-91-percent-ceiling]]）。所以相数 n 直接就是
+/// n × 11.2ms：8 相 ≈90ms（= 现状）/ 12 相 ≈133ms / 16 相 ≈179ms。
+/// 表里没有一个空相（第 0 相就在推），所以也不吃"前导保持跳过"那点便宜。
+///
+/// 上机扫档结论（2026-10-16，用户）：**12 与 16 相都还将就，超过 16 相对中文输入没有意义**
+/// ——所以菜单就开到 16（见 screen_settings 的 IME_GHOST_OPTS），上限也就是 16。
+///
+/// **8 是地板，不是保守值**：8 相就是跟随表本身（`E0470_FOLLOW_WHITE_FRAMES`），
+/// 也就是改动前一直在用的那一张。再往下就是"比现状还弱"（擦得更不干净、只快那几十毫秒），
+/// 现状已经被确认擦不干净，所以那个方向没有可去的地方。
+///
+///   n <= E0470_FOLLOW_FRAMES：这张表不参与，调用方直接用 E0470_FOLLOW_WAVEFORM。
+///   否则：`E0470_IME_WAVEFORM` + MODE_DU，相数 = n。
+/// n 会被夹到 [E0470_FOLLOW_FRAMES, E0470_IME_FRAMES_MAX]。
+/// **必须在下一次推屏之前调**（表是共享的，别在推屏走到一半时改）。
+/// / The IME strip's own per-keystroke frame's table: the follow-DU formula with the
+/// white-push budget raised from 8 to n phases; the darken side stays at the vendor's 7,
+/// so the only thing this changes on screen is old ink. Cost is panel time and nothing
+/// else can buy it — dose here is proportional to time (one phase = one full frame).
+void e0470_waveform_set_ime_frames(int n);
+
+/// 当前「打字残影」相数（未设过 = E0470_FOLLOW_FRAMES = 现状）。
+/// / Current phase count for the IME strip table.
+int e0470_waveform_ime_frames(void);
+
+/// 相数上限 = 16（用户实机扫档的上限，超过 16 对中文输入没有意义）。
+/// static 存放，所以这个数直接换内部 RAM（n×16×4 字节）：16 相 = 1024B，
+/// 和已有的几张可写表（37 相 2368B / 30 相 1920B）同一量级。
+/// / Upper bound on the phase count; the table is static, so this is internal RAM.
+#define E0470_IME_FRAMES_MAX 16
+
+/// 「打字残影」表本体（MODE_DU）。相数 = `e0470_waveform_set_ime_frames()` 设的那个。
+/// 只有 n > E0470_FOLLOW_FRAMES 时才该用它。
+/// / The IME strip table itself; phase count comes from the setter.
+extern const EpdWaveform E0470_IME_WAVEFORM;
+
 #ifdef __cplusplus
 }
 #endif

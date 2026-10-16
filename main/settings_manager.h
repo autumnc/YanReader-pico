@@ -68,6 +68,15 @@ public:
     // 1/4，刚上屏的字先发灰，等打字停顿由那一次区域 GC16 把它坐实)。见 ui_render.cpp
     // 的 ime_commit_fast_policy 与 render_present 的第 2 条路。
     std::string imeCommitMode();
+    // **编码区+候选区自己那一拍**（逐键、矩形只有输入法那两行）用几张相的跟随表：
+    // "8"(默认，现状) = 跟随表 8 相 / "12" / "16" = E0470_IME_WAVEFORM，同一条公式只把
+    // 擦白满推抬到 n。**相数就是时间**（n × 11.09ms，按每一键付）。实机扫档：
+    // 12 与 16 都还将就，超过 16 对中文输入没有意义 —— 菜单与上限都停在 16，
+    // 8 是地板（= 跟随表本身 = 改动前的行为），再往下只是"比现状更弱"。
+    // 见 ui_render.cpp 的 ime_ghost_mode_policy 与 flush_deferred。除写键外还要重建
+    // 波形组件那张共享表（reader_set_ime_frames）—— 挂它的两个点：
+    // screen_settings 的 pickerApply、main.cpp 的开机挂法。
+    std::string imeGhostMode();
     std::string clickChineseMode();  // "key"(每键一声) / "count"(上屏按字数) / "single"(上屏单声)
     int typingClickVolume();  // 0..100,按键音效音量
     int dailyGoalMinutes();   // 阅读统计的每日目标(分钟), 默认 30

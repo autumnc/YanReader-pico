@@ -1,6 +1,7 @@
 #include "screen_settings.h"
 #include "font_renderer.h"
 #include "settings_manager.h"
+#include "reader_refresh_bridge.h"   // reader_set_ime_frames / _for_mode（「打字残影」相数）
 #include "font_store.h"
 #include "ttf_font.h"
 #include "wifi_manager.h"
@@ -120,6 +121,11 @@ static const SettingField SETTINGS_FIELDS[] = {
     // 实体键盘打字时正文那一拍怎么刷：稳 = 整屏阈值 DU（墨实，每键约 220ms）；快 =
     // 差分矩形跟随 DU（约 56ms，字先发灰，停顿那次 GC16 坐实）。默认稳。
     {"_ime_commit_mode", "上屏刷法", false, true, CAT_IME},
+    // **编码区+候选区自己那一拍**（逐键、矩形只有输入法那两行）用几张相的跟随表。治的是"手还
+    // 不停的时候就能看见的那层旧字痕"：候选栏每敲一键整排换字，而那一拍走跟随表 DU 的
+    // 8 相，推白推力只有阈值表的 1/4。见 ui_render.cpp 的 flush_deferred 与 ime_ghost_mode_policy。
+    // 每一相都在**每一次按键**上付 11.09ms，所以默认 8 = 现状。
+    {"_ime_ghost", "打字残影", false, true, CAT_IME},
     {"ime_sentence", "整句候选", false, false, CAT_IME},
     {"ime_doc_context", "正文词优先", false, false, CAT_IME},
     // 实体键盘专用：有候选时按一下 Win/Cmd，候选序号换成 q..o，按字母直接选字上屏
@@ -287,6 +293,23 @@ static int imeCommitIndex(const char *k) {
         if (strcmp(k, IME_COMMIT_OPTS[i].key) == 0) return i;
     return 0;  // 认不出 → 稳（与 settings_manager 的默认值一致）
 }
+// 「打字残影」：编码区+候选区自己那一拍（逐键、矩形只有输入法那两行）用**几张相**的跟随表。
+// 现状 8 相 → 旧字痕手不停时就在；每加一相就是**每一次按键**多花 11.09ms（相数就是时间，
+// 区域刷不省时间），所以这里列成一排给用户自己找膝盖 —— 实测 8 相擦不干净，18/21 相擦得掉，
+// 中间那段没人量过。量它看 ui_render 的「打字帧」那行日志（`相=N … 刷屏 Nms`）。
+// 曾经上过"换 GL16 表"的两档（8 灰阶+擦除加强 / 37 相默认表），效果确实好但每键 330/410ms，
+// 用户判"没有实用性"，已下线；现在这两档的剂量改由上面的相数线性给（那条路只驱动变化像素，
+// 没有一相是浪费的）。键值就是相数字符串，认不出 → 8。
+// **8 是地板**（= 跟随表本身 = 改动前的行为），菜单只到 16：实机扫档的结论是
+// "12 与 16 都还将就，超过 16 相对中文输入没有意义"，再往下列只是在拉长选择。
+static const OptItem IME_GHOST_OPTS[] = {
+    {"8", "现状(跟随表8相)"}, {"12", "12相(≈133ms/键)"}, {"16", "16相(≈177ms/键)"},
+};
+static int imeGhostIndex(const char *k) {
+    for (int i = 0; i < (int)(sizeof(IME_GHOST_OPTS) / sizeof(IME_GHOST_OPTS[0])); i++)
+        if (strcmp(k, IME_GHOST_OPTS[i].key) == 0) return i;
+    return 0;  // 认不出 / 老键值("0"/"1"/"2") → 现状 8 相（与 settings_manager 的默认值一致）
+}
 static int kbLayoutIndex(const char *k) {
     for (int i = 0; i < (int)(sizeof(KB_LAYOUT_OPTS) / sizeof(KB_LAYOUT_OPTS[0])); i++)
         if (strcmp(k, KB_LAYOUT_OPTS[i].key) == 0) return i;
@@ -399,6 +422,7 @@ static bool pickerFieldSupported(const char *key) {
            strcmp(key, "_kb_layout") == 0 || strcmp(key, "_ime_fuzzy") == 0 ||
            strcmp(key, "_ime_predict_mode") == 0 || strcmp(key, "_ime_cand_size") == 0 ||
            strcmp(key, "_ime_clean") == 0 || strcmp(key, "_ime_commit_mode") == 0 ||
+           strcmp(key, "_ime_ghost") == 0 ||
            strcmp(key, "_editor_font_size") == 0 ||
            strcmp(key, "_click_volume") == 0 ||
            strcmp(key, "_click_chinese") == 0 || strcmp(key, "_vertical_ref_line_style") == 0;
@@ -444,6 +468,8 @@ static std::vector<PickerOpt> pickerOpts(const char *key) {
     if (strcmp(key, "_ime_clean") == 0) return optsFromTable(IME_CLEAN_OPTS, OPT_ITEM_N(IME_CLEAN_OPTS));
     if (strcmp(key, "_ime_commit_mode") == 0)
         return optsFromTable(IME_COMMIT_OPTS, OPT_ITEM_N(IME_COMMIT_OPTS));
+    if (strcmp(key, "_ime_ghost") == 0)
+        return optsFromTable(IME_GHOST_OPTS, OPT_ITEM_N(IME_GHOST_OPTS));
     if (strcmp(key, "_editor_font_size") == 0)
         return optsFromTable(EDITOR_FONT_SIZE_OPTS, OPT_ITEM_N(EDITOR_FONT_SIZE_OPTS));
     if (strcmp(key, "_click_chinese") == 0)
@@ -486,6 +512,8 @@ static std::string pickerCurValue(const char *key) {
         return IME_CLEAN_OPTS[imeCleanIndex(g_settings.imeCleanMode().c_str())].key;
     if (strcmp(key, "_ime_commit_mode") == 0)
         return IME_COMMIT_OPTS[imeCommitIndex(g_settings.imeCommitMode().c_str())].key;
+    if (strcmp(key, "_ime_ghost") == 0)
+        return IME_GHOST_OPTS[imeGhostIndex(g_settings.imeGhostMode().c_str())].key;
     if (strcmp(key, "_editor_font_size") == 0)
         return EDITOR_FONT_SIZE_OPTS[editorFontSizeIndex(g_settings.getString("editor_font_size", "45").c_str())].key;
     if (strcmp(key, "_click_volume") == 0) return std::to_string(g_settings.typingClickVolume());
@@ -673,6 +701,14 @@ static void pickerApply(const char *key, const std::string &value, ScreenContext
         // 只写键：ui_render 在 core0 组装每一帧的 UiJob 时现读（见 ime_commit_fast_policy），
         // 下一拍就生效，不用通知任何人。
         g_settings.setString("ime_commit_mode", value);
+    } else if (strcmp(key, "_ime_ghost") == 0) {
+        // 写键 + 立刻把波形组件那张表重建到新相数。**不能只写键**：表是共享的（波形组件里
+        // 就一张），得真的调 setter 才变；而 setter 会重建表、bump 内容版本号（让展开过的
+        // 相位 LUT 缓存失效），所以只在**改设置**这一下调，不放在每帧的渲染路径上。
+        // 挂着它的另外两个点：main.cpp 开机（读同一个键）—— 阅读模式那条路不吃这张表，
+        // 不用在出门时还原（阅读器的「残影治理」用的是另一套旋钮）。
+        g_settings.setString("ime_ghost_mode", value);
+        reader_set_ime_frames(reader_ime_frames_for_mode(value.c_str()));
     } else if (strcmp(key, "_ime_cand_size") == 0) {
         // 只写键：候选行几何每次绘制现算（ui_helpers 的 imeCandFontPx），下次重绘就是新字号。
         g_settings.setString("ime_cand_size", value);
@@ -2137,6 +2173,9 @@ static void drawBrowseListBody() {
             } else if (strcmp(f.key, "_ime_commit_mode") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          IME_COMMIT_OPTS[imeCommitIndex(g_settings.imeCommitMode().c_str())].label);
+            } else if (strcmp(f.key, "_ime_ghost") == 0) {
+                snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
+                         IME_GHOST_OPTS[imeGhostIndex(g_settings.imeGhostMode().c_str())].label);
             } else if (strcmp(f.key, "_ime_cand_size") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          IME_CAND_SIZE_OPTS[imeCandSizeIndex(g_settings.getString("ime_cand_size", "45").c_str())].label);

@@ -267,6 +267,12 @@ std::string SettingsManager::imeCleanMode() { return getString("ime_clean", "pun
 
 std::string SettingsManager::imeCommitMode() { return getString("ime_commit_mode", "solid"); }
 
+// 「打字残影」：编码区+候选区自己那一拍（逐键、矩形只有输入法那两行）用几张相的跟随表。
+// 默认 "8" = 现状（跟随表），与改动前逐字节一致。见 ui_render.cpp 的 ime_ghost_mode_policy。
+// **这个键不是"只写就生效"**：除写键还得调 reader_set_ime_frames() 重建共享表。
+// 老机器上存过 "0"/"1"/"2"（已下线的那三档）→ 认不出 → 8，等于回到现状，不用迁移。
+std::string SettingsManager::imeGhostMode() { return getString("ime_ghost_mode", "8"); }
+
 int SettingsManager::typingClickVolume() {
     // 默认 100：duty 映射的 legal_peak 就是满摆幅，以前默认 80 白扔了 20% 动态范围。
     // makeHit 归一化到满摆幅，所以 100% 也不会撞占空比两端削波。
