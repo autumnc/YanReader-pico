@@ -58,6 +58,15 @@ struct WeOpDeleter {
 // ⚠ 阅读器代码不要直接用这个宏，用下面的 uiFontId()：书内嵌字体模式会把内容面换成
 //   本书字面，那时外壳必须退回内置字体（见 uiFontId 的注释）。
 #define CONTENT_UI_FONT_ID 20
+// 书架**列表样式**行内文字专用的小一号 id（比 uiFontId() 小 6px，见 shelfListFontId()）。
+// 书架列表是"扫一眼挑书"的版面，菜单/对话框那档 UI 字号（42px）在列表里偏大。
+// 21 / 22 都不被占用：正文字体是 1..9，UI 面只有 id 0、内容 UI 面是 20。
+#define SHELF_LIST_FONT_ID 21
+// 阅读页**状态栏**（时钟/书名/页码/百分比/电量）专用的小一号 id（比 uiFontId() 小 4px，
+// 见 readerSbFontId()）。状态栏是常驻的一行小字，与正文/菜单同大偏抢眼。
+// ⚠ 只缩字，**不缩带子**：footerH()/statusTop() 决定正文排版基准，带子高度不动，
+//   所以每页行数、页码、书签一个都不变（文件分界线也照旧）。
+#define READER_SB_FONT_ID 22
 
 
 inline constexpr const char *CACHE_DIR = "/sdcard/.crossmux";

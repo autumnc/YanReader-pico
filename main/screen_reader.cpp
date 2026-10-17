@@ -149,6 +149,8 @@ struct RdFont {
 GfxRenderer g_rd(display);
 static RdFont g_uiFont;       // id 0
 static RdFont g_bodyFont[9];  // id 1..9
+static RdFont g_listFont;     // id 21：书架列表行的小一号 UI 字（见 shelfListFontId）
+static RdFont g_sbFont;       // id 22：阅读页状态栏的小一号 UI 字（见 readerSbFontId）
 
 RdState st;
 
@@ -2203,8 +2205,17 @@ static bool readerLocalNow(struct tm &out) {
   return true;
 }
 
+// 状态栏字用的字体 id：外壳 UI 小一号（READER_SB_FONT_ID），但**书内嵌字面在位时退回
+// uiFontId()**——理由同 shelfListFontId()：内嵌字面按本书正文子集化，书名里的字它多半没有。
+// 只有 id 0 走 UI 面，没有"小一号的 UI 面"可用，所以那种情况下状态栏不缩字（但仍比正文小）。
+static int readerSbFontId() {
+  return st.bookFontLocal.empty() ? READER_SB_FONT_ID : uiFontId();
+}
+
 // 阅读页底部状态栏：分隔线 + 左（时钟/标题）+ 右（页码/百分比/时钟/电量）
 // + 屏底进度条（占 RD_BOTTOM_INSET 留白，不与文字打架）。
+// 字号是 readerSbFontId()（比外壳小 4px）；带子高度仍由 footerH() 定，文字按行盒在带内
+// 垂直居中——所以缩字**不动机器排版**（footerH/statusTop 是正文排版基准，见那里的注释）。
 static void drawStatusBand(int y) {
   int w = g_rd.getScreenWidth();
   // 「状态栏: 隐藏」——整条都不画（连上面那道分隔线一起，它也是带子的一部分）。
@@ -2213,11 +2224,14 @@ static void drawStatusBand(int y) {
   if (sbCount("reader_sb_on", 0, 2) == 1) return;
   g_rd.drawLine(0, y, w, y, true);
 
-  int textY = y + 4;
   // 状态栏的字（书名/章节名/时钟/页码）用**用户字体**：内置子集只有 7710 字，
-  // 书名里的生僻字会变豆腐块、长书名截断得也早。asc 仍取 uiAsc()，两 id 同一
-  // 个 family，度量完全相同，版式不动。
-  int asc = uiAsc();
+  // 书名里的生僻字会变豆腐块、长书名截断得也早。字号取 readerSbFontId()（比外壳
+  // 小 4px）；基线按这个 id 的行盒在带内垂直居中（uiLineHeight 那个大小算出来正好
+  // 是原来的 y+4+asc，所以只是字变小、落点不动）。
+  const int fid = readerSbFontId();
+  const int asc = g_rd.getFontAscenderSize(fid);
+  const int sbDesc = g_rd.getLineHeight(fid) - asc;
+  const int baseY = y + (footerH() + asc - sbDesc) / 2;
   char buf[64];
 
   int titleMode = sbCount("reader_sb_title", 0, 3);
@@ -2246,10 +2260,10 @@ static void drawStatusBand(int y) {
   int rx = w - MARGIN;
   auto pushRight = [&](const std::string &s) {
     if (s.empty()) return;
-    int tw = g_rd.getTextWidth(uiFontId(), s.c_str());
+    int tw = g_rd.getTextWidth(fid, s.c_str());
     rx -= tw;
     if (rx < MARGIN) return;  // 放不下就整体不画，别和左侧叠字
-    g_rd.drawText(uiFontId(), rx, textY + asc, s.c_str(), true);
+    g_rd.drawText(fid, rx, baseY, s.c_str(), true);
     rx -= 12;
   };
 
@@ -2278,14 +2292,14 @@ static void drawStatusBand(int y) {
   // 左侧：时钟（可选）+ 标题（可选）。
   int lx = MARGIN;
   if (clockMode == 2 && !clock.empty()) {
-    g_rd.drawText(uiFontId(), lx, textY + asc, clock.c_str(), true);
-    lx += g_rd.getTextWidth(uiFontId(), clock.c_str()) + 12;
+    g_rd.drawText(fid, lx, baseY, clock.c_str(), true);
+    lx += g_rd.getTextWidth(fid, clock.c_str()) + 12;
   }
   if (titleMode != 2) {
     std::string t = (titleMode == 1) ? currentChapterTitle() : st.bookTitle;
     int avail = rx - lx;
-    if (avail > 0) t = g_rd.truncatedText(uiFontId(), t.c_str(), avail);
-    if (!t.empty() && lx < rx) g_rd.drawText(uiFontId(), lx, textY + asc, t.c_str(), true);
+    if (avail > 0) t = g_rd.truncatedText(fid, t.c_str(), avail);
+    if (!t.empty() && lx < rx) g_rd.drawText(fid, lx, baseY, t.c_str(), true);
   }
 
   // 底部进度条：描边槽 + 槽内浅灰 + 已读实心黑。
@@ -5410,7 +5424,19 @@ static bool drawCoverCell(const BookEntry &b, int cx, int cy, int cellW, int cel
   return drew;
 }
 
-// 列表样式的一行：左侧 3:4 缩略图，右侧书名（最多两行）+ 类型后缀。
+// 列表行文字用的字体 id：外壳 UI 小一号（SHELF_LIST_FONT_ID），但**书内嵌字面在位时退回
+// uiFontId()**。理由同 uiFontId() 那条：内嵌字面是按本书正文子集化的，书名里的字它多半没有
+// （一开列表就是一排豆腐块）。而 GfxRenderer 的约定是 **只有 id 0 走 UI 面**，其余 id 一律
+// 内容面 —— 没有"小一号的 UI 面"这个 id 可用，所以那种情况下字号不缩（仍与其它外壳同大），
+// 但单行书名照旧。
+static int shelfListFontId() {
+  return st.bookFontLocal.empty() ? SHELF_LIST_FONT_ID : uiFontId();
+}
+
+// 列表样式的一行：左侧 3:4 缩略图，右侧书名（**单行**，超宽按字宽截断）+ 类型后缀。
+// 书名原来折两行：同一本书名被摊成两截，长书名与短书名混在一起时一屏的视觉节奏很乱；
+// 列表本来就是"扫一眼挑书"，单行够用。行高（shelfListRowH）不动 —— 它同时决定左侧
+// 缩略图的高度，往下收会让封面先糊（见那里的注释）。
 static void drawListRow(const BookEntry &b, int cx, int cy, int cw, int ch, bool selected) {
   const int pad = 6;
   if (selected) g_rd.drawRect(cx + 1, cy + 1, cw - 2, ch - 2, true);
@@ -5422,21 +5448,20 @@ static void drawListRow(const BookEntry &b, int cx, int cy, int cw, int ch, bool
   drawCoverThumb(coverBmpPathFor(b), innerX, ty, thumbW, thumbH);
   g_rd.drawRect(innerX, ty, thumbW, thumbH, true);  // 描边：弱封面/占位都看得清边界
 
+  const int fid = shelfListFontId();
   int textX = innerX + thumbW + 12;
   int textW = cx + cw - pad - textX;
   if (textW < 16) textW = 16;
   std::string nm = b.name;
   size_t dot = nm.rfind('.');
   if (dot != std::string::npos) nm = nm.substr(0, dot);
-  auto lines = g_rd.wrappedText(uiFontId(), nm.c_str(), textW, 2);
-  const int lh = uiLineHeight() + 2;
+  const std::string title = g_rd.truncatedText(fid, nm.c_str(), textW);
   const char *kindName = b.kind == 0 ? "EPUB" : (b.kind == 1 ? "TXT" : "XTC");
-  int blockH = static_cast<int>(lines.size()) * lh + uiLineHeight();
-  int ty0 = cy + (ch - blockH) / 2;
-  for (size_t i = 0; i < lines.size(); i++) {
-    drawLineText(textX, ty0 + static_cast<int>(i) * lh, lines[i].c_str(), true);
-  }
-  drawLineText(textX, ty0 + static_cast<int>(lines.size()) * lh, kindName, true);
+  const int lh = g_rd.getLineHeight(fid) + 2;
+  const int blockH = 2 * lh;
+  const int ty0 = cy + (ch - blockH) / 2;
+  drawLineText(textX, ty0, title.c_str(), true, fid);
+  drawLineText(textX, ty0 + lh, kindName, true, fid);
 }
 
 static void renderBrowser() {
@@ -13196,6 +13221,16 @@ void screen_reader_init() {
   g_uiFont.set(uiPx, uiPx * 4 / 5);
   g_rd.insertFont(UI_FONT_ID, g_uiFont.family);
   g_rd.insertFont(CONTENT_UI_FONT_ID, g_uiFont.family);  // 度量同 UI，角色为内容
+  // 书架列表行的小一号字号（42→36 / 46→40 / 38→32）。同样挂内容面，所以书内嵌字面在位时
+  // 它会跟着换成那本书的字面 —— 那种情况下 shelfListFontId() 退回 id 0（见那里的注释）。
+  const int listPx = uiPx - 6;
+  g_listFont.set(listPx, listPx * 4 / 5);
+  g_rd.insertFont(SHELF_LIST_FONT_ID, g_listFont.family);
+  // 阅读页状态栏的小一号字号（42→38 / 46→42 / 38→34），同样挂内容面（理由同上）。
+  // 只缩字、不动 footerH()：带子高度是正文排版基准，缩了会重排全书。
+  const int sbPx = uiPx - 4;
+  g_sbFont.set(sbPx, sbPx * 4 / 5);
+  g_rd.insertFont(READER_SB_FONT_ID, g_sbFont.family);
   for (int i = 0; i < kBodyPxCount; i++) {
     g_bodyFont[i].set(kBodyPx[i], kBodyPx[i] * 4 / 5);
     g_rd.insertFont(BODY_FONT_ID_BASE + i, g_bodyFont[i].family);
