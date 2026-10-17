@@ -1,0 +1,10 @@
+{
+  "version": "1.8.4",
+  "tag": "v1.8.4",
+  "date": "2026-10-17",
+  "file": "firmware/yanreader-1.8.4-full.bin",
+  "size": 10895392,
+  "flashOffset": 0,
+  "sha256": "ca65bccf6ee9eb4095b6b1d07c5a5c94d005b104d8f1743bf965dbc51a9ed886",
+  "md5": "4483aa9bea641063fc7052b5b7b17bee"
+}
