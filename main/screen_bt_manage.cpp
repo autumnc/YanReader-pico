@@ -506,7 +506,10 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
     // 上方的点是"没点中行"，然后照样拿旧 selection 去连，于是点开关会顺手连上设备。
     // 先 peek：input_tap_xy 是取走即清，没点在这一行的话落点要原样留给下面那一段，
     // 否则"点哪行连哪行"会因为落点被人先取走而退化成"连当前选中项"。
-    if (key == 0x0A || key == 0x0D) {
+    // **只在已配对管理页**：扫描页没有开关行，而它的第一行设备正好落在开关行那个
+    // y 上（btScanListView 的 top 与 btSwitchRowY 同式），不判模式的话"点第一台设备"
+    // 会变成关蓝牙。用户报的就是这个。
+    if ((key == 0x0A || key == 0x0D) && g_btState.mode == BT_MANAGE) {
         int tx = 0, ty = 0;
         if (input_tap_peek_xy(&tx, &ty) && btSwitchRowHit(ty)) {
             input_tap_xy(&tx, &ty);   // 命中开关行：这颗落点归我，吃掉
@@ -568,6 +571,18 @@ AppState screen_bt_manage_handle(int key, ScreenContext &ctx) {
                     g_btState.scroll = lv.first;
                 }
             } else if (key == 0x0A || key == 0x0D) {
+                // 触摸：点哪台连哪台（键盘 Enter 没有落点，照旧连当前选中项）。
+                // 以前这里不看落点，点第二台也是去连默认选中的第一台；点在标题/空白上
+                // 更糟 —— 会拿旧选中项连一台根本没点中的设备。
+                int tx = 0, ty = 0;
+                if (input_tap_xy(&tx, &ty)) {
+                    int hit = listViewHitAt(btScanListView(), ty);
+                    if (hit < 0 || hit >= g_bt.deviceCount()) {
+                        drawScan();
+                        return APP_BT_MANAGE;
+                    }
+                    g_btState.selection = hit;
+                }
                 int n = g_bt.deviceCount();
                 if (n > 0 && g_btState.selection < n) {
                     g_btState.connecting = true;
