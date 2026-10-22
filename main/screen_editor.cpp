@@ -3426,6 +3426,18 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         return APP_EDITOR;
     }
 
+    // 「字母选字」触发键选了 Esc/Tab 时，**先问输入法**：有候选就接住（进入待选，候选
+    // 序号换成 q..o），没接住再走下面原有的语义（Esc 保存/返回、Tab 换字段）。必须排在
+    // Esc 那一支之前 —— 否则 Esc 根本到不了后面那个 IME 分支（那里同样会喂 handleKey）。
+    if ((key == 0x1B || key == 0x09) && g_editor.imeActive &&
+        g_ime.letterSelTriggerKey(key) && g_ime.letterSelReady()) {
+        std::string imeOut;
+        if (g_ime.handleKey(key, imeOut)) {
+            screen_editor_reset_drawn();   // 空转 tick 会重画候选带（序号换 q..o）
+            return APP_EDITOR;
+        }
+    }
+
     if (key == 0x1B) {
         if (inQuickFileSession()) {
             // 快捷编辑: 自动保存后跳到设置面板

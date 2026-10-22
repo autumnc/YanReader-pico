@@ -7,7 +7,7 @@
 #include "longop.h"  // 欠载探针：词库落盘也是"顺手写卡"的名录之一
 #include "hw/input.h"   // input_tick_throttled：整表落盘的写循环里补采触摸（见那里的说明）
 #include "settings_manager.h"
-#include "pjournal_app.h"   // KEY_META_TAP（实键盘 Win 单击，见 handleKeyImpl）
+#include "pjournal_app.h"   // KEY_META_TAP（实键盘修饰键单击，见 handleKeyImpl）
 #include <cstring>
 #include <cstdio>
 #include <cctype>
@@ -5881,22 +5881,37 @@ bool IME::handleKey(int key, std::string &out) {
 // 静态访问器。待选本身见 IME.h 的 letterSelectArmed()。
 const char *IME::letterSelKeys() { return "qwertyuio"; }
 
+// Esc/Tab 也能被选成「字母选字」的触发键（设置见 imeMetaLetterSelKey）。它们不是修饰键，
+// 没有"单击"事件，就按普通按键在下发处理里认；触发键是修饰键时 bt_keyboard 早已把它
+// 翻译成 KEY_META_TAP 了。KEY_META_TAP 恒真：那是专用码，只有选中的那一位会发。
+bool IME::letterSelTriggerKey(int key) const {
+    if (key == KEY_META_TAP) return true;
+    if (key != 0x1B && key != 0x09) return false;   // 先挡掉绝大多数键，别每键读设置
+    const std::string cfg = g_settings.imeMetaLetterSelKey();
+    return key == 0x1B ? cfg == "esc" : cfg == "tab";
+}
+
 bool IME::handleKeyImpl(int key, std::string &out) {
     if (!_active) return false;
     flushUserDictSaves(false);
 
-    // ── 实体键盘的「字母键选字」（有候选时按一下 Win，见 pjournal_app.h 的 KEY_META_TAP）──
+    // ── 实体键盘的「字母键选字」（有候选时按一下设置里选的触发键，见 letterSelTriggerKey）──
     // 放在所有分支之前，是因为它要改的正是**这一次按键被当作哪个键**：待选期间 q..o 就
     // 当成 1..9。这样下面每一处数字选字分支（歧义键/英文组合/主态/联想/v 模式）原样生效，
     // 一行都不用改 —— 待选不是"输入法多了个模式"，是"这一次输入重解释一下"。
     // 反向的边界也收在这一处：**取消待选**不需要另写，下面那句无条件清旗就是它
     // （任何一次按键都结束待选，退格/回车/Esc 因此天然就是取消）。
     if (key == KEY_META_TAP) {
-        // 开关式：再按一下取消。只在"候选真的是靠数字键选"的那些状态里开 —— 有候选
-        // （_page 空就没得选）、且不在 v 模式/删除态（那两处不吃数字选字，把字母吃成
-        // 数字没有意义）。开关关掉时只是不进入待选，照样吃掉这个键码（它不能被漏给宿主）。
-        const bool selState = !_page.empty() && !_vMode && !_lfMode && !_deleteMode;
-        _letterSelArmed = selState && !_letterSelArmed && g_settings.imeMetaLetterSel();
+        // 开关式：再按一下取消。只在"候选真的是靠数字键选"的那些状态里开（见
+        // letterSelReady）。没有可选的候选时照样吃掉这个键码 —— 它是专用的，
+        // 不能被漏给宿主（宿主也不认识它）。
+        if (letterSelReady()) _letterSelArmed = !_letterSelArmed;
+        return true;
+    }
+    // Esc/Tab 被选成触发键时，在有候选的状态里接住（进入待选）；其余情况**原样放行**，
+    // 保持它们本来的取消/换字段语义。注意不能"接住但不做任何事"：那会把宿主挡在外面。
+    if (letterSelTriggerKey(key) && letterSelReady()) {
+        _letterSelArmed = !_letterSelArmed;
         return true;
     }
     if (_letterSelArmed) {

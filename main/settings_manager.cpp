@@ -229,7 +229,16 @@ std::string SettingsManager::inputMode() { return getString("input_mode", "norma
 std::string SettingsManager::imeFuzzy() { return getString("ime_fuzzy", "zcs"); }
 std::string SettingsManager::imePredictMode() { return getString("ime_predict_mode", "always"); }
 bool SettingsManager::imeSentence() { return getString("ime_sentence", "1") == "1"; }
-bool SettingsManager::imeMetaLetterSel() { return getString("ime_meta_letter_sel", "1") == "1"; }
+std::string SettingsManager::imeMetaLetterSelKey() {
+    std::string v = getString("ime_meta_letter_sel", "win");
+    if (v == "1") return "win";   // 旧布尔值：开 = 左右任一 Win（改动前的行为）
+    if (v == "0") return "off";   // 旧布尔值：关
+    return v;
+}
+// **默认开**：这是用户主动要的功能（长按数字/标点出上档符号）。默认关的结果是
+// 用户刷完机直接试、看到"长按还是重复原字符"，以为功能没做出来。想回到原来的
+// "按下即出、按住重复"就在这里关掉（存 "0"）。
+bool SettingsManager::kbLongPressSymbol() { return getString("long_press_symbol", "1") == "1"; }
 bool SettingsManager::imeDocContext() { return getString("ime_doc_context", "1") == "1"; }
 bool SettingsManager::imeCandidateHighlight() { return getString("ime_candidate_highlight", "0") == "1"; }
 bool SettingsManager::imeDebug() { return getString("ime_debug", "0") == "1"; }

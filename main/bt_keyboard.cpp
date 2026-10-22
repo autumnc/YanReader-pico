@@ -1,5 +1,6 @@
 #include "bt_keyboard.h"
 #include "safe_file.h"
+#include "settings_manager.h"   // 「字母选字按键」/「长按输入符号」两个实体键盘设置
 #include <cstring>
 #include <cstdio>
 #include <sys/stat.h>
@@ -131,10 +132,78 @@ static bool s_scanning = false;
 static bool s_connecting = false;  // 新增：标记正在连接中
 static int64_t s_connect_started_us = 0;  // 本次连接尝试的起始时刻(仅在 s_connecting 为真时有意义)
 static bool s_deiniting = false;   // deinit 进行中:阻止重连逻辑再发起新连接尝试
-static bool s_shift_tap_armed = false;  // 左Shift 单击检测武装标记
-// Win/Cmd 单击检测的武装标记。和上面那个一模一样的一套（按下武装、期间按了别的键就撤、
-// 松开时仍武装才发键）：Win+字母是系统组合键，只有"单按一下"才是我们要的。
-static bool s_gui_tap_armed = false;
+// 修饰键单击检测的武装标记：一个修饰位一个。判据与左Shift那一套相同——按下武装、
+// 期间按了别的键就撤、松开时仍武装才算"单击"（修饰键+字母是系统组合键，不是我们要的）。
+// 哪一位的单击会变成 KEY_META_TAP 由设置「字母选字按键」现读（见 letterSelModBit）。
+static const uint8_t s_mod_bits[8] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+static bool s_mod_tap_armed[8] = {false};
+
+// 「长按输入符号」（设置 long_press_symbol，见 SettingsManager::kbLongPressSymbol）：
+// 按下先不发，抬手时才发原字符；一直按住超过这个时长，就改发键帽上那个符号
+// （相当于按住 sym 再按该键）。按下即发、长按再"退格改掉"的做法在墨水屏上要刷两次，
+// 而且输入法把键吃进编码/选词时退格会误删别的内容，所以这里选择推迟到抬手。
+// 哪些键有"符号"见 hasShiftSymbol / m1LetterSymbol；空格/回车/退格/方向键照旧。
+static const int64_t LONG_PRESS_SYMBOL_US = 500 * 1000;   // 与 KEY_REPEAT_DELAY_MS 对齐
+static uint8_t s_key_pending[MAX_KEYS] = {0};         // 待发的原字符（0=没有）
+static uint8_t s_key_pending_shift[MAX_KEYS] = {0};   // 长按时要发的符号字符
+static bool s_key_long_fired[MAX_KEYS] = {false};     // 符号已发：按住不再自动重复
+
+// 键帽上有"上档符号"的 HID usage：标准键盘的数字行(30..39)与标点行(45..56)。
+// 字母(4..29)的 Shift 层只是大写，不算"符号"；空格/回车/退格/Tab/方向键不在此列。
+static bool hasShiftSymbol(uint8_t kc) {
+    return (kc >= 30 && kc <= 39) || (kc >= 45 && kc <= 56);
+}
+
+// Mospace M1 这类手机式迷你键盘（BLE 名 "M1 Keyboard"）：没有单独的数字/标点排，
+// 数字和符号全印在字母键帽上，靠左下角 "123"（sym）键切层。键盘内部这层切换主机
+// 看不到，没法从 HID 报告反推，所以只能按它的键帽把 a..z → 符号写死。
+// 连的是普通键盘时 s_m1_layout=false，字母长按仍走原来的自动重复。
+static bool s_m1_layout = false;
+
+// 字母键帽上的符号（下标 = HID usage - 4，a..z）：
+//   Q1 W2 E3 R4 T5 Y6 U7 I8 O9 P0 / A- S/ D: F; G( H) J$ K' L" / Z% X& C* V? B! N, M.
+// N/M 两个键帽上的点太小，照片上认成 ~ 和 ` 了；实机实测是逗号和句号（2026-10-22）。
+static uint8_t m1LetterSymbol(uint8_t kc) {
+    static const char kSym[] = "-!*:3;()8$'\".,9014/57?2&6%";
+    if (kc < 4 || kc > 29) return 0;
+    return (uint8_t)kSym[kc - 4];
+}
+
+// 丢弃所有待发键（断连/清队列时用，**不要**补发：这一下按键已经失效）。
+static void clearPendingKeys() {
+    memset(s_key_pending, 0, sizeof(s_key_pending));
+    memset(s_key_pending_shift, 0, sizeof(s_key_pending_shift));
+    memset(s_key_long_fired, 0, sizeof(s_key_long_fired));
+}
+
+// 又有键按下（或组合键开始）时调用：待发的键按"短按"打出去，保持原按下顺序。
+static void flushPendingKeys() {
+    for (int i = 0; i < MAX_KEYS; i++) {
+        if (s_key_pending[i]) {
+            pushKey(s_key_pending[i]);
+            s_key_pending[i] = 0;
+            s_key_pending_shift[i] = 0;
+        }
+    }
+}
+
+// 「字母选字按键」设置 → 哪一个修饰位的单击该发 KEY_META_TAP。返回 0 表示设置里选的
+// 不是修饰键（Esc/Tab/关闭）：那几种是普通按键，由输入法在按键处理里自己认
+// （见 IME::letterSelTriggerKey）；Esc/Tab 不能在这里拦，否则菜单/对话框里的原义就没了。
+// "win" = 左右任一，是改动前的行为（也是旧布尔值 "1" 映射过来的值）。
+static uint8_t letterSelModBit() {
+    const std::string v = g_settings.imeMetaLetterSelKey();
+    if (v == "lctrl") return 0x01;
+    if (v == "lshift") return 0x02;
+    if (v == "lalt") return 0x04;
+    if (v == "lwin") return 0x08;
+    if (v == "rctrl") return 0x10;
+    if (v == "rshift") return 0x20;
+    if (v == "ralt") return 0x40;
+    if (v == "rwin") return 0x80;
+    if (v == "win") return 0x08 | 0x80;
+    return 0;
+}
 static int s_kb_battery = -1;           // 键盘电池电量 %，-1=未知/未连接
 
 // 低电提示：键盘电量掉到 KB_LOW_BATT_PCT 以下时置一次待发标记，UI 主循环取走即清。
@@ -279,11 +348,16 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
         if (param->open.status == ESP_OK) {
             s_dev = param->open.dev;
             s_connected = true;
+            // 认出 M1 小键盘：它的字母键帽上印着符号（Q1 A- Z% …），长按要按这张表走。
+            const char *nm = esp_hidh_dev_name_get(param->open.dev);
+            s_m1_layout = nm && strstr(nm, "M1 Keyboard") != nullptr;
             if (s_self) {
                 s_self->setConnected(true);
             }
-            ESP_LOGI(TAG, "Keyboard connected: %s",
-                     esp_hidh_dev_name_get(param->open.dev) ?: "?");
+            // 带上「长按输入符号」的**生效值**：这个功能只改 bt_keyboard 的键路径，
+            // 用户报"没生效"时先看这一行就知道是开关没开（或存的是 "0"）还是代码没走到。
+            ESP_LOGI(TAG, "Keyboard connected: %s (long_press_symbol=%d, m1_layout=%d)",
+                     nm ?: "?", (int)g_settings.kbLongPressSymbol(), (int)s_m1_layout);
         } else {
             ESP_LOGE(TAG, "Keyboard HID open failed: %d", param->open.status);
         }
@@ -302,12 +376,13 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
         s_dev = nullptr;
         s_connected = false;
         s_connecting = false;  // 连接断开
+        s_m1_layout = false;
         resetKbBattery();      // 键盘电量失效（低电提示一并复位）
         memset(s_last_keys, 0, MAX_KEYS);
         memset(s_key_press_time, 0, MAX_KEYS * sizeof(int64_t));
         memset(s_last_repeat_time, 0, MAX_KEYS * sizeof(int64_t));
-        s_shift_tap_armed = false;
-        s_gui_tap_armed = false;
+        memset(s_mod_tap_armed, 0, sizeof(s_mod_tap_armed));
+        clearPendingKeys();
         if (s_self) s_self->setConnected(false);
         ESP_LOGI(TAG, "Keyboard disconnected (rsn=0x%x)", param->close.reason);
         break;
@@ -333,15 +408,13 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
         size_t len = param->input.length;
         if (!data || len < 2) break;
         uint8_t mod = data[0];
-        // 左Shift 单击检测: 按下时武装, 期间按下任何键则解除, 松开时若仍武装则触发
-        bool lshiftNow = (mod & 0x02) != 0;
-        bool lshiftWas = (s_last_mod & 0x02) != 0;
-        if (lshiftNow && !lshiftWas) s_shift_tap_armed = true;
-        // Win/Cmd 单击检测：同上一模一样的判据。GUI 位是 0x08(左) | 0x80(右)，
-        // 与 shift(0x22)/ctrl(0x11)/alt(0x44) 不重叠，单独判不会互相干扰。
-        bool guiNow = (mod & 0x88) != 0;
-        bool guiWas = (s_last_mod & 0x88) != 0;
-        if (guiNow && !guiWas) s_gui_tap_armed = true;
+        // 修饰键单击检测：按下时武装，期间按下任何键则解除，松开时若仍武装则触发。
+        // 逐位判（Ctrl/Shift/Alt/GUI 的左右各一位，互不重叠）；具体哪一位变成
+        // 「字母选字」的触发键由设置决定，见 letterSelModBit / 下面的松开分支。
+        for (int i = 0; i < 8; i++) {
+            if ((mod & s_mod_bits[i]) && !(s_last_mod & s_mod_bits[i]))
+                s_mod_tap_armed[i] = true;
+        }
         const uint8_t *keys = (len >= HID_REPORT_LEN) ? (data + 2) : (data + 1);
         int nkeys = (len >= HID_REPORT_LEN) ? 6 : ((int)len - 1);
         if (nkeys > MAX_KEYS) nkeys = MAX_KEYS;
@@ -369,14 +442,19 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
 
             // If new key press, record time and send event
             if (!old) {
-                s_shift_tap_armed = false;  // 与Shift组合使用的按键按下, 取消单击
-                s_gui_tap_armed = false;    // 与Win组合使用的按键按下, 取消单击
+                // 又有键按下 → 之前挂起的键按短按打出去（保持按下顺序），
+                // 同时说明它不会再走"长按输入符号"。
+                flushPendingKeys();
+                // 与修饰键组合使用的按键按下 → 取消所有单击检测（Ctrl+C 之类不是单击）
+                memset(s_mod_tap_armed, 0, sizeof(s_mod_tap_armed));
                 // Find empty slot for this new key
+                int newSlot = -1;
                 for (int j = 0; j < MAX_KEYS; j++) {
                     if (s_last_keys[j] == 0) {
                         s_last_keys[j] = kc;
                         s_key_press_time[j] = esp_timer_get_time();
                         current_pressed[j] = true;
+                        newSlot = j;
                         break;
                     }
                 }
@@ -457,34 +535,95 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                     continue;
                 }
 
-                uint8_t ascii = hid_to_ascii(kc, mod);
-                if (ascii) pushKey(ascii);
+                // M1 小键盘的特殊键在 Windows 模式下发的是 Win+字母 快捷键，照字母放
+                // 出去会往正文里塞 d/l/h。按键帽重映射（只对 M1 生效）：
+                //   Esc 键 → Win+D：发 0x1B（返回）
+                //   画面锁定 → Win+L、语音输入 → Win+H：本机没有对应动作，吞掉
+                // press_time 清零 = 按住不自动重复（这些键在 M1 上会一直重发报告）。
+                if (s_m1_layout && (mod & 0x88)) {
+                    if (kc == 7) {  // Win+D → Esc
+                        uint8_t esc = 0x1B;
+                        pushKey(esc);
+                        s_key_press_time[newSlot] = 0;
+                        continue;
+                    }
+                    if (kc == 15 || kc == 11) {  // Win+L / Win+H：吞掉
+                        s_key_press_time[newSlot] = 0;
+                        continue;
+                    }
+                }
+
+                // M1 的 ⇧（大小写切换）键发的是 Caps Lock(0x39)。本机原来直接忽略，
+                // 按下去毫无反应。它在这台键盘上就是 Shift，按本机左 Shift 单击的老
+                // 语义处理：编辑器里切中英。Caps Lock 是锁存键、按住会重发报告，
+                // 所以只有第一次按下才发，press_time 清零保证不重复。
+                if (s_m1_layout && kc == 57) {
+                    uint8_t ev = KEY_LSHIFT_TAP;
+                    pushKey(ev);
+                    s_key_press_time[newSlot] = 0;
+                    continue;
+                }
+
+                // 「长按输入符号」：先挂起，抬手时才发原字符；按住到阈值改发键帽上的符号。
+                // 标准键盘 = 数字/标点键的 Shift 层；M1 小键盘 = 字母键帽上印的那个符号。
+                // 待 Ctrl/Alt/GUI/Shift 时不算（组合键；Shift 本身已经在上档）。
+                uint8_t symChar = 0;
+                if (hasShiftSymbol(kc)) {
+                    symChar = hid_to_ascii(kc, (uint8_t)(mod | 0x22));
+                } else if (s_m1_layout) {
+                    symChar = m1LetterSymbol(kc);
+                }
+                const bool delaySym = newSlot >= 0 && symChar != 0 &&
+                                      !(mod & (0x11 | 0x22 | 0x44 | 0x88)) &&
+                                      g_settings.kbLongPressSymbol();
+                if (delaySym) {
+                    s_key_pending[newSlot] = hid_to_ascii(kc, mod);
+                    s_key_pending_shift[newSlot] = symChar;
+                    s_key_long_fired[newSlot] = false;
+                } else {
+                    uint8_t ascii = hid_to_ascii(kc, mod);
+                    if (ascii) pushKey(ascii);
+                }
             }
         }
 
         // Clear keys that were released
         for (int i = 0; i < MAX_KEYS; i++) {
             if (s_last_keys[i] != 0 && !current_pressed[i]) {
+                // 短按：原字符这时候才发（长按那一路已经在 checkKeyRepeat 里发过符号）。
+                // 抬手时再按一下按住时长兜底：主循环被推屏占住、错过了 checkKeyRepeat
+                // 那一拍时，长按（≥阈值）也不会被当成短按打回原字符。
+                if (s_key_pending[i]) {
+                    const int64_t held = esp_timer_get_time() - s_key_press_time[i];
+                    pushKey(held >= LONG_PRESS_SYMBOL_US ? s_key_pending_shift[i]
+                                                        : s_key_pending[i]);
+                }
+                s_key_pending[i] = 0;
+                s_key_pending_shift[i] = 0;
+                s_key_long_fired[i] = false;
                 s_last_keys[i] = 0;
                 s_key_press_time[i] = 0;
                 s_last_repeat_time[i] = 0;
             }
         }
 
-        if (!lshiftNow && lshiftWas) {
-            if (s_shift_tap_armed) {
-                uint8_t ev = KEY_LSHIFT_TAP;
-                pushKey(ev);
+        // 修饰键抬手：单按（期间没按别的键）才发键。被设置选为「字母选字」触发键的那一位
+        // 发 KEY_META_TAP（用途见 pjournal_app.h）；没选中的左Shift保留老语义（中英切换），
+        // 其余修饰键单击本来就没有动作。
+        for (int i = 0; i < 8; i++) {
+            if (!(mod & s_mod_bits[i]) && (s_last_mod & s_mod_bits[i])) {
+                if (s_mod_tap_armed[i]) {
+                    const uint8_t selBit = letterSelModBit();  // 只在真单击时读设置
+                    if (selBit & s_mod_bits[i]) {
+                        uint8_t ev = KEY_META_TAP;
+                        pushKey(ev);
+                    } else if (s_mod_bits[i] == 0x02) {
+                        uint8_t ev = KEY_LSHIFT_TAP;
+                        pushKey(ev);
+                    }
+                }
+                s_mod_tap_armed[i] = false;
             }
-            s_shift_tap_armed = false;
-        }
-        // Win/Cmd 抬手：单按（期间没按别的键）才发键。用途见 pjournal_app.h 的 KEY_META_TAP。
-        if (!guiNow && guiWas) {
-            if (s_gui_tap_armed) {
-                uint8_t ev = KEY_META_TAP;
-                pushKey(ev);
-            }
-            s_gui_tap_armed = false;
         }
 
         s_last_mod = mod;
@@ -872,6 +1011,7 @@ void BtKeyboard::scanDevices() {
     connected_ = false;
     resetKbBattery();   // 键盘电量失效（低电提示一并复位）
     memset(s_last_keys, 0, MAX_KEYS);
+    clearPendingKeys();
     // Clear device list
     if (s_devices_mutex) xSemaphoreTake(s_devices_mutex, portMAX_DELAY);
     s_found_count = 0;
@@ -950,6 +1090,7 @@ void BtKeyboard::disconnect() {
     connected_ = false;
     resetKbBattery();   // 键盘电量失效（低电提示一并复位）
     memset(s_last_keys, 0, MAX_KEYS);
+    clearPendingKeys();
     if (s_queue) xQueueReset(s_queue);
 }
 
@@ -980,6 +1121,9 @@ bool BtKeyboard::waitKey(uint32_t timeout_ms) {
 }
 
 void BtKeyboard::flushKeys() {
+    // 待发键也一起丢掉：调用方要的是"从现在起没有旧输入"，抬手时再补打出来
+    // 一个字符就违背了这个意思。
+    clearPendingKeys();
     if (s_queue) xQueueReset(s_queue);
 }
 
@@ -1011,11 +1155,33 @@ void BtKeyboard::checkKeyRepeat() {
         if (elapsed >= (int64_t)KEY_REPEAT_MAX_MS * 1000) {
             ESP_LOGW(TAG, "key 0x%02X held >%dms (key-up lost?), stop repeat",
                      kc, KEY_REPEAT_MAX_MS);
+            // 还在等长按判定的键（主循环被长时间占住才会走到这里）：按长按的意图
+            // 补发上档符号，别让这一键凭空消失。
+            if (s_key_pending[i]) pushKey(s_key_pending_shift[i]);
+            s_key_pending[i] = 0;
+            s_key_pending_shift[i] = 0;
+            s_key_long_fired[i] = false;
             s_last_keys[i] = 0;
             s_key_press_time[i] = 0;
             s_last_repeat_time[i] = 0;
             continue;
         }
+
+        // 长按输入符号：待发键到阈值就改发键帽上的符号（sym+键），按住期间也不再自动重复。
+        // 频率很低（用户想打符号才按住），留一行日志方便以后查"为什么没生效"。
+        if (s_key_pending[i]) {
+            if (elapsed >= LONG_PRESS_SYMBOL_US) {
+                ESP_LOGI(TAG, "long-press fire kc=0x%02X elapsed=%lldms -> 0x%02X",
+                         kc, (long long)(elapsed / 1000), (unsigned)s_key_pending_shift[i]);
+                pushKey(s_key_pending_shift[i]);
+                s_key_pending[i] = 0;
+                s_key_pending_shift[i] = 0;
+                s_key_long_fired[i] = true;
+            }
+            continue;   // 还没到阈值：这一键还没发出去，当然不重复
+        }
+        // 符号已经发过：按住别再刷出一串符号
+        if (s_key_long_fired[i]) continue;
 
         // Check if key held long enough for repeat
         if (elapsed >= delay_us) {

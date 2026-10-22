@@ -20,15 +20,27 @@ public:
     bool active() const { return _active; }
     void setActive(bool on);
 
-    // ── 「字母键选字」待选（实体键盘：Win/Cmd 单击，见 pjournal_app.h 的 KEY_META_TAP）──
-    // 有候选时按一下 Win → 待选中：候选条序号由 1..9 换成 q..o，下一个字母直接选中并上屏。
+    // ── 「字母键选字」待选（实体键盘：按一下设置里选的触发键）──
+    // 有候选时按一下触发键 → 待选中：候选条序号由 1..9 换成 q..o，下一个字母直接选中并上屏。
+    // 触发键可在设置里选左/右 Ctrl、Alt、Win、Shift（单击）或 Esc、Tab；见
+    // SettingsManager::imeMetaLetterSelKey()。修饰键单击由 bt_keyboard 发 KEY_META_TAP；
+    // Esc/Tab 是普通按键，由本类在 handleKeyImpl 里认（没有候选时保持原义）。
     // 实现上**只是把这一次按键的字母翻译成数字**（handleKeyImpl 最前面一处），所以现有
     // 每一处数字选字分支（主态/联想/英文组合/v 模式/歧义键）一行都不用改。
-    // 一次性：任何一次按键都会结束待选；再按一次 Win 也取消（开关式）。
-    // **只在实体键盘上会进入**：bt_keyboard 发的 KEY_META_TAP 是唯一入口，虚拟键盘的
-    // 字符键走 disarmLetterSelect() 主动撤掉（见 screen_reader 的 vkTap / 编辑器的 VK 点按）。
+    // 一次性：任何一次按键都会结束待选；再按一次触发键也取消（开关式）。
+    // **只在实体键盘上会进入**：虚拟键盘的字符键走 disarmLetterSelect() 主动撤掉
+    // （见 screen_reader 的 vkTap / 编辑器的 VK 点按）。
     bool letterSelectArmed() const { return _letterSelArmed; }
     void disarmLetterSelect() { _letterSelArmed = false; }
+    // 现在能不能进入待选（候选确实靠数字键选的时候才成立）。
+    bool letterSelReady() const {
+        return _active && !_page.empty() && !_vMode && !_lfMode && !_deleteMode;
+    }
+    // 这个键码是不是当前设置选中的触发键。KEY_META_TAP 是专用的修饰键单击码（bt_keyboard
+    // 只在选中的那一位上发），恒为真；Esc/Tab 按键值 + 设置判断。宿主在**分发之前**用它
+    // 决定要不要先把 Esc/Tab 喂给输入法（阅读模式的各个打字界面），别的宿主直接把所有键
+    // 送进 handleKey 即可。
+    bool letterSelTriggerKey(int key) const;
     // 字母→序号的唯一一份表（"qwertyuio"）：handleKeyImpl 的翻译和 drawIMEUI 的标签
     // 都读它，不会各写一份慢慢漂移。
     static const char *letterSelKeys();

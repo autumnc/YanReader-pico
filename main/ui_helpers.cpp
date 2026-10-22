@@ -624,7 +624,7 @@ void drawIMEUI(int bottomY) {
     // ── 候选行：按候选字号量宽/直绘（imeCandStrW 量的正是 imeCandDrawText 画的）──
     int hl = g_ime.highlightIdx();
     int x = 4;
-    // 「字母键选字」待选中（实体键盘按了 Win，见 IME::letterSelectArmed）：序号画成
+    // 「字母键选字」待选中（实体键盘按了设置里选的触发键，见 IME::letterSelectArmed）：序号画成
     // q. w. e. … —— 画什么就得按什么，标签和 IME 里那份翻译表读同一份 letterSelKeys()。
     // 只认前 9 条：第 10 条起字母表就用完了（翻译表也只有 9 个），照旧画数字。
     const char *selKeys = g_ime.letterSelectArmed() ? IME::letterSelKeys() : nullptr;

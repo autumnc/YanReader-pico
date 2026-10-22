@@ -127,10 +127,12 @@ struct ScreenContext {
 // 主机拿它当"要关机了"的信号，抢在那 2s 窗口里把「已关机」页铺满 —— 不铺的话屏上就
 // 停在上一帧，看不出是关机（用户报过）。由 hw/input.cpp 的 poll_pmu_key() 产生。
 #define KEY_POWER_HOLD 0xB1
-// 蓝牙键盘的 **Win/Cmd 键单击**（按下又抬手，中间没按别的键）。取的是 HID 修饰字节里
-// 的 GUI 位（左 0x08 / 右 0x80），见 bt_keyboard.cpp 里那套"单击"判定。
+// 蓝牙键盘的 **修饰键单击**（按下又抬手，中间没按别的键），只有设置「字母选字按键」
+// 选中的那一位才发这个码（默认左右 Win 均可；也可选左右 Ctrl/Alt/Win/Shift，见
+// bt_keyboard.cpp 的 letterSelModBit 与 settings_manager 的 imeMetaLetterSelKey）。
 // 用途：输入法**有候选时**按一下它，候选条序号从 1..9 换成 q..o，直接按字母就选字上屏
 // （见 IME::handleKeyImpl 的 KEY_META_TAP 分支）。输入法没开 / 没候选时它什么都不做。
+// 选 Esc/Tab 作触发键时不走这个码（它们是普通按键，由输入法自己认）。
 // **只在实体键盘上产生**：虚拟键盘不经过 bt_keyboard，所以这条功能天然不碰虚拟键盘。
 // 必须与 bt_keyboard.cpp 的同名宏一致。
 #define KEY_META_TAP   0xB3

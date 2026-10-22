@@ -13664,19 +13664,33 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   // 网络传输心跳（按键帧和空闲帧都过这里）。放分发之前：它只置 st.dirty，不碰键。
   rdNetTick();
 
-  // 实体键盘按了 Win/Cmd（单击）→ 输入法「字母键选字」待选（见 IME::letterSelectArmed）。
-  // 钩子放在**分发之前**：下面各打字界面（笔记/词典/书架搜索/笔记搜索/WiFi/OPDS/改名/
-  // AI 对话）各有各的按键表，0xB3 它们一个都不认识；这一处就把它们全盖住了。
+  // 实体键盘按了「字母选字」的触发键 → 输入法进入待选（见 IME::letterSelectArmed）。
+  // 触发键可在设置里选：修饰键单击（bt_keyboard 只对选中的那一位发 KEY_META_TAP），或
+  // Esc/Tab（普通按键，输入法按设置认）。钩子放在**分发之前**：下面各打字界面（笔记/
+  // 词典/书架搜索/笔记搜索/WiFi/OPDS/改名/AI 对话）各有各的按键表，0xB3 它们一个都不
+  // 认识；Esc/Tab 则会被它们直接当成"关闭/换字段"。这一处就把它们全盖住了。
   // 放 rdNetTick 之后是为了不漏心跳；被跳过的尾巴只有 rdStatsNoteActivity()（它只对
   // RdMode::Reading 记账，而打字界面不是 Reading）。
-  // 输入法没开时 handleKey 返回 false：在阅读页上按 Win 就是一次纯粹的空转，无副作用。
+  // 输入法没开时 handleKey 返回 false：在阅读页上按触发键就是一次纯粹的空转，无副作用。
   if (key == KEY_META_TAP) {
     std::string metaOut;
     if (IME::getInstance().handleKey(key, metaOut)) {
       st.dirty = 1;
       renderCurrent();   // 候选条序号要立刻换成字母（这一步就是"按下去看得见"）
     }
-    return APP_READER;
+    return APP_READER;   // 专用码：宿主不认识，接没接住都不能往下漏
+  }
+  // Esc/Tab 只在**确实是设置里的触发键、且现在真有候选**时才先喂给输入法；否则原样往下
+  // 走（关键盘/换字段）。不能无条件喂 —— handleKeyImpl 对没候选的未知键会当"收尾"，
+  // 把正在打的编码清掉，而这里本来该是 Esc 关掉键盘。
+  if ((key == 0x1B || key == 0x09) && IME::getInstance().letterSelTriggerKey(key) &&
+      IME::getInstance().letterSelReady()) {
+    std::string metaOut;
+    if (IME::getInstance().handleKey(key, metaOut)) {
+      st.dirty = 1;
+      renderCurrent();
+      return APP_READER;
+    }
   }
 
   // 统计：记下分发前的模式。这一键哪怕把界面切走了（打开菜单/目录），

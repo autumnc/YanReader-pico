@@ -128,9 +128,17 @@ static const SettingField SETTINGS_FIELDS[] = {
     {"_ime_ghost", "打字残影", false, true, CAT_IME},
     {"ime_sentence", "整句候选", false, false, CAT_IME},
     {"ime_doc_context", "正文词优先", false, false, CAT_IME},
-    // 实体键盘专用：有候选时按一下 Win/Cmd，候选序号换成 q..o，按字母直接选字上屏
-    // （见 IME::letterSelectArmed）。虚拟键盘不受影响，所以这条跟着"实体键盘"走。
-    {"ime_meta_letter_sel", "Win键字母选字", false, false, CAT_IME},
+    // 实体键盘专用：有候选时按一下**选定的触发键**，候选序号换成 q..o，按字母直接选字
+    // 上屏（见 IME::letterSelectArmed / letterSelTriggerKey）。修饰键只认单击
+    // （按下又抬手、中间没按别的键；由 bt_keyboard 检测）；Esc/Tab 是普通按键，由输入法
+    // 在分发前认，没候选时仍是原来的取消/换字段。虚拟键盘不受影响。
+    // 默认「Win（左右均可）」= 改动前的行为。
+    {"_ime_meta_letter_sel", "字母选字按键", false, true, CAT_IME},
+    // 实体键盘专用：长按数字行/标点键 = 按住 Shift（sym）再按它，输入键帽上的上档
+    // 符号（1→!、,→<、/→?）。短按仍是原字符；字母键长按仍是自动重复（见
+    // bt_keyboard 的 hasShiftSymbol / checkKeyRepeat）。默认开（用户主动要的功能，
+    // 默认关会让人刷完机试一下以为没做出来；见 toggleValue）。
+    {"long_press_symbol", "长按输入符号", false, false, CAT_IME},
     {"_dict_mgr", "词库管理", false, true, CAT_IME},
     // ── 打字机模式 ──
     // 输入模式开关和它的按键音效设置放一起：以前平铺时它们紧挨着，拆开分类后
@@ -310,6 +318,23 @@ static int imeGhostIndex(const char *k) {
         if (strcmp(k, IME_GHOST_OPTS[i].key) == 0) return i;
     return 0;  // 认不出 / 老键值("0"/"1"/"2") → 现状 8 相（与 settings_manager 的默认值一致）
 }
+// 「字母选字」的触发键。修饰键只认**单击**（按下又抬手、中间没按别的键；见 bt_keyboard
+// 的 letterSelModBit），Esc/Tab 是普通按键、由输入法在按键处理里认（没候选时保持原义）。
+// key 与 SettingsManager::imeMetaLetterSelKey() 同一套字面量；"win" = 左右任一，是
+// 改动前的行为（旧布尔值 "1" 也映射到它）。
+static const OptItem IME_META_LETTER_SEL_OPTS[] = {
+    {"win", "Win（左右均可）"}, {"lwin", "左Win"}, {"rwin", "右Win"},
+    {"lctrl", "左Ctrl"}, {"rctrl", "右Ctrl"},
+    {"lalt", "左Alt"}, {"ralt", "右Alt"},
+    {"lshift", "左Shift"}, {"rshift", "右Shift"},
+    {"esc", "Esc"}, {"tab", "Tab"},
+    {"off", "关闭"},
+};
+static int imeMetaLetterSelIndex(const char *k) {
+    for (int i = 0; i < (int)(sizeof(IME_META_LETTER_SEL_OPTS) / sizeof(IME_META_LETTER_SEL_OPTS[0])); i++)
+        if (strcmp(k, IME_META_LETTER_SEL_OPTS[i].key) == 0) return i;
+    return 0;  // 认不出 → 左右任一 Win（与 settings_manager 的默认值一致）
+}
 static int kbLayoutIndex(const char *k) {
     for (int i = 0; i < (int)(sizeof(KB_LAYOUT_OPTS) / sizeof(KB_LAYOUT_OPTS[0])); i++)
         if (strcmp(k, KB_LAYOUT_OPTS[i].key) == 0) return i;
@@ -422,7 +447,7 @@ static bool pickerFieldSupported(const char *key) {
            strcmp(key, "_kb_layout") == 0 || strcmp(key, "_ime_fuzzy") == 0 ||
            strcmp(key, "_ime_predict_mode") == 0 || strcmp(key, "_ime_cand_size") == 0 ||
            strcmp(key, "_ime_clean") == 0 || strcmp(key, "_ime_commit_mode") == 0 ||
-           strcmp(key, "_ime_ghost") == 0 ||
+           strcmp(key, "_ime_ghost") == 0 || strcmp(key, "_ime_meta_letter_sel") == 0 ||
            strcmp(key, "_editor_font_size") == 0 ||
            strcmp(key, "_click_volume") == 0 ||
            strcmp(key, "_click_chinese") == 0 || strcmp(key, "_vertical_ref_line_style") == 0;
@@ -470,6 +495,8 @@ static std::vector<PickerOpt> pickerOpts(const char *key) {
         return optsFromTable(IME_COMMIT_OPTS, OPT_ITEM_N(IME_COMMIT_OPTS));
     if (strcmp(key, "_ime_ghost") == 0)
         return optsFromTable(IME_GHOST_OPTS, OPT_ITEM_N(IME_GHOST_OPTS));
+    if (strcmp(key, "_ime_meta_letter_sel") == 0)
+        return optsFromTable(IME_META_LETTER_SEL_OPTS, OPT_ITEM_N(IME_META_LETTER_SEL_OPTS));
     if (strcmp(key, "_editor_font_size") == 0)
         return optsFromTable(EDITOR_FONT_SIZE_OPTS, OPT_ITEM_N(EDITOR_FONT_SIZE_OPTS));
     if (strcmp(key, "_click_chinese") == 0)
@@ -514,6 +541,7 @@ static std::string pickerCurValue(const char *key) {
         return IME_COMMIT_OPTS[imeCommitIndex(g_settings.imeCommitMode().c_str())].key;
     if (strcmp(key, "_ime_ghost") == 0)
         return IME_GHOST_OPTS[imeGhostIndex(g_settings.imeGhostMode().c_str())].key;
+    if (strcmp(key, "_ime_meta_letter_sel") == 0) return g_settings.imeMetaLetterSelKey();
     if (strcmp(key, "_editor_font_size") == 0)
         return EDITOR_FONT_SIZE_OPTS[editorFontSizeIndex(g_settings.getString("editor_font_size", "45").c_str())].key;
     if (strcmp(key, "_click_volume") == 0) return std::to_string(g_settings.typingClickVolume());
@@ -529,9 +557,9 @@ static bool isToggleField(const char *key) {
            strcmp(key, "first_line_indent") == 0 || strcmp(key, "version_history") == 0 ||
            strcmp(key, "recovery_draft") == 0 || strcmp(key, "vertical_ref_line") == 0 ||
            strcmp(key, "click_enabled") == 0 ||
+           strcmp(key, "long_press_symbol") == 0 ||
            strcmp(key, "ime_sentence") == 0 ||
            strcmp(key, "ime_doc_context") == 0 || strcmp(key, "ime_candidate_highlight") == 0 ||
-           strcmp(key, "ime_meta_letter_sel") == 0 ||
            strcmp(key, "reader_perf_log") == 0 ||
            strcmp(key, "ui_perf_log") == 0 ||
            strcmp(key, "webdav_debug_log") == 0 ||
@@ -547,8 +575,8 @@ static bool toggleValue(const char *key) {
     if (strcmp(key, "click_enabled") == 0) return g_settings.typingClickEnabled();
     if (strcmp(key, "ime_sentence") == 0) return v != "0";  // 默认开
     if (strcmp(key, "ime_doc_context") == 0) return v != "0";  // 默认开
-    if (strcmp(key, "ime_meta_letter_sel") == 0) return v != "0";  // 默认开
     if (strcmp(key, "ime_candidate_highlight") == 0) return v == "1";  // 默认关
+    if (strcmp(key, "long_press_symbol") == 0) return v != "0";  // 默认开，与访问器一致
     // 走访问器：它带"读不到新键就回退旧键 reader_night"的迁移逻辑。
     if (strcmp(key, "night_mode") == 0) return g_settings.nightMode();
     return v == "1";  // auto_save: 默认关
@@ -701,6 +729,10 @@ static void pickerApply(const char *key, const std::string &value, ScreenContext
         // 只写键：ui_render 在 core0 组装每一帧的 UiJob 时现读（见 ime_commit_fast_policy），
         // 下一拍就生效，不用通知任何人。
         g_settings.setString("ime_commit_mode", value);
+    } else if (strcmp(key, "_ime_meta_letter_sel") == 0) {
+        // 只写键：bt_keyboard 在修饰键**单击抬起**时现读，输入法认 Esc/Tab 时也现读，
+        // 下一按键就生效，不用通知谁。
+        g_settings.setString("ime_meta_letter_sel", value);
     } else if (strcmp(key, "_ime_ghost") == 0) {
         // 写键 + 立刻把波形组件那张表重建到新相数。**不能只写键**：表是共享的（波形组件里
         // 就一张），得真的调 setter 才变；而 setter 会重建表、bump 内容版本号（让展开过的
@@ -2176,6 +2208,10 @@ static void drawBrowseListBody() {
             } else if (strcmp(f.key, "_ime_ghost") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          IME_GHOST_OPTS[imeGhostIndex(g_settings.imeGhostMode().c_str())].label);
+            } else if (strcmp(f.key, "_ime_meta_letter_sel") == 0) {
+                snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
+                         IME_META_LETTER_SEL_OPTS[imeMetaLetterSelIndex(
+                             g_settings.imeMetaLetterSelKey().c_str())].label);
             } else if (strcmp(f.key, "_ime_cand_size") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          IME_CAND_SIZE_OPTS[imeCandSizeIndex(g_settings.getString("ime_cand_size", "45").c_str())].label);

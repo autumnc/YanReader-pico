@@ -46,9 +46,17 @@ public:
     std::string imeFuzzy();  // comma/space separated fuzzy pinyin options
     std::string imePredictMode();  // "always" / "space" / "off"
     bool imeSentence();  // 长全拼串的整句候选
-    // 实体键盘：有候选时按一下 Win/Cmd → 候选序号换成 q..o，直接按字母选字上屏
-    // （见 IME::letterSelectArmed）。默认开。
-    bool imeMetaLetterSel();
+    // 实体键盘：有候选时按一下**这个键** → 候选序号换成 q..o，直接按字母选字上屏
+    // （见 IME::letterSelectArmed）。取值："win"(左右任一，默认) / "lwin" / "rwin" /
+    // "lctrl" / "rctrl" / "lalt" / "ralt" / "lshift" / "rshift" / "esc" / "tab" / "off"。
+    // 旧布尔值兼容："1" = "win"、"0" = "off"。
+    std::string imeMetaLetterSelKey();
+    // 实体键盘：长按 = 按住 sym 再按这个键，输入键帽上印的符号。短按仍是原字符。
+    // 标准键盘：数字行/标点键走 Shift 层（1→!、,→<、/→? …），字母长按仍是自动重复。
+    // M1 这类手机式小键盘（BLE 名 "M1 Keyboard"，没有数字排、符号印在字母键帽上）：
+    // 字母键长按也生效（Q→1、A→-、Z→% …）。空格/回车/退格/方向键不受影响。
+    // 默认开（设置里叫「长按输入符号」）。
+    bool kbLongPressSymbol();
     bool imeDocContext();  // 正文已出现的词在小范围加分
     bool imeCandidateHighlight();  // 候选页内左右键高亮选择
     bool imeDebug();  // hidden: log IME candidate scoring details
