@@ -382,8 +382,8 @@ static void drawDictAppIcon(int x, int y, int box, bool invert) {
 }
 
 // 剩下的「字典」入口仍是程序化画的：子集里没有 md-book-search / md-dictionary，
-// 也没有为它新裁字形（对比：「微信读书」「DeepSeek 对话」两枚已换成源字体里的专用图形，
-// 见 tab_icons.h 的 APP_ICON_*）。
+// 也没有为它新裁字形（对比：「微信读书」「DeepSeek 对话」「应用商店」三枚已换成
+// 源字体里的专用图形，见 tab_icons.h 的 APP_ICON_*）。
 
 
 // ── 主界面标签栏（书架 / 应用 / 笔记 / 设置 / 统计）──────────────────────
@@ -1536,10 +1536,19 @@ static void rdSweepStandbyImageCache(const std::string &keep, int w, int h) {
   closedir(dp);
 }
 
+static bool rdImageExtIs(const std::string &name, const char *ext);
+
 bool readerStandbyImage(std::string &bmpPath, std::string &srcPath) {
   srcPath = g_settings.getString("standby_image");
+  if (srcPath.empty()) return false;
+  // BMP 源图（AirPage 的壁纸）不需要缓存：它本身就是按 16 灰阶存的，待机那一刻
+  // 只是"读 BMP + 缩放到屏"，比 JPEG 解码便宜得多。直接把它当缓存路径返回。
+  if (rdImageExtIs(srcPath, ".bmp")) {
+    bmpPath = srcPath;
+    return true;
+  }
   bmpPath = standbyImageCacheFor(srcPath, SCREEN_W, SCREEN_H);
-  return !srcPath.empty();
+  return true;
 }
 
 // 后缀判断（大小写不敏感——相册/网友上传来的图常是 .JPG）。
@@ -1603,6 +1612,30 @@ bool readerSetStandbyImage(const std::string &srcPath, std::string &err) {
 // 「这组 (原图, 屏尺寸) 已经试过了」——成功失败都算，免得失败时每个空闲帧重解一次。
 static std::string s_rdSbImageSrc;
 static int s_rdSbImageW = 0, s_rdSbImageH = 0;
+
+bool readerSetStandbyBmp(const std::string &srcPath, std::string &err) {
+  err.clear();
+  if (srcPath.empty()) { err = "还没选图片"; return false; }
+  if (!rdImageExtIs(srcPath, ".bmp")) { err = "不是 BMP 文件"; return false; }
+  if (!Storage.exists(srcPath.c_str())) { err = "图片不在卡上"; return false; }
+  {
+    HalFile f;
+    if (!Storage.openFileForRead(TAG, srcPath, f)) { err = "读不了这张图"; return false; }
+    Bitmap bmp(f, false);
+    if (bmp.parseHeaders() != BmpReaderError::Ok || bmp.getWidth() <= 0 || bmp.getHeight() <= 0) {
+      err = "这张 BMP 解不开";
+      return false;
+    }
+  }
+  g_settings.setString("standby_image", srcPath);
+  g_settings.setString("clock_face", standbyFaceKey(StandbyFace::Image));
+  // 告诉空闲补做"这组看过、不需要缓存"，否则它会在下一个空闲帧拿 BMP 去走
+  // JPEG/PNG 解码那条路，白报一次"只支持 JPG / PNG"。
+  s_rdSbImageSrc = srcPath;
+  s_rdSbImageW = SCREEN_W;
+  s_rdSbImageH = SCREEN_H;
+  return true;
+}
 
 // 网页（/api/set_standby）那条路**只投递、不落地**。原因是栈：解一张几百万像素的
 // JPEG 要十几 KB 栈（stb_image 的霍夫曼/IDCT 那几层），而 httpd 任务只有 8KB（够发
@@ -2190,6 +2223,8 @@ static void rdStandbyImageIdlePrebuild() {
   s_rdSbImageSrc = src;
   s_rdSbImageW = w;
   s_rdSbImageH = h;
+  // BMP 源图不建缓存（AirPage 壁纸，直接上屏），别把它丢进 JPEG/PNG 解码器。
+  if (rdImageExtIs(src, ".bmp")) return;
   if (Storage.exists(standbyImageCacheFor(src, w, h).c_str())) return;   // 已经有缓存
   std::string err;
   rdBuildStandbyImageCache(src, err);
@@ -10384,13 +10419,17 @@ static void handleSettingsTab(int key) {
 //
 // 交互刻意跟书架标签一致：**左右键在这个标签里是"换选中项"**，不是换标签（书架用它们
 // 翻封面，已经开了这个先例）。换标签靠点标签栏，或 Esc 回书架再用左右键。
-// 2 行 × 2 列。加第 4 枚时若还挤单行，竖屏 684/4 = 171px，而「文件管理」/「微信读书」
-// 各 168px，相邻标签只剩 1.5px 缝、会视觉连成一片 —— 所以改成田字格（用户定的）。
-// kAppCount 保持是 kAppCols 的整数倍：左右键的同一排内绕法依赖这一点。
-static const int kAppCount = 4;
-static const int kAppCols = 2;
-static const int kAppRows = (kAppCount + kAppCols - 1) / kAppCols;
-static const char *kAppNames[kAppCount] = {"文件管理", "微信读书", "字典", "DeepSeek 对话"};
+// 3 列 × 2 行，第五枚「应用商店」自己独占第二排、**整排居中**（2 枚在 3 列里居中，
+// 左右各让半格）。单行 5 枚在 684px 上每格只有 137px，「DeepSeek 对话」六个字放不下；
+// 田字格又只剩四格 —— 所以是 3+2 的布局。每一排的行首/行长见下面的表。
+static const int kAppCount = 5;
+static const int kAppCols = 3;
+static const int kAppRows = 2;
+static const char *kAppNames[kAppCount] = {"文件管理", "微信读书", "字典", "DeepSeek 对话",
+                                           "应用商店"};
+// 每一排从第几枚开始、有几枚（左右绕行/上下换排都按这张表算）。
+static const int kAppRowStart[kAppRows] = {0, 3};
+static const int kAppRowLen[kAppRows] = {3, 2};
 
 // 图标目标像素高。ICON_MAX_PX=112 是硬上限（超了字形被静默丢弃，画出来是空的），
 // 这里留出余量；96 也比标签栏的 56 更适合"一排大图标"的入口页。
@@ -10412,6 +10451,17 @@ static int rdAppIconTop() {
   return top;
 }
 static int rdAppRowTop(int r) { return rdAppIconTop() + r * (rdAppCellH() + rdAppRowGap()); }
+// 不满一排的那一排（第二排 2 枚）整排居中：行首缩进半个格子。
+static int rdAppRowOffset(int r) {
+  return (kAppRowLen[r] >= kAppCols) ? 0
+                                     : (g_rd.getScreenWidth() - kAppRowLen[r] * rdAppSlotW()) / 2;
+}
+// 第 i 枚图标的水平中心。渲染、命中、左右导航共用这一份几何。
+static int rdAppCenterX(int i) {
+  const int r = i / kAppCols;
+  const int c = i % kAppCols;
+  return rdAppRowOffset(r) + c * rdAppSlotW() + rdAppSlotW() / 2;
+}
 
 // 点按命中哪一格：横向按整格切（手指落点糙，不瞄字形），纵向给整块留 12px 容差；
 // 落在行缝/边距里就夹到最近的一行一列，不判空。
@@ -10420,15 +10470,15 @@ static int rdAppSlotAt(int x, int y) {
   const int bot = top + rdAppBlockH();
   if (y < top - 12 || y > bot + 12) return -1;
   int r = (y - top) / (rdAppCellH() + rdAppRowGap());
-  int c = x / rdAppSlotW();
   r = std::min(std::max(r, 0), kAppRows - 1);
-  c = std::min(std::max(c, 0), kAppCols - 1);
-  const int s = r * kAppCols + c;
-  return (s < kAppCount) ? s : -1;
+  // 第二排居中了半格：先扣掉行首缩进，再按整格切。
+  int c = (x - rdAppRowOffset(r)) / rdAppSlotW();
+  c = std::min(std::max(c, 0), kAppRowLen[r] - 1);
+  return kAppRowStart[r] + c;
 }
 
-// 按下某一枚入口。四个都不换标签（st.tab 停在 1），进去的子界面 Esc 都回这一页 ——
-// 文件浏览器回在 handleFileBrowser 的卡根分支，另三个借 st.retMode（见 handleApps）。
+// 按下某一枚入口。都不换标签（st.tab 停在 1），进去的子界面 Esc 都回这一页 ——
+// 文件浏览器回在 handleFileBrowser 的卡根分支，另几个借 st.retMode（见 handleApps）。
 static void rdOpenApp(int i) {
   switch (i) {
     case 0:
@@ -10447,6 +10497,11 @@ static void rdOpenApp(int i) {
       // Key 没配时它弹提示、不进屏 —— 那时也得重绘一次把浮层画出来，所以照样 return。
       rdAiChatBegin(std::string(), RdMode::Apps);
       return;
+    case 4:
+      // 应用商店是独立 AppState（写作模式栈），不是阅读器的子界面：投递之后本拍
+      // 直接返回 APP_APPSTORE，不先画一帧阅读器（见 screen_reader_request_appstore）。
+      screen_reader_request_appstore();
+      return;
     default:
       return;
   }
@@ -10457,13 +10512,11 @@ static void rdOpenApp(int i) {
 static void renderApps() {
   g_rd.clearScreen();
   drawTabBar();
-  const int slotW = rdAppSlotW();
   const int iconPx = rdAppIconPx();
   uint8_t *fb = g_rd.getFrameBuffer();
   for (int i = 0; i < kAppCount; i++) {
     const int r = i / kAppCols;
-    const int c = i % kAppCols;
-    const int cx = c * slotW + slotW / 2;
+    const int cx = rdAppCenterX(i);
     const int top = rdAppRowTop(r);
     const int ix = cx - iconPx / 2;
     const bool sel = (i == st.appSel);
@@ -10479,36 +10532,48 @@ static void renderApps() {
       if (fb) icon_font_draw_sized(fb, ix, top, iconPx, iconPx, APP_ICON_WEREAD, sel, iconPx);
     } else if (i == 2) {
       drawDictAppIcon(ix, top, iconPx, sel);
+    } else if (i == 4) {
+      if (fb) icon_font_draw_sized(fb, ix, top, iconPx, iconPx, APP_ICON_STORE, sel, iconPx);
     } else {
       if (fb) icon_font_draw_sized(fb, ix, top, iconPx, iconPx, APP_ICON_DEEPSEEK, sel, iconPx);
     }
     // 标签按**格子**居中（drawCenteredLine 是按整屏居中的，这儿用不上）。
-    const char *nm = kAppNames[i];
-    drawLineText(cx - g_rd.getTextWidth(uiFontId(), nm) / 2, top + iconPx + 16, nm, true);
+    // 3 列之后每格只有 ~228px，「DeepSeek 对话」放不下：按格宽截断加省略号，
+    // 免得两格的字连到一起（2 列时代不需要这一步）。
+    std::string nm = kAppNames[i];
+    const int maxW = rdAppSlotW() - 16;
+    if (g_rd.getTextWidth(uiFontId(), nm.c_str()) > maxW) {
+      while (!nm.empty() && g_rd.getTextWidth(uiFontId(), (nm + "…").c_str()) > maxW) {
+        size_t end = nm.size();
+        do {
+          --end;
+        } while (end > 0 && (static_cast<unsigned char>(nm[end]) & 0xC0) == 0x80);
+        nm.resize(end);
+      }
+      nm += "…";
+    }
+    drawLineText(cx - g_rd.getTextWidth(uiFontId(), nm.c_str()) / 2, top + iconPx + 16, nm.c_str(), true);
   }
   drawFooter("←→↑↓ 选择  Enter 打开  Esc 返回书架");
 }
 
 static void handleApps(int key) {
-  // 田字格：左右在同**排**内绕，上下换排。四个方向键在 2×2 下就是标准网格导航，
-  // 不再像单行三格那样"四个键当同一个用"。
-  if (key == KEY_LEFT) {
-    st.appSel = (st.appSel % kAppCols == 0) ? st.appSel + kAppCols - 1 : st.appSel - 1;
+  // 3+2 网格：左右在同**排**内绕（第二排只有两枚），上下换排、列号夹到目标排的长度。
+  if (key == KEY_LEFT || key == KEY_RIGHT) {
+    const int r = (st.appSel < kAppRowStart[1]) ? 0 : 1;
+    int c = st.appSel - kAppRowStart[r];
+    const int n = kAppRowLen[r];
+    c = (key == KEY_LEFT) ? (c + n - 1) % n : (c + 1) % n;
+    st.appSel = kAppRowStart[r] + c;
     st.dirty = 1;
     return;
   }
-  if (key == KEY_RIGHT) {
-    st.appSel = (st.appSel % kAppCols == kAppCols - 1) ? st.appSel - kAppCols + 1 : st.appSel + 1;
-    st.dirty = 1;
-    return;
-  }
-  if (key == KEY_UP) {
-    st.appSel = (st.appSel + kAppCount - kAppCols) % kAppCount;
-    st.dirty = 1;
-    return;
-  }
-  if (key == KEY_DOWN) {
-    st.appSel = (st.appSel + kAppCols) % kAppCount;
+  if (key == KEY_UP || key == KEY_DOWN) {
+    const int r = (st.appSel < kAppRowStart[1]) ? 0 : 1;
+    const int nr = 1 - r;
+    int c = st.appSel - kAppRowStart[r];
+    c = std::min(c, kAppRowLen[nr] - 1);
+    st.appSel = kAppRowStart[nr] + c;
     st.dirty = 1;
     return;
   }
@@ -13168,6 +13233,90 @@ static void rdRestoreReturnPoint() {
 
 // ── 公开入口 ────────────────────────────────────────────────────────────
 
+// ── Lua 应用投递的跳转（见 screen_reader.h）────────────────────────────
+// 应用先投递、再切 AppState；下一次 screen_reader_init 在恢复完返回点之后消费。
+// 三种请求互斥：最后一次投递赢（投递时先清空整组），所以不会出现"又开书又切标签"。
+static int s_reqTab = -1;
+static std::string s_reqBook;
+static bool s_reqOpds = false;
+static bool s_reqNetshare = false;
+// 与应用内跳转相反方向的那一条：阅读器主动离开、去应用商店。由 handle 在分发完
+// 之后消费（不能等下一次 init —— 那会先画一帧书架再盖商店）。
+static bool s_reqAppstore = false;
+
+static void rdClearRequests() {
+  s_reqTab = -1;
+  s_reqBook.clear();
+  s_reqOpds = false;
+  s_reqNetshare = false;
+}
+
+void screen_reader_request_tab(int tab) {
+  rdClearRequests();
+  s_reqTab = clampI(tab, 0, kTabCount - 1);
+}
+
+void screen_reader_request_open_book(const std::string &path) {
+  rdClearRequests();
+  s_reqBook = path;
+}
+
+void screen_reader_request_opds() {
+  rdClearRequests();
+  s_reqOpds = true;
+}
+
+void screen_reader_request_netshare() {
+  rdClearRequests();
+  s_reqNetshare = true;
+}
+
+void screen_reader_request_appstore() { s_reqAppstore = true; }
+
+// 在 init 里调用一次：恢复返回点之后、第一次出画之前。
+static void rdApplyRequests() {
+  const bool any = s_reqOpds || s_reqNetshare || !s_reqBook.empty() || s_reqTab >= 0;
+  if (!any) return;
+  // 先取走再清空：下面的动作可能回头投递别的请求（例如开书失败退回书架不投递，
+  // 但保持这个习惯，免得将来加分支时把新请求一起清掉）。
+  const std::string book = s_reqBook;
+  const int tab = s_reqTab;
+  const bool opds = s_reqOpds;
+  const bool netshare = s_reqNetshare;
+  rdClearRequests();
+
+  // 两个子界面 Esc 都回 st.retMode，根标签入口进来就回对应的标签页。
+  st.retMode = tabMode(st.tab);
+
+  if (opds) {
+    doMenuAction(MenuAct::Opds);
+    return;
+  }
+  if (netshare) {
+    doMenuAction(MenuAct::NetShare);
+    return;
+  }
+  if (!book.empty()) {
+    int kind = 0;
+    if (endsWith(book, ".txt")) kind = 1;
+    else if (endsWith(book, ".xtc")) kind = 2;
+    if (openBook(book, kind)) {
+      st.tab = 0;               // 从书页 Esc 回书架，而不是应用页
+      st.mode = RdMode::Reading;
+      st.fullRefresh = true;
+      st.dirty = 1;
+    } else {
+      // 开不出来（文件被删/损坏）：留在恢复点，给一条提示，别卡在空白页。
+      st.floatMsg = "无法打开这本书";
+      st.floatSub = book;
+      st.floatUntilUs = esp_timer_get_time() + 3 * 1000 * 1000;
+      st.dirty = 1;
+    }
+    return;
+  }
+  if (tab >= 0) switchTab(tab);
+}
+
 void screen_reader_init() {
   // 这一次 init 是从长按中间键切模式那一刻起、到阅读页上屏为止的**全部**耗时（屏在这段
   // 里一动不动）。每次进入都起一次账 —— 见上面 rdTraceBegin 的说明。
@@ -13338,9 +13487,13 @@ void screen_reader_init() {
   // 从其它模式切回来时回到切换出去前那一屏（书的位置一起带回）。开机首次进入时
   // s_return 无效，保持上面的"书架首页"默认。
   rdRestoreReturnPoint();
+  // Lua 应用投递的跳转（打开某本书 / 切到某标签 / OPDS / WiFi 传书）。放在恢复点
+  // **之后**：应用明确要求看的东西优先于"上次停在哪"；也放在第一次出画之前，
+  // 这样不会先闪一帧旧界面。
+  rdApplyRequests();
   // 上面这一行里是**开书**：Epub::load + 内嵌字体 + Section 重解析 + 排到上次那一页，
   // 切模式卡顿的主犯基本都在这一段里，它自己会在上面插好各自的明细。
-  rdTraceMark("恢复返回点(含开书)");
+  rdTraceMark("恢复返回点(含开书/应用请求)");
   ESP_LOGI(TAG, "阅读模式初始化: %d 本书, ui=%dpx, body=%dpx, 行距档=%d, 缩进=%d",
            (int)st.books.size(), uiPx, kBodyPx[st.fontLevel],
            spacingIdx(), st.indentMode);
@@ -13751,6 +13904,13 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     case RdMode::StatsProfile: handleStatsProfile(key); break;
     case RdMode::StatsAdjust: handleStatsAdjust(key); break;
     case RdMode::StatsSettings: handleStatsSettings(key); break;
+  }
+
+  // 应用页 → 应用商店：分发已经做完，本拍直接换屏。**不能**落到下面去渲染 ——
+  // 那会先把书架画一遍、推一屏，用户看到的就是"点商店先闪一下书页"。
+  if (s_reqAppstore) {
+    s_reqAppstore = false;
+    return APP_APPSTORE;
   }
 
   // **必需的**一次输入法同步：分发已经做完，这一拍要停在哪个界面已成定局，此时再对齐

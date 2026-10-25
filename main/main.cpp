@@ -23,6 +23,8 @@
 #include "screen_polish_prompt.h"
 #include "screen_flomo.h"
 #include "screen_reader.h"
+#include "screen_appstore.h"
+#include "screen_luaapp.h"
 #include "ui_helpers.h"
 #include "ui_render.h"
 #include "ui/screen.h"   // Screen：每屏一行（handle/idle_ms/键盘宿主/局刷）
@@ -464,6 +466,10 @@ void app_bt_set_enabled(bool on) {
 // （定义在文件上半部分的蓝牙那一段之前，btInitBody 也要用它。）
 // 本帧的 key 来自蓝牙键盘/遥控器（见 pjournal_app.h）。每帧先置位,再被 hw 键补充。
 bool g_key_from_ble = false;
+// Lua 应用可以 system("power.keep_awake","on") 请求别进待机（例如正在导出/对时）。
+// 权限位 keep_awake 在安装时授过才允许；应用退出时 screen_luaapp 无条件清掉，
+// 防止一次崩溃把整机钉醒。
+bool g_lua_keep_awake = false;
 // 唤醒后的首次按键释放不应再次触发休眠(唤醒按键与休眠按键是同一个键)
 static bool s_boot_wake_release_pending = false;
 
@@ -651,6 +657,7 @@ static void checkLightSleep(AppState state) {
     if (standby_min <= 0) return;
     if (g_wifi.isConnected()) return;  // 网络操作中不休眠
     if (state == APP_BT_MANAGE) return;  // 用户在蓝牙管理界面
+    if (g_lua_keep_awake) return;      // Lua 应用显式要求保持唤醒
 
     static int64_t s_last_wake_us = 0;
     int64_t now = esp_timer_get_time();
@@ -1054,6 +1061,13 @@ static const Screen kScreens[APP_QUIT + 1] = {
     // s_return 记返回点，见 rdRestoreReturnPoint）。
     /* APP_READER        */ {.name = "reader",         .enter = screen_reader_enter, .handle = scrReader,
                              .leave = screen_reader_leave, .idle_ms = 0, .vk_host = true },
+    // 商店与 Lua 应用都是写作模式的横屏界面（见 pjournal_app.h 的枚举注释）。
+    // 两者都自己画整屏（商店是图标网格，应用是画布），变化常超半屏，local_only
+    // 让它们走局刷、别掉进整屏 GL16（和 flomo/设置同一处理由）。
+    /* APP_APPSTORE      */ {.name = "appstore",       .enter = screen_appstore_enter, .handle = screen_appstore_handle,
+                             .leave = screen_appstore_leave, .local_only = true },
+    /* APP_LUA_APP       */ {.name = "lua_app",        .enter = screen_luaapp_enter, .handle = screen_luaapp_handle,
+                             .leave = screen_luaapp_leave, .local_only = true },
 };
 static_assert(sizeof(kScreens) / sizeof(kScreens[0]) == APP_QUIT + 1,
               "kScreens 必须一个界面一行（含 APP_QUIT 占位）");
@@ -1104,6 +1118,9 @@ static bool autoOrientWantedFor(AppState st) {
         case APP_POLISH:
         case APP_POLISH_PROMPT:
         case APP_FLOMO:
+        // 商店与 Lua 应用属于写作模式（appModeOfState），方向也跟写作模式走。
+        case APP_APPSTORE:
+        case APP_LUA_APP:
             return g_settings.getString("writing_orientation", "") == "auto";
         case APP_GTD:
             return g_settings.getString("gtd_orientation", "") == "auto";
@@ -1883,6 +1900,8 @@ extern "C" void app_main() {
             case APP_FLOMO:       // 条目列表 + 检索结果
             case APP_BT_MANAGE:   // 扫描列表 / 已配对列表
             case APP_POLISH:      // 润色结果页
+            case APP_APPSTORE:    // 商店列表（detail/安装列表按屏翻）
+            case APP_LUA_APP:     // Lua 应用的列表版式（画布版式自己忽略）
                 break;
             default:
                 if (key == KEY_PAGE_UP) key = KEY_UP;
@@ -1914,7 +1933,7 @@ extern "C" void app_main() {
             && currentState != APP_OUTLINE && currentState != APP_EDITOR
             && currentState != APP_FLOMO && currentState != APP_BT_MANAGE
             && currentState != APP_INSPIRATION && currentState != APP_SETTINGS
-            && currentState != APP_POLISH_PROMPT) key = 0x1B;
+            && currentState != APP_POLISH_PROMPT && currentState != APP_LUA_APP) key = 0x1B;
 
         // 屏幕边缘向中间横划 = 返回（三种模式通用，见 pjournal_app.h KEY_BACK）。
         // ① 虚拟键盘候选行上的横划仍归键盘：editorVkSwipePage 按**按下点**认候选行，

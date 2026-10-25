@@ -46,6 +46,10 @@ static const uint32_t BAR_ICON_REFRESH   = 0xF0450;  // md-refresh 重新扫描�
 // 这两位**，否则 icon_font_draw_sized 会静默画成空白（日志里有一行 glyph missing）。
 static const uint32_t APP_ICON_WEREAD    = 0xF1AF3;  // 微信读书
 static const uint32_t APP_ICON_DEEPSEEK  = 0xF1AF4;  // DeepSeek 对话
+// 应用商店：购物袋（FA 段的 shopping_bag）。之前是程序化画的店面，缩小后雨棚/门
+// 几条细线容易糊成一块；这枚实心图形在 96px 下轮廓清楚。4 位码位只走
+// icon_font_draw_sized()，别交给文本路径。
+static const uint32_t APP_ICON_STORE     = 0xF290;
 
 // ── 文件浏览页的浮动按钮（网络文件管理）──────────────────────────────────
 // 是新加进子集的（scripts/subset_icon_font.py 的 FAB 组）。

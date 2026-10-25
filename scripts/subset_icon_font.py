@@ -79,7 +79,8 @@ FAB = [0xF059F]         # md-web   网络文件管理（浏览器传书）
 # 比"借一枚通用图标"更贴题。**源字体里没有这两位，这里裁出来是空的** ——
 # 换 NF-Propo 时记得确认它们还在。
 APPS = [0xF1AF3,        # 微信读书
-        0xF1AF4]        # DeepSeek 对话
+        0xF1AF4,        # DeepSeek 对话
+        0xF290]         # FA shopping_bag：应用商店（4 位码位，NF-Propo 自带的 FA 段）
 
 CHARSET = (ASCII + FULLWIDTH + STATUS + INLINE + MENU + COMMON + KEYBOARD + TABS +
            SHELF_BAR + FAB + APPS + BOOKMARK)

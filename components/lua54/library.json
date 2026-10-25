@@ -1,0 +1,21 @@
+{
+  "name": "CrossStoreLua",
+  "version": "5.4.9",
+  "description": "Pinned Lua runtime for portable CrossStore packages",
+  "build": {
+    "srcFilter": [
+      "+<*.c>",
+      "-<lua.c>",
+      "-<luac.c>",
+      "-<linit.c>",
+      "-<liolib.c>",
+      "-<loslib.c>",
+      "-<loadlib.c>",
+      "-<ldblib.c>",
+      "-<lcorolib.c>"
+    ],
+    "flags": [
+      "-DLUAI_MAXCCALLS=50"
+    ]
+  }
+}

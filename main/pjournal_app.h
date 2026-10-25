@@ -23,6 +23,11 @@ enum AppState {
     APP_POLISH_PROMPT,
     APP_FLOMO,
     APP_READER,
+    // CrossStore 应用商店与它拉起的 Lua 应用。两者都算写作模式（appModeOfState
+    // 落到最后的 return 1）：商店是横屏列表界面，应用也是横排画布。从阅读器的
+    // 「应用」页进来时，阅读器 leave 会把方向还给全局设置，正好接上。
+    APP_APPSTORE,
+    APP_LUA_APP,
     APP_QUIT,
 };
 

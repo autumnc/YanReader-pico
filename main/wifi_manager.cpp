@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
@@ -184,7 +185,14 @@ bool WifiManager::connect(const char *ssid, const char *password, ConnectProgres
 
     // Radio may have been stopped by a previous disconnect() — bring it back up
     if (!_started) {
-        if (esp_wifi_start() != ESP_OK) return false;
+        const esp_err_t se = esp_wifi_start();
+        if (se != ESP_OK) {
+            // 这里失败没有 reason 码，界面只会显示"见 reason 码"；把内存现场一起记下来。
+            ESP_LOGE(TAG, "esp_wifi_start 失败: 0x%x (%s)，内部RAM余 %u 最大块 %u", se,
+                     esp_err_to_name(se), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            return false;
+        }
         _started = true;
     }
 
@@ -248,8 +256,9 @@ bool WifiManager::connect(const char *ssid, const char *password, ConnectProgres
     if (s_wifi_event) xEventGroupClearBits(s_wifi_event, WIFI_CONNECTED_BIT);
     err = esp_wifi_connect();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_connect 失败: 0x%x (%s)", err, esp_err_to_name(err));
-        return false;
+        // "sta is connecting" 多半是 STA_START 事件晚到、事件任务已经替我们发起了一次
+        // 连接（见上面 STA_START 的处理）。那不是真的失败，继续等 IP 就行。
+        ESP_LOGW(TAG, "esp_wifi_connect: 0x%x (%s)", err, esp_err_to_name(err));
     }
 
     // Wait for connection (10s timeout)。分成 250ms 的小段等：段与段之间调一次

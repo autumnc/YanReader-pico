@@ -83,6 +83,11 @@ idf_component_register(SRCS
     "boot_splash.cpp"
     "json_parser.cpp"
     "json_utils.cpp"
+    "crossstore/CrossStoreRuntime.cpp"  # CrossStore 沙箱：Lua 宿主绑定（见 components/lua54）
+    "crossstore/store_package.cpp"      # CrossStore 包/目录/安装/权限/图标
+    "screen_appstore.cpp"               # 应用商店：目录/安装/详情/已安装（写作模式）
+    "screen_luaapp.cpp"                 # Lua 应用宿主：画布/列表版式 + 系统与阅读服务
+    "airpage_service.cpp"               # AirPage 原生服务：设备 ID/扫码地址/拉图/历史/壁纸
     "ime/IME.cpp"
     "ime/yong_dict.cpp"
     "ime/yong_pinyin.cpp"
@@ -124,6 +129,7 @@ idf_component_register(SRCS
         "ime"
         "ui"
         "net"
+        "crossstore"
     EMBED_FILES
         ${PJOURNAL_EMBED_FILES}
     REQUIRES
@@ -152,10 +158,11 @@ idf_component_register(SRCS
         fatfs
         driver
         crossmux
+        lua54
 )
 
 # 本工程是独立项目，版本号不复用 pjournal 那条线：从 1.0.0 重新起算。
-target_compile_definitions(${COMPONENT_LIB} PRIVATE YAN_READER_VERSION="1.8.5")
+target_compile_definitions(${COMPONENT_LIB} PRIVATE YAN_READER_VERSION="1.9.0")
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PJOURNAL_IME_ENABLE_PINYIN=$<BOOL:${PJOURNAL_IME_ENABLE_PINYIN}>
     PJOURNAL_IME_ENABLE_LIANGFEN=$<BOOL:${PJOURNAL_IME_ENABLE_LIANGFEN}>

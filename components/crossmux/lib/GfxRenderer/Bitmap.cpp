@@ -271,6 +271,18 @@ BmpReaderError Bitmap::parseHeaders() {
 // packed 2bpp output, 0 = black, 1 = dark gray, 2 = light gray, 3 = white
 BmpReaderError Bitmap::readNextRow(uint8_t* data, uint8_t* rowBuffer, uint8_t* opacityRow, RowOutput output) const {
   // Note: rowBuffer should be pre-allocated by the caller to size 'rowBytes'
+  // Bottom-up BMPs (positive biHeight) store the **bottom** row first. Everything this
+  // firmware writes is top-down (JpegToBmpConverter writes -height), so the old
+  // "just read forward" behaviour went unnoticed — but images from the network are
+  // ordinary bottom-up BMPs, and they came out vertically mirrored on screen
+  // (AirPage: "图片显示是倒着的，而且像是镜像化了"). Jump to the row belonging to
+  // prevRowY+1 so every caller keeps seeing rows top-to-bottom regardless of encoding.
+  if (!topDown) {
+    const int row = prevRowY + 1;
+    if (row >= 0 && row < height &&
+        !sourceSeek(static_cast<size_t>(bfOffBits) + static_cast<size_t>(height - 1 - row) * rowBytes))
+      return BmpReaderError::SeekPixelDataFailed;
+  }
   if (sourceRead(rowBuffer, rowBytes) != rowBytes) return BmpReaderError::ShortReadRow;
 
   prevRowY += 1;
@@ -385,6 +397,8 @@ BmpReaderError Bitmap::rewindToData() const {
   if (!sourceSeek(bfOffBits)) {
     return BmpReaderError::SeekPixelDataFailed;
   }
+  // 下一次 readNextRow 重新从第 0 行算起（bottom-up 的逐行定位也靠它）。
+  prevRowY = -1;
 
   // Reset dithering when rewinding
   if (fsDitherer) fsDitherer->reset();

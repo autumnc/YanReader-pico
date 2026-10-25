@@ -2279,7 +2279,7 @@ static void drawEditor() {
 }
 
 static void drawConfirmDialog() {
-    ui_draw_confirm_dialog("是否保存当前内容？", "Enter=保存", "ESC=放弃");
+    ui_draw_confirm_dialog("是否保存当前内容？", "Enter=保存", "ESC=放弃  C=取消");
 }
 
 static void drawRecoveryDialog() {
@@ -3224,6 +3224,12 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             g_editor.confirmSave = false;
             ctx.nextState = ctx.prevState;
             return ctx.prevState;
+        }
+        // C=取消：只关掉对话框，留在编辑器里继续改
+        if (key == 'c' || key == 'C') {
+            g_editor.confirmSave = false;
+            ui_clear(); drawEditor(); ui_commit();
+            return APP_EDITOR;
         }
         ui_clear(); drawEditor(); drawConfirmDialog(); ui_commit();
         return APP_EDITOR;

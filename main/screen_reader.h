@@ -25,6 +25,22 @@ AppState screen_reader_handle(int key, ScreenContext &ctx);
 void screen_reader_enter(ScreenContext &ctx);
 void screen_reader_leave(AppState next);
 
+// ── 从 Lua 应用跳进阅读器 ────────────────────────────────────────────────
+// 应用商店的 Lua 应用可以 app.open("library"/"file_transfer"/"opds") 或
+// reading.open(index)（跳去读某本书）。它们先把请求投递到这里，再切到 APP_READER；
+// screen_reader_init 在恢复完上次位置之后、第一次出画之前把请求消费掉。
+// 语义：tab=0 书架；tab 1.. 见阅读器的标签定义；Netshare/OPDS 直接进对应子界面。
+void screen_reader_request_tab(int tab);
+void screen_reader_request_open_book(const std::string &path);
+void screen_reader_request_opds();
+void screen_reader_request_netshare();
+
+// ── 从阅读器跳进应用商店 ────────────────────────────────────────────────
+// 「应用」标签里的「应用商店」入口用。投递之后 screen_reader_handle 本拍直接返回
+// APP_APPSTORE —— **不能**等下一次 init，也**不能**先画一帧阅读器再把商店盖上去
+// （e-ink 上就是闪一下书架）。阅读器的 leave 钩子照常收尾（记进度/还方向）。
+void screen_reader_request_appstore();
+
 // ── 待机表盘「书籍封面」的两个出口 ───────────────────────────────────────
 // 只有 screen_reader.cpp 知道进度表、封面缓存路径的算法和封面解码器，所以这两件事
 // 都由它出面。做成"取数"而不是"绘制"：待机表盘画在 ui_render 的工作缓冲上，而这里
@@ -91,6 +107,11 @@ bool readerStandbyImage(std::string &bmpPath, std::string &srcPath);
 // 「图片」（"设为待机画面"这个动作的语义就是"以后待机看这张"）。失败时 err 填原因。
 // 会**原地解一张大图**（秒级）：调用方要先给一帧"正在…"的提示再进。
 bool readerSetStandbyImage(const std::string &srcPath, std::string &err);
+
+// AirPage 的休眠壁纸：源文件本来就是 BMP（AirPage 下载时就归一成了 Gray8 BMP），
+// 不用再解一遍，直接让设置键指过去。readerStandbyImage 对 .bmp 原样返回源路径，
+// 显示时 readerCoverScaleTo 自己 fit/居中；转屏也不用重建缓存。
+bool readerSetStandbyBmp(const std::string &srcPath, std::string &err);
 
 // ── 网页（/api/set_standby）那条路要拆成两步 ─────────────────────────────
 // 原因只有一条：栈。解一张几百万像素的 JPEG 要十几 KB 栈，而 httpd 任务只有 8KB。
