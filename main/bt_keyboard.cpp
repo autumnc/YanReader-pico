@@ -671,6 +671,24 @@ static bool has_hid_service(uint8_t *data, uint8_t len) {
     return false;
 }
 
+// SMP 安全参数：SC + Just Works（无 MITM），配对不需要用户操作。
+// 实测 TypixNode KBD 就是这样配对成功的（日志里走 SC，生成 LTK，auth success，
+// 全程没有配对码）；M1 / Eyelash40 也一直是这套。不要改成 MITM：本机没有键盘，
+// 只能当 DisplayYesNo，而对方若是 KeyboardOnly 就要走 Passkey Entry —— 配对码只
+// 出现在串口日志里，用户根本看不到，而且配错还会让协议栈删掉本机 bond。
+static void applySecurityParams() {
+    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_BOND;
+    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
+    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t key_size = 16;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, 1);
+    esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, 1);
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, 1);
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, 1);
+    esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, 1);
+}
+
 static void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
     switch (event) {
     case ESP_GAP_BLE_SCAN_RESULT_EVT:
@@ -749,6 +767,14 @@ static void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             ESP_LOGI(TAG, "BLE auth success");
         } else {
             ESP_LOGE(TAG, "BLE auth fail: 0x%x", param->ble_security.auth_cmpl.fail_reason);
+            // 0x50 = ESP_AUTH_SMP_PAIR_AUTH_FAIL。典型成因是两边 bond 不一致：本机
+            // 这份被删了（Bluedroid 在每次 auth 失败时都会自动删本机的），键盘那头
+            // 还留着旧记录，于是它拒绝这次重新配对。这时只能让键盘忘掉旧主机、重新
+            // 进入配对模式；删本机 bond 无济于事（本来就已经没有了），所以这里不动
+            // 任何密钥，只把线索打到日志里。
+            if (param->ble_security.auth_cmpl.fail_reason == ESP_AUTH_SMP_PAIR_AUTH_FAIL) {
+                ESP_LOGW(TAG, "配对被拒(0x50)：若反复失败，请让键盘重新进入配对模式");
+            }
         }
         break;
     default:
@@ -765,7 +791,18 @@ static void scan_task(void *arg) {
     s_found_count = 0;
     if (s_devices_mutex) xSemaphoreGive(s_devices_mutex);
 
+    // 防御性停扫：正常路径上一轮窗口结束时已经停过；这里再停一次，避免遗留的
+    // 扫描命令让下面的 start 被控制器拒绝。未在扫描时这条命令只会返回错误，
+    // 无副作用。3 秒预热正好给异步命令留出完成时间。
+    if (!s_deiniting) esp_ble_gap_stop_ext_scan();
+
     vTaskDelay(pdMS_TO_TICKS(3000));
+    // 预热期间可能被 deinit(待机)或连接请求取消。栈已经拆掉时绝不能再碰 GAP API。
+    if (s_deiniting || !s_scanning) {
+        s_scanning = false;
+        vTaskDelete(NULL);
+        return;
+    }
     ESP_LOGI(TAG, "Scanning for BLE devices...");
 
     esp_err_t ret;
@@ -774,14 +811,28 @@ static void scan_task(void *arg) {
         ESP_LOGE(TAG, "set_ext_scan_params failed: %d", ret);
     }
     vTaskDelay(pdMS_TO_TICKS(100));
+    // 设参数和启动之间还有一次异步往返；这 100ms 里可能刚好被 deinit(待机)拆栈，
+    // 或用户已经点选设备开始连接。此时绝不能再把扫描打开 —— 打开之后收尾逻辑会
+    // 因为 s_scanning 已被清掉而跳过停扫，射频就遗留下来了。
+    if (s_deiniting || !s_scanning) {
+        s_scanning = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    bool scan_started = false;
     ret = esp_ble_gap_start_ext_scan(SCAN_DURATION * 100, 0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "start_ext_scan failed: %d", ret);
     } else {
+        scan_started = true;
         ESP_LOGI(TAG, "Extended scan started for %d seconds", SCAN_DURATION);
     }
 
     vTaskDelay(pdMS_TO_TICKS((SCAN_DURATION + 3) * 1000));
+    // duration 到点后控制器会自己停扫（日志里有 "Scan timeout"），period=0 只是
+    // 不周期重扫。这里再显式停一次，兜住"启动/取消命令交错"的情况，也保证收工后
+    // 射频确实空闲、不干扰紧接着的连接。deinit 之后栈已经拆了，绝不能再碰 GAP API。
+    if (scan_started && !s_deiniting) esp_ble_gap_stop_ext_scan();
     ESP_LOGI(TAG, "Scan complete, found %d devices", s_found_count);
     s_scanning = false;
     // 不要在这里 setConnected(false)：扫描结束时连接可能刚建立，误清会把已连接的
@@ -805,11 +856,12 @@ static void connect_task(void *arg) {
              s_connect_req.bda[3], s_connect_req.bda[4], s_connect_req.bda[5]);
     ESP_LOGI(TAG, "Connecting to %s...", hex);
 
-    // 清除旧 bond：上次配对用旧安全参数(SC_MITM_BOND)留下的残留 LTK 会让重连在
-    // 加密阶段卡死 ~30s 后以 CONN_CANCEL(0x100) 失败。清掉后走全新 Just Works 配对
-    // (无需用户交互，透明重配对)。
-    esp_ble_remove_bond_device(s_connect_req.bda);
-
+    // 不要在这里删 bond。esp_ble_remove_bond_device() 是**异步**的：删除命令可能正好
+    // 落在连接后的加密握手中间，协议栈会认为密钥/设备不存在，SMP 以 PAIR_AUTH_FAIL
+    // (0x50) 失败并把链路断掉 —— 用户看到的就是"连上就断"，而且 Bluedroid 还会顺手
+    // 把本机这份 bond 删掉，于是下次只能重新配对，越删越坏（TypixNode KBD 实测）。
+    // 正常重连直接复用手上的 LTK；真的密钥不匹配时协议栈会在 auth 失败时自己删掉
+    // 本机这份 bond，下一次尝试走全新配对，不需要我们抢时序。
     esp_hidh_dev_t *dev = esp_hidh_dev_open(s_connect_req.bda, ESP_HID_TRANSPORT_BLE,
                                             s_connect_req.addr_type);
     if (dev == nullptr) {
@@ -905,19 +957,8 @@ esp_err_t BtKeyboard::init() {
 
     esp_ble_gap_register_callback(ble_gap_cb);
 
-    // Configure SMP/security parameters for HID keyboard pairing.
-    // 本键盘仅支持 Just Works(NoInputNoOutput)；强制 MITM 反而协商不出配对方法。
-    // 连接前已用 esp_ble_remove_bond_device 清除残留 bond。
-    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_BOND;
-    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
-    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-    uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-    uint8_t key_size = 16;
-    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, 1);
-    esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, 1);
-    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, 1);
-    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, 1);
-    esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, 1);
+    // SMP/security 参数：SC + Just Works（见 applySecurityParams 上面的说明）。
+    applySecurityParams();
 
     esp_ble_gattc_register_callback(esp_hidh_gattc_event_handler);
 
@@ -946,6 +987,11 @@ esp_err_t BtKeyboard::init() {
 void BtKeyboard::deinit() {
     s_deiniting = true;
     s_connect_task = nullptr;
+    // 扫描用射频，而且拆 bluedroid 时扫描还在跑会报一堆错 —— 先停掉它。
+    if (s_scanning) {
+        s_scanning = false;
+        esp_ble_gap_stop_ext_scan();
+    }
     if (s_dev) {
         esp_hidh_dev_close(s_dev);
         // esp_hidh_deinit 要求所有设备已关闭,而 close 是异步的
@@ -1002,6 +1048,14 @@ void BtKeyboard::deinit() {
 }
 
 void BtKeyboard::scanDevices() {
+    // 上一轮扫描还没结束就别再起一个：连点两下会白建一个 4KB 内部栈的任务。
+    // **必须在清空列表之前拦下**：以前先清列表再判断 s_scanning，扫描还在跑时
+    // 第二次点"添加设备"会把已经收集到的设备全抹掉，而剩下的扫描窗口里未必会
+    // 再上报一遍 —— 列表就一直是空的。
+    if (s_scanning) {
+        ESP_LOGI(TAG, "Scan already in progress, keep current results");
+        return;
+    }
     if (s_dev) {
         esp_hidh_dev_close(s_dev);
         esp_hidh_dev_free(s_dev);
@@ -1016,9 +1070,6 @@ void BtKeyboard::scanDevices() {
     if (s_devices_mutex) xSemaphoreTake(s_devices_mutex, portMAX_DELAY);
     s_found_count = 0;
     if (s_devices_mutex) xSemaphoreGive(s_devices_mutex);
-    // 扫描已经在跑就别再建一个：任务的入口也有同样的判断，但等它被调度到再退出
-    // 需要一次上下文切换，连点两下就白建一个 4KB 内部栈的任务。在这里先拦掉。
-    if (s_scanning) return;
     xTaskCreate(scan_task, "bt_scan", 4096, NULL, 2, NULL);
     ESP_LOGI(TAG, "BT scan started for HID keyboards");
 }
@@ -1244,7 +1295,12 @@ void BtKeyboard::savePairedDevice(const uint8_t *bda, esp_ble_addr_type_t addr_t
     for (int i = 0; i < s_paired_count; i++) {
         if (memcmp(s_paired[i].bda, bda, ESP_BD_ADDR_LEN) == 0) { idx = i; break; }
     }
+    // 记住旧名字：连接后加密失败时 esp_hidh_dev_name_get() 返回空串，HID OPEN
+    // 事件照样会走到这里。以前空名字会覆盖掉扫描时存下的 "TypixNode KBD"，变成
+    // "BLE-24e2ac" —— 一次失败的连接就把列表里的名字毁了。空名字时保留旧名字。
+    char prev_name[32] = "";
     if (idx >= 0) {
+        snprintf(prev_name, sizeof(prev_name), "%s", s_paired[idx].name);
         for (int i = idx; i < s_paired_count - 1; i++) s_paired[i] = s_paired[i + 1];
         s_paired_count--;
     }
@@ -1255,6 +1311,8 @@ void BtKeyboard::savePairedDevice(const uint8_t *bda, esp_ble_addr_type_t addr_t
     s_paired[0].addr_type = addr_type;
     if (name && name[0]) {
         snprintf(s_paired[0].name, sizeof(s_paired[0].name), "%.31s", name);
+    } else if (prev_name[0]) {
+        snprintf(s_paired[0].name, sizeof(s_paired[0].name), "%s", prev_name);
     } else {
         snprintf(s_paired[0].name, sizeof(s_paired[0].name), "BLE-%02x%02x%02x", bda[3], bda[4], bda[5]);
     }
