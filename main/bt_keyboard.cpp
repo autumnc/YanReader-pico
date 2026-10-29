@@ -63,6 +63,9 @@ static int64_t s_consumer_press_us = 0;
 #define KEY_SEARCH     0xA2
 #define KEY_HELP       0xA3
 #define KEY_REDO       0xA4
+// 中间电容键长按 → 阅读/写作/计划三模式轮换（main.cpp 全局处理）。
+// 必须与 pjournal_app.h 的同名宏一致。
+#define KEY_LONG_CONFIRM 0xA5
 // 晃动机身 = 一次全刷（清残影）。蓝牙键盘上由 Alt+R 产生（见下面的修饰键分支），
 // 主机在 main.cpp 的非阅读界面兜底分支里把它翻成 ui_full_refresh_now()。
 // 必须与 pjournal_app.h 的同名宏一致。
@@ -108,6 +111,9 @@ static uint8_t hid_to_ascii(uint8_t kc, uint8_t mod) {
     return shift ? s_asc_shift[i] : s_asc_low[i];
 }
 
+// M1 小键盘功能键的重映射（定义在后面，要读 s_m1_layout）。
+static int m1ConsumerRemap(uint16_t usage);
+
 // 消费类报告 → 键码。usage 为 0 表示全部松开。不自动重复（遥控器按键没有重复语义）。
 static void handleConsumerReport(const uint8_t *data, size_t len) {
     uint16_t usage = 0;
@@ -117,6 +123,12 @@ static void handleConsumerReport(const uint8_t *data, size_t len) {
     s_last_consumer = usage;
     if (usage == 0) return;
     s_consumer_press_us = esp_timer_get_time();
+    const int m1 = m1ConsumerRemap(usage);
+    if (m1) {
+        pushKey((uint16_t)m1);
+        ESP_LOGI(TAG, "M1 consumer key usage=0x%04X → 0x%02X (功能键重映射)", (unsigned)usage, m1);
+        return;
+    }
     pushKey((uint16_t)(KEY_CONSUMER_BASE | (usage & 0x1FFF)));
     ESP_LOGI(TAG, "consumer key usage=0x%04X → 0x%04X", (unsigned)usage,
              (unsigned)(KEY_CONSUMER_BASE | (usage & 0x1FFF)));
@@ -159,6 +171,26 @@ static bool hasShiftSymbol(uint8_t kc) {
 // 看不到，没法从 HID 报告反推，所以只能按它的键帽把 a..z → 符号写死。
 // 连的是普通键盘时 s_m1_layout=false，字母长按仍走原来的自动重复。
 static bool s_m1_layout = false;
+
+// M1 小键盘的功能键重映射（2026-10-29 用户要求）：
+//   音量+ / 音量-  → PageUp / PageDown
+//   搜索键         → 模式切换（等同长按中间电容键）
+//   地球键         → 开关输入法（等同 Ctrl+Space）
+// 只对 M1 生效：消费类 usage 本来由「按键映射」按需绑定，遥控器/翻页器的音量键
+// 不该被这里改成翻页（而且写死会盖掉用户自己的绑定）。M1 的这几个键有的走消费类
+// 报告、有的走键盘报告（0x7F~0x81 是 HID 键盘页自己的音量键，0x90/0x91 是 LANG1/2），
+// 两条路都会进到这里（键盘页那条在下面的循环里直接调 remap）。
+// 消费类 usage：0xE9 音量增、0xEA 音量减、0x221 AC Search、0x290 Keyboard Layout Select。
+static int m1ConsumerRemap(uint16_t usage) {
+    if (!s_m1_layout) return 0;
+    switch (usage) {
+        case 0x00E9: return KEY_PAGE_UP;        // 音量+
+        case 0x00EA: return KEY_PAGE_DOWN;      // 音量-
+        case 0x0221: return KEY_LONG_CONFIRM;   // 搜索 → 模式切换
+        case 0x0290: return KEY_IME_TOGGLE;     // 地球键 → 输入法开关
+        default: return 0;
+    }
+}
 
 // 字母键帽上的符号（下标 = HID usage - 4，a..z）：
 //   Q1 W2 E3 R4 T5 Y6 U7 I8 O9 P0 / A- S/ D: F; G( H) J$ K' L" / Z% X& C* V? B! N, M.
@@ -564,6 +596,19 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                     continue;
                 }
 
+                // M1 的功能键：键盘页上的音量键是 0x7F~0x81（0x80 增 / 0x81 减），
+                // 地球键是 LANG1/LANG2(0x90/0x91)。这些 usage 不会变成字符，以前被
+                // hid_to_ascii 静默丢掉，按了毫无反应（见 m1ConsumerRemap 的总说明；
+                // 有的 M1 固件把音量和搜索走消费类报告，那条路已按功能键重映射）。
+                if (s_m1_layout && (kc == 0x80 || kc == 0x81 || kc == 0x90 || kc == 0x91)) {
+                    uint8_t ev = KEY_IME_TOGGLE;   // 地球键
+                    if (kc == 0x80) ev = KEY_PAGE_UP;
+                    else if (kc == 0x81) ev = KEY_PAGE_DOWN;
+                    pushKey(ev);
+                    s_key_press_time[newSlot] = 0;   // 按住不重复（同上面几个 M1 键）
+                    continue;
+                }
+
                 // 「长按输入符号」：先挂起，抬手时才发原字符；按住到阈值改发键帽上的符号。
                 // 标准键盘 = 数字/标点键的 Shift 层；M1 小键盘 = 字母键帽上印的那个符号。
                 // 待 Ctrl/Alt/GUI/Shift 时不算（组合键；Shift 本身已经在上档）。
@@ -583,6 +628,8 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                 } else {
                     uint8_t ascii = hid_to_ascii(kc, mod);
                     if (ascii) pushKey(ascii);
+                    // M1 上还没认出来的功能键：打一行日志，方便下次照 usage 补映射。
+                    else if (s_m1_layout) ESP_LOGI(TAG, "M1 未映射键盘 usage=0x%02X (mod=0x%02X)", kc, mod);
                 }
             }
         }
