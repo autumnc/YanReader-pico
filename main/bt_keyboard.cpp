@@ -18,6 +18,8 @@
 #include <esp_hidh.h>
 #include <esp_hid_common.h>
 #include <esp_heap_caps.h>   // bt_conn 创建失败时打内部 RAM 余量（见 requestConnect）
+#include <atomic>
+#include <freertos/idf_additions.h>   // xTaskCreateWithCaps/vTaskDeleteWithCaps：内堆紧时把连接任务栈放 PSRAM
 
 static const char *TAG = "BtKeybrd";
 
@@ -273,8 +275,18 @@ static int64_t s_last_repeat_time[MAX_KEYS] = {0};
 static esp_ble_addr_type_t s_paired_addr_type = BLE_ADDR_TYPE_RANDOM;
 
 // 连接在后台任务里执行: esp_hidh_dev_open 是同步阻塞的(连接失败要等链路层
-// 超时 ~30s),不能放在主循环里,否则 UI 会卡死。s_connect_task 非空表示任务存活。
+// 超时 ~30s),不能放在主循环里,否则 UI 会卡死。s_connect_task 非空表示任务存活
+// （或已收工、等着被收尸，见 reapFinishedConnect）。
 static TaskHandle_t s_connect_task = nullptr;
+// 连接任务收工标记。任务在结束前 store(true)，持有者看到它再去收尸/清句柄。
+static std::atomic<bool> s_connect_task_done{false};
+// 这一趟的栈是不是 PSRAM（xTaskCreateWithCaps 建的）。两种任务的收尾方式不同：
+// 内部栈的自删；PSRAM 栈的**不能自删**（IDF 的自删路径要临时建清理任务，内堆紧时直接
+// abort，见 idf_additions.c 的 vTaskDeleteWithCaps），只能挂起自己等持有者收尸。
+static bool s_connect_task_psram = false;
+// 连接任务栈大小。4096 是历史值（esp_hidh_dev_open 内部最多几百字节），别加大：
+// 这台机器内部 RAM 常年只剩 4~8KB，大一分就多一种建不起来的情形。
+#define BT_CONN_STACK 4096
 
 // 单次连接尝试的最长寿命。正常路径不用它兜底: 失败时 esp_hidh_dev_open 会在 ~30s 后
 // 返回 NULL 并自行复位 s_connecting。取 60s 是给"卡死"留的出口 —— 任务创建失败、
@@ -298,6 +310,65 @@ static int s_paired_count = 0;
 
 // BLE scan params (extended)
 static esp_ble_ext_scan_params_t s_ext_scan_params = {};
+
+// ── 断连期间的"在场扫描" ─────────────────────────────────────────────
+// 盲连 esp_hidh_dev_open 对不在场的设备要**同步空等 30 秒**才认输；而键盘从关机/
+// 省电状态被按键唤醒后广播窗口往往只有几十秒。配对表里三台轮着盲连时，轮到目标那台
+// 可能要一两分钟 —— 用户看到的就是"键盘开了却怎么都不重连"（阅读模式下尤其明显：
+// 看书时不连续打字，键盘广播窗口不会被一直续上，比写作模式更容易错过）。
+// 所以断连时让控制器以低占空比（100ms 里开 20ms 窗）扫着，看到**任一已配对设备**
+// 在广播就立刻连它。命中只按配对表里的地址连 —— 广播里的地址可能是配对后换的 RPA。
+static volatile bool s_presence_on = false;   // 在场扫描在跑（扫到的结果不进"添加设备"列表）
+static volatile bool s_presence_hit = false;
+static esp_bd_addr_t s_presence_bda;
+static esp_ble_addr_type_t s_presence_type = BLE_ADDR_TYPE_RANDOM;
+static int64_t s_presence_hit_us = 0;
+static int64_t s_presence_next_us = 0;        // 开扫失败后的重试时刻（3 秒）
+static esp_ble_ext_scan_params_t s_presence_scan_params = {};
+static uint32_t s_presence_rx = 0;   // 本轮在场扫描收到的广播数（只给"扫得着吗"这条日志用）
+
+static uint8_t* find_name_in_ad(uint8_t *data, uint8_t len, uint8_t *out_len);
+
+// 广播是不是来自某台已配对设备？命中就把**配对表里的**地址记进 s_presence_*。
+// 地址先比（静态/公有地址够用），再比名字 —— 配对之后不少键盘改用可解析私有地址
+// (RPA) 广播，地址每次开机都变，只有名字稳定。
+static void presenceCheckAdv(const uint8_t *addr, uint8_t addr_type,
+                             const uint8_t *adv, uint16_t adv_len, int rssi) {
+    (void)addr_type;
+    if (!s_presence_on || s_connected || s_connecting || s_deiniting) return;
+    // 每轮扫描的第一条广播打一行：用来区分"射频真在收"和"扫描根本没跑起来"。
+    // 用户报"键盘开了还是连不上"时，这行和下面的"看到已配对设备"哪个没出现，
+    // 一眼就知道该修哪头（收不到 = 扫描/射频问题；收得到但没认出来 = 地址/名字问题）。
+    if (s_presence_rx++ == 0) {
+        ESP_LOGI(TAG, "在场扫描：收到第一个广播（%02x%02x%02x…，addr_type=%u，rssi=%d）",
+                 addr[0], addr[1], addr[2], (unsigned)addr_type, rssi);
+    }
+    for (int i = 0; i < s_paired_count; i++) {
+        bool hit = memcmp(s_paired[i].bda, addr, ESP_BD_ADDR_LEN) == 0;
+        if (!hit && s_paired[i].name[0]) {
+            uint8_t nlen = 0;
+            uint8_t *nm = esp_ble_resolve_adv_data_by_type((uint8_t *)adv, adv_len,
+                                                           ESP_BLE_AD_TYPE_NAME_CMPL, &nlen);
+            if (!nm || !nlen)
+                nm = esp_ble_resolve_adv_data_by_type((uint8_t *)adv, adv_len,
+                                                      ESP_BLE_AD_TYPE_NAME_SHORT, &nlen);
+            if (!nm || !nlen)
+                nm = find_name_in_ad((uint8_t *)adv, adv_len > 255 ? 255 : (uint8_t)adv_len, &nlen);
+            const size_t plen = strlen(s_paired[i].name);
+            hit = nm && nlen > 0 && nlen == plen && memcmp(nm, s_paired[i].name, plen) == 0;
+        }
+        if (!hit) continue;
+        if (!s_presence_hit || memcmp(s_presence_bda, s_paired[i].bda, ESP_BD_ADDR_LEN) != 0) {
+            ESP_LOGI(TAG, "在场扫描：看到已配对设备 %s (addr_type=%d, rssi=%d) 在广播",
+                     s_paired[i].name, (int)s_paired[i].addr_type, rssi);
+        }
+        memcpy(s_presence_bda, s_paired[i].bda, ESP_BD_ADDR_LEN);
+        s_presence_type = s_paired[i].addr_type;
+        s_presence_hit_us = esp_timer_get_time();
+        s_presence_hit = true;
+        return;
+    }
+}
 
 // Find device index by BDA, or -1 if not found
 static int find_device(esp_bd_addr_t bda) {
@@ -789,6 +860,11 @@ static void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         break;
     case ESP_GAP_BLE_EXT_ADV_REPORT_EVT: {
         auto &rpt = param->ext_adv_report.params;
+        // 先看是不是已配对设备在广播（在场扫描）——这一条不走下面的 HID 服务过滤：
+        // 很多键盘的广播里根本没有 HID UUID，只在连上后的 GATT 表里才有。
+        presenceCheckAdv(rpt.addr, rpt.addr_type, rpt.adv_data, rpt.adv_data_len, rpt.rssi);
+        // 在场扫描的报告不进"添加设备"列表，免得蓝牙管理页上凭空冒出设备。
+        if (s_presence_on && !s_scanning) break;
         // Skip non-HID devices
         if (!has_hid_service(rpt.adv_data, rpt.adv_data_len))
             break;
@@ -909,12 +985,15 @@ static void scan_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-// 后台执行实际连接。esp_hidh_dev_open 同步阻塞: 成功时返回 dev,随后由异步的
-// ESP_HIDH_OPEN_EVENT 复位 s_connecting;失败时返回 NULL 且不发任何事件,
+// 后台执行实际连接的主体（两种栈的任务共用）。esp_hidh_dev_open 同步阻塞: 成功时返回
+// dev,随后由异步的 ESP_HIDH_OPEN_EVENT 复位 s_connecting;失败时返回 NULL 且不发任何事件,
 // 必须在这里复位 s_connecting,否则重连逻辑会永远被 isConnecting() 卡住。
-static void connect_task(void *arg) {
-    if (s_scanning) {
+static void connectOpenBody() {
+    // 扫描和连接抢同一个射频：用户手动扫/在场扫描都得先停，否则 open 会被控制器
+    // 拒绝或直接超时。在场扫描停了之后重连循环会在失败后自动再开。
+    if (s_scanning || s_presence_on) {
         s_scanning = false;
+        s_presence_on = false;
         esp_ble_gap_stop_ext_scan();
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -937,8 +1016,39 @@ static void connect_task(void *arg) {
         s_connecting = false;
         ESP_LOGE(TAG, "HID open failed for %s", hex);
     }
-    s_connect_task = nullptr;
+}
+
+// 内部栈版：收工后自删。句柄与 done 标记留给持有者清（reapFinishedConnect），
+// 这里不自己置空 —— 否则持有者分不清"还在跑"和"已收工"。
+static void connect_task(void *arg) {
+    (void)arg;
+    connectOpenBody();
+    s_connect_task_done.store(true, std::memory_order_release);
     vTaskDelete(NULL);
+}
+
+// PSRAM 栈版：收工后挂起自己，等持有者 vTaskDeleteWithCaps 收尸（见上面 s_connect_task_psram）。
+static void connect_task_psram(void *arg) {
+    (void)arg;
+    connectOpenBody();
+    s_connect_task_done.store(true, std::memory_order_release);
+    vTaskSuspend(NULL);
+}
+
+// 收掉上一趟已经收工的连接任务。
+//   - 内部栈的已经自删，这里只清句柄；
+//   - PSRAM 栈的还挂在那里占着堆，必须 vTaskDeleteWithCaps 才会释放（它自删会 abort）。
+// 只在 done 标记置位后动手：vTaskDeleteWithCaps 自己会先 suspend 再删，所以"刚置完
+// done、还没走到 vTaskSuspend"那个窗口也安全。
+void BtKeyboard::reapFinishedConnect() {
+    if (s_connect_task == nullptr) return;
+    if (!s_connect_task_done.load(std::memory_order_acquire)) return;
+    if (s_connect_task_psram) {
+        vTaskDeleteWithCaps(s_connect_task);
+        s_connect_task_psram = false;
+    }
+    s_connect_task = nullptr;
+    s_connect_task_done.store(false, std::memory_order_release);
 }
 
 // 记录连接请求并启动后台连接任务。s_connected/s_connecting/s_deiniting 门控避免重复发起,
@@ -948,24 +1058,52 @@ static void requestConnect(const uint8_t *bda, esp_ble_addr_type_t addr_type) {
         ESP_LOGI(TAG, "Already connected or connecting, skip connect request");
         return;
     }
+    // 上一趟收工了还没被收尸（PSRAM 栈那趟会一直挂着占堆）：先收掉再起新的。
+    g_bt.reapFinishedConnect();
+    // 上一趟还没收工：正常走不到这儿（s_connecting 为假才放行），只有 isConnecting()
+    // 的 60s 兜底已经放弃、而任务其实还卡在 Bluedroid 里时才会。这种情况**照旧再发起**
+    // （加壳前的行为）：卡死的那趟等不到，不能因此把自动重连永久锁死。代价是可能有两个
+    // open 同时在飞，句柄也只能丢下（PSRAM 栈那趟会漏一份栈）—— 别的地方没有出路。
+    if (s_connect_task != nullptr) {
+        ESP_LOGW(TAG, "上一趟连接任务仍未退出（已按超时放弃），照旧再发起一次");
+        s_connect_task = nullptr;
+        s_connect_task_psram = false;
+    }
     memcpy(s_connect_req.bda, bda, ESP_BD_ADDR_LEN);
     s_connect_req.addr_type = addr_type;
     s_connecting = true;
     s_connect_started_us = esp_timer_get_time();
-    s_connect_task = nullptr;
+    s_connect_task_done.store(false, std::memory_order_release);
+    s_connect_task_psram = false;
     // 必须检查返回值。这里原先不看，一旦任务创建失败(内堆不足)就没人再复位
     // s_connecting，主循环的 !isConnecting() 门永远打不开 —— 键盘从此不会自动重连，
     // 且全程没有任何日志（日志里"auto-reconnect retry"之后 connect_task 那句
     // "Connecting to %s..." 一行都没有，就是这个失败形态）。
-    if (xTaskCreate(connect_task, "bt_conn", 4096, NULL, 3, &s_connect_task) != pdPASS) {
+    if (xTaskCreate(connect_task, "bt_conn", BT_CONN_STACK, NULL, 3, &s_connect_task) == pdPASS) {
+        return;
+    }
+    // 内部栈建不起：阅读时内部最大连续块常常刚好卡在 4096（栈要 4096、TCB 还要另要
+    // 一块），首帧重建那种紧的瞬间尤其如此。这条路上没人会复位 s_connecting，这一次
+    // 重连就整个被跳过 —— 退回 PSRAM 栈（3MB 余量、最大块也大），和 ai_chat / ui_render
+    // 同一个办法。注意"阅读模式下不重连"的真正病根不在这里（任务其实建得起来），
+    // 而是盲连错过了键盘广播窗口，见下面"在场扫描"。
+    s_connect_task = nullptr;
+    ESP_LOGW(TAG, "内部栈建不起 bt_conn（栈 %d）：内部RAM余 %u，最大块 %u —— 改用 PSRAM 栈",
+             BT_CONN_STACK, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    // 标记先置位再建任务：任务不分核，建好就可能立刻在另一个核上跑完并置 done，
+    // 这一拍之前把 "栈在 PSRAM" 记下来，收尸那边才不会当它是内部栈任务只清句柄。
+    s_connect_task_psram = true;
+    if (xTaskCreateWithCaps(connect_task_psram, "bt_conn_ps", BT_CONN_STACK, NULL, 3,
+                            &s_connect_task, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        s_connect_task_psram = false;
         s_connect_task = nullptr;
         s_connecting = false;
         s_connect_started_us = 0;
-        // 打的是**内部** RAM：xTaskCreate 的 TCB+栈只能在内部 RAM 上分配，而这台机器
-        // 内部 RAM 常年吃紧（蓝牙 + WiFi 的地板见 internal-ram-floor 那条笔记），
-        // 用 esp_get_free_heap_size() 会把 8MB PSRAM 算进去，完全看不出真正的原因。
-        ESP_LOGE(TAG, "bt_conn task create failed, internal free=%u, giving up this attempt",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        ESP_LOGE(TAG, "bt_conn 两种栈都建不起（PSRAM 余 %u，最大块 %u），放弃本次",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        return;
     }
 }
 
@@ -1048,6 +1186,21 @@ esp_err_t BtKeyboard::init() {
     s_ext_scan_params.uncoded_cfg.scan_interval = 0x50;
     s_ext_scan_params.uncoded_cfg.scan_window = 0x30;
 
+    // 在场扫描：100ms 里开 20ms 窗（20% 占空比）。够在一个广播事件内撞上，
+    // 又比"盲连"（每次 30 秒满功率等）省得多。ACTIVE 是为了把名字拿回来 ——
+    // 配对后地址变 RPA 的键盘只能靠名字认。
+    s_presence_scan_params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+    s_presence_scan_params.filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
+    s_presence_scan_params.scan_duplicate = BLE_SCAN_DUPLICATE_ENABLE;
+    s_presence_scan_params.cfg_mask = ESP_BLE_GAP_EXT_SCAN_CFG_UNCODE_MASK;
+    s_presence_scan_params.uncoded_cfg.scan_type = BLE_SCAN_TYPE_ACTIVE;
+    s_presence_scan_params.uncoded_cfg.scan_interval = 0xA0;
+    s_presence_scan_params.uncoded_cfg.scan_window = 0x20;
+    s_presence_on = false;
+    s_presence_hit = false;
+    s_presence_hit_us = 0;
+    s_presence_next_us = 0;
+
     ESP_LOGI(TAG, "BT keyboard driver initialized");
     s_init_done = true;
     return ESP_OK;
@@ -1055,12 +1208,17 @@ esp_err_t BtKeyboard::init() {
 
 void BtKeyboard::deinit() {
     s_deiniting = true;
-    s_connect_task = nullptr;
+    // 上一趟已经收工的连接任务先收尸（PSRAM 栈那趟必须走 vTaskDeleteWithCaps 才放得掉
+    // 栈；原来这里一句 s_connect_task = nullptr 就把句柄丢了、栈永远漏着）。
+    // 还在跑的那趟不在这里删 —— 它可能正卡在 esp_hidh_dev_open 里，下面等它自己退出。
+    reapFinishedConnect();
     // 扫描用射频，而且拆 bluedroid 时扫描还在跑会报一堆错 —— 先停掉它。
-    if (s_scanning) {
+    if (s_scanning || s_presence_on) {
         s_scanning = false;
+        s_presence_on = false;
         esp_ble_gap_stop_ext_scan();
     }
+    s_presence_hit = false;
     if (s_dev) {
         esp_hidh_dev_close(s_dev);
         // esp_hidh_deinit 要求所有设备已关闭,而 close 是异步的
@@ -1095,6 +1253,9 @@ void BtKeyboard::deinit() {
         ESP_LOGW(TAG, "连接尝试 %dms 后仍在飞行中，hidh 可能无法完全清理", waited);
     }
     s_connecting = false;
+    // 上面那几秒里上一趟连接任务多半已经退出来了，顺手收尸（PSRAM 栈那趟挂在那里占堆，
+    // 不收掉就会漏到下一次开机）。
+    reapFinishedConnect();
     // 退避重试：之前只调一次、失败就静默丢返回值(esp_hidh_deinit 在设备表非空时开头
     // 就返回 ESP_ERR_INVALID_STATE)，留下事件循环与信号量泄漏 —— 唤醒后
     // esp_hidh_init 报 Already initialized，键盘一直连不上，直到下次完整 deinit。
@@ -1114,6 +1275,55 @@ void BtKeyboard::deinit() {
     if (s_queue) { vQueueDelete(s_queue); s_queue = nullptr; }
     if (s_devices_mutex) { vSemaphoreDelete(s_devices_mutex); s_devices_mutex = nullptr; }
     s_init_done = false;
+}
+
+// 由重连循环每拍调用：维持"断连时在场扫描"的起停。连上/正在连/用户自己在扫时停扫
+// （连接和扫描抢同一个射频，connectOpenBody 里也会兜一手）。
+// 200ms 一次的调用里只有状态翻转那一拍真的碰 GAP API；start 前照 scan_task 的做法
+// 留 100ms 给异步命令（设参数→开扫中间要一次往返），这一拍阻塞的是 bt_init 任务，
+// 不影响界面。
+void BtKeyboard::presenceTick() {
+    if (!s_init_done || s_deiniting) return;
+    // 配对表还没读进来时扫了也认不出谁是谁（开机头 30 秒就是这样），别白开射频。
+    const bool want = !s_connected && !s_connecting && !s_scanning && s_paired_count > 0;
+    if (want && !s_presence_on) {
+        if (esp_timer_get_time() < s_presence_next_us) return;
+        s_presence_on = true;   // 先置位：广播回调靠它认"这是在场扫描"
+        s_presence_rx = 0;
+        esp_err_t ret = esp_ble_gap_set_ext_scan_params(&s_presence_scan_params);
+        if (ret == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (!s_presence_on || s_deiniting) return;   // 这一觉里状态变了
+            ret = esp_ble_gap_start_ext_scan(0, 0);      // duration=0 → 一直扫到我们停
+            if (ret == ESP_OK)
+                ESP_LOGI(TAG, "在场扫描已开启（配对表 %d 台）", s_paired_count);
+        }
+        if (ret != ESP_OK) {
+            s_presence_on = false;
+            s_presence_next_us = esp_timer_get_time() + 3000000LL;
+            ESP_LOGW(TAG, "在场扫描开启失败(%d)，3 秒后再试", (int)ret);
+        }
+    } else if (!want && s_presence_on) {
+        s_presence_on = false;
+        esp_ble_gap_stop_ext_scan();
+    }
+}
+
+bool BtKeyboard::presenceScanActive() const {
+    return s_presence_on;
+}
+
+// 取走一次"看到已配对设备"的命中。10 秒前的旧报告不作数（设备可能又睡了）。
+bool BtKeyboard::takePresenceHit(esp_bd_addr_t bda, esp_ble_addr_type_t *addr_type) {
+    if (!s_presence_hit) return false;
+    if (esp_timer_get_time() - s_presence_hit_us > 10000000LL) {
+        s_presence_hit = false;
+        return false;
+    }
+    s_presence_hit = false;
+    memcpy(bda, s_presence_bda, ESP_BD_ADDR_LEN);
+    if (addr_type) *addr_type = s_presence_type;
+    return true;
 }
 
 void BtKeyboard::scanDevices() {

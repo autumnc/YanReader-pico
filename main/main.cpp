@@ -272,16 +272,40 @@ static void btInitBody() {
     // 再来一次就能成。原来失败直接 return，那句"需下个 init 周期自愈"就成了空话：
     // 没有任何人再起下一个周期，蓝牙一直瘫到重启（2026-10-09 实测：关开关再打开，
     // stage 6 失败后就再没动静了）。
+    // init 失败**永远不再放弃**。原来 3 次失败就 return，而 s_btInitRunning 变回假之后
+    // 没有任何人会再起下一个周期 —— 蓝牙一直瘫到重启/关一次开关（注释里"需下个 init
+    // 周期自愈"其实从来没发生过，因为根本没有下一个周期）。最常撞的就是待机唤醒那一趟：
+    // 上一次拆除没走完，esp_hidh_init 报 "Already initialized"，而这次失败自己就会把残骸
+    // 收掉，隔一拍再来就能成 —— 早先只隔 500ms，500ms 往往不够，于是整个会话再没有蓝牙。
+    // 现在按指数退避一直试到成功（最长 60s 一次），退出只认 s_btInitStop。
     esp_err_t initRet = ESP_FAIL;
-    for (int attempt = 0; attempt < 3; attempt++) {
+    int initTries = 0;
+    static const int64_t kInitGapUs[] = {500000LL,   1000000LL,  2000000LL,  5000000LL,
+                                         10000000LL, 30000000LL, 60000000LL};
+    while (!s_btInitStop.load(std::memory_order_relaxed)) {
         initRet = g_bt.init();
         if (initRet == ESP_OK) break;
-        ESP_LOGW(TAG, "BT init 失败(%s)，第 %d/3 次", esp_err_to_name(initRet), attempt + 1);
-        if (attempt < 2) vTaskDelay(pdMS_TO_TICKS(500));
+        initTries++;
+        const int64_t gapUs = kInitGapUs[initTries < (int)(sizeof(kInitGapUs) / sizeof(kInitGapUs[0]))
+                                             ? initTries - 1
+                                             : (int)(sizeof(kInitGapUs) / sizeof(kInitGapUs[0])) - 1];
+        // 带上内部 RAM 余量：init 失败最常见的原因是上一次拆除的残骸，其次就是唤醒时
+        // 内堆紧到建不起内部任务/队列。两个原因在日志上长得一样，只有这组数分得开。
+        ESP_LOGW(TAG, "BT init 失败(%s)，第 %d 次；%llds 后再试（内部RAM余 %u，最大块 %u）",
+                 esp_err_to_name(initRet), initTries, (long long)(gapUs / 1000000),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        // 分段睡：stop 请求（待机/关开关）不能等满这一觉。
+        for (int64_t slept = 0; slept < gapUs && !s_btInitStop.load(std::memory_order_relaxed);
+             slept += 200000) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
     }
-    if (initRet != ESP_OK) {
-        ESP_LOGE(TAG, "蓝牙初始化失败，本次不再重连（关一次开关再打开可再试）");
-        return;
+    if (s_btInitStop.load(std::memory_order_relaxed)) {
+        return;   // 被要求退出（待机/关开关），别再往下起重连
+    }
+    if (initTries > 0) {
+        ESP_LOGI(TAG, "BT init 第 %d 次重试成功", initTries);
     }
     int64_t lastReloadUs = 0;
     int64_t nextTryUs = 0;         // 下一次允许发起连接的时刻；0 = 立刻
@@ -301,6 +325,12 @@ static void btInitBody() {
     static const int64_t kRetryGapUs[] = {2000000LL, 5000000LL, 10000000LL,
                                           30000000LL, 60000000LL};
     while (!s_btInitStop.load(std::memory_order_relaxed)) {
+        // 上一趟连接任务收工了就把它的栈收掉（内堆紧时那趟的栈在 PSRAM，只能在这里
+        // vTaskDeleteWithCaps 放）。没在"收工未收尸"状态时这是空操作。
+        g_bt.reapFinishedConnect();
+        // 断连时维持在场扫描（连上/正在连时它会自己停）。看到键盘在广播就立刻连，
+        // 不等盲连的退避 —— 键盘开机后广播窗口只有几十秒，等不起。
+        g_bt.presenceTick();
         if (s_btManageActive.load(std::memory_order_relaxed)) {
             wasConnected = false;
             nextTryUs = 0;
@@ -367,18 +397,51 @@ static void btInitBody() {
             listLoaded = after > 0;
             if (after != before) tryIdx = 0;   // 名单变了才从头轮，否则接着上一轮往后走
             if (listLoaded) ESP_LOGI(TAG, "Loaded %d paired device(s)", after);
+            // 名单一到就开扫：再往后一拍才轮到下面的盲连判断，不在这里补一次，
+            // 第一拍会白白花在 30 秒的盲连上（见下面 blindAllowed 的说明）。
+            g_bt.presenceTick();
+        }
+
+        // 在场扫描看到键盘了 → 立刻连，不等退避表（它刚刚开机/被按键唤醒，广播只
+        // 持续几十秒）。2 秒的护栏防"连不上但一直在广播"的设备把重连打成死循环。
+        static int64_t lastPresenceConnectUs = 0;
+        if (listLoaded && !g_bt.isConnecting() &&
+            nowUs - lastPresenceConnectUs >= 2000000LL) {
+            esp_bd_addr_t seenBda;
+            esp_ble_addr_type_t seenType = BLE_ADDR_TYPE_RANDOM;
+            if (g_bt.takePresenceHit(seenBda, &seenType)) {
+                lastPresenceConnectUs = nowUs;
+                ESP_LOGI(TAG, "BT 在场扫描命中，直接发起连接（不等退避）");
+                attemptInFlight = true;
+                nextTryUs = 0;
+                g_bt.connectBDA(seenBda, seenType);
+            }
         }
 
         // 到点了就试下一个设备：失败一次换一台轮着来（键盘不在范围时，三台轮流试
         // 比死磕一台更容易在用户把键盘拿过来时撞上）。这笔只在醒着时花，待机时
         // enterLightSleep 会把蓝牙整个拆掉。
-        if (listLoaded && !g_bt.isConnecting() && nowUs >= nextTryUs) {
+        //
+        // 在场扫描健康时，盲连退成"每 3 分钟一趟"的安全网：盲连每趟要占 30 秒射频，
+        // 这 30 秒里扫描是停的 —— 而扫描能看到的设备盲连也一定能连。2026-10-29 实测
+        // 就撞上过：键盘正好在盲连 e179（旧键盘）那 30 秒里开机广播，只能等这趟空跑
+        // 完才认出来，白白晚了几十秒。扫描起不来（s_presence_on 为假）时盲连照旧。
+        static int64_t lastBlindUs = 0;
+        const bool blindAllowed = !g_bt.presenceScanActive() ||
+                                  nowUs - lastBlindUs > 180000000LL;
+        if (listLoaded && !g_bt.isConnecting() && nowUs >= nextTryUs && blindAllowed) {
+            lastBlindUs = nowUs;
             const int n = g_bt.pairedDeviceCount();
             if (n > 0) {
                 if (tryIdx >= n) tryIdx = 0;
                 const BtPairedDevice *p = g_bt.getPairedDevice(tryIdx);
-                ESP_LOGI(TAG, "BT auto-reconnect retry %d/%d（连续未连上 %d 轮，留空 %llds）",
-                         tryIdx + 1, n, misses, (long long)(lastGapUs / 1000000));
+                // 内部 RAM 顺手打出来：重连在阅读模式里"没反应"最常见的那条路就是
+                // bt_conn 的栈建不起来（见 requestConnect），这组数能一眼认出来。
+                ESP_LOGI(TAG, "BT auto-reconnect retry %d/%d（连续未连上 %d 轮，留空 %llds，"
+                              "内部RAM余 %u，最大块 %u）",
+                         tryIdx + 1, n, misses, (long long)(lastGapUs / 1000000),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
                 if (p) {
                     attemptInFlight = true;
                     g_bt.connectBDA(p->bda, p->addr_type);
@@ -388,6 +451,9 @@ static void btInitBody() {
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+    // 退出前最后收一次：连接任务可能正好在最后一拍之后收工，挂着的那份 PSRAM 栈
+    // 不在这里放掉就没人放了（下一个 bt_init 周期要等唤醒/开关，等于漏到重启）。
+    g_bt.reapFinishedConnect();
 }
 
 static void btInitTask(void *arg) {

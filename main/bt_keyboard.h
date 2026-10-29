@@ -56,6 +56,19 @@ public:
     const BtPairedDevice* getPairedDevice(int idx);
     int connectedPairedIndex();  // paired-list index of connected device, -1 if none
     esp_err_t connectBDA(const uint8_t *bda, esp_ble_addr_type_t addr_type);
+    // 收掉已经收工的连接任务（PSRAM 栈那趟要 vTaskDeleteWithCaps 才放得掉栈）。
+    // 由持有者周期调用：main 的 bt_init 循环每 200ms 一次、deinit 开头各一次。
+    // 没在"收工且未收尸"状态时是空操作。
+    void reapFinishedConnect();
+
+    // 断连期间的"在场扫描"：重连循环每拍调 presenceTick() 维护扫描起停；
+    // 看到已配对设备在广播时 takePresenceHit() 取走它的**配对地址**，由调用方立刻连。
+    // 没有这一步，回连只能靠"盲连"（不在场的设备要空等 30 秒），键盘开机后那段
+    // 几十秒的广播窗口很容易整段错过。
+    void presenceTick();
+    bool takePresenceHit(esp_bd_addr_t bda, esp_ble_addr_type_t *addr_type);
+    // 在场扫描是否在跑（扫描健康时，主循环把"盲连"退成低频安全网）。
+    bool presenceScanActive() const;
 
     // Keyboard input。返回 pjournal 键码；BLE 遥控器的消费类键 >0xFF（见 KEY_CONSUMER_BASE）。
     uint16_t readKey();
