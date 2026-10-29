@@ -655,13 +655,21 @@ bool read_pico_rails_on(void) {
     return rails_on;
 }
 
-bool read_pico_sd_present(void) {
+int read_pico_sd_cd_sample(void) {
     // 卡座 CD 信号低有效，连接到 FCA9555 P0.6。
-    // 读失败时不要把低有效 CD 判成“有卡”。
-    // / Slot CD is active-low on FCA9555 P0.6. A failed read must not look like "card present".
+    // 读失败返回 -1（未知），**不能**当成"有卡"也不能当成"无卡"：后者会让驱动的
+    // 去抖逻辑把一次 I2C 抖动认成拔卡（见 read_pico_sd.c 的 observe_media_locked）。
+    // / Slot CD is active-low on FCA9555 P0.6. A failed read returns -1 (unknown):
+    // it must not be mistaken for either present or absent.
     uint8_t in0 = 0xFF;
-    if (s_ioe == NULL || fca9555_read_reg(s_ioe, 0, &in0) != ESP_OK) return false;
-    return (in0 & IOE_SD_CD) == 0;
+    if (s_ioe == NULL || fca9555_read_reg(s_ioe, 0, &in0) != ESP_OK) return -1;
+    return (in0 & IOE_SD_CD) == 0 ? 1 : 0;
+}
+
+bool read_pico_sd_present(void) {
+    // 老接口保留 bool 语义：只有"采样成功且判在有卡"才算有卡。需要区分未知的
+    // 调用方用 read_pico_sd_cd_sample()。
+    return read_pico_sd_cd_sample() == 1;
 }
 
 void read_pico_clear_ioe_int(void) {

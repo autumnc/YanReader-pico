@@ -85,6 +85,11 @@ esp_err_t read_pico_get_ioe_status(read_pico_status_t* status);
 esp_err_t read_pico_get_ioe_status_full(read_pico_status_t* status);
 int read_pico_ioe_int_level(void);
 bool read_pico_sd_present(void);
+/// SD 卡座 CD 三态采样：1=有卡，0=无卡，-1=I2C 读失败（未知）。
+/// 读失败**不等于无卡**：一次总线抖动若被当成拔卡，驱动会置 media_invalidated，
+/// 阅读器退出当前书、remount 还会卸载 VFS —— 内容字体的 fd 是常开的，跟着作废
+/// （症状就是"缺字"）。需要去抖/重试的调用方用这个，不要用上面那个 bool。
+int read_pico_sd_cd_sample(void);
 bool read_pico_rails_on(void);
 
 /// 翻转 VCOMCTL：1=外部 VCOM_EN，0=自动时序。

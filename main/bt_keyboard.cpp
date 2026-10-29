@@ -70,6 +70,9 @@ static int64_t s_consumer_press_us = 0;
 // 主机在 main.cpp 的非阅读界面兜底分支里把它翻成 ui_full_refresh_now()。
 // 必须与 pjournal_app.h 的同名宏一致。
 #define KEY_SHAKE      0xAF
+// M1 方向键旁那颗"返回"→ 阅读页回书架 / 其余界面退一层（main.cpp 认这个键）。
+// 必须与 pjournal_app.h 的同名宏一致。
+#define KEY_BACK       0xA8
 // Win/Cmd 键**单击**（按下又抬手，中间没按别的键）→ 输入法「字母键选字」待选。
 // 必须与 pjournal_app.h 的同名宏一致。
 #define KEY_META_TAP   0xB3
@@ -94,7 +97,13 @@ static const uint8_t s_asc_shift[] = {
     '~',':','"','~','<','>','?',
 };
 
+// M1「锁定」键（Windows 模式发 Win+L）触发的**大写锁存**。只影响字母键：置位时
+// 与按着 Shift 同效（hid_to_ascii 里把 Shift 位补上），再按一下解除。不做"Shift 反相"：
+// 这里没有宿主 OS 的 CapsLock 状态机，简单锁存更不容易让用户按出意外的小写。
+static bool s_caps_lock = false;
+
 static uint8_t hid_to_ascii(uint8_t kc, uint8_t mod) {
+    if (s_caps_lock && kc >= 4 && kc <= 29) mod |= 0x02;   // 字母键：锁存即 Shift
     if (kc == 82) return (mod & 0x22) ? KEY_SHIFT_UP : KEY_UP;
     if (kc == 81) return (mod & 0x22) ? KEY_SHIFT_DOWN : KEY_DOWN;
     if (kc == 80) return (mod & 0x22) ? KEY_SHIFT_LEFT : KEY_LEFT;
@@ -176,6 +185,7 @@ static bool s_m1_layout = false;
 //   音量+ / 音量-  → PageUp / PageDown
 //   搜索键         → 模式切换（等同长按中间电容键）
 //   地球键         → 开关输入法（等同 Ctrl+Space）
+//   返回键（方向键旁）→ KEY_BACK（阅读页无浮层=回书架，其余=退一层）
 // 只对 M1 生效：消费类 usage 本来由「按键映射」按需绑定，遥控器/翻页器的音量键
 // 不该被这里改成翻页（而且写死会盖掉用户自己的绑定）。M1 的这几个键有的走消费类
 // 报告、有的走键盘报告（0x7F~0x81 是 HID 键盘页自己的音量键，0x90/0x91 是 LANG1/2），
@@ -188,6 +198,10 @@ static int m1ConsumerRemap(uint16_t usage) {
         case 0x00EA: return KEY_PAGE_DOWN;      // 音量-
         case 0x0221: return KEY_LONG_CONFIRM;   // 搜索 → 模式切换
         case 0x0290: return KEY_IME_TOGGLE;     // 地球键 → 输入法开关
+        // 方向键旁那颗"返回"发的是消费类 AC Back(0x224)，此前只落成 KEY_CONSUMER_BASE|0x224
+        // （没人接，按了毫无反应）。KEY_BACK 的语义就是阅读器那位：阅读页无浮层→回书架，
+        // 有菜单/注文等浮层→先退一层；其余模式由 main.cpp 翻成 Esc 退一层。
+        case 0x0224: return KEY_BACK;           // 返回 → 回书架 / 退一层
         default: return 0;
     }
 }
@@ -570,7 +584,8 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                 // M1 小键盘的特殊键在 Windows 模式下发的是 Win+字母 快捷键，照字母放
                 // 出去会往正文里塞 d/l/h。按键帽重映射（只对 M1 生效）：
                 //   Esc 键 → Win+D：发 0x1B（返回）
-                //   画面锁定 → Win+L、语音输入 → Win+H：本机没有对应动作，吞掉
+                //   语音键 → Win+H：发 Tab
+                //   锁定键 → Win+L：大写锁存开/关（见 s_caps_lock）
                 // press_time 清零 = 按住不自动重复（这些键在 M1 上会一直重发报告）。
                 if (s_m1_layout && (mod & 0x88)) {
                     if (kc == 7) {  // Win+D → Esc
@@ -579,7 +594,14 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                         s_key_press_time[newSlot] = 0;
                         continue;
                     }
-                    if (kc == 15 || kc == 11) {  // Win+L / Win+H：吞掉
+                    if (kc == 11) {  // Win+H（语音键）→ Tab
+                        pushKey('\t');
+                        s_key_press_time[newSlot] = 0;
+                        continue;
+                    }
+                    if (kc == 15) {  // Win+L（锁定键）→ CapsLock 锁存开/关
+                        s_caps_lock = !s_caps_lock;
+                        ESP_LOGI(TAG, "M1 CapsLock %s", s_caps_lock ? "开" : "关");
                         s_key_press_time[newSlot] = 0;
                         continue;
                     }

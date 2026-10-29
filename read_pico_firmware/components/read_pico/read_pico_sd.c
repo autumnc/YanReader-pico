@@ -52,8 +52,36 @@ static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool media_invalidated;
 static read_pico_sd_info_t cached_info;
 
+// 拔卡要连续这么多次 CD 采样才认。main 每 500ms 问一次 get_info，3 次约 1.5s。
+// 去抖的理由不是"慢一点无所谓"，而是代价不对称：一置 media_invalidated，消费者就会
+// 退出当前书、清空书架，remount 还会卸载 VFS —— 内容字体的 fd 是常开的（ttf_font.c
+// 的 font_fd 在整场开机里不关），卸载即作废，症状是"字体缺字"。一次 I2C 读错或
+// CD 线上的瞬时抖动不该造成这一整套后果。真实拔卡晚 1.5s 认出来没有副作用。
+// / Remove needs N consecutive absent CD samples. The cost is asymmetric: a false
+// invalidation makes consumers close the book and remount unmounts the VFS, killing
+// the always-open content-font fd (symptom: missing glyphs).
+#define CD_ABSENT_CONFIRM_SAMPLES 3
+static uint8_t cd_absent_streak;
+
+// cd: 1=有卡，0=无卡，-1=I2C 读失败（未知）。
 // 失效只影响快照，消费者释放句柄前不得卸载卡。/ Invalidation changes snapshots only; consumers must close handles before unmount.
-static void observe_media_locked(bool present) {
+static void observe_media_locked(int cd) {
+    if (cd < 0) return;   // 读失败 ≠ 拔卡：保持上一次判断，等下一次采样
+    const bool present = cd != 0;
+    if (present) {
+        if (cd_absent_streak != 0) {
+            ESP_LOGI(TAG, "SD_CD 恢复有卡（此前连续 %u 次判无卡）", (unsigned)cd_absent_streak);
+            cd_absent_streak = 0;
+        }
+    } else if (cached_info.present) {
+        // 只对"当前认为有卡"的迁移去抖；本来就没卡时不需要数。
+        cd_absent_streak = (cd_absent_streak < 255) ? (uint8_t)(cd_absent_streak + 1) : 255;
+        if (cd_absent_streak < CD_ABSENT_CONFIRM_SAMPLES) {
+            ESP_LOGW(TAG, "SD_CD 判无卡（连续第 %u/%u 次），暂不认作拔卡",
+                     (unsigned)cd_absent_streak, (unsigned)CD_ABSENT_CONFIRM_SAMPLES);
+            return;
+        }
+    }
     const bool inserted = present && !cached_info.present;
     if (!present && (cached_info.mounted || probe_state == 1)) media_invalidated = true;
     // 开机时没插卡：探测定格为"无卡"（probe_state=2），此后 read_pico_sd_start_probe()
@@ -83,17 +111,19 @@ static void observe_media_locked(bool present) {
 }
 
 static void publish_info(const read_pico_sd_info_t* info) {
-    bool present = read_pico_sd_present();
+    const int cd = read_pico_sd_cd_sample();
     portENTER_CRITICAL(&state_lock);
     cached_info = *info;
-    observe_media_locked(present);
+    observe_media_locked(cd);
     probe_state = 2;
     portEXIT_CRITICAL(&state_lock);
 }
 
 static void fill_info(read_pico_sd_info_t* info, esp_err_t mount_err) {
     memset(info, 0, sizeof(*info));
-    info->present = read_pico_sd_present();
+    // 读失败按"有卡"记：刚挂上卡（mounted 即将置真）时若把一次坏采样记成无卡，
+    // get_info 会报 present=0/mounted=1，main 的轮询反而会把一张好好的卡判丢。
+    info->present = read_pico_sd_cd_sample() != 0;
     info->error = mount_err;
     info->needs_format = info->present && !info->mounted
         && mount_err != ESP_OK
@@ -229,7 +259,9 @@ static void close_card(void) {
 static void probe_task(void* arg) {
     (void)arg;
     read_pico_sd_info_t info = { 0 };
-    info.present = read_pico_sd_present();
+    // 采样失败（-1）也往下试一次挂载：卡真不在时 mount_card 会很快以 NOT_FOUND 退出，
+    // 比"因为一次读错就回放无卡"更接近真相。
+    info.present = read_pico_sd_cd_sample() != 0;
     if (!info.present) {
         info.error = ESP_ERR_NOT_FOUND;
         publish_info(&info);
@@ -257,9 +289,10 @@ static void probe_task(void* arg) {
 }
 
 esp_err_t read_pico_sd_start_probe(void) {
-    bool present = read_pico_sd_present();
+    const int cd = read_pico_sd_cd_sample();
+    const bool present = cd != 0;
     portENTER_CRITICAL(&state_lock);
-    observe_media_locked(present);
+    observe_media_locked(cd);
     esp_err_t err = ESP_OK;
     if (probe_state == 1) err = ESP_ERR_NOT_FINISHED;
     else if (media_invalidated) err = cached_info.error;
@@ -292,10 +325,13 @@ esp_err_t read_pico_sd_start_probe(void) {
 
 esp_err_t read_pico_sd_get_info(read_pico_sd_info_t* info) {
     if (info == NULL) return ESP_ERR_INVALID_ARG;
-    bool present = read_pico_sd_present();
+    const int cd = read_pico_sd_cd_sample();
     portENTER_CRITICAL(&state_lock);
-    observe_media_locked(present);
+    observe_media_locked(cd);
     *info = cached_info;
+    // 用**去抖后的** present，而不是这一次采样：读失败/未凑够连续次数的"无卡"
+    // 都还没被认作拔卡，报给调用方的必须仍是上一次的稳定判断。
+    const bool present = info->present;
     esp_err_t err = !present || media_invalidated ? info->error :
         probe_state == 0 ? ESP_ERR_INVALID_STATE :
         probe_state == 1 ? ESP_ERR_NOT_FINISHED : info->error;

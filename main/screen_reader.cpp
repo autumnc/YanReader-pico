@@ -14030,7 +14030,7 @@ bool screen_reader_on_sd_lost(bool card_absent) {
   st.fullRefresh = true;
   rdShowFloat(card_absent ? "SD 卡已拔出" : "SD 卡不可用",
               hadBook ? "已退回书架，插回后重新打开"
-                      : (card_absent ? "插回后自动恢复" : "挂载失败，请重新插拔一次"),
+                      : (card_absent ? "插回后自动恢复" : "正在自动重试挂载"),
               4000);
   renderCurrent();
   ESP_LOGW(TAG, "SD 卡丢失（%s）：%s", card_absent ? "卡不在" : "卡在但没挂上",

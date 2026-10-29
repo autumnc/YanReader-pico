@@ -693,10 +693,26 @@ static void checkLightSleep(AppState state) {
 //                    阅读器那一拍已经先把它关掉了），挂上之后再让阅读器重扫书架。
 // 阅读器那两个钩子只在"当前界面就是阅读器"时调：卡不在时别的界面（编辑器/WiFi…）各自
 // 报错就够，而那两个钩子会当场渲染，调错界面就把人家正在看的画面盖掉了。
+// 卡被卸载/重挂之后，内容字体那条常开的 fd 已经指向失效的 VFS 文件（字体文件在 SD 上，
+// face_open 之后整场开机都不关，见 ttf_font.c 的 font_fd）。不重开的话所有文字都会
+// "缺字"，而且不会自愈 —— 只有重启。路径不在 SD 上的（内置字体）不受影响。
+static void reopenContentFontAfterSd() {
+    const char* path = font_store_get_path();
+    if (path == nullptr || strncmp(path, "/sdcard/", 8) != 0) return;
+    const esp_err_t err = ttf_font_open(path);
+    g_content_font.reloadFont();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "SD 恢复：内容字体已重新打开 %s", path);
+    } else {
+        ESP_LOGW(TAG, "SD 恢复：内容字体重开失败 %s (%s)", path, esp_err_to_name(err));
+    }
+}
+
 static void sdHotplugTick(AppState state) {
     static int64_t s_next_us = 0;
-    static bool s_saw_lost = false;      // 上一次轮询时卡是"不在 / 没挂上"
-    static bool s_tried_remount = false; // 本次"卡回来"已经试过挂载了吗
+    static bool s_saw_lost = false;         // 上一次轮询时卡是"不在 / 没挂上"
+    static int64_t s_remount_next_us = 0;   // 下一次允许尝试重挂的时刻
+    static int s_remount_tries = 0;         // 本次"卡回来"已经试过几次（日志/退避用）
     const int64_t now = esp_timer_get_time();
     if (now < s_next_us) return;
     s_next_us = now + 500 * 1000;
@@ -715,8 +731,10 @@ static void sdHotplugTick(AppState state) {
     if (info.present && info.mounted) {
         if (s_saw_lost) {
             s_saw_lost = false;
-            s_tried_remount = false;
+            s_remount_tries = 0;
+            s_remount_next_us = 0;
             ESP_LOGI(TAG, "SD 卡已恢复（已挂载）");
+            reopenContentFontAfterSd();
             if (state == APP_READER) screen_reader_on_sd_ready();
         }
         return;
@@ -724,16 +742,27 @@ static void sdHotplugTick(AppState state) {
 
     if (!s_saw_lost) {
         s_saw_lost = true;
-        s_tried_remount = false;
+        s_remount_tries = 0;
+        s_remount_next_us = 0;
         ESP_LOGW(TAG, "SD 卡丢失: present=%d needs_format=%d err=%s", (int)info.present,
                  (int)info.needs_format, esp_err_to_name(info.error));
         if (state == APP_READER) screen_reader_on_sd_lost(!info.present);
-    } else if (info.present && !s_tried_remount) {
-        // 卡回来了但还没挂上：这一次插入只试一次（重新挂载会重走 40/20/10MHz 那条梯子，
-        // 一张坏卡每 500ms 重试一次没有意义，还会把日志刷满）。
-        s_tried_remount = true;
+    } else if (info.present && now >= s_remount_next_us) {
+        // 卡回来了但还没挂上：**要重试**，不是一插只试一次。唤醒后内部 RAM 常被
+        // BT 初始化压到最大块 < 4KB，sd_probe 那个 4096 字节的栈都建不起来
+        // （日志里 ALLOC FAILED size=4096 caps=0x804 就是它/同类任务），一次失败
+        // 就放弃的话用户只能重启 —— 这正是"重启就好了"的来源。退避到 30s 封顶：
+        // 一张坏卡也不会 500ms 刷一次屏。
+        const int tries = s_remount_tries++;
+        static const int64_t kBackoffUs[] = {0, 1000 * 1000, 2 * 1000 * 1000,
+                                             4 * 1000 * 1000, 8 * 1000 * 1000,
+                                             15 * 1000 * 1000};
+        const int64_t backoff = tries < (int)(sizeof(kBackoffUs) / sizeof(kBackoffUs[0]))
+                                    ? kBackoffUs[tries] : 30 * 1000 * 1000;
+        s_remount_next_us = now + backoff;
         const esp_err_t err = read_pico_sd_remount();
-        ESP_LOGW(TAG, "SD 卡回来，重新挂载: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "SD 卡回来，重新挂载（第 %d 次）: %s", tries + 1,
+                 esp_err_to_name(err));
     }
 }
 
