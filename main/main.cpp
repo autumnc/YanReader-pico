@@ -60,6 +60,7 @@
 #include <driver/gpio.h>
 #include <sys/time.h>
 #include <freertos/semphr.h>
+#include <freertos/idf_additions.h>   // xTaskCreateWithCaps/vTaskDeleteWithCaps：同步任务栈放 PSRAM
 #include <cstdio>
 #include <cerrno>
 #include <cstring>
@@ -105,6 +106,10 @@ static std::string s_flomoText;
 static AppState s_flomoReturnTo = APP_EDITOR;
 static int64_t s_flomoResultUntil = 0;
 static bool s_flomoBusyDrawn = false;
+// PSRAM 栈那趟的句柄（内部栈建得起来时一直是 nullptr）。WithCaps 的任务不能自删，
+// 收工后挂起自己，由屏上那一拍用 vTaskDeleteWithCaps 收尸。
+static TaskHandle_t s_webdavCapsTask = nullptr;
+static TaskHandle_t s_flomoCapsTask = nullptr;
 static SemaphoreHandle_t s_asyncResultMutex = nullptr;
 
 static void ensureAsyncResultMutex() {
@@ -189,6 +194,59 @@ static void flomoSendTask(void *arg) {
     (void)arg;
     flomoSendBody();
     vTaskDelete(nullptr);
+}
+
+// ── 同步 worker 的 PSRAM 栈兜底 ──────────────────────────────────────────────
+// xTaskCreate 的栈和 TCB 只能从内部 RAM 出。WiFi/蓝牙起来以后内部最大连续块常在
+// 7~8KB（2026-10-29 实测 free 9507 / largest 7680），webdav_sync 要的 12288 根本
+// 不存在，于是每次同步都直接落到"系统繁忙,请重试"。同一类问题 1.9.2 在 AI 对话上
+// 已经修过（见 screen_reader_ai.cpp 的 ai_chat_ps）：内部栈先试，建不起就改 PSRAM 栈。
+// WithCaps 的任务**不能自删**（自删要临时建清理任务，内堆紧时直接 abort），所以
+// caps 版入口放下结果后 vTaskSuspend(NULL)，由屏上那一拍调 reapAsyncWorker 收尸。
+
+static bool startAsyncWorker(TaskFunction_t internalFn, TaskFunction_t capsFn, const char *name,
+                             uint32_t stack, TaskHandle_t *capsOut) {
+    TaskHandle_t h = nullptr;
+    // 先量再试：栈之外 xTaskCreate 还要一块 TCB（实测 bt_conn 约 1.1KB），留 1536 余量。
+    // 明知装不下就别硬撞 —— 那一下失败会进"分配失败黑匣子"，此后整场开机每 2s
+    // 刷一条 `OOM seen N time(s)`，把真正的分配失败淹掉。
+    const size_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (largest8 >= stack + 1536 &&
+        xTaskCreate(internalFn, name, stack, nullptr, 1, &h) == pdPASS) {
+        return true;
+    }
+    ESP_LOGW(TAG, "内部栈建不起 %s（栈 %u）：内部RAM余 %u，最大块 %u —— 改用 PSRAM 栈",
+             name, (unsigned)stack,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (xTaskCreateWithCaps(capsFn, name, stack, nullptr, 1, &h,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        return false;
+    }
+    *capsOut = h;
+    return true;
+}
+
+// 收尸：只在 worker 已经把状态置成非 Running（结果已放下）时才删。vTaskDeleteWithCaps
+// 先 suspend 再确认两个核都没在跑它，所以"置了 Done 但还没走到 vTaskSuspend"那一拍也安全。
+static void reapAsyncWorker(TaskHandle_t *handle, AsyncUiState state, const char *name) {
+    if (*handle && state != AsyncUiState::Running) {
+        vTaskDeleteWithCaps(*handle);
+        *handle = nullptr;
+        ESP_LOGI(TAG, "收了 %s 的 PSRAM 栈", name);
+    }
+}
+
+static void webdavSyncCapsTask(void *arg) {
+    (void)arg;
+    webdavSyncBody();
+    vTaskSuspend(nullptr);
+}
+
+static void flomoSendCapsTask(void *arg) {
+    (void)arg;
+    flomoSendBody();
+    vTaskSuspend(nullptr);
 }
 
 static void ntpSyncBody() {
@@ -972,6 +1030,7 @@ static AppState scrSyncWebdav(int key, ScreenContext &ctx) {
     g_font.setSize(20);
     IME::getInstance().setPageSize(7);
     AsyncUiState state = s_webdavState.load(std::memory_order_acquire);
+    reapAsyncWorker(&s_webdavCapsTask, state, "webdav_sync");
     if (state == AsyncUiState::Idle) {
         lockAsyncResult();
         s_webdavResult = {false, ""};
@@ -979,8 +1038,8 @@ static AppState scrSyncWebdav(int key, ScreenContext &ctx) {
         s_webdavResultUntil = 0;
         s_webdavBusyDrawn = false;
         s_webdavState.store(AsyncUiState::Running, std::memory_order_release);
-        TaskHandle_t h = nullptr;
-        if (xTaskCreate(webdavSyncTask, "webdav_sync", 12288, nullptr, 1, &h) != pdPASS) {
+        if (!startAsyncWorker(webdavSyncTask, webdavSyncCapsTask, "webdav_sync", 12288,
+                              &s_webdavCapsTask)) {
             lockAsyncResult();
             s_webdavResult = {false, "系统繁忙,请重试"};
             unlockAsyncResult();
@@ -1013,6 +1072,7 @@ static AppState scrSyncWebdav(int key, ScreenContext &ctx) {
     }
     s_webdavState.store(AsyncUiState::Idle, std::memory_order_release);
     s_webdavBusyDrawn = false;
+    reapAsyncWorker(&s_webdavCapsTask, AsyncUiState::Idle, "webdav_sync");
     return APP_MAIN;
 }
 
@@ -1020,6 +1080,7 @@ static AppState scrSyncWebdav(int key, ScreenContext &ctx) {
 static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
     (void)key; (void)ctx;
     AsyncUiState state = s_flomoState.load(std::memory_order_acquire);
+    reapAsyncWorker(&s_flomoCapsTask, state, "flomo_send");
     if (state == AsyncUiState::Idle) {
         if (!g_flomoPendingText.empty()) {
             s_flomoText = std::move(g_flomoPendingText);
@@ -1035,8 +1096,8 @@ static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
         s_flomoResultUntil = 0;
         s_flomoBusyDrawn = false;
         s_flomoState.store(AsyncUiState::Running, std::memory_order_release);
-        TaskHandle_t h = nullptr;
-        if (xTaskCreate(flomoSendTask, "flomo_send", 8192, nullptr, 1, &h) != pdPASS) {
+        if (!startAsyncWorker(flomoSendTask, flomoSendCapsTask, "flomo_send", 8192,
+                              &s_flomoCapsTask)) {
             lockAsyncResult();
             s_flomoResult = {false, "系统繁忙,请重试"};
             unlockAsyncResult();
@@ -1073,6 +1134,7 @@ static AppState scrSyncSendFlomo(int key, ScreenContext &ctx) {
     s_flomoText.clear();
     s_flomoState.store(AsyncUiState::Idle, std::memory_order_release);
     s_flomoBusyDrawn = false;
+    reapAsyncWorker(&s_flomoCapsTask, AsyncUiState::Idle, "flomo_send");
     return s_flomoReturnTo;
 }
 
