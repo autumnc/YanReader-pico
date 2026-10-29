@@ -13898,28 +13898,25 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     }
   }
 
-  // 实体键盘 Tab = 切标签（2026-10-29 用户要求）。阅读器里有两层标签，按当前
-  // 画面上实际看得见的那一层走：
-  //   · 浮动阅读菜单开着 → 切它的 4 张卡（目录/字体/笔记/排版），与 ←→ 同义；
-  //   · 否则在根标签界面（含阅读页）→ 循环切根标签（书架/应用/笔记/设置/统计）。
-  // 书架有书时 ←→ 要换封面、阅读页 ←→ 要翻页，所以 Tab 是这几个界面里唯一不冲突的
-  // "换标签"键。放在输入法分发之后：设置里把 Tab 选成「字母选字」触发键、且真有
-  // 候选时，那一拍已经先喂给输入法了。只在根标签界面生效 —— 目录/搜索/WiFi 等
-  // 子界面各有各的 Tab 语义或被输入框占用，不抢。设置弹层是模态的，也不抢。
+  // 实体键盘 Tab = 切根标签（2026-10-29 用户要求）。**只在根标签界面生效**
+  // （书架/应用/笔记/设置/统计），循环切这 5 个页签。阅读页上 Tab 什么都不做 ——
+  // 用户明确要"只在根标签切"：原来那一版把阅读页也算进去，按一下就直接离开书了。
+  // 浮动阅读菜单开着时 Tab 也不抢（菜单内切卡用 ←→，见 rdSheetHandle）。
+  // 书架有书时 ←→ 要换封面，所以 Tab 是这几个界面里唯一不冲突的"换标签"键。
+  // 放在输入法分发之后：设置里把 Tab 选成「字母选字」触发键、且真有候选时，那一拍
+  // 已经先喂给输入法了。目录/搜索/WiFi 等子界面各有各的 Tab 语义或被输入框占用，
+  // 不抢。设置弹层是模态的，也不抢。
+  // **必须自己 renderCurrent()**：早返回跳过了帧尾那句 `if (st.dirty) renderCurrent();`，
+  // 只置脏的话 st.tab 在变、屏上纹丝不动 —— 2026-10-29 用户报的就是这个"Tab 按了没
+  // 反应"（切了几个标签，再随便按一个别的键才突然跳到第 N 个标签上，正是被跳过的
+  // 那些帧攒下来的）。
   if (key == 0x09 && !st.pickOpen) {
-    if (sheetVisible()) {
-      st.sheetTab = (st.sheetTab + 1) % kSheetTabCount;
-      rdSheetTabChanged();
-      return APP_READER;
-    }
     const bool rootTab = st.mode == RdMode::Browser || st.mode == RdMode::Apps ||
                          st.mode == RdMode::Notes || st.mode == RdMode::Settings ||
                          st.mode == RdMode::Stats;
-    // 阅读页只在没有更上层的交互时切走（选区/脚注弹注开着时 Tab 不抢）。
-    const bool readingPage = st.mode == RdMode::Reading && !st.selActive &&
-                             st.fnPopNum.empty();
-    if (rootTab || readingPage) {
+    if (rootTab) {
       switchTab((st.tab + 1) % kTabCount);
+      renderCurrent();
       return APP_READER;
     }
   }
