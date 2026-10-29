@@ -38,8 +38,10 @@
 #include <string>
 #include <vector>
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/task.h>
 
 static const char *TAG = "RdAiChat";
@@ -71,6 +73,9 @@ static std::atomic<bool> s_aiRunning{false};
 static std::atomic<RdAiJob *> s_aiReady{nullptr};   // release 存 / exchange(acq_rel) 取
 static std::atomic_bool s_aiCancel{false};
 static int s_aiGen = 0;      // 只在主任务里动
+// 用 PSRAM 栈建出来的 worker（内部 RAM 建不起 7680 时走这条路）。WithCaps 任务不能自删，
+// 它挂起自己、这里留着句柄，由主任务在 aiPollResult 里 vTaskDeleteWithCaps 收尸。
+static TaskHandle_t s_aiCapsTask = nullptr;
 
 // ── 文本小工具 ───────────────────────────────────────────────────────────
 static void trimAsciiInPlace(std::string &s) {
@@ -158,12 +163,23 @@ static void rdAiRunJob(RdAiJob &job) {
   else job.error = dr.content;
 }
 
-static void rdAiTask(void *arg) {
+static void rdAiFinishJob(void *arg) {
   std::unique_ptr<RdAiJob> job(static_cast<RdAiJob *>(arg));
   rdAiRunJob(*job);
   s_aiReady.store(job.release(), std::memory_order_release);
   s_aiRunning.store(false, std::memory_order_release);
+}
+
+static void rdAiTask(void *arg) {
+  rdAiFinishJob(arg);
   vTaskDelete(nullptr);
+}
+
+// PSRAM 栈版：入口在放下结果后**挂起**自己。WithCaps 建的任务不能 vTaskDelete（IDF 不释放
+// 静态分配的栈/TCB，自删路径还要临时建清理任务，内部 RAM 紧时直接 abort）—— 由主任务收尸。
+static void rdAiCapsTask(void *arg) {
+  rdAiFinishJob(arg);
+  vTaskSuspend(nullptr);
 }
 
 // ── 取件 ─────────────────────────────────────────────────────────────────
@@ -173,6 +189,13 @@ static void rdAiTask(void *arg) {
 static bool aiPollResult() {
   std::unique_ptr<RdAiJob> job(s_aiReady.exchange(nullptr, std::memory_order_acq_rel));
   if (!job) return false;
+  // PSRAM 栈的 worker 放下结果后自己挂起（或在挂起的路上），这里收尸：
+  // vTaskDeleteWithCaps 会先替我们 suspend 并在两个核上都确认它已不在跑，再来真的删 ——
+  // 所以"刚 store 完还没走到 vTaskSuspend"那个窗口也能安全删掉。
+  if (s_aiCapsTask) {
+    vTaskDeleteWithCaps(s_aiCapsTask);
+    s_aiCapsTask = nullptr;
+  }
   s_aiRunning.store(false, std::memory_order_release);
   if (job->gen != s_aiGen) return false;         // 上一场对话的残留：放掉，不碰 st
   // 本场在等的那一份落地了：先把在飞标记放下来，**再**看还在不在这一屏 —— 反了的话
@@ -471,6 +494,12 @@ void rdAiChatSubmit() {
     st.dirty = 1;
     return;
   }
+  // 兜底：上一趟的 PSRAM 栈 worker 还没收尸（结果落地了但这一屏没机会取件）就先收掉。
+  // s_aiRunning 为假 = 它已经放下结果，只差走到 vTaskSuspend 那一拍，删了不亏。
+  if (s_aiCapsTask) {
+    vTaskDeleteWithCaps(s_aiCapsTask);
+    s_aiCapsTask = nullptr;
+  }
 
   // WiFi 由**主任务**负责连：readerEnsureWifi 会写 st.busyMsg 并自己 renderCurrent()，
   // 而 worker 不许碰 st、不许渲染（全仓铁律）。
@@ -513,13 +542,23 @@ void rdAiChatSubmit() {
   // 再起任务**的，那时最大连续块正好 8192 —— 申请 8192 会因为块头差一点而每次都失败
   // （screen_settings.cpp 记着实测 free=18415 largest=8192；Flomo 的 TLS 登录也是从 6144
   // 崩过之后定到 7680）。polish/prompt_gen 用 8192 没事，是因为它们的任务自己才去连 WiFi。
+  // 内部 RAM 建不起来就改从 PSRAM 出栈：连着蓝牙键盘时 WiFi 握手后内部最大块能塌到
+  // ~1.5KB（screen_appstore.cpp 记着实测 free=3179 largest=1472），7680 必然失败 ——
+  // 这条路上界面上就是永远的"系统繁忙，请重试"。worker 只做网络、不碰 SD/flash。
   if (xTaskCreate(rdAiTask, "ai_chat", kAiTaskStack, job.get(), 1, &h) != pdPASS) {
-    s_aiRunning.store(false, std::memory_order_release);
-    st.aiTurns.pop_back();
-    st.aiInput = q;
-    st.aiStatus = "系统繁忙，请重试";
-    aiRebuildTranscript();
-    return;
+    ESP_LOGW(TAG, "内部栈建不起 ai_chat（栈 %d）：内部RAM余 %u，最大块 %u —— 改用 PSRAM 栈",
+             kAiTaskStack, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (xTaskCreateWithCaps(rdAiCapsTask, "ai_chat_ps", kAiTaskStack, job.get(), 1, &h,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+      s_aiRunning.store(false, std::memory_order_release);
+      st.aiTurns.pop_back();
+      st.aiInput = q;
+      st.aiStatus = "系统繁忙，请重试";
+      aiRebuildTranscript();
+      return;
+    }
+    s_aiCapsTask = h;
   }
   (void)job.release();
   st.aiBusy = true;
