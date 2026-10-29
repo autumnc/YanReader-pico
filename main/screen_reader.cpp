@@ -180,6 +180,12 @@ static int spacingIdx() {
 int uiLineHeight() { return g_rd.getLineHeight(UI_FONT_ID); }
 int uiAsc() { return g_rd.getFontAscenderSize(UI_FONT_ID); }
 
+// 横屏（1216×684）判定。阅读器方向由 st.orientation 定，运行时宽度已按旋转后的
+// 逻辑坐标给出，所以直接比宽高最可靠 —— 不依赖字符串设置，也不会和 applyReaderOrientation
+// 的任何一条分支错开。目前只有 AI 对话的横屏版式按它分支（词典维持查询框在上、
+// 词条在下的单栏版式，用户明确不要双栏）。
+bool rdWideLayout() { return g_rd.getScreenWidth() > g_rd.getScreenHeight(); }
+
 // 底部状态栏/提示栏高度与上边界。留 RD_BOTTOM_INSET 底部物理留白，
 // 避免提示文字贴到屏幕底边被边框遮挡（原版固定 44px 时文字基线落到底边被截断）。
 int footerH() { return uiLineHeight() + 8; }
@@ -274,6 +280,9 @@ static void handleApps(int key);
 // 那个小图标，症状与之前一模一样（本轮报障就是）。现在一律弹，蓝牙键盘连着时附一条
 // 提示（只出一次，断开重连会重新计）说明：键盘能用、右下角的图标能收起。
 //
+// 2026-10-29 起**词典 / AI 对话**这两个应用例外：连着蓝牙键盘时默认不弹，见
+// rdTypingAppVkDefault / rdTypingAppTapInput（那是用户点名要的，别把这一条改回去）。
+//
 // 返回 true = 键盘已展开（调用方标脏重绘即可）。恒为 true，保留返回值是为了调用点
 // 不用改（有"弹出来了才 return"的写法，见 handleNoteEdit / handleShelfSearch）。
 bool rdVkWantShow() {
@@ -297,6 +306,46 @@ bool rdVkWantShow() {
   if (!st.vkVisible) st.fullRefresh = true;
   st.vkVisible = true;
   return true;
+}
+
+// ── 词典 / AI 对话的键盘默认态（2026-10-29）───────────────────────────────
+// 这两个应用一进来就是一整屏内容（释义 / 多轮对话），横屏下虚拟键盘要占掉半屏多一点；
+// 连着蓝牙键盘时再自动弹出来，等于每进一次屏都先把正文按下去再看一遍。用户要求
+// "连着实体键盘就默认不弹"。想用屏幕键盘时点右下角那个图标随时能展开（rdToggleVk），
+// 实体键盘也照常可用（候选条由 drawRdImeBar 照画）。
+//
+// 和 rdVkWantShow 的默认相反 —— 那个仍服务于其余输入框（笔记/搜索/WiFi/OPDS…）：
+// 用户明确点进编辑态时，弹出来最符合预期。这里只在进屏/点输入框时用，别扩散。
+static bool s_typingVkHinted = false;
+
+static void typingVkHintOnce() {
+  if (s_typingVkHinted) return;
+  s_typingVkHinted = true;
+  rdShowFloat("蓝牙键盘已连接", "屏幕键盘默认收起；点右下角键盘图标可展开", 4000);
+}
+
+void rdTypingAppVkDefault() {
+  if (!g_bt.isConnected()) {
+    s_typingVkHinted = false;
+    rdVkWantShow();
+    return;
+  }
+  // 从上一个界面带过来的"弹着"状态要收掉 —— 否则"默认不弹"在第二次进屏时就不成立。
+  if (st.vkVisible) {
+    st.vkVisible = false;
+    st.fullRefresh = true;   // 整块面板消失必须全刷（同 rdToggleVk）
+  }
+  typingVkHintOnce();
+}
+
+void rdTypingAppTapInput() {
+  if (!g_bt.isConnected()) {
+    s_typingVkHinted = false;
+    rdVkWantShow();
+    return;
+  }
+  // 已经手动展开过的（用户就是想用屏幕键盘）不要在这里再收起来。
+  typingVkHintOnce();
 }
 
 // 底部提示行。
@@ -9988,7 +10037,8 @@ static void doMenuAction(MenuAct act) {
       st.dictHeadword.clear();
       st.dictStatus.clear();
       rdDictResetScroll();
-      rdVkWantShow();
+      // 连着蓝牙键盘时默认不弹（见 rdTypingAppVkDefault）；没连则照旧直接弹。
+      rdTypingAppVkDefault();
       st.mode = RdMode::Dictionary;
       st.fullRefresh = true;
       break;
@@ -11896,7 +11946,9 @@ static void handleDict(int key) {
       if (rdVkIconHit(x, y)) {
         rdToggleVk();
       } else if (y >= dictQueryTop() && y < dictQueryTop() + dictQueryH()) {
-        rdVkWantShow();   // 点到查询框：展开键盘（蓝牙键盘连着时给一次浮动提示）
+        // 点到查询框：没连蓝牙键盘就展开面板；连着则只给一句"右下角图标可展开"的提示
+        // （见 rdTypingAppTapInput）。
+        rdTypingAppTapInput();
       } else if (st.vkVisible) {
         vkTap(x, y);
       } else {

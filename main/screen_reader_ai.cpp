@@ -21,6 +21,7 @@
 #include "screen_reader_internal.h"
 #include "screen_reader.h"
 
+#include "bt_keyboard.h"   // g_bt.isConnected()：连着实体键盘时默认不弹屏幕键盘
 #include "deepseek_client.h"
 #include "settings_manager.h"
 #include "wifi_manager.h"
@@ -200,42 +201,198 @@ static bool aiPollResult() {
   return true;
 }
 
-// 输入框矩形与命中**必须同源**（同 dictQueryTop 那段注释）：渲染用 drawTitle 的返回值
-// 当 qy，命中用这里；两者相等是约定，所以这里直接取 coverTop()。
-static int aiInputTop() { return coverTop(); }
+// 输入框矩形与命中**必须同源**（同 dictQueryTop 那段注释）：竖屏用 drawTitle 的返回值
+// 当 qy，命中用 coverTop()；横屏输入框贴底，两边都取 rdBodyBottom() - dictQueryH()。
+static int aiInputTop() {
+  if (!rdWideLayout()) return coverTop();
+  return rdBodyBottom() - dictQueryH();
+}
+// 输入框恒为一行。横屏按聊天软件的排法：对话正文在上、输入框贴底（虚拟键盘/输入法条
+// 弹着时，rdBodyBottom 已经让到它们上面），状态行夹在正文与输入框之间；竖屏维持
+// "标题 → 输入框 → 状态 → 正文"的老版式。
+static int aiInputH() { return dictQueryH(); }
+static int aiInputW() { return g_rd.getScreenWidth() - 2 * MARGIN; }
+static int aiInputLeft() { return MARGIN; }
+static bool aiInputHit(int x, int y) {
+  const int top = aiInputTop();
+  const int left = aiInputLeft();
+  return x >= left && x < left + aiInputW() && y >= top && y < top + aiInputH();
+}
+// 单行输入框里显示输入的**尾部**（光标在末尾）：长问题打字时看得到刚敲的字，而不是
+// 永远停在开头。超宽时前缀一个省略号表示前面还有内容。
+static std::string aiInputTail(const std::string &s, int maxW) {
+  if (g_rd.getTextWidth(uiFontId(), s.c_str()) <= maxW) return s;
+  const int ellW = g_rd.getTextWidth(uiFontId(), "…");
+  const std::vector<std::string> lines =
+      g_rd.wrappedText(uiFontId(), s.c_str(), maxW > ellW ? maxW - ellW : maxW, 64);
+  if (lines.empty()) return s;
+  return std::string("…") + lines.back();
+}
+
+// ── 横屏的轮次列表（浮动图标 + 左侧 1/3 抽屉）──────────────────────────────
+// 一轮问答在正文里可能占几十行，翻起来找某一问很费劲。横屏标题行右端画一个列表
+// 图标，点开后从左侧弹出 1/3 屏宽的抽屉，列出本次对话的每个问题（编号 + 问句），
+// 点一条就跳到那一轮的开头。竖屏不画（屏幕太窄，抽屉放不下几个字，且不是本次
+// 要优化的方向）。
+static bool s_aiListOpen = false;
+static int s_aiListFirst = 0;   // 抽屉里当前显示的轮次下标（翻页用）
+static int s_aiListRows = 1;    // 抽屉一屏能放几行（绘制时算出，翻页用）
+
+static int aiListIconSize() { return uiLineHeight(); }
+static int aiListIconX() { return g_rd.getScreenWidth() - MARGIN - aiListIconSize(); }
+static int aiListIconY() {
+  // 标题行（RD_TOP_INSET 到 rdHeadBottom 之间）右侧本来就是空的，图标就嵌在这里，
+  // 悬浮在正文之上但不压字。
+  const int band = rdHeadBottom() - RD_TOP_INSET;
+  int y = RD_TOP_INSET + (band - aiListIconSize()) / 2;
+  return y < RD_TOP_INSET ? RD_TOP_INSET : y;
+}
+static bool aiListIconHit(int x, int y) {
+  const int sx = aiListIconX(), sy = aiListIconY(), sz = aiListIconSize();
+  return x >= sx && x < sx + sz && y >= sy && y < sy + sz;
+}
+
+static int aiDrawerW() { return g_rd.getScreenWidth() / 3; }
+// 抽屉底边让开输入框（有状态行时再让开状态行）；列表不遮输入区。
+static int aiDrawerBottom() {
+  const int inputTop = aiInputTop();
+  if (!st.aiStatus.empty()) return inputTop - uiLineHeight() - 12;
+  return inputTop - 8;
+}
+static int aiListTop() { return RD_TOP_INSET + uiLineHeight() + 10; }  // “对话”标题下面
+static int aiListRowH() { return uiLineHeight() + 6; }
+static int aiListRowsCompute() {
+  const int rows = (aiDrawerBottom() - aiListTop()) / aiListRowH();
+  return std::max(1, rows);
+}
+static int aiListFirstNow() {
+  const int rows = aiListRowsCompute();
+  const int total = static_cast<int>(st.aiTurns.size());
+  const int maxFirst = std::max(0, total - rows);
+  if (s_aiListFirst < 0) s_aiListFirst = 0;
+  if (s_aiListFirst > maxFirst) s_aiListFirst = maxFirst;
+  return s_aiListFirst;
+}
+// 第 idx 轮在正文行表里的首行号（“我：…”那一行）。用与 aiRebuildTranscript **同一条
+// 拼接规则**重算出前缀，再按同一折行宽度量一遍 —— 前缀的折行行数就是它的行下标。
+static int aiTurnLineStart(int idx) {
+  std::string prefix;
+  if (!st.aiCtx.empty()) {
+    prefix += "【选段】\n";
+    prefix += st.aiCtx;
+    prefix += "\n";
+  }
+  for (int i = 0; i < idx; i++) {
+    if (i > 0 || !st.aiCtx.empty()) prefix += "\n";
+    prefix += "我：";
+    prefix += st.aiTurns[i].q;
+    prefix += "\nAI：";
+    prefix += st.aiTurns[i].a.empty() ? "（正在思考…）" : st.aiTurns[i].a;
+    prefix += "\n";
+  }
+  if (idx > 0 || !st.aiCtx.empty()) prefix += "\n";
+  const int trW = g_rd.getScreenWidth() - 2 * MARGIN;
+  return static_cast<int>(g_rd.wrappedText(uiFontId(), prefix.c_str(), trW, kAiMaxLines).size());
+}
+static void aiJumpToTurn(int idx) {
+  st.aiScroll = std::min(aiTurnLineStart(idx), std::max(0, st.aiScrollMax));
+  st.aiScrollToEnd = false;
+}
+
+static void aiDrawListIcon() {
+  const int sz = aiListIconSize();
+  const int x = aiListIconX();
+  const int y = aiListIconY();
+  const bool on = s_aiListOpen;
+  // 反白 = 列表已展开（同键盘开关图标）。
+  if (on) g_rd.fillRect(x, y, sz, sz, true);
+  g_rd.drawRect(x, y, sz, sz, !on);
+  const int pad = std::max(3, sz / 5);
+  const int barH = std::max(2, sz / 12);
+  const int gap = std::max(2, (sz - 2 * pad - 3 * barH) / 2);
+  for (int i = 0; i < 3; i++) {
+    g_rd.fillRect(x + pad, y + pad + i * (barH + gap), sz - 2 * pad, barH, !on);
+  }
+}
+
+static void aiDrawListDrawer() {
+  const int dw = aiDrawerW();
+  const int bottom = aiDrawerBottom();
+  g_rd.fillRect(0, 0, dw, bottom, false);        // 白底盖住正文
+  g_rd.drawLine(dw, 0, dw, bottom, true);        // 右侧分界
+  drawLineText(12, RD_TOP_INSET, "对话", true);
+  const int total = static_cast<int>(st.aiTurns.size());
+  const int rows = aiListRowsCompute();
+  s_aiListRows = rows;
+  const int first = aiListFirstNow();
+  const int pages = (total + rows - 1) / rows;
+  if (pages > 1) {
+    char pg[24];
+    snprintf(pg, sizeof(pg), "%d/%d", first / rows + 1, pages);
+    const int tw = g_rd.getTextWidth(uiFontId(), pg);
+    drawLineText(dw - 12 - tw, RD_TOP_INSET, pg, true);
+  }
+  if (total == 0) {
+    drawLineText(12, aiListTop(), "（还没有对话）", true);
+    return;
+  }
+  const int last = std::min(total, first + rows);
+  int y = aiListTop();
+  for (int i = first; i < last; i++) {
+    char num[16];
+    snprintf(num, sizeof(num), "%d. ", i + 1);
+    std::string s = num;
+    s += st.aiTurns[i].q;
+    s = g_rd.truncatedText(uiFontId(), s.c_str(), dw - 24);
+    drawLineText(12, y, s.c_str(), true);
+    y += aiListRowH();
+  }
+}
 
 // ── 渲染 ─────────────────────────────────────────────────────────────────
 void renderAiChat() {
   aiPollResult();   // 渲染时也取件（三处缺一，就是"答案到了屏上还在转圈"）
   g_rd.clearScreen();
   const int w = g_rd.getScreenWidth();
+  const bool wide = rdWideLayout();
   // 无 ctx（应用页入口）的标题跟着入口名走：入口页那格叫「DeepSeek 对话」，
   // 进来看到别的名字会以为是两个东西。有 ctx 那版仍是「问 AI」（从选区动作条来的）。
   const int top = drawTitle(st.aiCtx.empty() ? "DeepSeek 对话" : "问 AI");
-  const int qy = top;
-  const int qh = dictQueryH();
-  g_rd.drawRect(MARGIN, qy, w - 2 * MARGIN, qh, true);
+  const int qh = aiInputH();
+  const int qw = aiInputW();
+  const int qx = aiInputLeft();
+  const int lineH = uiLineHeight() + 4;
+  const int bottom = rdBodyBottom();
+
+  // 横屏按聊天软件排：正文在上、输入框贴底（单行），状态行夹在正文与输入框之间；
+  // 竖屏维持老版式：标题 → 输入框 → 状态 → 正文。
+  const int qy = wide ? bottom - qh : top;
+  const int statusY = wide ? qy - uiLineHeight() - 6 : qy + qh + 12;
+
+  g_rd.drawRect(qx, qy, qw, qh, true);
   {
     const std::string raw = st.aiInput.empty() ? std::string("输入问题后回车发送") : st.aiInput;
-    const std::string disp = g_rd.truncatedText(uiFontId(), raw.c_str(), w - 2 * MARGIN - 16);
-    drawLineText(MARGIN + 8, qy + 6, disp.c_str(), true);
+    const std::string disp =
+        wide ? aiInputTail(raw, qw - 16) : g_rd.truncatedText(uiFontId(), raw.c_str(), qw - 16);
+    drawLineText(qx + 8, qy + 6, disp.c_str(), true);
   }
-  int ry = qy + qh + 12;
-  const int bottom = rdBodyBottom();
-  if (!st.aiStatus.empty()) {
-    drawLineText(MARGIN, ry, st.aiStatus.c_str(), true);
-    ry += uiLineHeight() + 6;
-  }
+
+  int ry = wide ? top : qy + qh + 12;
+  if (!wide && !st.aiStatus.empty()) ry += uiLineHeight() + 6;
+  // 正文区的下沿：横屏要停在状态行/输入框上面（有状态行时给它让一行）。
+  const int trW = w - 2 * MARGIN;
+  const int trBottom = wide ? (st.aiStatus.empty() ? qy - 8 : statusY - 6) : bottom;
+
+  int total = 0;
+  int maxLines = 1;
   if (!st.aiTranscript.empty()) {
-    const int maxW = w - 2 * MARGIN;
     // 折行只算一次：宽度没变就复用上一帧的行表（多轮正文逐帧重新量宽度会拖慢滚动/打字）。
-    if (st.aiLinesW != maxW) {
-      st.aiLinesW = maxW;
-      st.aiLines = g_rd.wrappedText(uiFontId(), st.aiTranscript.c_str(), maxW, kAiMaxLines);
+    if (st.aiLinesW != trW) {
+      st.aiLinesW = trW;
+      st.aiLines = g_rd.wrappedText(uiFontId(), st.aiTranscript.c_str(), trW, kAiMaxLines);
     }
-    const int lineH = uiLineHeight() + 4;
-    const int maxLines = std::max(1, (bottom - ry) / lineH);
-    const int total = static_cast<int>(st.aiLines.size());
+    maxLines = std::max(1, (trBottom - ry) / lineH);
+    total = static_cast<int>(st.aiLines.size());
     if (st.aiScrollToEnd) {
       st.aiScroll = std::max(0, total - maxLines);
       st.aiScrollToEnd = false;
@@ -251,23 +408,47 @@ void renderAiChat() {
       drawLineText(MARGIN, y, st.aiLines[i].c_str(), true);
       y += lineH;
     }
-    // 翻页指示：只有真看不全时才画，且只在状态行占着那一行时画（同 renderDict 的做法；
-    // 状态行空着时那一行是输入框底边，画上去就是压框）。
-    if (total > maxLines && !st.aiStatus.empty()) {
-      char ind[24];
-      const int pageCount = (total + maxLines - 1) / maxLines;
-      snprintf(ind, sizeof(ind), "%d/%d", first / maxLines + 1, pageCount);
-      const int tw = g_rd.getTextWidth(uiFontId(), ind);
-      drawLineText(w - MARGIN - tw, ry - uiLineHeight() - 6, ind, true);
-    }
+  } else {
+    st.aiScrollMax = 0;
+    st.aiPageLines = std::max(1, (trBottom - ry) / lineH);
   }
+
+  // 状态行：横屏在输入框上方、竖屏在正文上方（都是原版式的位置）。横屏整行宽，
+  // 超长时截断 —— 留一整行给报错已经够用，不为它再压正文。
+  if (!st.aiStatus.empty()) {
+    const std::string s = wide ? g_rd.truncatedText(uiFontId(), st.aiStatus.c_str(), trW)
+                               : st.aiStatus;
+    drawLineText(MARGIN, statusY, s.c_str(), true);
+  }
+  // 翻页指示：只有真看不全、且状态行占着那一行时才画（状态行空着时那一行是输入框
+  // 底边/正文底边，画上去就是压框）。
+  if (total > maxLines && !st.aiStatus.empty()) {
+    char ind[24];
+    const int pageCount = (total + maxLines - 1) / maxLines;
+    snprintf(ind, sizeof(ind), "%d/%d", st.aiScroll / maxLines + 1, pageCount);
+    const int tw = g_rd.getTextWidth(uiFontId(), ind);
+    drawLineText(w - MARGIN - tw, statusY, ind, true);
+  }
+
+  // 轮次抽屉画在正文/状态之上；浮动图标最后画（跟键盘图标同一层），面板收起时也
+  // 不会被子集盖掉。
+  if (wide && s_aiListOpen) aiDrawListDrawer();
+
   if (st.vkVisible) {
     drawVk();
   } else {
     drawRdImeBar();   // 蓝牙键盘打字：编码行 + 候选行（见 drawRdImeBar）
-    drawFooter(st.aiScrollMax > 0 ? "上下划翻页  点输入框输入  Enter 发送  Esc 返回"
-                                  : "点输入框输入  Enter 发送  Esc 返回");
+    // 蓝牙键盘连着时面板默认收起（rdTypingAppVkDefault），提示语别说成"点输入框输入"。
+    const bool bt = g_bt.isConnected();
+    if (st.aiScrollMax > 0) {
+      drawFooter(bt ? "上下划翻页  实体键盘输入  Enter 发送  Esc 返回"
+                    : "上下划翻页  点输入框输入  Enter 发送  Esc 返回");
+    } else {
+      drawFooter(bt ? "实体键盘输入  Enter 发送  Esc 返回"
+                    : "点输入框输入  Enter 发送  Esc 返回");
+    }
   }
+  if (wide) aiDrawListIcon();
   rdDrawVkIcon();   // **必须最后画**（面板收起时它才露出来，画在前面会被面板盖掉）
 }
 
@@ -348,6 +529,29 @@ void rdAiChatSubmit() {
 // ── 按键 ─────────────────────────────────────────────────────────────────
 void handleAiChat(int key) {
   if (aiPollResult()) st.dirty = 1;   // 按键帧也取件（同 handleFileBrowser / handleDict）
+  // 轮次抽屉开着时，方向键/翻页键翻列表，Esc 先收抽屉；别的键先收起抽屉再照常处理
+  // （别让用户以为字打进去了、其实全被抽屉吃掉）。
+  if (s_aiListOpen) {
+    if (key == 0x1B) {
+      s_aiListOpen = false;
+      st.dirty = 1;
+      return;
+    }
+    if (key == KEY_UP || key == KEY_DOWN || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+      const int rows = aiListRowsCompute();
+      const int total = static_cast<int>(st.aiTurns.size());
+      int first = aiListFirstNow();
+      if (key == KEY_UP) first -= 1;
+      else if (key == KEY_DOWN) first += 1;
+      else if (key == KEY_PAGE_UP) first -= rows;
+      else first += rows;
+      s_aiListFirst = std::max(0, std::min(first, std::max(0, total - rows)));
+      st.dirty = 1;
+      return;
+    }
+    s_aiListOpen = false;
+    st.dirty = 1;
+  }
   if (key == 0x1B) {
     if (st.aiBusy) {
       // 取消是**请求**不是立即生效：net::Request 以 1s 粒度轮询取消旗（见 net/http.h），
@@ -393,10 +597,35 @@ void handleAiChat(int key) {
   if (key == '\n') {
     int x = 0, y = 0;
     if (input_tap_xy(&x, &y)) {
+      const bool wide = rdWideLayout();
+      if (wide && aiListIconHit(x, y)) {
+        s_aiListOpen = !s_aiListOpen;
+        if (s_aiListOpen) s_aiListFirst = 0;   // 每次打开从第一页看起
+        st.dirty = 1;
+        return;
+      }
+      if (wide && s_aiListOpen) {
+        if (x < aiDrawerW()) {
+          const int top = aiListTop();
+          const int row = y >= top ? (y - top) / aiListRowH() : -1;
+          const int idx = row >= 0 && row < aiListRowsCompute() ? aiListFirstNow() + row : -1;
+          if (idx >= 0 && idx < static_cast<int>(st.aiTurns.size())) {
+            aiJumpToTurn(idx);
+            s_aiListOpen = false;
+          }
+          // 留在抽屉内的空白处点按：什么也不做，保持展开。
+        } else {
+          s_aiListOpen = false;   // 点抽屉外面：收起
+        }
+        st.dirty = 1;
+        return;
+      }
       if (rdVkIconHit(x, y)) {
         rdToggleVk();
-      } else if (y >= aiInputTop() && y < aiInputTop() + dictQueryH()) {
-        rdVkWantShow();   // 点到输入框：展开键盘（蓝牙键盘连着时给一次浮动提示）
+      } else if (aiInputHit(x, y)) {
+        // 点到输入框：没连蓝牙键盘就展开面板；连着则只给一次"右下角图标可展开"的提示
+        // （见 rdTypingAppTapInput）。横屏下输入框在右栏，别把左栏正文的点按也算进来。
+        rdTypingAppTapInput();
       } else if (st.vkVisible) {
         vkTap(x, y);
       }
@@ -446,12 +675,16 @@ bool rdAiChatBegin(const std::string &ctx, RdMode from) {
   st.aiScrollMax = 0;
   st.aiPageLines = 1;
   st.aiScrollToEnd = false;
+  s_aiListOpen = false;
+  s_aiListFirst = 0;
   aiRebuildTranscript();
 
   st.retMode = from;   // 每次开场都覆盖，所以残留的旧值无害
   st.mode = RdMode::AiChat;
   st.fullRefresh = true;
-  rdVkWantShow();      // 进来就是要打字的：直接弹键盘
+  // 进来就是要打字的，但连着蓝牙键盘时默认不弹屏幕键盘（把整屏让给对话正文）——
+  // 没连则照旧直接弹（见 rdTypingAppVkDefault）。
+  rdTypingAppVkDefault();
   st.dirty = 1;
   ESP_LOGI(TAG, "begin from=%d ctx=%d bytes", static_cast<int>(from), static_cast<int>(st.aiCtx.size()));
   return true;

@@ -863,6 +863,9 @@ int footerH();
 int uiLineHeight();
 int uiAsc();
 int uiFontId();      // 外壳字体 id（书内嵌字面在位时退回内置字体）
+// 当前是不是"宽屏"（横屏 1216×684）。AI 对话的横屏版式按它分支；其余界面
+// 仍按老版式走。用屏幕逻辑宽高判，不看 st.orientation —— 竖屏反过来也是同一回事。
+bool rdWideLayout();
 
 int clampI(int v, int lo, int hi);
 
@@ -986,6 +989,14 @@ void rdToggleVk();
 void rdDrawVkIcon();
 bool rdVkIconHit(int x, int y);
 bool rdVkWantShow();
+// 词典 / AI 对话这两个"整屏都在等输入"的应用专用（其余输入框仍走 rdVkWantShow）：
+// 蓝牙键盘连着时**默认不弹**虚拟键盘，把整屏让给释义/对话正文（2026-10-29 用户要求）。
+//   rdTypingAppVkDefault —— 进屏那一刻定默认态：连着实体键盘就收起面板（并给一次
+//                            "右下角图标可展开"的浮动提示），没连则等同 rdVkWantShow。
+//   rdTypingAppTapInput —— 点输入框：连着实体键盘时不再弹面板，只留同一句提示；
+//                            没连则等同 rdVkWantShow。
+void rdTypingAppVkDefault();
+void rdTypingAppTapInput();
 void drawRdImeBar();
 // fromVk = 这个字符是屏幕键盘点出来的（不是实体键盘敲的）：会撤掉 Win 键的「字母键选字」
 // 待选，让那条功能只作用于实体键盘。物理键盘那几处调用点不传，默认 false。

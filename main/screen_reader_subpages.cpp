@@ -103,8 +103,15 @@ void renderDict() {
   if (st.vkVisible) drawVk();
   else {
     drawRdImeBar();   // 蓝牙键盘打字：编码行 + 候选行（见 drawRdImeBar）
-    drawFooter(st.dictScrollMax > 0 ? "上下划翻页  点查询框输入  Enter 查词  Esc 返回"
-                                    : "点查询框输入  Enter 查词  Esc 返回");
+    // 蓝牙键盘连着时面板默认收起（rdTypingAppVkDefault），提示语别说成"点查询框输入"。
+    const bool bt = g_bt.isConnected();
+    if (st.dictScrollMax > 0) {
+      drawFooter(bt ? "上下划翻页  实体键盘输入  Enter 查词  Esc 返回"
+                    : "上下划翻页  点查询框输入  Enter 查词  Esc 返回");
+    } else {
+      drawFooter(bt ? "实体键盘输入  Enter 查词  Esc 返回"
+                    : "点查询框输入  Enter 查词  Esc 返回");
+    }
   }
   rdDrawVkIcon();
 }
