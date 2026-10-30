@@ -2684,7 +2684,9 @@ int IME::recentCommitBoost(const std::string &code, const std::string &word) con
 
 void IME::appendRecentCommitCandidates(const std::string &code,
                                        const std::vector<std::string> &aliasCodes,
-                                       int typedLen) {
+                                       int typedLen,
+                                       bool deferPhrases,
+                                       std::vector<std::pair<std::string, int>> *deferred) {
     if (code.empty() || typedLen < 2 || _recentCommittedWords.empty()) return;
     auto matchesInput = [&](const std::string &entryCode) -> bool {
         if ((int)entryCode.size() >= typedLen &&
@@ -2701,6 +2703,12 @@ void IME::appendRecentCommitCandidates(const std::string &code,
     };
     for (auto &item : _recentCommittedWords) {
         if (!matchesInput(item.first)) continue;
+        // 单音节完整码就是某个字的编码, 多字词（含历史上以短码误学的词条）只按
+        // 前缀命中时不能抢在单字前面；交给调用方在 Phase 2 之后追加。
+        if (deferPhrases && utf8TextCharCount(item.second) > 1) {
+            if (deferred) deferred->push_back({item.second, (int)item.first.length()});
+            continue;
+        }
         appendCandidate(item.second, (int)item.first.length());
         if (_all.size() >= _candidateLimit) break;
     }
@@ -3746,9 +3754,14 @@ void IME::lookup() {
         if (_all.size() >= _candidateLimit) { perf.exitName = "exact-phrase-limit"; buildPage(); return; }
     }
 
+    // 单音节完整码(单字编码)下, 最近上屏的多字词按前缀命中时先压住, 等 Phase 2
+    // 单字全部追加后再补, 避免"打 fan 时翻盖排第一"。
+    bool deferRecentPhrases = hasVowel && primarySplit.tokens.size() <= 1;
+    std::vector<std::pair<std::string, int>> deferredRecentPhrases;
     {
         int64_t t = IME_PERF_NOW();
-        appendRecentCommitCandidates(pinyinCode, aliasCodes, qlen);
+        appendRecentCommitCandidates(pinyinCode, aliasCodes, qlen, deferRecentPhrases,
+                                     &deferredRecentPhrases);
         perf.recentUs += IME_PERF_NOW() - t;
     }
     if (_all.size() >= _candidateLimit) { perf.exitName = "recent-limit"; buildPage(); return; }
@@ -3780,6 +3793,12 @@ void IME::lookup() {
     perf.singleUs += IME_PERF_NOW() - t;
     }
     if (_all.size() >= _candidateLimit) { perf.exitName = "single-limit"; buildPage(); return; }
+
+    // 被压住的"最近上屏词组"在单字之后补上, 与 seg/词典词组的位置一致。
+    for (auto &item : deferredRecentPhrases) {
+        appendCandidate(item.first, item.second);
+        if (_all.size() >= _candidateLimit) break;
+    }
 
     // 补充词典表分段匹配: xian/xi'an/xi'a -> 西安, anguang -> 暗光。
     // 拼音段解析由独立引擎负责, 这里仍只关心候选生成和去重。
@@ -5661,6 +5680,11 @@ bool IME::commit(int idx, std::string &out, bool bySpace) {
     bool candContinue = (!partial && consumedLen > 0
                          && consumedLen < (int)_code.length()
                          && consumedLen <= 17);
+    // 前缀命中的多字词: 候选完整码比已输入码长(如打 "fan" 选 seg 表的"翻盖",
+    // candLen=6)。此时不能拿 _code 当学习码 —— 否则会给单音节键写一条高 count 的
+    // 词组词条, 下次输入这个单字码时它还会借"最近上屏"插到单字前面。
+    bool prefixMatchedPhrase = consumedLen > (int)_code.length() &&
+                               utf8TextCharCount(out) > 1;
     if (partial || candContinue) {
         if (!partial)
             _remainder = _code.substr(consumedLen);
@@ -5729,7 +5753,7 @@ bool IME::commit(int idx, std::string &out, bool bySpace) {
     } else {
         std::string learnCode = _code;
         if (hasUpperSuffix) out += _code.substr(pLen);
-        if (!hasUpperSuffix) {
+        if (!hasUpperSuffix && !prefixMatchedPhrase) {
             bumpFrequency(learnCode, out, learnWeight);
             for (auto &code : alternateLearningCodes(learnCode)) bumpFrequency(code, out);
             learnAutoPhraseFromSingle(learnCode, out);

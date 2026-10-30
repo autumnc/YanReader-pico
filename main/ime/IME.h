@@ -449,9 +449,13 @@ private:
     void rememberCommittedText(const std::string &text);
     void rememberRecentCommit(const std::string &code, const std::string &word);
     int recentCommitBoost(const std::string &code, const std::string &word) const;
+    // 单音节完整码(如 "fan")下, 词组只允许排到 Phase 2 单字之后: deferPhrases
+    // 为真时多字词不立即 append, 而是写进 deferred, 由 lookup() 在单字阶段之后补上。
     void appendRecentCommitCandidates(const std::string &code,
                                       const std::vector<std::string> &aliasCodes,
-                                      int typedLen);
+                                      int typedLen,
+                                      bool deferPhrases = false,
+                                      std::vector<std::pair<std::string, int>> *deferred = nullptr);
     // 「最近删除」名单：删词模式删掉一个学出来的词之后，挡它别再被学回来。
     // **作用范围只到多字词**——单字永不进名单、也永不被它过滤，否则一个被删的单字会
     // 从所有候选（含内置单字表）里消失，再也打不出来。见 IME.cpp 的实现处说明。
