@@ -10,6 +10,7 @@
 
 #include "usb_msc.h"
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <stdlib.h>
 
@@ -140,6 +141,36 @@ static void storage_teardown_sdmmc(sdmmc_card_t **out_card) {
     *out_card = NULL;
 }
 
+// 把 FSLS PHY 交还给 USB-Serial-JTAG（否则退出 U 盘后串口/刷机口消失）。
+//
+// ESP32-S3 只有一路 FSLS PHY（SOC_USB_FSLS_PHY_NUM==1），USB-Serial-JTAG 与 USB-OTG
+// 靠 RTCCNTL.usb_conf 的 mux 二选一：sw_hw_usb_phy_sel=1（软件控制）时
+// sw_usb_phy_sel=0 → PHY 给 USJ，=1 → PHY 给 OTG。
+// 装 OTG 时 usb_wrap_ll_phy_enable_external(false) 把 mux 拨到 OTG 侧；而卸载时
+// usb_del_phy() 只清 pad 的上下拉覆盖、phy_uninstall() 只关 OTG wrap 的时钟，
+// **没有任何一步把 mux 拨回来** —— 于是 USJ 侧从此没有 PHY，PC 上的串口（也是刷机口）
+// 一直到复位为止都不再出现。这里照 usb_serial_jtag_driver_install() 的做法补上两步，
+// 把 PHY 与 pad 重新交给 USJ（USJ 驱动本身一直装着，不必也不能重装）。
+//
+// 成功路径和失败路径都要调：tinyusb_driver_install() 内部是先 usb_new_phy()（这时
+// mux 已经拨到 OTG）再建任务，任务建不起来（内部 RAM 不够最常见）时它自己只会
+// usb_del_phy()，同样不还 mux。不还的话"进 U 盘失败"就会附带"串口/刷机口消失"。
+static void restore_usj_phy(void) {
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+    usb_serial_jtag_ll_phy_enable_external(false);  // PHY 路由回 USJ
+    usb_serial_jtag_ll_phy_enable_pad(true);        // 打开 PHY 的 D+/D- pad
+#endif
+}
+
+// 进入各步之间打一行内部 RAM 余量：TinyUSB 要在内部 RAM 里建一个 4096 字节栈的任务，
+// 而本机 BLE 初始化后内部 RAM 常年只有 ~9KB、最大块 ~7.9KB，唤醒后那一刻还可能更碎。
+// 失败时这三行能直接回答"是不是内存不足"。
+static void log_internal_ram(const char *stage) {
+    ESP_LOGI(TAG, "%s: int free=%u largest=%u", stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
 // 轮询等 read_pico_sd_remount() 的异步探测把卡挂回 /sdcard（上限 ~3s）。
 static void wait_sd_remounted(void) {
     read_pico_sd_info_t info = {};
@@ -158,9 +189,20 @@ esp_err_t usb_msc_run(usb_msc_should_exit_cb_t should_exit, usb_msc_blocked_cb_t
     s_host_hold = false;
 
     // 1. 应用侧卸载（把 FATFS 句柄与 host 一并释放）。
-    esp_err_t sync_err = read_pico_sd_sync();
-    if (sync_err != ESP_OK && sync_err != ESP_ERR_NOT_FINISHED &&
-        sync_err != ESP_ERR_INVALID_STATE) {
+    //
+    // 撞上 sd_probe 正在探测时 sync 返回 NOT_FINISHED：**这一趟并没有卸载**，卡还挂在
+    // FATFS 手里。原来直接往下走，storage_init_sdmmc() 就会在 host 仍被占着的时候去
+    // 重新 init —— 从待机唤醒后（sdHotplugTick 会补探测/重挂）最容易撞上，表现就是
+    // "一进 U 盘模式立刻退回阅读器"。这里等探测定稿（~4s 上限）再卸一次。
+    log_internal_ram("enter: before sd sync");
+    esp_err_t sync_err = ESP_ERR_NOT_FINISHED;
+    for (int i = 0; i < 40; i++) {
+        sync_err = read_pico_sd_sync();
+        if (sync_err != ESP_ERR_NOT_FINISHED) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGI(TAG, "sd app-side sync: %s", esp_err_to_name(sync_err));
+    if (sync_err != ESP_OK && sync_err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "read_pico_sd_sync: %s", esp_err_to_name(sync_err));
     }
 
@@ -173,6 +215,8 @@ esp_err_t usb_msc_run(usb_msc_should_exit_cb_t should_exit, usb_msc_blocked_cb_t
         wait_sd_remounted();
         return err;
     }
+    ESP_LOGI(TAG, "SDMMC raw card ready: %s, %llu MB", card->cid.name,
+             (unsigned long long)((uint64_t)card->csd.capacity * card->csd.sector_size / (1024 * 1024)));
 
     // 3. TinyUSB MSC 存储实例 + USB 设备栈。mount_point=USB：只做扇区级暴露，
     //    设备侧不挂 FATFS，所以电脑端独占卡、本机绝不并发读写。
@@ -194,11 +238,17 @@ esp_err_t usb_msc_run(usb_msc_should_exit_cb_t should_exit, usb_msc_blocked_cb_t
         wait_sd_remounted();
         return err;
     }
+    ESP_LOGI(TAG, "MSC storage created");
+    log_internal_ram("before tinyusb install");
 
     tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     err = tinyusb_driver_install(&tusb_cfg);
     if (err != ESP_OK) {
+        // 这里 mux 很可能已经被 usb_new_phy() 拨到 OTG：先把它还给 USJ，否则这条
+        // 错误日志根本发不出去，用户还会连带失去串口/刷机口直到重启。
+        restore_usj_phy();
         ESP_LOGE(TAG, "tinyusb install failed: %s", esp_err_to_name(err));
+        log_internal_ram("after failed tinyusb install");
         tinyusb_msc_delete_storage(handle);
         storage_teardown_sdmmc(&card);
         read_pico_sd_remount();
@@ -238,19 +288,7 @@ esp_err_t usb_msc_run(usb_msc_should_exit_cb_t should_exit, usb_msc_blocked_cb_t
     tinyusb_driver_uninstall();
 
     // 5b. 把 FSLS PHY 交还给 USB-Serial-JTAG（否则退出 U 盘后串口/刷机口消失）。
-    //
-    // ESP32-S3 只有一路 FSLS PHY（SOC_USB_FSLS_PHY_NUM==1），USB-Serial-JTAG 与 USB-OTG
-    // 靠 RTCCNTL.usb_conf 的 mux 二选一：sw_hw_usb_phy_sel=1（软件控制）时
-    // sw_usb_phy_sel=0 → PHY 给 USJ，=1 → PHY 给 OTG。
-    // 装 OTG 时 usb_wrap_ll_phy_enable_external(false) 把 mux 拨到 OTG 侧；而卸载时
-    // usb_del_phy() 只清 pad 的上下拉覆盖、phy_uninstall() 只关 OTG wrap 的时钟，
-    // **没有任何一步把 mux 拨回来** —— 于是 USJ 侧从此没有 PHY，PC 上的串口（也是刷机口）
-    // 一直到复位为止都不再出现。这里照 usb_serial_jtag_driver_install() 的做法补上两步，
-    // 把 PHY 与 pad 重新交给 USJ（USJ 驱动本身一直装着，不必也不能重装）。
-#if SOC_USB_SERIAL_JTAG_SUPPORTED
-    usb_serial_jtag_ll_phy_enable_external(false);  // PHY 路由回 USJ
-    usb_serial_jtag_ll_phy_enable_pad(true);        // 打开 PHY 的 D+/D- pad
-#endif
+    restore_usj_phy();
 
     tinyusb_msc_delete_storage(handle);
     storage_teardown_sdmmc(&card);

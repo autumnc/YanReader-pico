@@ -189,3 +189,10 @@ bool screen_reader_long_confirm_is_action();
 // 恢复自动重连。界面入口是蓝牙管理页最上面那一行（screen_bt_manage）。
 bool app_bt_enabled();
 void app_bt_set_enabled(bool on);
+
+// U 盘模式的内部 RAM 兜底：TinyUSB 要在内部 RAM 建 4096 字节栈的任务，而 BLE
+// 初始化后/待机唤醒后最大块常只剩 4KB 上下。紧的时候临时把蓝牙栈收掉（不改编
+// 设置），给安装腾地方；返回 true 表示确实收过，退出 U 盘模式后要调 resume 恢复。
+// 实现的阈值与理由见 main.cpp。
+bool app_bt_suspend_for_usb_if_tight();
+void app_bt_resume_after_usb(bool suspended);

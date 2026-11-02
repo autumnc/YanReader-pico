@@ -579,6 +579,33 @@ void app_bt_set_enabled(bool on) {
     }
 }
 
+// ── U 盘模式：按需临时释放蓝牙栈 ──────────────────────────────────────────
+// TinyUSB 驱动安装时要在**内部 RAM**里建一个 4096 字节栈的任务（esp_tinyusb 的
+// tinyusb_task.c 用普通 xTaskCreatePinnedToCore，没有 PSRAM 栈选项）。而本机 BLE
+// 初始化后内部 RAM 最大块常年只有 4~8KB —— 待机唤醒后又常被 BT 初始化/重连压到
+// 4KB 上下，4096 的栈就贴着边（还差块头开销），一旦分配失败 install 直接失败，
+// 表现就是"一进 U 盘模式立刻退回阅读器"。
+//
+// U 盘模式里只需要点屏幕上的退出按钮，蓝牙键盘用不上，所以紧的时候把整个 BT 栈
+// 临时收掉（不改进设置），退出后再交给 spawnBtInit 的重连循环恢复。留 6KB 阈值：
+// 正常空闲态最大块 ~7.9KB 不触发，省掉 1.5 秒拆除；只有紧到可能装不上时才拆。
+bool app_bt_suspend_for_usb_if_tight() {
+    if (!g_settings.btEnabled()) return false;
+    const size_t largest =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (largest >= 6144) return false;
+    ESP_LOGW(TAG, "U盘模式：内部 RAM 最大块 %u < 6KB，临时收掉蓝牙栈给 TinyUSB 腾地方",
+             (unsigned)largest);
+    btTearDown();
+    return true;
+}
+
+void app_bt_resume_after_usb(bool suspended) {
+    if (!suspended) return;
+    ESP_LOGI(TAG, "U盘模式退出：蓝牙栈重新初始化（失败由重试循环自愈）");
+    spawnBtInit();
+}
+
 // ── Light sleep 空闲待机 ────────────────────────────────────────────────
 // 键盘/物理按键无输入 ≥ N 分钟后进入 ESP light sleep(RAM 保留、BLE 射频关闭)。
 // N 由「阅读设置 → 自动待机」定（关/5/10/15/20 分钟，见 g_settings.autoStandbyMinutes()）。

@@ -83,6 +83,7 @@
 #include "pcf85063.h"  // g_rtc：状态栏时钟
 #include "file_manager_server.h"
 #include "standby_clock.h"
+#include "pjournal_app.h"  // app_bt_suspend_for_usb_if_tight：U 盘模式按需腾内部 RAM
 #include "clipboard.h"  // 选区「复制」：跨模式粘贴板（写作/阅读/计划共享一份）
 #include "ime/IME.h"
 #include "ui/ime_field.h"  // 输入框绑定：落串/退格/光标的 UTF-8 算术（与写作/计划共用一份）
@@ -10165,7 +10166,7 @@ static void doMenuAction(MenuAct act) {
       st.fullRefresh = true;
       st.dirty = 1;
       break;
-    case MenuAct::UsbDrive:
+    case MenuAct::UsbDrive: {
       // U 盘模式：先画提示页，再把阅读器整个退掉（释放所有 SD 文件句柄）。
       // **退出后必须把 epd 旋转与 g_rd 方向一起钉回阅读方向**（applyReaderOrientation），
       // 不能只拨 epd（board_restore_orientation 恢复的是全局方向，可能是另一种）。
@@ -10186,7 +10187,12 @@ static void doMenuAction(MenuAct act) {
       // 挂起期间 ttf 一律不碰 SD，那几页改用内建字面画（字形齐全）。
       ttf_font_suspend_sd(true);
       applyReaderOrientation();
+      // TinyUSB 要在内部 RAM 建 4096 字节栈的任务；唤醒后/蓝牙初始化后最大块可能
+      // 只有 4KB 上下，装不上就是"一进 U 盘模式立刻退回阅读器"。紧的时候临时收掉
+      // 蓝牙栈（U 盘模式里只用手指点退出按钮，键盘用不上），退出后恢复自动重连。
+      const bool btSuspended = app_bt_suspend_for_usb_if_tight();
       usb_msc_run(usbDriveShouldExit, usbDriveBlockedHint, usbDriveExitingHint);
+      app_bt_resume_after_usb(btSuspended);
       // SD 已重挂：解禁并按设置重开用户字体（此刻内容面还是内建，所以这一次是真开，
       // 不会被 applyUserContentFont 的"同路径"短路挡掉）。书内字面/次字面由下面的
       // init 重开（openEpub 按 st 里记的路径重装）。
@@ -10194,6 +10200,7 @@ static void doMenuAction(MenuAct act) {
       applyUserContentFont();
       screen_reader_init();
       break;
+    }
     case MenuAct::ToShelf:
       gotoBookshelf();
       break;
