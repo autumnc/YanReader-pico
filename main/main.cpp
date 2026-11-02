@@ -666,6 +666,18 @@ static void enterLightSleep(void) {
     // 1.2 秒还打一条"清理不干净"的假错误日志。
     if (g_settings.btEnabled()) btTearDown();
 
+    // WiFi 射频也停。自动待机那条路（checkLightSleep）只在"已连接"时拒绝进入，
+    // 所以正常自动待机时它是断的；但阅读菜单的「待机时钟」走 app_enterStandby
+    // 直接调到这里，不经过那条判断，连接中的射频会跟着进浅睡。另外"射频已启动但
+    // 没连上"（扫描/连接失败后停在 started）也不会被那条判断挡住 —— 只要还开着，
+    // 浅睡 240µA 的前提（Wi-Fi powered down）就不成立。disconnect() 里连
+    // esp_wifi_stop 一起做，radioUp() 为假时不用碰。
+    if (g_wifi.radioUp()) g_wifi.disconnect();
+
+    // 触摸芯片进深睡（动态报点典型 <5mA → 深睡 10µA）。整段浅睡里没人在读它，
+    // 这是待机电流最大的一笔；唤醒源只有电源键，INT 不拉也不影响唤醒。
+    input_touch_suspend();
+
     // 墨水屏断电(双稳态保留画面) + 面板下电之后把总线引脚（D0~D15 / XCL / XLE / XSTL /
     // SPV / CKV）显式拉到低电平并 hold 住，整个浅睡期间都保持这个电平。理由见
     // epd_lcd_bus_park 的注释：面板断了电，而总线上还挂着最后一帧的残余电平，睡一晚就是
@@ -757,6 +769,11 @@ static void enterLightSleep(void) {
         struct timeval tv = {(time_t)t, 0};
         settimeofday(&tv, NULL);
     }
+
+    // 触摸复位 + 回到动态报点（约 60ms）。放在唤醒尾巴最后：前面 1~2s 的
+    // epd_clear + 从白重绘期间触摸是深睡状态，既不多耗那一点，也不会让恢复
+    // 过程中的手指误触排进队列。之后再上报按键，用户看到画面就能正常点按。
+    input_touch_resume();
 
     // 唤醒用的是**电源键**，而按电源键在这台机器上还有"待机"的含义（短按即睡）。唤醒
     // 那一按的 KEY_DOWN 已经被 take_key_wakeup ack 掉了，可松手时的 KEY_SHORT 会在我们

@@ -75,6 +75,16 @@ void renderDict() {
       st.dictLinesW = maxW;
       // 上限只是防病态输入（几万行会把 PSRAM 里的 vector 撑爆），正常释义远到不了。
       st.dictLines = g_rd.wrappedText(uiFontId(), st.dictResult.c_str(), maxW, kDictMaxLines);
+      // 横屏（1216×684）纵向只有 684 像素，释义里的段落空行太费地方：折完把纯空白行
+      // 整行去掉，空间让给正文。纵屏高度宽松，段落间距照旧留在 wrappedText 里。
+      // 转屏时 maxW 跟着变（684↔1216），上面的缓存判断会自动重建，过滤不会串档。
+      if (rdWideLayout()) {
+        st.dictLines.erase(std::remove_if(st.dictLines.begin(), st.dictLines.end(),
+                                          [](const std::string &ln) {
+                                            return ln.find_first_not_of(" \t") == std::string::npos;
+                                          }),
+                           st.dictLines.end());
+      }
     }
     const int lineH = uiLineHeight() + 4;
     const int maxLines = std::max(1, (bottom - ry) / lineH);

@@ -759,3 +759,16 @@ int input_poll() {
 
     return 0;
 }
+
+// ── 待机前后的触摸电源管理 ────────────────────────────────────────────────
+// 见 input.h 的说明：动态报点 <5mA → 深睡 10µA。驱动自己会把失败原因打出来
+// （cst836u_set_mode / cst836u_wake 里都有 ESP_LOGE），这里不再重复。
+void input_touch_suspend() {
+    if (g_hw.touch == nullptr) return;
+    (void)cst836u_set_mode(g_hw.touch, CST836U_MODE_DEEPSLEEP);
+}
+
+void input_touch_resume() {
+    if (g_hw.touch == nullptr) return;
+    (void)cst836u_wake(g_hw.touch);
+}
