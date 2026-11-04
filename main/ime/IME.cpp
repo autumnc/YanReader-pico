@@ -133,6 +133,12 @@ static const int IME_SENTENCE_MIN_TOKENS = 4;
 // 整句相位单独的低阈值探针: 它可能只有几毫秒, 达不到 12ms 的总阈值, 但那正是
 // 需要盯着看的数字。
 static const int IME_SENTENCE_PERF_LOG_US = 3000;
+// 词组前缀(组合)匹配。整串在词表里没有条目时, 前面的相位只能靠 Phase 8 逐字
+// 匹配出首音节单字("womenxian" 只出 "我")。这里沿已输入码的音节边界, 把"能完整
+// 消费前几个音节的词典词"作为候选, 候选消费到这个边界, 剩余码由 commit 的
+// candContinue 继续查词("我们" + "现")。边界必须是完整音节, 否则 "mingtian…"
+// 里的 "mingti" 会被当成 "命题"。
+static const int IME_PARTIAL_WORD_ARCS = 3;  // 每个边界最多取几个词
 // 弧打分。词弧按字数给正分, 单字给负分(等于每条弧的固定罚项), 这样 DP 才不会把
 // "xian" 拆成 "xi"+"an" 去多赚一条弧的分——没有弧罚项时它一定会这么拆。
 static const int IME_SENTENCE_WORD_UNIT = 4000;
@@ -814,6 +820,7 @@ struct ImePerfTrace {
     int64_t userInitialUs = 0;
     int64_t initialUs = 0;
     int64_t shorthandUs = 0;
+    int64_t prefixWordUs = 0;
     int64_t partialUs = 0;
     int64_t recentUs = 0;
     int64_t sentenceUs = 0;
@@ -853,20 +860,21 @@ struct ImePerfTrace {
             userInitialUs < IME_PERF_SLOW_US &&
             initialUs < IME_PERF_SLOW_US &&
             shorthandUs < IME_PERF_SLOW_US &&
+            prefixWordUs < IME_PERF_SLOW_US &&
             partialUs < IME_PERF_SLOW_US &&
             recentUs < IME_PERF_SLOW_US &&
             sentenceUs < IME_PERF_SLOW_US)
             return;
         int64_t trackedUs = setupUs + userUs + singleUs + segUs + userPhraseUs +
                             phraseUs + phraseSortUs + userInitialUs + initialUs +
-                            shorthandUs + partialUs + recentUs + sentenceUs;
+                            shorthandUs + prefixWordUs + partialUs + recentUs + sentenceUs;
         int64_t otherUs = totalUs > trackedUs ? totalUs - trackedUs : 0;
         ESP_LOGW(IME_TAG,
                  "perf lookup code='%s' exit=%s total=%lldus cand=%u limit=%u hv=%d inc=%d fixed=%d "
                  "setup=%lld[rebuild=%lld r=%d meta=%lld] user=%lld[fixed=%lld dyn=%lld] "
                  "single=%lld seg=%lld[split=%lld match=%lld sort=%lld] userPhrase=%lld "
                  "phrase=%lld sort=%lld userInit=%lld[segInit=%lld dedup=%lld boost=%lld rest=%lld siSort=%lld uiSort=%lld] "
-                 "init=%lld shorthand=%lld partial=%lld recent=%lld sentence=%lld other=%lld",
+                 "init=%lld shorthand=%lld prefixWord=%lld partial=%lld recent=%lld sentence=%lld other=%lld",
                  code.c_str(), exitName, (long long)totalUs, (unsigned)candidates.size(),
                  (unsigned)limit, hasVowel ? 1 : 0, incomplete ? 1 : 0, fixedPaging ? 1 : 0,
                  (long long)setupUs, (long long)rebuildUs, rebuilt ? 1 : 0, (long long)metaUs,
@@ -878,7 +886,8 @@ struct ImePerfTrace {
                  (long long)userInitialUs, (long long)segInitUs,
                  (long long)segInitDedupUs, (long long)segInitBoostUs, (long long)segInitRestUs,
                  (long long)segInitSortUs, (long long)userInitSortUs,
-                 (long long)initialUs, (long long)shorthandUs, (long long)partialUs,
+                 (long long)initialUs, (long long)shorthandUs, (long long)prefixWordUs,
+                 (long long)partialUs,
                  (long long)recentUs, (long long)sentenceUs, (long long)otherUs);
     }
 };
@@ -4263,6 +4272,54 @@ void IME::lookup() {
             }
         }
         perf.shorthandUs += IME_PERF_NOW() - t;
+    }
+
+    // Phase 7b: 词组前缀(组合)匹配。只追加"消费部分编码"的候选, 所以排在所有
+    // 整码相位之后、Phase 8 逐字单字之前: 整串有词条(怎么会)或简码命中时仍优先,
+    // 没有时用户看到的是"我们/这个/你好"而不是首音节单字。
+    if (_scheme == PINYIN && hasVowel && qlen >= 3 && _dict.hasWords() &&
+        _all.size() < _candidateLimit) {
+        int64_t t = IME_PERF_NOW();
+        int prefixLens[IME_SENTENCE_MAX_LEN + 1];
+        int prefixCount = 0;
+        int cum = 0;
+        for (auto &tok : primarySplit.tokens) {
+            cum += (int)tok.text.length();
+            if (cum >= qlen) break;
+            // commit 的 candContinue 只续拼消费长度 <=17 的候选; 更长的前缀一旦被选中
+            // 会把剩余码一起吞掉, 所以这里不生成。
+            if (cum >= 2 && cum <= 17 && prefixCount < IME_SENTENCE_MAX_LEN + 1)
+                prefixLens[prefixCount++] = cum;
+        }
+        const uint8_t *wordData = _dict.wordData();
+        // 长边界优先: "明天继续处理"先给"明天继续"(若词库有), 否则"明天"。
+        for (int pi = prefixCount - 1; pi >= 0 && _all.size() < _candidateLimit; pi--) {
+            int plen = prefixLens[pi];
+            size_t wlo = 0, whi = _dict.wordDataSize();
+            wordWindowCached(q, plen, wlo, whi);
+            int ignored = 0;
+            size_t wpos = _dict.wordGroupSeek(wlo, whi, q, plen, ignored);
+            if (wpos >= whi) continue;
+            int cl = 0;
+            const uint8_t *wc = _dict.wordGroupCode(wpos, cl);
+            if (!wc || cl != plen || memcmp(wc, q, (size_t)plen) != 0) continue;
+            size_t next = wpos + 1 + (size_t)cl;
+            if (next >= whi) continue;
+            uint8_t n = wordData[next++];
+            int taken = 0;
+            for (uint8_t j = 0; j < n && next < whi && _all.size() < _candidateLimit; j++) {
+                uint8_t wl = wordData[next];
+                if (wl == 0 || next + 1 + wl + 1 > whi) break;
+                std::string w((const char *)wordData + next + 1, wl);
+                uint8_t wf = wordData[next + 1 + wl];
+                next += 1 + (size_t)wl + 1;
+                // 单字由 Phase 2/Phase 8 负责, 这里只补词组。
+                if (utf8TextCharCount(w) < 2) continue;
+                if (!wordVisible(_trad, w, wf)) continue;
+                if (appendCandidate(w, plen) && ++taken >= IME_PARTIAL_WORD_ARCS) break;
+            }
+        }
+        perf.prefixWordUs += IME_PERF_NOW() - t;
     }
 
     // Phase 8: partial (逐字) match

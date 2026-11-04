@@ -43,6 +43,7 @@ __asm__(
 
 static std::string g_fuzzy = "zcs";
 static std::string g_predictMode = "always";
+static std::string g_metaLetterSelKey = "win";
 static bool g_sentence = true;
 static bool g_docContext = true;
 static bool g_candidateHighlight = false;
@@ -54,6 +55,7 @@ std::string SettingsManager::imeFuzzy() { return g_fuzzy; }
 bool SettingsManager::imeSentence() { return g_sentence; }
 bool SettingsManager::imeDocContext() { return g_docContext; }
 std::string SettingsManager::imePredictMode() { return g_predictMode; }
+std::string SettingsManager::imeMetaLetterSelKey() { return g_metaLetterSelKey; }
 bool SettingsManager::imeCandidateHighlight() { return g_candidateHighlight; }
 bool SettingsManager::imeDebug() { return g_debugLog; }
 

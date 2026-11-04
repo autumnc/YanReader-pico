@@ -27,8 +27,9 @@ Exit status is non-zero when a regression case fails. Nothing is written outside
 | file | what |
 |---|---|
 | `ime_driver.cpp` | the driver: init like `main.cpp`, feed keys, dump state, commit, assert |
-| `stubs.cpp` / `stubs.h` | `g_settings` + the 6 `SettingsManager` getters IME.cpp calls, the embedded dictionary symbols (`.incbin` of the real `main/ime/*.bin`), the candidate-width callback |
+| `stubs.cpp` / `stubs.h` | `g_settings` + the `SettingsManager` getters IME.cpp calls, the embedded dictionary symbols (`.incbin` of the real `main/ime/*.bin`), the candidate-width callback |
 | `esp_log.h`, `esp_timer.h` | host shims for the two ESP-IDF headers IME.cpp includes |
+| `pjournal_app.h` | shim for the real header, which drags in LVGL/ESP-IDF; IME.cpp only needs `KEY_META_TAP` from it |
 | `run.sh` | one-command build + run |
 | `build/` | build output (gitignored) |
 

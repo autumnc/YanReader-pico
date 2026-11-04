@@ -44,9 +44,10 @@ build() {
 
 build "$BIN" "$REPO/main/ime/IME.cpp"
 
-# The two sequences from the bug report. The intermediate keystroke matters, so the
-# driver feeds them one at a time (see ime_driver.cpp).
-REGRESS_CASES=("zhege 这个" "jiushi 就是")
+# The two sequences from the original "stray remainder" bug report, plus zenmehui
+# (繁简位图误标时 怎么会/怎么 被藏掉, 只剩单字). The intermediate keystroke matters,
+# so the driver feeds them one at a time (see ime_driver.cpp).
+REGRESS_CASES=("zhege 这个" "jiushi 就是" "zenmehui 怎么会")
 
 run_regress() {
     local bin="$1" expect="$2" failed=0
@@ -66,7 +67,8 @@ run_regress() {
 
 # 「输入中按回车 = 编码原样上屏」（用户 2026-10-05 报告"这个功能没了"）。不放进
 # run_regress：那组是拿 pre-fix 的 IME.cpp 反证用的，而这条从来没坏过 —— 它是
-# **回归护栏**，钉住这个语义别在以后被改掉。
+# **回归护栏**，钉住这个语义别在以后被改掉。候选高亮开关也不改变它（7dd0d9c）：
+# 三种情况都期望原始编码，所以 --highlight 那档照样放在这里一起钉。
 ENTER_CASES=("--enter nihao" "--enter zhege" "--enter nihao --highlight")
 
 run_enter() {

@@ -16,9 +16,9 @@
 //   ime_driver --enter <letters> [--highlight]        Enter 直接编码上屏的断言
 //
 // ENTER (--enter): 输入中按回车必须**原样上屏还没有选中的编码**（typing nihao + Enter
-// → 正文里出现 "nihao"，不是换行、也不是第一个候选）。默认「候选高亮」关着，所以
-// out 必须逐字节等于输入串；--highlight 把 imeCandidateHighlight 打开后，回车改成
-// 上屏**高亮那个候选**（_highlightSelectMode 分支，见 IME.cpp:6132）。
+// → 正文里出现 "nihao"，不是换行、也不是第一个候选）。**没有例外**：候选高亮开关
+// （--highlight）不再改变回车的语义，out 一律逐字节等于输入串（7dd0d9c 起；选字只走
+// 空格和数字键）。
 //
 // Both modes print, after every keystroke:
 //   _code, _displayCode, _pageStart, _page.size(), _all.size(), _curPage,
@@ -292,19 +292,17 @@ int main(int argc, char **argv) {
         printf("\n=== Enter: 输入中直接编码上屏 ===\n");
         printf("  输入中: _code='%s' 候选 %zu 个 高亮模式=%d 高亮位=%d\n",
                ime._code.c_str(), ime._page.size(), opt.highlight ? 1 : 0, ime._sel);
-        // 期望先取好：回车之后 _page/_sel 都被 reset 了。
-        // 默认（高亮关）→ 逐字节等于输入串；高亮开 → 上屏**当前高亮位**那个候选。
+        // 期望先取好：回车之后 _page/_sel 都被 reset 了。候选高亮开关不影响这里的
+        // 期望 —— 回车一律上屏原始编码（见文件头的 ENTER 说明）。
         std::string want = opt.letters;
-        if (opt.highlight && ime._sel >= 0 && ime._sel < (int)ime._page.size())
-            want = ime._page[ime._sel];
         std::string out;
         bool handled = ime.handleKey('\n', out);
         printf("  handleKey('\\n') handled=%d out='%s'\n", handled ? 1 : 0, out.c_str());
         dumpState(ime, "after-enter");
         bool ok = handled && out == want && !leftoverComposition(ime);
         if (ok) {
-            printf("  PASS: 回车%s → '%s'，没有残留编码\n",
-                   opt.highlight ? "上屏高亮候选" : "原样上屏编码", out.c_str());
+            printf("  PASS: 原样上屏编码%s → '%s'，没有残留编码\n",
+                   opt.highlight ? "（高亮开启）" : "", out.c_str());
         } else {
             printf("  FAIL: 期望 out=='%s'（handled=1、_code/_prefix/_remainder 清空），"
                    "实际 out='%s' handled=%d _code='%s' _prefix='%s' _remainder='%s'\n",
