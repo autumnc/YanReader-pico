@@ -407,35 +407,6 @@ static void drawAppsTabIcon(int x, int y, int box, bool invert) {
   }
 }
 
-// 「字典」入口的图标：一本摊开的书（外框 + 书脊 + 三行字）。同样没有现成字形可用
-// （子集里没有 md-book-search / md-dictionary），照上面两枚的先例程序化画。
-// 尺寸全按 box 等比推，和旁边两枚真字形图标排在一行不会显得矮一截。
-static void drawDictAppIcon(int x, int y, int box, bool invert) {
-  const bool fg = !invert;      // 选中时整枚反白（黑底上的白书）
-  const int pad = box / 8;
-  const int w = box - 2 * pad;
-  const int h = (box * 3) / 4;  // 书是扁的：高三 quarter、宽整幅
-  const int top = y + (box - h) / 2;
-  const int t = std::max(2, box / 20);   // 线宽
-  // 四条边（画成外框）
-  g_rd.fillRect(x + pad, top, w, t, fg);
-  g_rd.fillRect(x + pad, top + h - t, w, t, fg);
-  g_rd.fillRect(x + pad, top, t, h, fg);
-  g_rd.fillRect(x + pad + w - t, top, t, h, fg);
-  // 书脊（靠左一竖）+ 右边三行"字"
-  const int spineX = x + pad + w / 4;
-  g_rd.fillRect(spineX, top, t, h, fg);
-  for (int i = 0; i < 3; i++) {
-    const int ly = top + h / 2 - box / 8 + i * (box / 6);
-    g_rd.fillRect(spineX + 2 * t, ly, w - w / 4 - 4 * t, std::max(2, t / 2), fg);
-  }
-}
-
-// 剩下的「字典」入口仍是程序化画的：子集里没有 md-book-search / md-dictionary，
-// 也没有为它新裁字形（对比：「微信读书」「DeepSeek 对话」「应用商店」三枚已换成
-// 源字体里的专用图形，见 tab_icons.h 的 APP_ICON_*）。
-
-
 // ── 主界面标签栏（书架 / 应用 / 笔记 / 设置 / 统计）──────────────────────
 // 刻意与 drawTitle 占用同一条顶栏、返回同一个正文 top（都取 rdHeadBottom()），
 // 标签化不需要另做一套内容区排版。
@@ -773,6 +744,7 @@ static int totalPages() {
     return std::max(1, static_cast<int>((st.txtLineStarts.size() + lpp - 1) / lpp));
   }
   if (st.bookKind == 2) return st.xtc ? static_cast<int>(st.xtc->getPageCount()) : 1;
+  if (st.bookKind == 5) return std::max(1, st.pdf.pageCount);
   return 1;
 }
 
@@ -1252,6 +1224,8 @@ bool openBook(const std::string &path, int kind) {
   if (!st.bookPath.empty() && st.bookPath != path) rdRememberProgress(true);
   // 换书 = 上一本的"下一页排版结果"作废（那一份 Page/文字地图只属于上一本）。
   rdAheadClear();
+  // 从 PDF 切到别的书：文档/文件句柄必须还掉，否则一直挂在 SD 上（见 sd-open-handle 那条）。
+  if (st.bookKind == 5 && st.bookPath != path) pdfCloseDocument();
   st.bookKind = kind;
   st.bookPath = path;
   // 换书 = 上一本的内嵌字体作废。放在这里（而不是 openEpub 里）是因为 openEpub 也会
@@ -1264,13 +1238,17 @@ bool openBook(const std::string &path, int kind) {
   if (kind == 0) ok = openEpub(path);
   else if (kind == 1) ok = openTxt(path);
   else if (kind == 2) ok = openXtc(path);
+  else if (kind == 5) ok = pdfOpenDocumentForBook(path);
   if (ok) {
     // 读到哪就从哪继续。显式跳页的调用方（书签/返回点）随后会再跳一次覆盖掉，
     // 那条路径不受影响。
     if (!rdRestoreProgress()) return false;   // 章没排出来 = 这次开书失败（见其说明）
     rdTraceMark("恢复阅读位置");
-    generateCoverForOpenedBook();
-    rdTraceMark("封面(文件在就跳过)");
+    // PDF 没有可渲染的封面页，也不进阅读时长统计：跳过这两步（其余书照旧）。
+    if (kind != 5) {
+      generateCoverForOpenedBook();
+      rdTraceMark("封面(文件在就跳过)");
+    }
     pushRecent(path, kind, st.bookTitle);
     // 刚打开的这本立刻挪到进度表表头。"最近阅读的一本"= 用户此刻在看的这本，而表头原本
     // 只在**位置变了**（翻页）时才挪 —— 于是"打开一本旧书、还没翻页就待机"的窗口里表头
@@ -1281,8 +1259,10 @@ bool openBook(const std::string &path, int kind) {
     rdRememberProgress(true);
     // 统计会话：同一本书因为改字号/行距重排会再走一次这里（reopenBook），
     // rdStatsBeginSession 内部认活跃路径，同书不重开会话。
-    rdStatsBeginSession();
-    rdTraceMark("进度落盘+统计会话");
+    if (kind != 5) {
+      rdStatsBeginSession();
+      rdTraceMark("进度落盘+统计会话");
+    }
   }
   return ok;
 }
@@ -1290,7 +1270,10 @@ bool openBook(const std::string &path, int kind) {
 // ── 封面 ────────────────────────────────────────────────────────────────
 // 一本书的缓存目录（与 crossmux 一致：缓存目录 + 类型前缀 + path 哈希）。
 static std::string bookCacheDirFor(const std::string &path, int kind) {
-  const char *pfx = (kind == 0) ? "epub" : (kind == 1) ? "txt" : "xtc";
+  const char *pfx = (kind == 0) ? "epub"
+                    : (kind == 1) ? "txt"
+                    : (kind == 5) ? "pdf"
+                                  : "xtc";
   return std::string(CACHE_DIR) + "/" + pfx + "_" + std::to_string(std::hash<std::string>{}(path));
 }
 // 封面缓存路径。v2 = 8 位灰阶封面，v3 = 渐进式封面改了降尺度解码（见 Epub::getCoverBmpPath
@@ -1394,6 +1377,8 @@ void readerStandbyCoverLayout(StandbyCoverLayout &out) {
 static void rdCoverThumbForget(const std::string &bmpPath);  // 定义在封面缩放那一段
 
 static void generateCoverForOpenedBook() {
+  // PDF 没有可渲染的封面页（页面图像型也没有"第一页缩略图"这套现成管线），直接不做。
+  if (st.bookKind == 5) return;
   // 顺手清掉几代老封面：改名之后它们再也不会被读到，留着白占卡（每本一两百 KB，
   // 几百本就是几十 MB）。删失败也无所谓，下次打开再试。
   const std::string legacy = bookCacheDirFor(st.bookPath, st.bookKind) + "/cover.bmp";      // 更早的整屏封面
@@ -1466,7 +1451,7 @@ void rdRebuildBookCoverArtifacts(const std::string &path, int kind) {
 //   · 用户后来才把表盘切成「书籍封面」→ 设置动的那一下（MenuAct::ClockFace）。
 // 没补上的窗口很短：drawCoverFace 会退回书架封面兜底，不会画不出来。
 static void rdBuildStandbyCoverForOpenBook() {
-  if (st.bookPath.empty() || st.bookKind == 2) return;
+  if (st.bookPath.empty() || st.bookKind == 2 || st.bookKind == 5) return;
   const std::string out = standbyCoverPathFor(st.bookPath, st.bookKind);
   if (Storage.exists(out.c_str())) return;   // 一书一次
 
@@ -1529,7 +1514,7 @@ static void rdStandbyCoverTask(void *arg) {
 }
 
 static void rdQueueStandbyCoverForOpenBook() {
-  if (st.bookPath.empty() || st.bookKind == 2) return;
+  if (st.bookPath.empty() || st.bookKind == 2 || st.bookKind == 5) return;
   const std::string out = standbyCoverPathFor(st.bookPath, st.bookKind);
   if (Storage.exists(out.c_str())) return;
   bool expected = false;
@@ -3750,7 +3735,11 @@ static int rdWordAtPoint(const RdPageText &pt, int fontId, int x, int y) {
 static constexpr int kSelMaxSpanPages = 8;    // 跨页选区的页数上限（超了不再外扩）
 
 // 页号口径：与全仓"位置键"那一套一样 —— st.page 对 TXT/XTC 是**不维护的**，别用它。
-static int rdPosPage() { return (st.bookKind == 0) ? st.page : st.txtPage; }
+static int rdPosPage() {
+  if (st.bookKind == 0) return st.page;
+  if (st.bookKind == 5) return st.pdf.page;
+  return st.txtPage;
+}
 
 // 选区的"当前页投影"：落在本页上的那一段词下标。两端都不在本页（不该发生）时给 -1。
 static void rdSelSyncEnds(const RdPageText &pt) {
@@ -5697,10 +5686,28 @@ static void handleRecent(int key) {
     BookEntry b = st.recent[st.recentSel];
     rdShowBusy("正在打开…", b.name);
     if (openBook(b.path, b.kind)) {
-      st.mode = RdMode::Reading;
+      if (b.kind == 5) {
+        // PDF：openBook 已经恢复页码，这里只负责把模式切到 PDF 阅读视图并解码。
+        st.mode = RdMode::Pdf;
+        pdfEnsureCurrentPage(true);
+      } else {
+        st.mode = RdMode::Reading;
+      }
       st.fullRefresh = true;
     } else {
       ESP_LOGE(TAG, "最近阅读打开失败: %s", b.path.c_str());
+      if (b.kind == 5) {
+        // PDF 失败时给整屏中文错误（st.pdf.status 由打开层填），而不是静默留在最近列表。
+        st.pdf.view = PdfView::Reader;
+        st.pdf.pageReady = false;
+        st.pdf.pageCount = 1;
+        st.pdf.page = 0;
+        if (st.pdf.status.empty()) st.pdf.status = "PDF 打开失败";
+        st.bookPath.clear();
+        st.bookKind = -1;
+        st.mode = RdMode::Pdf;
+        st.fullRefresh = true;
+      }
     }
     st.dirty = 1;
     return;
@@ -6107,6 +6114,7 @@ struct MenuItem { std::string label; MenuAct act; };
 static int curPage() {
   if (st.bookKind == 0) return st.page;
   if (st.bookKind == 1) return st.txtPage;
+  if (st.bookKind == 5) return st.pdf.page;
   return st.xtcPage;
 }
 
@@ -7407,22 +7415,35 @@ bool readerLastBookInfo(StandbyBookInfo &out) {
   // 表头只作两处兜底：① 还没开过书（本机开机后没进过阅读）；② 开着的这本连封面产物
   // 都没有（打不开的书 / 缓存被清了），而表头那本有 —— 那还是画得出来的那张更好。
   loadProgress();
+  // PDF 没有封面产物，也不该顶掉待机「书籍封面」：当前开着 PDF 时当没开书处理，
+  // 从进度表里挑最近一本有封面的非 PDF 书。
+  auto frontNonPdf = [&]() -> const RdProgress * {
+    for (const auto &r : s_progress) {
+      if (r.kind != 5) return &r;
+    }
+    return nullptr;
+  };
   std::string path = st.bookPath;
   int kind = st.bookKind;
-  if (path.empty() || st.bookKind < 0) {
-    if (s_progress.empty()) return false;      // 本机还没读过任何书
-    path = s_progress.front().path;            // "最新在前"：表头就是最后读的那本
-    kind = s_progress.front().kind;
+  if (kind == 5) {
+    path.clear();
+    kind = -1;
+  }
+  if (path.empty() || kind < 0) {
+    const RdProgress *fr = frontNonPdf();
+    if (!fr) return false;                     // 本机只读过 PDF / 还没读过书
+    path = fr->path;                           // "最新在前"：表头就是最后读的那本
+    kind = fr->kind;
     // 封面产物也要跟着解析。**这一支原来漏了这一步**：out.coverBmp 留空 → 待机表盘画
     // 「暂无封面」，而书名照常从 ReadingStats 取到、是对的 —— 用户报的"退出到书架再待机，
     // 封面没了但书名正确"就是这个形状（那时 st.bookPath 是空的，走的正是这一支）。
     if (!coverFor(path, kind, out.coverBmp)) out.coverBmp = coverBmpPathFor(path, kind);
-  } else if (!coverFor(path, kind, out.coverBmp) && !s_progress.empty() &&
-             coverFor(s_progress.front().path, s_progress.front().kind, out.coverBmp)) {
+  } else if (!coverFor(path, kind, out.coverBmp) && frontNonPdf() &&
+             coverFor(frontNonPdf()->path, frontNonPdf()->kind, out.coverBmp)) {
     // 开着的这本连封面产物都没有（打不开的书 / 缓存被清），而表头那本有 —— 画得出来的
     // 那张更好。此时书目信息也跟着换成表头那本，免得"封面是 A、文字是 B"。
-    path = s_progress.front().path;
-    kind = s_progress.front().kind;
+    path = frontNonPdf()->path;
+    kind = frontNonPdf()->kind;
   } else if (out.coverBmp.empty()) {
     out.coverBmp = coverBmpPathFor(path, kind);   // 没有封面产物：调用方画占位框
   }
@@ -7525,10 +7546,19 @@ static void rdRememberProgress(bool force) {
   RdProgress cur;
   cur.path = st.bookPath;
   cur.kind = st.bookKind;
-  cur.spine = st.spineIndex;
-  cur.page = st.page;
-  cur.txtPage = st.txtPage;
-  cur.xtcPage = st.xtcPage;
+  if (st.bookKind == 5) {
+    // PDF 只用 page 字段存页码（spine 恒 -1，txt/xtc 恒 0）。绝不新增第 7 字段：
+    // 旧固件按 6 字段整行重写，加了会在它翻别的书时丢掉。
+    cur.spine = -1;
+    cur.page = st.pdf.page;
+    cur.txtPage = 0;
+    cur.xtcPage = 0;
+  } else {
+    cur.spine = st.spineIndex;
+    cur.page = st.page;
+    cur.txtPage = st.txtPage;
+    cur.xtcPage = st.xtcPage;
+  }
 
   loadProgress();
   int idx = -1;
@@ -7572,6 +7602,9 @@ static bool rdRestoreProgress() {
       st.txtPage = clampI(r.txtPage, 0, std::max(0, totalPages() - 1));
     } else if (st.bookKind == 2 && st.xtc) {
       st.xtcPage = clampI(r.xtcPage, 0, std::max(0, static_cast<int>(st.xtc->getPageCount()) - 1));
+    } else if (st.bookKind == 5) {
+      // 页数已由 pdfOpenDocumentForBook 填好；页码夹到范围内（文件被换过也不越界）。
+      st.pdf.page = clampI(r.page, 0, std::max(0, st.pdf.pageCount - 1));
     }
     return true;
   }
@@ -8304,6 +8337,7 @@ void renderCurrent() {
     case RdMode::About: renderAbout(); break;
     case RdMode::RefreshTest: renderRefreshTest(); break;
     case RdMode::Apps: renderApps(); break;
+    case RdMode::Pdf: pdfRender(); break;
     case RdMode::Settings: renderSettingsTab(); break;
     case RdMode::Notes: renderNotes(); break;
     case RdMode::NoteDetail: renderNoteDetail(); break;
@@ -8419,6 +8453,17 @@ void renderCurrent() {
     // s_prevSample 推成了当前帧（菜单帧的模式就是 Reading，条件必然成立），所以这里
     // 不必、也不该再采一次 —— 再采一次等于拿当前帧与自己比，白白扫一遍帧缓冲。
     m = HalDisplay::GRAY8_TEXT_REFRESH;
+  } else if (st.mode == RdMode::Pdf && st.pdf.view == PdfView::Reader) {
+    // PDF 阅读页：翻页/旋转/裁边/缩放方式已在处理器里置了 fullRefresh（GC16 清场）。
+    // 剩下的缩放/平移/浮层帧走 GL16 差分；连续 3 帧后强制全刷，免得灰底越叠越脏。
+    // **绝不走 reader_list_present()**（那是给纯黑白列表的区域刷）。
+    if (st.pdf.diffSteps < 3) {
+      m = HalDisplay::HALF_REFRESH;
+      st.pdf.diffSteps++;
+    } else {
+      m = HalDisplay::FULL_REFRESH;
+      st.pdf.diffSteps = 0;
+    }
   } else if (st.mode == RdMode::Reading) {
     const int strat = refreshStrategy();
     // 全刷频率：选了 5/10/15/20 就每翻够这么多页清一次（与策略无关，但策略是
@@ -8492,6 +8537,7 @@ void renderCurrent() {
   if (m == HalDisplay::FULL_REFRESH || m == HalDisplay::GRAY8_REFRESH) {
     s_ghostAccum = 0;
     s_pagesSinceFull = 0;
+    st.pdf.diffSteps = 0;   // PDF 的差分预算跟全刷一起清账
   }
   const int turn = pendingTurn;
   s_pendingTurn = 0;
@@ -8528,6 +8574,7 @@ void renderCurrent() {
     // st.fullRefresh 那一帧不走这条：进界面首帧本来就该整屏 GC16 清场（那是应该的整屏刷）。
     display.displayBufferVk(vkVkTop(), editorVkCandH());
   } else if (m == HalDisplay::HALF_REFRESH && st.mode != RdMode::Reading &&
+             !(st.mode == RdMode::Pdf && st.pdf.view == PdfView::Reader) &&
              !reader_white_exit_pending()) {
     // 列表/菜单帧（书架、目录、书签、设置…所有非正文页）：只驱动本帧真正变了的那块
     // 矩形。整屏 HALF 会把滚动变成"整屏全像素驱动 + 吃掉一次共享残影预算"，连滚
@@ -10479,14 +10526,15 @@ static void handleSettingsTab(int key) {
 // 3 列 × 2 行，第五枚「应用商店」自己独占第二排、**整排居中**（2 枚在 3 列里居中，
 // 左右各让半格）。单行 5 枚在 684px 上每格只有 137px，「DeepSeek 对话」六个字放不下；
 // 田字格又只剩四格 —— 所以是 3+2 的布局。每一排的行首/行长见下面的表。
-static const int kAppCount = 5;
+static const int kAppCount = 6;
 static const int kAppCols = 3;
 static const int kAppRows = 2;
-static const char *kAppNames[kAppCount] = {"文件管理", "微信读书", "字典", "DeepSeek 对话",
-                                           "应用商店"};
+static const char *kAppNames[kAppCount] = {"文件管理", "微信读书", "字典",
+                                           "DeepSeek 对话", "应用商店", "PDF 阅读"};
 // 每一排从第几枚开始、有几枚（左右绕行/上下换排都按这张表算）。
+// 3+3：两排都满格。以后再加会比第二排更长时要重排这张表，不是简单追加。
 static const int kAppRowStart[kAppRows] = {0, 3};
-static const int kAppRowLen[kAppRows] = {3, 2};
+static const int kAppRowLen[kAppRows] = {3, 3};
 
 // 图标目标像素高。ICON_MAX_PX=112 是硬上限（超了字形被静默丢弃，画出来是空的），
 // 这里留出余量；96 也比标签栏的 56 更适合"一排大图标"的入口页。
@@ -10559,6 +10607,10 @@ static void rdOpenApp(int i) {
       // 直接返回 APP_APPSTORE，不先画一帧阅读器（见 screen_reader_request_appstore）。
       screen_reader_request_appstore();
       return;
+    case 5:
+      // PDF 阅读 App：列表页。Esc 回本页（st.tab 停在 1）。
+      pdfEnterList();
+      return;
     default:
       return;
   }
@@ -10588,9 +10640,11 @@ static void renderApps() {
     } else if (i == 1) {
       if (fb) icon_font_draw_sized(fb, ix, top, iconPx, iconPx, APP_ICON_WEREAD, sel, iconPx);
     } else if (i == 2) {
-      drawDictAppIcon(ix, top, iconPx, sel);
+      if (fb) icon_font_draw_sized(fb, ix, top, iconPx, iconPx, APP_ICON_DICT, sel, iconPx);
     } else if (i == 4) {
       if (fb) icon_font_draw_sized(fb, ix, top, iconPx, iconPx, APP_ICON_STORE, sel, iconPx);
+    } else if (i == 5) {
+      if (fb) icon_font_draw_sized(fb, ix, top, iconPx, iconPx, APP_ICON_PDF, sel, iconPx);
     } else {
       if (fb) icon_font_draw_sized(fb, ix, top, iconPx, iconPx, APP_ICON_DEEPSEEK, sel, iconPx);
     }
@@ -13205,6 +13259,15 @@ static void rdSaveReturnPoint() {
     case RdMode::Percent:     r.mode = RdMode::Percent; break;
     case RdMode::Recent:      r.mode = RdMode::Recent; break;
     case RdMode::FileBrowser: r.mode = RdMode::FileBrowser; break;
+    // PDF 阅读页跟书一样按"重开 + 跳页"恢复；PDF 列表只是应用页的子界面，回应用页。
+    case RdMode::Pdf:
+      if (st.pdf.view == PdfView::Reader) {
+        r.mode = RdMode::Pdf;
+        r.page = st.pdf.page;
+      } else {
+        r.mode = RdMode::Apps;
+      }
+      break;
     // 五个根标签各有自己的常驻界面，直接按标签回来。
     case RdMode::Browser:
     case RdMode::Apps:
@@ -13234,7 +13297,7 @@ static void rdRestoreReturnPoint() {
   // 有书：重开后跳回原来的章节/页。跳页复用书签那套 buildToPage。
   // 目录/百分比定位依附于当前书，走同一条重建路径，只是最后停的界面交给 r.mode。
   const bool needBook = r.mode == RdMode::Reading || r.mode == RdMode::Toc ||
-                        r.mode == RdMode::Percent;
+                        r.mode == RdMode::Percent || r.mode == RdMode::Pdf;
   if (needBook && r.bookKind >= 0 && !r.bookPath.empty() &&
       openBook(r.bookPath, r.bookKind)) {
     if (r.bookKind == 0) {
@@ -13251,8 +13314,11 @@ static void rdRestoreReturnPoint() {
     } else if (r.bookKind == 2) {
       st.xtcPage = clampI(r.xtcPage, 0,
                           st.xtc ? static_cast<int>(st.xtc->getPageCount()) - 1 : 0);
+    } else if (r.bookKind == 5) {
+      st.pdf.page = clampI(r.page, 0, std::max(0, st.pdf.pageCount - 1));
+      pdfEnsureCurrentPage(true);
     }
-    st.mode = r.mode;   // Reading / Toc / Bookmarks / Percent
+    st.mode = r.mode;   // Reading / Toc / Bookmarks / Percent / Pdf
     st.fullRefresh = true;
     st.dirty = 1;
     ESP_LOGI(TAG, "返回界面 %d: %s spine=%d page=%d", (int)st.mode, r.bookPath.c_str(),
@@ -13532,6 +13598,9 @@ void screen_reader_init() {
   st.floatUntilUs = 0;
   st.dictOpen = false;
   st.vkVisible = false;
+  // PDF 文档/文件句柄必须先还掉：下面是"书对象整套释放"的同一条路。
+  pdfCloseDocument();
+  pdfResetUi();
   st.bookKind = -1;
   st.bookPath.clear();
   st.epub.reset();
@@ -13612,6 +13681,8 @@ void screen_reader_exit() {
   reader_set_erase_pushes(0);
   // 先记下"现在在哪一屏"，下面就要把书和列表都释放掉了。
   rdSaveReturnPoint();
+  // PDF 的文档/文件句柄也是 SD 句柄，跟着书对象一起还掉。
+  pdfCloseDocument();
   // 恢复全局方向设置（写作模式可能为竖屏），由 main 的 ui_invalidate_snapshot
   // 触发整屏重刷。
   board_restore_orientation();
@@ -13752,7 +13823,9 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     //   · rdAiChatIdleTick —— AI 对话的回答落地（worker 在自己的任务里发请求，
     //     这一侧只能轮询）。同样是"只标脏"，所以同样要在这里自己收帧。
     const bool aiTick = rdAiChatIdleTick();
-    if (netTick || scanTick || wifiTick || aiTick) renderCurrent();
+    // PDF 的单击延迟判双击：过点没等到第二击就当场兑现，所以要自己收帧。
+    const bool pdfTick = pdfIdleTick();
+    if (netTick || scanTick || wifiTick || aiTick || pdfTick) renderCurrent();
     return APP_READER;
   }
 
@@ -13945,6 +14018,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
     case RdMode::Percent: handlePercent(key); break;
     case RdMode::Qr: handleQr(key); break;
     case RdMode::Apps: handleApps(key); break;
+    case RdMode::Pdf: pdfHandle(key); break;
     case RdMode::Dictionary: handleDict(key); break;
     case RdMode::AiChat: handleAiChat(key); break;
     case RdMode::Weread: handleWeread(key); break;
@@ -14003,7 +14077,7 @@ AppState screen_reader_handle(int key, ScreenContext &ctx) {
   rdSyncImeActive();
   if (st.dirty) renderCurrent();
   // 阅读页的位置一有变化就落盘（位置没变时 rdRememberProgress 自己会早退，不写 SD）。
-  if (st.mode == RdMode::Reading) rdRememberProgress(false);
+  if (st.mode == RdMode::Reading || st.mode == RdMode::Pdf) rdRememberProgress(false);
   // 统计记时：一次按键只记一笔（翻页/滚动/弹菜单都算），不在 turnBook 里另记。
   if (statsModeBefore == RdMode::Reading) rdStatsNoteActivity();
   return APP_READER;
@@ -14026,6 +14100,8 @@ bool screen_reader_on_sd_lost(bool card_absent) {
     // 都通向一张已经不在的卡，点开/翻页只会一路报错。整套释放顺序照抄
     // screen_reader_exit 里那一段（少一样就会漏一个句柄或一段 PSRAM）。
     gotoBookshelf();
+    pdfCloseDocument();
+    pdfResetUi();
     st.epub.reset();
     st.section.reset();
     st.xtc.reset();

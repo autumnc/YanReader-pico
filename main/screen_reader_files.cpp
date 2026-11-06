@@ -56,6 +56,8 @@ static int fbKindForName(const std::string &name, bool isDir) {
   if (endsWith(name, ".epub")) return 0;
   if (endsWith(name, ".txt")) return 1;
   if (endsWith(name, ".xtc")) return 2;
+  // 5 = 页面图像型 PDF（pdfOpenFrom 接管；不进 openBook 的 Reading 管线）。
+  if (endsWith(name, ".pdf") || endsWith(name, ".PDF")) return 5;
   if (rdIsImageName(name)) return 3;
   return 4;
 }
@@ -520,8 +522,11 @@ static void fbOpenEntry(BookEntry e) {
     st.imgFromReader = false;  // 从文件标签打开的：Esc 回文件浏览器
     st.mode = RdMode::Image;
     st.fullRefresh = true;
+  } else if (e.kind == 5) {
+    // PDF 阅读 App：从文件管理器直接进阅读视图，Esc 回文件浏览器。
+    pdfOpenFrom(e.path, PdfReturn::FileBrowser);
   } else if (e.kind == 4) {
-    // 打不开的普通文件（.pdf/.zip/.md…）：直接进详情页，顺带告诉用户长按能改名/复制/删除。
+    // 打不开的普通文件（.zip/.md…）：直接进详情页，顺带告诉用户长按能改名/复制/删除。
     for (size_t i = 0; i < st.fbEntries.size(); i++)
       if (st.fbEntries[i].path == e.path) { st.fmIdx = static_cast<int>(i); break; }
     st.mode = RdMode::FileInfo;
@@ -1133,7 +1138,8 @@ void renderFileInfo() {
   };
   const char *typeStr = e->kind < 0 ? "文件夹" : e->kind == 0 ? "EPUB 电子书"
                         : e->kind == 1 ? "TXT 文本" : e->kind == 2 ? "XTC 漫画"
-                        : e->kind == 3 ? "图片" : "文件";
+                        : e->kind == 3 ? "图片"
+                        : e->kind == 5 ? "PDF 文档" : "文件";
   row("名称", e->name);
   row("类型", typeStr);
   row("大小", ok ? humanSize(static_cast<long long>(sb.st_size)) : "未知");

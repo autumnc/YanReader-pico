@@ -455,7 +455,9 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   }
 
   ImageDimensions sourceDimensions;
-  if (!validateAndStoreDimensions(jpeg->getWidth(), jpeg->getHeight(), sourceDimensions, "JPEG")) return false;
+  if (!validateAndStoreDimensions(jpeg->getWidth(), jpeg->getHeight(), sourceDimensions, "JPEG",
+                                  config.maxSourcePixels))
+    return false;
   const int srcWidth = sourceDimensions.width;
   const int srcHeight = sourceDimensions.height;
 

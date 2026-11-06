@@ -1,0 +1,103 @@
+ok   fixture classic loads
+ok   classic: open
+ok   classic: one page
+ok   classic: page geometry
+classic geom media=612x792 crop=612x792 rot=0
+ok   classic: main image found
+classic coverage=1.00
+ok   classic: image info
+classic image=1200x1600 dct=1 comps=1
+ok   classic: DCT extract
+classic dct bytes=304123 crc=c630e7b3
+ok   fixture xrefstm loads
+ok   xrefstm: open
+xrefstm pages=1
+ok   xrefstm: one page (catalog in ObjStm)
+ok   xrefstm: geometry
+ok   xrefstm: main image
+ok   xrefstm: image info
+xrefstm image=40x30 comps=1
+ok   xrefstm: flate decode
+xrefstm pxc crc=19ad51a6 s00=0 s2020=9
+ok   fixture flate_gray loads
+ok   flate_gray: open
+ok   flate_gray: geometry
+ok   flate_gray: main image
+ok   flate_gray: image info
+ok   flate_gray: decode with PNG predictor
+flate_gray pxc=64x48 crc=99472492 s00=0 s1020=6 s6347=8
+ok   fixture flate_rgb loads
+ok   flate_rgb: open
+ok   flate_rgb: geometry
+ok   flate_rgb: main image
+ok   flate_rgb: image info
+ok   flate_rgb: 3 components
+ok   flate_rgb: decode with Up predictor
+flate_rgb pxc=32x24 crc=7a444789 s00=0 s1512=7
+ok   fixture multi loads
+ok   multi: open
+ok   multi: geometry
+ok   multi: main image
+ok   multi: image info
+multi coverage=1.00 image=1200x1600
+ok   multi: picks the large image
+ok   fixture textonly loads
+ok   textonly: open
+ok   textonly: geometry
+ok   textonly: NoPageImage
+textonly err=此 PDF 不是页面图像型
+ok   fixture unsupported loads
+ok   unsupported: open
+ok   unsupported: geometry
+ok   unsupported: main image
+ok   unsupported: UnsupportedFilter
+unsupported err=PDF 滤镜不支持
+ok   fixture encrypted loads
+ok   encrypted: Encrypted
+encrypted err=加密 PDF 不支持
+ok   fixture badxref loads
+ok   badxref: rejected
+badxref err=PDF 结构损坏
+ok   fixture truncated loads
+ok   truncated: rejected
+truncated err=PDF 结构损坏
+ok   fixture bomb loads
+ok   bomb: open
+ok   bomb: geometry
+ok   bomb: main image
+ok   bomb: TooLarge
+bomb err=PDF 页面过大
+ok   pxc: header
+ok   pxc: dimensions
+ok   pxc: auto crop
+ok   pxc: crop valid
+pxc crop=30,15,170,85
+ok   pxc: crop bbox (15% cap)
+ok   view: fit page
+view fitpage scale=3.0 disp=200x100 off=0.0,250.0
+ok   view: fit page scale 3
+ok   view: top-left maps
+ok   view: fit width
+view fitwidth scale=3.0 off=0.0,250.0
+ok   view: original
+view original scale=1.0 off=200.0,350.0
+ok   view: rotate map
+ok   view: rotate round trip
+view rot=0 src=37,61 disp=37.5,61.5 screen=112.5,434.5
+ok   view: rotate map
+ok   view: rotate round trip
+view rot=90 src=37,61 disp=38.5,37.5 screen=254.0,150.0
+ok   view: rotate map
+ok   view: rotate round trip
+view rot=180 src=37,61 disp=162.5,38.5 screen=487.5,365.5
+ok   view: rotate map
+ok   view: rotate round trip
+view rot=270 src=37,61 disp=61.5,162.5 screen=346.0,650.0
+ok   view: crop
+view crop scale=5.0 disp=120x60 off=0.0,250.0
+ok   view: crop origin
+ok   view: anchor base
+ok   view: anchor zoomed
+view anchor tap=361.5,371.5 pan=-184.5,85.5 now=361.5,371.5
+ok   view: double-tap anchor holds
+failures=0

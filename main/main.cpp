@@ -359,13 +359,21 @@ static void btInitBody() {
             vTaskDelay(pdMS_TO_TICKS(200));
         }
     }
-    if (s_btInitStop.load(std::memory_order_relaxed)) {
-        return;   // 被要求退出（待机/关开关），别再往下起重连
-    }
     if (initTries > 0) {
         ESP_LOGI(TAG, "BT init 第 %d 次重试成功", initTries);
     }
-    int64_t lastReloadUs = 0;
+}
+
+// 常驻重连循环，跑在 **PSRAM 栈**上（见 btInitTask）。这里绝不能调 g_bt.init()：
+// 控制器初始化会关 flash cache，PSRAM 栈任务在那一刻连自己的栈都读不到
+// （2026-11-06 实测 assert esp_task_stack_is_sane_cache_disabled）。init 全部留在
+// 内部栈的 btInitBody 里，循环只调用蓝牙协议栈 / SD 读，不落盘、不关 cache。
+static void btLoopBody() {
+    // 负数 = 开机第一拍就重读配对表。原来初值 0，而 nowUs 是开机以来的微秒数 ——
+    // "nowUs - 0 > 30s" 要等开机满 30 秒才成立，于是开机后前 30 秒根本不读名单、
+    // 不开在场扫描，键盘就在旁边广播也只能干等（2026-11-06 实测：6s 起来，32s 才
+    // 读到名单、36s 才连上）。初值给 -60s 让第一拍无条件命中。
+    int64_t lastReloadUs = -60000000LL;
     int64_t nextTryUs = 0;         // 下一次允许发起连接的时刻；0 = 立刻
     int64_t lastGapUs = 0;         // 上一次排出来的留空（只给日志看）
     int tryIdx = 0;
@@ -514,8 +522,35 @@ static void btInitBody() {
     g_bt.reapFinishedConnect();
 }
 
+static void btLoopTask(void *arg) {
+    btLoopBody();
+    s_btInitRunning.store(false, std::memory_order_release);
+    // 栈在 PSRAM（xTaskCreatePinnedToCoreWithCaps），自删必须走 WithCaps 才会连栈一起放。
+    vTaskDeleteWithCaps(NULL);
+}
+
 static void btInitTask(void *arg) {
+    // 这一段必须占内部栈：控制器初始化会关 flash cache，任务栈若在 PSRAM，那一刻
+    // 连自己的栈都读不到（实测 assert esp_task_stack_is_sane_cache_disabled，开蓝牙
+    // 立即重启）。所以 init 走内部栈，成功后再把"常驻"的部分交给 PSRAM 栈的
+    // bt_loop —— 内部 RAM 在连接/配对那一刻只剩 ~1.5KB，连 SMP/L2CAP 的 84 字节都
+    // 要不到、IDF 在 NULL 队列上 assert 重启；这 8KB 内部栈一直挂着正是那批内存。
     btInitBody();
+    if (s_btInitStop.load(std::memory_order_relaxed)) {
+        s_btInitRunning.store(false, std::memory_order_release);
+        vTaskDelete(NULL);
+        return;
+    }
+    if (xTaskCreatePinnedToCoreWithCaps(btLoopTask, "bt_loop", 6144, NULL, 5, NULL, 1,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS) {
+        // 本任务退出，内部栈由 IDLE 回收；s_btInitRunning 交给 bt_loop 在退出时清。
+        // 第一次连接在循环里最快也要一拍之后，那时 IDLE 早已回收完这块栈。
+        vTaskDelete(NULL);
+        return;
+    }
+    // PSRAM 栈都建不起（极罕见）：退回旧行为，重连循环留在内部栈上跑。
+    ESP_LOGW(TAG, "bt_loop 的 PSRAM 栈建不起，重连循环留在内部栈上");
+    btLoopBody();
     s_btInitRunning.store(false, std::memory_order_release);
     vTaskDelete(NULL);
 }
@@ -539,6 +574,9 @@ static void spawnBtInit() {
     }
     s_btInitStop.store(false, std::memory_order_relaxed);
     s_btInitRunning.store(true, std::memory_order_release);
+    // bt_init 本身必须**内部栈**（初始化会关 flash cache，PSRAM 栈读不了自己，见
+    // btInitTask 注释）；它只在 init 期间活着，成功后把重连循环交给 PSRAM 栈的
+    // bt_loop 再退出，把 8KB 还给内部堆。
     if (xTaskCreatePinnedToCore(btInitTask, "bt_init", 8192, NULL, 5, NULL, 1) != pdPASS) {
         s_btInitRunning.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "bt_init 任务创建失败");
@@ -2082,6 +2120,23 @@ extern "C" void app_main() {
             if (currentState == APP_EDITOR) inspEditorReturnTo = ctx.prevState;
             currentState = APP_INSPIRATION;
             key = 0;
+        }
+
+        // 蓝牙键盘触控板滑动（bt_keyboard 发 KEY_SWIPE_*）：
+        //   · 输入法正出候选时 → 原样交给输入法：←/→ 移动候选选择、↑ 把选中的那条
+        //     上屏（见 IME::handleKeyImpl 顶部；宿主把键喂给 g_ime，会顺手重画候选带）。
+        //     只在会打字的界面（vk_host）里这么放行，别让残留的组合态吃掉普通方向的滑动。
+        //   · 其余情况（以及 ↓）→ 方向键。
+        if (key >= KEY_SWIPE_UP && key <= KEY_SWIPE_RIGHT) {
+            const bool imePick = key != KEY_SWIPE_DOWN && kScreens[currentState].vk_host &&
+                                 g_ime.active() && g_ime.composing() &&
+                                 !g_ime.candidates().empty();
+            if (!imePick) {
+                if (key == KEY_SWIPE_UP) key = KEY_UP;
+                else if (key == KEY_SWIPE_DOWN) key = KEY_DOWN;
+                else if (key == KEY_SWIPE_LEFT) key = KEY_LEFT;
+                else key = KEY_RIGHT;
+            }
         }
 
         // 触摸上下滑产生翻页键：**上下滑 = 整页翻**，这条在各界面内部实现（列表按屏翻、

@@ -6009,6 +6009,24 @@ bool IME::handleKeyImpl(int key, std::string &out) {
         // 不在 q..o 里的键（a/z/p…）照常往下走：待选结束了，它回到自己本来的语义
         // （当拼音字母接着打），只是这一次没选字。
     }
+    // 蓝牙键盘触控板的滑动手势（bt_keyboard 发 KEY_SWIPE_*；主循环在有候选时原样
+    // 放行到这里，见 main.cpp 派发前的归一化）：←/→ 在当前候选页里移动选择，
+    // ↑ 把选中的那条上屏（与空格同义，bySpace=true）。选择动作顺手打开候选高亮
+    // 显示——默认设置里它是关的，不打开用户看不见自己选到了哪一条。
+    // 没有候选时不接管：main.cpp 早把它翻成方向键了。
+    if (key == KEY_SWIPE_LEFT || key == KEY_SWIPE_RIGHT || key == KEY_SWIPE_UP) {
+        // 没有候选：主循环早把它翻成方向键，正常到不了这里。放行给宿主，别掉进下面
+        // 「未知键 = 收尾上屏/复位」那条兜底（会把正在敲的码整个清掉）。
+        if (_page.empty()) return false;
+        _highlightSelectMode = true;
+        if (key == KEY_SWIPE_UP) {
+            commit(_sel, out, true);
+        } else {
+            const int n = (int)_page.size();
+            _sel = (key == KEY_SWIPE_RIGHT) ? (_sel + 1) % n : (_sel + n - 1) % n;
+        }
+        return true;
+    }
     // 虚拟键盘的「一键多字母」键（14/18/9 键布局）走这条支路。物理键盘永远不发这些码，
     // 所以对实体键盘零影响。放在最前：由 handleAmbigKey 统一收口模式冲突。
     if (key >= KEY_AMBIG_BASE) return handleAmbigKey(key - KEY_AMBIG_BASE, out);

@@ -141,6 +141,14 @@ struct ScreenContext {
 // **只在实体键盘上产生**：虚拟键盘不经过 bt_keyboard，所以这条功能天然不碰虚拟键盘。
 // 必须与 bt_keyboard.cpp 的同名宏一致。
 #define KEY_META_TAP   0xB3
+// 蓝牙键盘**触控板**的滑动 → 四个方向键（bt_keyboard.cpp 的 handlePointerReport）。
+// 由主循环统一翻译：一般情况 = 方向键；输入法正出候选时「上滑」翻成空格 = 上屏
+// 当前选中的候选（见 main.cpp 派发前的归一化）。
+// 必须与 bt_keyboard.cpp 的同名宏一致。
+#define KEY_SWIPE_UP    0xB4
+#define KEY_SWIPE_DOWN  0xB5
+#define KEY_SWIPE_LEFT  0xB6
+#define KEY_SWIPE_RIGHT 0xB7
 // BLE 遥控器/翻页器的消费类(Consumer Control)按键：KEY_CONSUMER_BASE | 16 位 HID usage。
 // 这类键只有蓝牙设备会产生；默认无动作，由阅读菜单「按键映射」绑到某个阅读动作。
 // 必须与 bt_keyboard.cpp 的同名宏一致。

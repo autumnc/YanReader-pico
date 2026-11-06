@@ -22,6 +22,10 @@ enum class DecodeOutput : uint8_t {
 struct RenderConfig {
   int x, y;
   int maxWidth, maxHeight;
+  // 每调用的源像素上限（0 = 沿用 MAX_SOURCE_PIXELS）。PDF 页面图像按原生分辨率解码，
+  // A4 300dpi 有 8.7 MP，超过 8 MP 的默认值；只放宽给这条明确知道代价的调用，
+  // EPUB 插图/头图的行为一点不变。
+  int64_t maxSourcePixels = 0;
   bool useGrayscale = true;
   // 8 位灰 → 16 级灰的抖动档。阅读器把用户设置推给 ImageBlock::setDitherMode()
   // 后落到这里；独立图片查看器直接填。
@@ -73,7 +77,8 @@ class ImageToFramebufferDecoder {
 
   // Validate decoder/header dimensions before narrowing them into the layout
   // representation. Shared by header probing and decoder fallbacks.
-  static bool validateAndStoreDimensions(int64_t width, int64_t height, ImageDimensions& out, const char* format);
+  static bool validateAndStoreDimensions(int64_t width, int64_t height, ImageDimensions& out,
+                                         const char* format, int64_t maxPixels = 0);
 
  protected:
   // Size validation helpers. The cap bounds decode TIME, not memory: both decoders

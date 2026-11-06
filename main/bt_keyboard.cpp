@@ -145,6 +145,113 @@ static void handleConsumerReport(const uint8_t *data, size_t len) {
              (unsigned)(KEY_CONSUMER_BASE | (usage & 0x1FFF)));
 }
 
+// ── 触控板（鼠标/指针报告）→ 方向键 ───────────────────────────────────────
+// 带触控板的 BLE 键盘（M1 Keyboard）会额外发鼠标报告。以前这类报告被整包丢弃，
+// 触控板完全没反应。这里把一次滑动识别成四个方向键；输入法有候选时「上滑」由
+// main.cpp 翻成空格（= 上屏当前选中的候选，与键盘空格同义）。
+// 必须与 pjournal_app.h 的同名宏一致。
+#define KEY_SWIPE_UP    0xB4
+#define KEY_SWIPE_DOWN  0xB5
+#define KEY_SWIPE_LEFT  0xB6
+#define KEY_SWIPE_RIGHT 0xB7
+
+#define SWIPE_FIRE_UNITS   60      // 累计位移阈值（鼠标单位≈屏幕像素）
+#define SWIPE_IDLE_US      150000  // 这么久没有位移 = 这一划结束，重新累计
+
+static int32_t s_ptr_dx = 0;
+static int32_t s_ptr_dy = 0;
+static int64_t s_ptr_last_us = 0;
+static bool s_ptr_fired = false;
+static int s_ptr_dump_left = 30;   // 前 30 条指针报告打原始字节，方便核对厂商布局
+
+static void logHex(const char *what, int usage, uint16_t report_id, const uint8_t *data,
+                   size_t len) {
+    char hex[3 * 12 + 1] = {0};
+    int n = 0;
+    for (size_t i = 0; i < len && i < 12 && n < (int)sizeof(hex) - 3; i++) {
+        n += snprintf(hex + n, sizeof(hex) - (size_t)n, "%02X ", data[i]);
+    }
+    ESP_LOGI(TAG, "%s usage=%d id=%u len=%u: %s", what, usage, (unsigned)report_id,
+             (unsigned)len, hex);
+}
+
+static void handlePointerReport(uint16_t report_id, const uint8_t *data, size_t len,
+                                int usage) {
+    if (!data || len < 3) return;
+    if (s_ptr_dump_left > 0) {
+        s_ptr_dump_left--;
+        logHex("pointer", usage, report_id, data, len);
+    }
+    // 报告布局按长度分流。M1 键盘的触控板是 **16 位小端相对坐标**：实测 len=7，
+    //   [buttons, x_lo, x_hi, y_lo, y_hi, wheel, acpan]
+    // （横向划动 x=0x000A..0x0015，y 恒在 0xFFFD 附近小幅漂移）。原先一律按标准
+    // 8 位 [buttons, dx8, dy8, wheel] 解析：横向侥幸能用（dx 恰好读到 x 的低字节），
+    // 纵向则完全失效 —— y 的变化根本不在读到的字节里，上下划永远没反应。
+    // 标准 8 位鼠标报告 len 只有 3~5，所以 len>=6 即按 16 位坐标读。
+    int32_t dx, dy;
+    if (len >= 6) {
+        dx = (int16_t)((uint16_t)data[1] | ((uint16_t)data[2] << 8));
+        dy = (int16_t)((uint16_t)data[3] | ((uint16_t)data[4] << 8));
+    } else {
+        dx = (int8_t)data[1];
+        dy = (int8_t)data[2];
+    }
+    if (dx == 0 && dy == 0) return;
+    const int64_t now = esp_timer_get_time();
+    if (now - s_ptr_last_us > SWIPE_IDLE_US) {
+        s_ptr_dx = 0;
+        s_ptr_dy = 0;
+        s_ptr_fired = false;
+    }
+    s_ptr_last_us = now;
+    s_ptr_dx += dx;
+    s_ptr_dy += dy;
+    if (s_ptr_fired) return;   // 一次滑动只发一个键
+    const int ax = s_ptr_dx < 0 ? (int)-s_ptr_dx : (int)s_ptr_dx;
+    const int ay = s_ptr_dy < 0 ? (int)-s_ptr_dy : (int)s_ptr_dy;
+    if (ax < SWIPE_FIRE_UNITS && ay < SWIPE_FIRE_UNITS) return;
+    s_ptr_fired = true;
+    const bool horizontal = ax >= ay;
+    const uint16_t key = horizontal ? (s_ptr_dx > 0 ? KEY_SWIPE_RIGHT : KEY_SWIPE_LEFT)
+                                    : (s_ptr_dy > 0 ? KEY_SWIPE_DOWN : KEY_SWIPE_UP);
+    pushKey(key);
+    ESP_LOGI(TAG, "pointer swipe dx=%d dy=%d → %s", (int)s_ptr_dx, (int)s_ptr_dy,
+             horizontal ? (s_ptr_dx > 0 ? "RIGHT" : "LEFT")
+                        : (s_ptr_dy > 0 ? "DOWN" : "UP"));
+}
+
+// 连上后把 HID 报告描述符里解析出的报告条目打一遍：带触控板的键盘会多出鼠标
+// 报告，各厂商布局不一样，日志是离线核对格式的依据（见 handlePointerReport）。
+static void logReportMaps(esp_hidh_dev_t *dev) {
+    size_t num = 0;
+    esp_hid_raw_report_map_t *maps = nullptr;
+    if (esp_hidh_dev_report_maps_get(dev, &num, &maps) != ESP_OK || !maps) return;
+    bool saw_mouse = false;
+    for (size_t i = 0; i < num && i < 4; i++) {
+        if (!maps[i].data) continue;
+        esp_hid_report_map_t *parsed = esp_hid_parse_report_map(maps[i].data, maps[i].len);
+        if (!parsed) continue;
+        for (int j = 0; j < parsed->reports_len && j < 16; j++) {
+            const esp_hid_report_item_t &r = parsed->reports[j];
+            if (r.usage == ESP_HID_USAGE_MOUSE) saw_mouse = true;
+            ESP_LOGI(TAG, "report map %u: id=%u type=%u usage=%d len=%u", (unsigned)i,
+                     (unsigned)r.report_id, (unsigned)r.report_type, (int)r.usage,
+                     (unsigned)r.value_len);
+        }
+        esp_hid_free_report_map(parsed);
+    }
+    if (!saw_mouse) {
+        // 没有标准鼠标条目：把原始描述符前 128 字节打出来，便于认出厂商自定义布局。
+        for (size_t i = 0; i < num && i < 1; i++) {
+            if (!maps[i].data) continue;
+            for (size_t off = 0; off < maps[i].len && off < 128; off += 32) {
+                const size_t n = maps[i].len - off < 32 ? maps[i].len - off : 32;
+                logHex("report desc", (int)i, 0, maps[i].data + off, n);
+            }
+        }
+    }
+}
+
 static BtKeyboard *s_self = nullptr;
 BtKeyboard g_bt;
 static esp_hidh_dev_t *s_dev = nullptr;
@@ -307,6 +414,11 @@ static SemaphoreHandle_t s_devices_mutex = nullptr;
 // Paired device list (persisted to /sdcard/settings/bt_paired, most recent first)
 static BtPairedDevice s_paired[MAX_BT_DEVICES];
 static int s_paired_count = 0;
+// 名单会在三个任务上被改：bt_loop（每 30s/5min 重读 SD）、HID 回调（连接成功后
+// savePairedDevice 置顶）、界面（删除设备）。load 开头就把 count 清零再逐条填 ——
+// 与 save/remove 撞上时会拿半个名单拼内容写盘，日志里实测过 "Saved 0 paired
+// device(s)" 跟在 "Loaded 6" 前面。所有读写都先拿这把锁。
+static SemaphoreHandle_t s_paired_mutex = nullptr;
 
 // BLE scan params (extended)
 static esp_ble_ext_scan_params_t s_ext_scan_params = {};
@@ -475,6 +587,7 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
             // 用户报"没生效"时先看这一行就知道是开关没开（或存的是 "0"）还是代码没走到。
             ESP_LOGI(TAG, "Keyboard connected: %s (long_press_symbol=%d, m1_layout=%d)",
                      nm ?: "?", (int)g_settings.kbLongPressSymbol(), (int)s_m1_layout);
+            logReportMaps(param->open.dev);
         } else {
             ESP_LOGE(TAG, "Keyboard HID open failed: %d", param->open.status);
         }
@@ -513,11 +626,20 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
             handleConsumerReport(param->input.data, param->input.length);
             break;
         }
+        // 触控板/鼠标报告：滑动识别成方向键（见 handlePointerReport）。
+        if (param->input.usage & ESP_HID_USAGE_MOUSE) {
+            handlePointerReport(param->input.report_id, param->input.data,
+                                param->input.length, (int)param->input.usage);
+            break;
+        }
         if (param->input.usage != ESP_HID_USAGE_KEYBOARD) {
-            static bool s_non_kbd_logged = false;
-            if (!s_non_kbd_logged) {
-                s_non_kbd_logged = true;
-                ESP_LOGI(TAG, "ignoring non-keyboard input reports (usage=%d)", (int)param->input.usage);
+            // 既不是键盘也不是标准鼠标：可能是平板/厂商自定义报告。头 20 条打原始
+            // 字节，用于离线认出布局（触控板不走标准 Mouse 集合时只有这条线索）。
+            static int s_non_kbd_dump_left = 20;
+            if (s_non_kbd_dump_left > 0) {
+                s_non_kbd_dump_left--;
+                logHex("input", (int)param->input.usage, param->input.report_id,
+                       param->input.data, param->input.length);
             }
             break;
         }
@@ -1113,6 +1235,15 @@ BtKeyboard& BtKeyboard::getInstance() {
     return inst;
 }
 
+// 初始化各阶段的内部 RAM 快照。BT 栈里有两笔任务栈必须拿到**连续的**内部块，碎片化时
+// 「总余量够」不代表分得出来，所以每个阶段都把 free/largest 打出来，失败时一眼能认出
+// 是"真不够"还是"被切碎"。
+static void heapNow(const char *stage) {
+    ESP_LOGI(TAG, "heap %s: int free=%u largest=%u", stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
 esp_err_t BtKeyboard::init() {
     s_self = this;  // g_bt 全局实例直接使用；补齐单例指针，否则 setConnected/save-on-open 被跳过
     // 守卫用 s_init_done（只在**全部**成功时才置位），不能再用 `if (s_queue)`：
@@ -1124,6 +1255,7 @@ esp_err_t BtKeyboard::init() {
     // 上一次失败留下的残骸先清掉，让这次能从干净状态重来。
     if (s_queue) { vQueueDelete(s_queue); s_queue = nullptr; }
     if (s_devices_mutex) { vSemaphoreDelete(s_devices_mutex); s_devices_mutex = nullptr; }
+    if (s_paired_mutex) { vSemaphoreDelete(s_paired_mutex); s_paired_mutex = nullptr; }
 
     // 失败回退：按"走到哪一步"逐级关回去（stage 越大表示走得越深），最后删掉队列/互斥量，
     // 保证返回值不为 OK 时系统状态和没调用过 init 一样。
@@ -1138,6 +1270,7 @@ esp_err_t BtKeyboard::init() {
         if (stage >= 3) esp_bt_controller_deinit();
         if (s_queue) { vQueueDelete(s_queue); s_queue = nullptr; }
         if (s_devices_mutex) { vSemaphoreDelete(s_devices_mutex); s_devices_mutex = nullptr; }
+        if (s_paired_mutex) { vSemaphoreDelete(s_paired_mutex); s_paired_mutex = nullptr; }
         s_init_done = false;
         ESP_LOGE(TAG, "BT init failed (stage %d): %s", stage, esp_err_to_name(err));
         return err;
@@ -1149,18 +1282,38 @@ esp_err_t BtKeyboard::init() {
 
     s_devices_mutex = xSemaphoreCreateMutex();
     if (!s_devices_mutex) return fail(ESP_FAIL, 2);
+    s_paired_mutex = xSemaphoreCreateMutex();
+    if (!s_paired_mutex) return fail(ESP_FAIL, 2);
 
+    heapNow("before controller init");
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     esp_err_t ret = esp_bt_controller_init(&bt_cfg);
     if (ret != ESP_OK) return fail(ret, 2);
     ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
     if (ret != ESP_OK) return fail(ret, 3);
+    heapNow("after controller enable");
 
     esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
     ret = esp_bluedroid_init_with_cfg(&bluedroid_cfg);
     if (ret != ESP_OK) return fail(ret, 4);
+    heapNow("after bluedroid init");
+
+    // esp_bluedroid_enable() 里才创建 BTU 任务栈（BT_BTU_TASK_STACK_SIZE + 512），且
+    // **IDF 对这次分配失败的处理是坏的**：BTU_StartUp 失败后直接 BTU_ShutDown →
+    // btu_free_core → l2c_free 在从未初始化过的 L2CAP 池上 list_begin(NULL) → assert
+    // 整机重启。2026-11-06 串口实测：ALLOC FAILED size=8704 之后紧跟
+    //     assert failed: list_begin list.c:266 (list != NULL)
+    // 所以启用前先量最大**连续**块（总余量够不等于分得出来），不够就自己干净地退回，
+    // 交给 bt_init 的重试循环晚点再来 —— 绝不把一笔必死的分配交给 IDF。
+    const size_t bt_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (bt_largest < 8192) {
+        ESP_LOGW(TAG, "内部 RAM 不够起 BTU 任务（最大连续块 %u < 8192），跳过本次初始化",
+                 (unsigned)bt_largest);
+        return fail(ESP_ERR_NO_MEM, 5);
+    }
     ret = esp_bluedroid_enable();
     if (ret != ESP_OK) return fail(ret, 5);
+    heapNow("after bluedroid enable");
 
     esp_ble_gap_register_callback(ble_gap_cb);
 
@@ -1569,6 +1722,7 @@ void BtKeyboard::checkKeyRepeat() {
 }
 
 void BtKeyboard::savePairedDevice(const uint8_t *bda, esp_ble_addr_type_t addr_type, const char *name) {
+    if (s_paired_mutex) xSemaphoreTake(s_paired_mutex, portMAX_DELAY);
     // Upsert: move to front (most recently used first), drop oldest if full
     int idx = -1;
     for (int i = 0; i < s_paired_count; i++) {
@@ -1609,15 +1763,21 @@ void BtKeyboard::savePairedDevice(const uint8_t *bda, esp_ble_addr_type_t addr_t
     }
     if (!safeWriteFile("/sdcard/settings/bt_paired", content)) {
         ESP_LOGE(TAG, "Failed to save paired devices (SD card write error)");
+        if (s_paired_mutex) xSemaphoreGive(s_paired_mutex);
         return;
     }
     ESP_LOGI(TAG, "Saved %d paired device(s), first %s", s_paired_count, s_paired[0].name);
+    if (s_paired_mutex) xSemaphoreGive(s_paired_mutex);
 }
 
 void BtKeyboard::loadPairedDevices() {
+    if (s_paired_mutex) xSemaphoreTake(s_paired_mutex, portMAX_DELAY);
     s_paired_count = 0;
     FILE *f = fopen("/sdcard/settings/bt_paired", "r");
-    if (!f) return;
+    if (!f) {
+        if (s_paired_mutex) xSemaphoreGive(s_paired_mutex);
+        return;
+    }
     char line[64];
     while (s_paired_count < MAX_BT_DEVICES) {
         if (!fgets(line, sizeof(line), f)) break;
@@ -1655,9 +1815,11 @@ void BtKeyboard::loadPairedDevices() {
     }
     fclose(f);
     ESP_LOGI(TAG, "Loaded %d paired device(s)", s_paired_count);
+    if (s_paired_mutex) xSemaphoreGive(s_paired_mutex);
 }
 
 bool BtKeyboard::removePairedDevice(const uint8_t *bda) {
+    if (s_paired_mutex) xSemaphoreTake(s_paired_mutex, portMAX_DELAY);
     for (int i = 0; i < s_paired_count; i++) {
         if (memcmp(s_paired[i].bda, bda, ESP_BD_ADDR_LEN) == 0) {
             for (int j = i; j < s_paired_count - 1; j++) s_paired[j] = s_paired[j + 1];
@@ -1679,9 +1841,11 @@ bool BtKeyboard::removePairedDevice(const uint8_t *bda) {
             const bool saved = safeWriteFile("/sdcard/settings/bt_paired", content);
             if (!saved) ESP_LOGE(TAG, "Failed to save paired devices (SD card write error)");
             ESP_LOGI(TAG, "Removed paired device, %d remaining", s_paired_count);
+            if (s_paired_mutex) xSemaphoreGive(s_paired_mutex);
             return saved;
         }
     }
+    if (s_paired_mutex) xSemaphoreGive(s_paired_mutex);
     return false;
 }
 

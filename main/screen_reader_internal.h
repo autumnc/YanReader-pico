@@ -34,6 +34,7 @@
 
 #include "dictionary_store.h"
 #include "opds_client.h"
+#include "screen_reader_pdf.h"
 #include "tab_icons.h"
 #include "ui/list_view.h"
 #include "weread_skill_client.h"   // 发现页（搜索/推荐）的结果类型进了 RdState
@@ -194,7 +195,8 @@ enum class RdMode {
   StatsAdjust, // 调整某本书某一天的阅读时长
   StatsSettings,// 统计设置（每日目标）
   RefreshTest,  // 灰阶自检页（16 级梯 / 细线 / 抖动三档对比 / 各刷法耗时，自推屏）
-  AiChat        // AI 对话（两个入口：阅读页选区「问AI」带 ctx / 应用页「DeepSeek 对话」无 ctx）
+  AiChat,       // AI 对话（两个入口：阅读页选区「问AI」带 ctx / 应用页「DeepSeek 对话」无 ctx）
+  Pdf           // PDF 阅读 App（页面图像型）：内部再分 列表 / 阅读 两视图，见 screen_reader_pdf.h
 };
 
 // 主界面五个根标签：0=书架 1=应用 2=笔记 3=设置 4=统计。标签栏只画图标（tab_icons.h）。
@@ -310,7 +312,7 @@ struct RdState {
   int searchSel = 0;
 
   // 当前书
-  int bookKind = -1;  // -1 无 0 epub 1 txt 2 xtc
+  int bookKind = -1;  // -1 无 0 epub 1 txt 2 xtc 5 pdf（5 恒配 RdMode::Pdf，不进 Reading 管线）
   std::string bookPath;
   std::string bookTitle;
 
@@ -427,6 +429,10 @@ struct RdState {
   int imgSrcH = 0;
   // 从阅读页长按插图进来的查看器：Esc 回阅读页（而不是文件浏览器），且不动标签高亮。
   bool imgFromReader = false;
+
+  // PDF 阅读 App（页面图像型）。文档/缓存句柄在 screen_reader_pdf_cache.cpp，这里只放
+  // 会话状态（页码、缩放方式、裁边、旋转、浮层、单击待定）。见 screen_reader_pdf.h。
+  PdfState pdf;
 
   // 书签
   struct RdBookmark {

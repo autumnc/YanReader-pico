@@ -111,6 +111,8 @@ idf_component_register(SRCS
     "screen_reader_files.cpp"    # 「文件」标签：浏览器/文件菜单/图片查看器（P3b 拆出）
     "screen_reader_footnotes.cpp" # 正文脚注引擎（P3b 从 screen_reader.cpp 拆出）
     "screen_reader_wifi.cpp"     # 安卓式 WiFi 管理界面（开关/扫描/连接/已保存）
+    "screen_reader_pdf.cpp"      # PDF 阅读 App：列表/阅读/浮动设置/触摸
+    "screen_reader_pdf_cache.cpp" # PDF 文档与页缓存（HalPdfSource、解码、视口 blit）
     "reading_stats.cpp"
     # 硬件适配层
     "hw/board.cpp"
@@ -162,7 +164,7 @@ idf_component_register(SRCS
 )
 
 # 本工程是独立项目，版本号不复用 pjournal 那条线：从 1.0.0 重新起算。
-target_compile_definitions(${COMPONENT_LIB} PRIVATE YAN_READER_VERSION="1.9.5")
+target_compile_definitions(${COMPONENT_LIB} PRIVATE YAN_READER_VERSION="1.9.6")
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PJOURNAL_IME_ENABLE_PINYIN=$<BOOL:${PJOURNAL_IME_ENABLE_PINYIN}>
     PJOURNAL_IME_ENABLE_LIANGFEN=$<BOOL:${PJOURNAL_IME_ENABLE_LIANGFEN}>

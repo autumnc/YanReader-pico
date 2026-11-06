@@ -50,6 +50,11 @@ static const uint32_t APP_ICON_DEEPSEEK  = 0xF1AF4;  // DeepSeek 对话
 // 几条细线容易糊成一块；这枚实心图形在 96px 下轮廓清楚。4 位码位只走
 // icon_font_draw_sized()，别交给文本路径。
 static const uint32_t APP_ICON_STORE     = 0xF290;
+// PDF 阅读：纸张 + "PDF" 字样；字典：书 + 放大镜。两位都是用户指定的专用图形
+// （U+F0226 / U+F061D，NF-Propo 源字体自带），由 scripts/subset_icon_font.py
+// 的 APPS 组裁进子集。5 位 PUA 只走 icon_font_draw_sized()。
+static const uint32_t APP_ICON_PDF       = 0xF0226;  // PDF 阅读
+static const uint32_t APP_ICON_DICT      = 0xF061D;  // 字典（书 + 放大镜）
 
 // ── 文件浏览页的浮动按钮（网络文件管理）──────────────────────────────────
 // 是新加进子集的（scripts/subset_icon_font.py 的 FAB 组）。
