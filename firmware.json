@@ -1,0 +1,10 @@
+{
+  "version": "1.9.7",
+  "tag": "v1.9.7",
+  "date": "2026-11-07",
+  "file": "firmware/yanreader-1.9.7-full.bin",
+  "size": 11336736,
+  "flashOffset": 0,
+  "sha256": "35a6791c4cfe801b43319d6873aababf6ff50ce50f6783aad4e6420183ef93af",
+  "md5": "06c025a3386e16126d4d911e3c3753f3"
+}
