@@ -534,7 +534,12 @@ static void btInitTask(void *arg) {
     // 连自己的栈都读不到（实测 assert esp_task_stack_is_sane_cache_disabled，开蓝牙
     // 立即重启）。所以 init 走内部栈，成功后再把"常驻"的部分交给 PSRAM 栈的
     // bt_loop —— 内部 RAM 在连接/配对那一刻只剩 ~1.5KB，连 SMP/L2CAP 的 84 字节都
-    // 要不到、IDF 在 NULL 队列上 assert 重启；这 8KB 内部栈一直挂着正是那批内存。
+    // 要不到、IDF 在 NULL 队列上 assert 重启；这块内部栈一直挂着正是那批内存。
+    //
+    // 4096 而不是原来的 8192：init 期间这块栈占着的正是 BTU/HIDH 事件任务要的
+    // 连续内部 RAM（2026-11-07 唤醒后实测 bluedroid init 完只剩 free=6755/
+    // largest=5120，BTU 起不来）。IDF 的 hid_host 例程就是在 3584 字节的 app_main
+    // 栈里跑同一串 init 的，4096 留了余量；实际水线在 init 末尾打出来核对。
     btInitBody();
     if (s_btInitStop.load(std::memory_order_relaxed)) {
         s_btInitRunning.store(false, std::memory_order_release);
@@ -576,8 +581,8 @@ static void spawnBtInit() {
     s_btInitRunning.store(true, std::memory_order_release);
     // bt_init 本身必须**内部栈**（初始化会关 flash cache，PSRAM 栈读不了自己，见
     // btInitTask 注释）；它只在 init 期间活着，成功后把重连循环交给 PSRAM 栈的
-    // bt_loop 再退出，把 8KB 还给内部堆。
-    if (xTaskCreatePinnedToCore(btInitTask, "bt_init", 8192, NULL, 5, NULL, 1) != pdPASS) {
+    // bt_loop 再退出，把这块内部栈还给内部堆。4096 的理由见 btInitTask 上方注释。
+    if (xTaskCreatePinnedToCore(btInitTask, "bt_init", 4096, NULL, 5, NULL, 1) != pdPASS) {
         s_btInitRunning.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "bt_init 任务创建失败");
     }

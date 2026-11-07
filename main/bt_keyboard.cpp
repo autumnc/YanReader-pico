@@ -1,4 +1,5 @@
 #include "bt_keyboard.h"
+#include "sdkconfig.h"          // CONFIG_BT_BTU_TASK_STACK_SIZE（起 BTU 前的连续块门槛）
 #include "safe_file.h"
 #include "settings_manager.h"   // 「字母选字按键」/「长按输入符号」两个实体键盘设置
 #include <cstring>
@@ -1272,7 +1273,10 @@ esp_err_t BtKeyboard::init() {
         if (s_devices_mutex) { vSemaphoreDelete(s_devices_mutex); s_devices_mutex = nullptr; }
         if (s_paired_mutex) { vSemaphoreDelete(s_paired_mutex); s_paired_mutex = nullptr; }
         s_init_done = false;
-        ESP_LOGE(TAG, "BT init failed (stage %d): %s", stage, esp_err_to_name(err));
+        // bt_init 栈缩小到 4096 后，这条水线是判断"缩过头了没有"的唯一依据
+        // （FreeRTOS 的 high water mark 单位是字节，= 跑到这里时还剩多少）。
+        ESP_LOGE(TAG, "BT init failed (stage %d): %s（bt_init 栈水线余 %u）", stage,
+                 esp_err_to_name(err), (unsigned)uxTaskGetStackHighWaterMark(NULL));
         return err;
     };
 
@@ -1305,10 +1309,21 @@ esp_err_t BtKeyboard::init() {
     //     assert failed: list_begin list.c:266 (list != NULL)
     // 所以启用前先量最大**连续**块（总余量够不等于分得出来），不够就自己干净地退回，
     // 交给 bt_init 的重试循环晚点再来 —— 绝不把一笔必死的分配交给 IDF。
+    //
+    // 门槛必须跟着 CONFIG_BT_BTU_TASK_STACK_SIZE 走，不能写死旧默认值。2026-11-07
+    // 待机唤醒后实测：bluedroid init 完 largest=5120，而阈值曾是 8192（= 改成 4096
+    // 之前那版的栈大小），于是本来放得下的 4608 被一直拒掉，BT 再也起不来
+    // （日志：`最大连续块 5120 < 8192` 每 60s 一次，自动/手动连接都没有栈可用）。
+    // 真正要连续的是**栈本身**，但 BTU_StartUp 在拿栈之前还会先分三张定时器哈希表、
+    // 一把互斥量，以及 osi_thread_create 里的线程结构、100 项工作队列（100×8B）和
+    // 3 个信号量 —— 这些都会从同一片大块里切走约 1.5KB。余量给 2048B。
+    // 2026-11-07 实测：唤醒后 bluedroid init 完 largest=19456，离这道门槛很远。
+    const size_t btu_stack = (size_t)CONFIG_BT_BTU_TASK_STACK_SIZE + 512;  // + TASK_EXTRA_STACK_SIZE
+    const size_t btu_need = btu_stack + 2048;
     const size_t bt_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (bt_largest < 8192) {
-        ESP_LOGW(TAG, "内部 RAM 不够起 BTU 任务（最大连续块 %u < 8192），跳过本次初始化",
-                 (unsigned)bt_largest);
+    if (bt_largest < btu_need) {
+        ESP_LOGW(TAG, "内部 RAM 不够起 BTU 任务（最大连续块 %u < 需要 %u），跳过本次初始化",
+                 (unsigned)bt_largest, (unsigned)btu_need);
         return fail(ESP_ERR_NO_MEM, 5);
     }
     ret = esp_bluedroid_enable();
@@ -1322,6 +1337,9 @@ esp_err_t BtKeyboard::init() {
 
     esp_ble_gattc_register_callback(esp_hidh_gattc_event_handler);
 
+    // event_stack_size：HIDH 自建的事件任务栈（内部 RAM）。必须用默认 4096：
+    // 2026-11-07 实测降到 3072 后，键盘连接/认证那一刻直接在 esp_hidh_events
+    // 里栈溢出重启（GATT notif + SMP 认证回调比预想深得多）。
     esp_hidh_config_t hid_cfg = {
         .callback = hidh_cb,
         .event_stack_size = 4096,
@@ -1354,7 +1372,8 @@ esp_err_t BtKeyboard::init() {
     s_presence_hit_us = 0;
     s_presence_next_us = 0;
 
-    ESP_LOGI(TAG, "BT keyboard driver initialized");
+    ESP_LOGI(TAG, "BT keyboard driver initialized（bt_init 栈水线余 %u）",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     s_init_done = true;
     return ESP_OK;
 }

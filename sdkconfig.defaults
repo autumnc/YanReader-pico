@@ -123,7 +123,7 @@ CONFIG_READ_PICO_EPD_SMALL_FEED_QUEUE=y
 CONFIG_BT_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=y
 CONFIG_BT_BTU_TASK_STACK_SIZE=4096
-CONFIG_BT_BTC_TASK_STACK_SIZE=4096
+CONFIG_BT_BTC_TASK_STACK_SIZE=3072
 # 控制器为"活动"(连接/扫描/同步/广播)预分配的实例数，Kconfig 原文："Each instance
 # needs to consume 828 bytes"。这台机器只当一把 BLE HID 键盘的 host：活动数最多是
 # 「扫描」+「已建连接」两种，而 bt_keyboard.cpp 的 connect_task 在 gattc_open 之前
